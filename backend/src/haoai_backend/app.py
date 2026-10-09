@@ -37,6 +37,9 @@ from .personal_production.rough_cut.persistence import (
 from .series_data.http import mount_series_data_routes
 from .series_data.persistence import SqlAlchemySeriesDataUnitOfWork
 from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
+from .teams import JoinQuota, build_teams_routers, create_team_uow_factory
+from .teams.management.persistence import create_management_uow_factory
+from .teams.series.persistence import create_series_uow_factory
 
 SessionFactory = Callable[[], Session]
 
@@ -48,8 +51,9 @@ def create_app(
     series_access_policy: SeriesAccessCheck | None = None,
     authentication_runtime: AuthenticationRuntime | None = None,
     download_url_resolver: DownloadURLResolver | None = None,
+    team_join_quota: JoinQuota | None = None,
 ) -> FastAPI:
-    """Compose 11 authentication and 46 business methods without startup I/O."""
+    """Compose 11 authentication and 71 business methods without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
@@ -195,4 +199,22 @@ def create_app(
         uow_factory=replacement_uow_factory,
         resolve_actor=effective_resolver,
     )
+
+    management_team_uow_factory = None
+    series_team_uow_factory = None
+    reporting_team_uow_factory = None
+    if effective_session_factory is not None and effective_resolver is not None:
+        team_uow_factory = create_team_uow_factory(effective_session_factory)
+        management_team_uow_factory = create_management_uow_factory(team_uow_factory)
+        series_team_uow_factory = create_series_uow_factory(effective_session_factory)
+        reporting_team_uow_factory = team_uow_factory
+
+    for router in build_teams_routers(
+        management_uow_factory=management_team_uow_factory,
+        series_uow_factory=series_team_uow_factory,
+        reporting_uow_factory=reporting_team_uow_factory,
+        resolve_actor=effective_resolver,
+        join_quota=team_join_quota,
+    ):
+        app.include_router(router)
     return app

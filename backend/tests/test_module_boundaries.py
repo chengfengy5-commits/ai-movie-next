@@ -132,6 +132,31 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/chapters/{chapter_id}/ai-stats", frozenset({"GET"})),
         ("/api/download", frozenset({"GET"})),
         ("/api/sign-download-urls", frozenset({"POST"})),
+        ("/api/teams", frozenset({"POST"})),
+        ("/api/teams/my", frozenset({"GET"})),
+        ("/api/teams/{team_id}", frozenset({"GET"})),
+        ("/api/teams/{team_id}", frozenset({"PUT"})),
+        ("/api/teams/{team_id}", frozenset({"DELETE"})),
+        ("/api/teams/{team_id}/leave", frozenset({"POST"})),
+        ("/api/teams/{team_id}/members/{user_id}", frozenset({"DELETE"})),
+        ("/api/teams/{team_id}/members/{user_id}/role", frozenset({"PUT"})),
+        ("/api/teams/{team_id}/members/{user_id}/permissions", frozenset({"PUT"})),
+        ("/api/teams/{team_id}/invites", frozenset({"POST"})),
+        ("/api/teams/{team_id}/invites", frozenset({"GET"})),
+        ("/api/teams/{team_id}/invites/{invite_id}", frozenset({"DELETE"})),
+        ("/api/teams/join", frozenset({"POST"})),
+        ("/api/teams/{team_id}/series", frozenset({"GET"})),
+        ("/api/teams/{team_id}/series", frozenset({"POST"})),
+        ("/api/series/{series_id}/share", frozenset({"POST"})),
+        ("/api/series/{series_id}/share", frozenset({"DELETE"})),
+        ("/api/teams/{team_id}/series/{series_id}/claim", frozenset({"POST"})),
+        ("/api/teams/{team_id}/series/{series_id}/claim", frozenset({"DELETE"})),
+        ("/api/teams/{team_id}/series/{series_id}/transfer", frozenset({"POST"})),
+        ("/api/teams/{team_id}/members/{user_id}/tasks", frozenset({"GET"})),
+        ("/api/teams/{team_id}/usage", frozenset({"GET"})),
+        ("/api/teams/{team_id}/series/{series_id}/usage", frozenset({"GET"})),
+        ("/api/teams/{team_id}/usage/model", frozenset({"GET"})),
+        ("/api/teams/{team_id}/usage/export", frozenset({"GET"})),
     }
     assert app.openapi_url is None
     assert app.docs_url is None
@@ -245,7 +270,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 57, [(route.path, route.methods) for route in app.routes]
+        assert len(app.routes) == 82, [(route.path, route.methods) for route in app.routes]
         assert effects == [], effects
         # Pydantic probes this optional schema flag; application modules must not read env.
         for key, caller, frames in environment_reads:

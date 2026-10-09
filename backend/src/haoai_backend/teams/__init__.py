@@ -67,14 +67,16 @@ from .ports import (
 
 if TYPE_CHECKING:
     from fastapi import APIRouter
+    from .management.ports import ManagementUnitOfWorkFactory
+    from .series.ports import SeriesUnitOfWorkFactory
 else:
     APIRouter = Any
 
 
 def build_teams_routers(
     *,
-    management_uow_factory: TeamsUnitOfWorkFactory | None,
-    series_uow_factory: TeamsUnitOfWorkFactory | None,
+    management_uow_factory: ManagementUnitOfWorkFactory | None,
+    series_uow_factory: SeriesUnitOfWorkFactory | None,
     reporting_uow_factory: TeamsUnitOfWorkFactory | None,
     resolve_actor: Any,
     join_quota: JoinQuota | None,

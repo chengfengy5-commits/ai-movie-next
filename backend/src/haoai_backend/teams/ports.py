@@ -5,11 +5,15 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import AssignmentPlan, TeamConfig, TeamMembershipRecord, TeamRecord, UserRecord
+
+if TYPE_CHECKING:
+    from .management.ports import ManagementUnitOfWorkFactory
+    from .series.ports import SeriesUnitOfWorkFactory
 
 
 class Clock(Protocol):
@@ -117,8 +121,8 @@ TeamsUnitOfWorkFactory = Callable[[], TeamsUnitOfWork]
 
 @dataclass(frozen=True, slots=True)
 class TeamFamilyFactories:
-    management_uow_factory: TeamsUnitOfWorkFactory | None
-    series_uow_factory: TeamsUnitOfWorkFactory | None
+    management_uow_factory: ManagementUnitOfWorkFactory | None
+    series_uow_factory: SeriesUnitOfWorkFactory | None
     reporting_uow_factory: TeamsUnitOfWorkFactory | None
     resolve_actor: Callable[..., Any] | None
     join_quota: JoinQuota | None
