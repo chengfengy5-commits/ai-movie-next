@@ -78,3 +78,9 @@ backend/src/haoai_backend/chat_data 将聊天请求、领域记录、用例、Uo
 聊天读取先取得章节所属剧集，再在同一业务 UoW 中执行现有剧集访问策略和查询。创建消息会在同一事务内尝试续期本人章节锁，不续期他人锁；创建与内容更新提交后通过同一 UoW 重新读取行。提交后读取失败属于结果未知，调用方应显式读取核实，模块不自动重发写入。删除聊天消息不会顺带删除无消息外键约束的任务、账务或队列历史。
 
 Core 表只是本适配器所需的查询投影，不是完整生产 schema 或 migration；生产源码不创建 Engine/schema。架构边界见[聊天数据后端说明](../docs/architecture/chat-data-backend.md)，真实运行层次和限制见[本批 verification](../openspec/changes/modularize-backend-chat-data/verification.md)。
+
+## 第二十九批：章节画布模块
+
+`backend/src/haoai_backend/canvas_data` 将画布 DTO、用例、端口、SQLAlchemy Core 持久化和 HTTP 适配分层。应用在同一业务 UoW 中依次查章节、执行剧集访问策略、续期本人的已有锁，再进行序列化、大小/版本检查和写入。画布是章节共享数据；GET 缺行时返回完整默认对象且不建行。
+
+PUT 按已读版本快照比较并按主键更新，不增加 SQL 版本 CAS；每次成功请求提交一次，再由同一 UoW 真实读取返回行。提交前失败回滚；提交后确认或刷新失败属于结果未知，模块不自动重发，调用方应显式 GET 核实。Core 表是此适配器的查询投影，不是完整生产 schema；生产源码不创建 Engine 或 schema。见[架构说明](../docs/architecture/canvas-data-backend.md)和[验收记录](../openspec/changes/modularize-backend-canvas-data/verification.md)。

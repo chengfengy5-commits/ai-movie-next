@@ -122,7 +122,7 @@ def test_cold_app_import_and_unwired_factory_do_not_open_env_or_construct_sqlalc
         module = importlib.import_module('haoai_backend.app')
         app = module.create_app()
         paths = [(route.path, route.methods) for route in app.routes]
-        assert len(paths) == 52, paths
+        assert len(paths) == 54, paths
         for module_name in ("passlib", "jose"):
             assert module_name not in sys.modules, module_name
         assert side_effects == [], side_effects

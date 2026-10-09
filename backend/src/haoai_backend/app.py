@@ -11,6 +11,9 @@ from .asset_data.http import mount_asset_data_routes
 from .chat_data.http import mount_chat_data_routes
 from .chat_data.persistence import SqlAlchemyChatDataUnitOfWork
 from .chat_data.ports import UnitOfWorkFactory as ChatDataUnitOfWorkFactory
+from .canvas_data.http import mount_canvas_data_routes
+from .canvas_data.persistence import SqlAlchemyCanvasDataUnitOfWork
+from .canvas_data.ports import UnitOfWorkFactory as CanvasDataUnitOfWorkFactory
 from .asset_data.persistence import SqlAlchemyAssetDataUnitOfWork
 from .asset_data.ports import AssetDataUnitOfWorkFactory
 from .authentication.configuration import AuthenticationRuntime
@@ -39,7 +42,7 @@ def create_app(
     series_access_policy: SeriesAccessCheck | None = None,
     authentication_runtime: AuthenticationRuntime | None = None,
 ) -> FastAPI:
-    """Compose 11 authentication and 41 business methods without startup I/O."""
+    """Compose 11 authentication and 43 business methods without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
@@ -142,6 +145,18 @@ def create_app(
     mount_chat_data_routes(
         app,
         uow_factory=chat_data_uow_factory,
+        resolve_actor=effective_resolver,
+    )
+
+    canvas_data_uow_factory: CanvasDataUnitOfWorkFactory | None = None
+    if effective_session_factory is not None and effective_resolver is not None:
+        def make_canvas_data_uow() -> SqlAlchemyCanvasDataUnitOfWork:
+            return SqlAlchemyCanvasDataUnitOfWork(effective_session_factory())
+
+        canvas_data_uow_factory = make_canvas_data_uow
+    mount_canvas_data_routes(
+        app,
+        uow_factory=canvas_data_uow_factory,
         resolve_actor=effective_resolver,
     )
     return app

@@ -89,3 +89,9 @@ haoai_backend.chat_data 将纯消息记录和统计合并放在 domain/statistic
 访问策略复用公开 series_access 核心。应用先按各端点既有顺序解析章节所属剧集，再在同一业务 UoW 中检查可信 actor 的访问资格并读取消息或统计；认证 Session 与业务 Session 仍由认证层分开管理。缺少身份或 UoW 接线时新路由返回 503。
 
 模块保留单请求提交和提交后同 UoW readback 的边界。消息写入成功而后续读取失败时结果可能未知，不自动重试；单条删除只按聊天/素材消息既有类别条件执行，不删除关联任务和账务历史。数据表定义是最小投影，不是生产 schema 或 migration。细节与实际证据见[架构说明](chat-data-backend.md)和[本批 verification](../../openspec/changes/modularize-backend-chat-data/verification.md)。
+
+## 第二十九批：章节画布模块边界
+
+`canvas_data.domain` 负责纯转换和错误语义；`schemas` 定义兼容 DTO；`application` 按用例协调 UoW；`ports` 表达应用依赖；`persistence` 与 `tables` 以 SQLAlchemy Core 实现当前查询投影；`presentation` 投影响应，`http` 注册既有 GET/PUT 路由。应用工厂显式接线，不在模块导入时启动生产数据库。
+
+章节查找和公开 `series_access` 策略在同一业务 Session 中执行。GET 的缺省画布不落库；PUT 保持已读快照比较、按主键更新和单次提交，再在同一 UoW 刷新持久元数据。没有新增 revision CAS 或自动重试；提交后的确认失败必须按未知结果处理。完整边界见[画布后端架构](canvas-data-backend.md)，实际验证范围见[本批验收记录](../../openspec/changes/modularize-backend-canvas-data/verification.md)。

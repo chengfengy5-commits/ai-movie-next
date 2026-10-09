@@ -500,3 +500,14 @@ Schema 和字段更新保留旧默认、空值、额外字段与错误顺序：�
 GET 普通聊天列表按章节、chat_mode 和可选 frame_index 查询，不额外排除素材关联记录；素材聊天列表再按 asset_type/asset_id 查询。请求 schema 保留旧默认值、可空字段和 extra-ignore 行为。单条普通消息删除使用 asset_type IS NULL，素材消息删除使用 asset_type IS NOT NULL，空字符串归入后者；批量删除按章节及可选帧索引执行。AI 统计只汇总旧规则中的 completed/failed 任务，按模型和状态分组；空模型名合并为“未知模型”，失败任务只计入失败数；积分仅累计 completed 任务，并保留可能为负的原始积分值。
 
 身份与剧集访问复用既有可信 actor/series_access，同一请求使用一个业务 UoW。写入按用例提交；创建和内容更新提交后通过同一 UoW 重新读取实际消息行。提交后 readback 失败不能证明写入未发生，不自动重试，应显式读取核实。统一工厂登记数为五十二；本批 TCP 证据只覆盖十个新增方法及四个既有 smoke 方法，见[本批 verification](../../openspec/changes/modularize-backend-chat-data/verification.md)。
+
+## 第二十九批：章节画布迁移契约
+
+本批继续提供既有章节共享画布接口：
+
+| 方法 | 路径 | 成功状态 |
+| --- | --- | --- |
+| GET | `/api/chapters/{chapter_id}/canvas` | 200 |
+| PUT | `/api/chapters/{chapter_id}/canvas` | 200 |
+
+章节不存在仍先返回原 404，再检查剧集访问；写入沿用本人锁续期、按 Python 字符数计算的 1,000,000 字符上限及已读版本快照冲突规则。缺失画布的 GET 返回完整字面默认对象且不写入。已有记录成功 PUT 会递增版本，即使正文相同；更新按主键执行，不增加数据库版本条件。成功提交后真实刷新元数据，响应正文回显本次请求。提交后的确认/刷新异常不自动重发，需显式 GET 核实。

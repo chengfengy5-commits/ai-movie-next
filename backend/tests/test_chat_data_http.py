@@ -50,7 +50,7 @@ def request(app, method: str, path: str, *, user: str = "user-a", body: Any = No
     return asyncio.run(send())
 
 
-def test_factory_registers_exact_ten_chat_methods_and_fifty_two_total() -> None:
+def test_factory_registers_exact_ten_chat_methods_and_fifty_four_total() -> None:
     app = create_app(
         session_factory=lambda: None,
         resolve_actor=lambda request: TrustedActor("user-a"),
@@ -73,8 +73,14 @@ def test_factory_registers_exact_ten_chat_methods_and_fifty_two_total() -> None:
         ("/api/chapters/{chapter_id}/ai-stats", "GET"),
     }
 
+    expected_canvas = {
+        ("/api/chapters/{chapter_id}/canvas", "GET"),
+        ("/api/chapters/{chapter_id}/canvas", "PUT"),
+    }
+
     assert expected <= paths
-    assert len(paths) == 52
+    assert expected_canvas <= paths
+    assert len(paths) == 54
 
 
 def test_http_status_filters_body_chapter_and_no_asset_discriminator(database: ChatDatabase) -> None:

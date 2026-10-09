@@ -360,3 +360,9 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 模块沿用可信身份、同一业务 Session 内的剧集访问策略和原错误优先级。它只提供既有聊天与统计能力，不改认证方式，也不迁移旧站点完整后端入口。分层说明见[聊天数据后端架构](docs/architecture/chat-data-backend.md)，实际验收与未覆盖边界见[本批 verification](openspec/changes/modularize-backend-chat-data/verification.md)。
 
 根实际全量后端回归为 344 项通过，另有九条既有依赖/弃用警告；loopback 和失败历史单独记录在 verification。SQLite 与本地 HTTP 证据不代表真实 PostgreSQL 并发、生产迁移、完整前端/浏览器验收或部署。指定的 GPT-5.6 Sol/xhigh Grillme 外审仍单独待办。
+
+## 第二十九批：章节画布后端
+
+隔离后端的 `canvas_data` 模块承接章节共享画布的 `GET` 与 `PUT`。首次读取返回完整默认画布但不写入；保存沿用原有版本快照、本人锁续期和错误顺序，不增加数据库版本 CAS 或自动重试。成功提交后同一 UoW 重新读取持久行，响应元数据以刷新结果为准，画布正文回显本次请求。
+
+本批根验收包括 374 项后端测试和本地 SQLite/HTTP 验收；实际范围及 SQL 追踪边界见[画布后端说明](docs/architecture/canvas-data-backend.md)与[验收记录](openspec/changes/modularize-backend-canvas-data/verification.md)。这些证据不代表真实 PostgreSQL 并发、浏览器、生产部署或指定外部评审已完成。

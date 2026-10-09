@@ -50,7 +50,7 @@ def build_app(database: TestDatabase, *, resolver=None, policy=None, counter=Non
     )
 
 
-def test_app_factory_registers_eleven_auth_ten_chat_four_personal_twelve_series_and_fifteen_asset_methods(database: TestDatabase) -> None:
+def test_app_factory_registers_eleven_auth_ten_chat_four_personal_twelve_series_fifteen_asset_and_two_canvas_methods(database: TestDatabase) -> None:
     app = build_app(database)
     routes = {
         (route.path, frozenset(getattr(route, "methods", set())))
@@ -72,6 +72,8 @@ def test_app_factory_registers_eleven_auth_ten_chat_four_personal_twelve_series_
         ("/api/chapters/{chapter_id}/rough-cut", frozenset({"PUT"})),
         ("/api/chapters/{chapter_id}/personal-production-notes", frozenset({"GET"})),
         ("/api/chapters/{chapter_id}/personal-production-notes", frozenset({"PUT"})),
+        ("/api/chapters/{chapter_id}/canvas", frozenset({"GET"})),
+        ("/api/chapters/{chapter_id}/canvas", frozenset({"PUT"})),
         ("/api/series", frozenset({"GET"})),
         ("/api/series/{series_id}", frozenset({"GET"})),
         ("/api/series", frozenset({"POST"})),
