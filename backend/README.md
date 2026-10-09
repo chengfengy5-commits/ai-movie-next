@@ -84,3 +84,10 @@ Core 表只是本适配器所需的查询投影，不是完整生产 schema 或 
 `backend/src/haoai_backend/canvas_data` 将画布 DTO、用例、端口、SQLAlchemy Core 持久化和 HTTP 适配分层。应用在同一业务 UoW 中依次查章节、执行剧集访问策略、续期本人的已有锁，再进行序列化、大小/版本检查和写入。画布是章节共享数据；GET 缺行时返回完整默认对象且不建行。
 
 PUT 按已读版本快照比较并按主键更新，不增加 SQL 版本 CAS；每次成功请求提交一次，再由同一 UoW 真实读取返回行。提交前失败回滚；提交后确认或刷新失败属于结果未知，模块不自动重发，调用方应显式 GET 核实。Core 表是此适配器的查询投影，不是完整生产 schema；生产源码不创建 Engine 或 schema。见[架构说明](../docs/architecture/canvas-data-backend.md)和[验收记录](../openspec/changes/modularize-backend-canvas-data/verification.md)。
+
+
+## 第三十批：下载链接模块
+
+backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分为领域、用例、端口、schema 与 HTTP 适配。应用工厂显式接入可信 actor resolver 和可选 URL resolver；模块不依赖业务 Session factory 或 series access policy。未接入身份时失败关闭。
+
+默认 resolver 是无存储副作用的 identity 实现，不读取环境配置、不探测临时目录、不生成 HMAC。要改变 URL，必须由应用组合根传入显式异步 resolver。详见[架构说明](../docs/architecture/download-links-backend.md)和[验证记录](../openspec/changes/modularize-backend-download-links/verification.md)。

@@ -511,3 +511,13 @@ GET 普通聊天列表按章节、chat_mode 和可选 frame_index 查询，不�
 | PUT | `/api/chapters/{chapter_id}/canvas` | 200 |
 
 章节不存在仍先返回原 404，再检查剧集访问；写入沿用本人锁续期、按 Python 字符数计算的 1,000,000 字符上限及已读版本快照冲突规则。缺失画布的 GET 返回完整字面默认对象且不写入。已有记录成功 PUT 会递增版本，即使正文相同；更新按主键执行，不增加数据库版本条件。成功提交后真实刷新元数据，响应正文回显本次请求。提交后的确认/刷新异常不自动重发，需显式 GET 核实。
+
+
+## 第三十批：下载链接 API 兼容契约
+
+| 方法 | 路径 | 关键边界 |
+| --- | --- | --- |
+| GET | /api/download | url 为必需普通字符串；filename 可省略，省略时为 null。活动会员且参数合法时返回固定 HTTP 403“下载代理已停用（服务器不承载下载流量）：请使用 POST /api/sign-download-urls 获取签名直链，由浏览器直连 OSS 下载”。 |
+| POST | /api/sign-download-urls | items 为必需数组；每项 url 为普通字符串，filename 默认空字符串。默认忽略额外字段，不 trim、不验证 URL 格式；合法项目超过 500 项时返回固定 HTTP 400“单次最多 500 条”，无效 DTO 仍由标准 422 验证。 |
+
+批次按输入顺序逐项 await resolver，一项恰好调用一次；重复项保留。结果保留每项原 filename，并以 resolver 返回 URL 与输入 URL 是否不同计算 signed。resolver 异常产生通用 HTTP 500，不重试、不返回部分结果。未接线的 actor resolver 失败关闭为 503；两路均先执行活动会员身份校验。默认 resolver 是逐字 identity，不代表真实签名或下载。其他实现及证据见[下载链接后端说明](download-links-backend.md)。

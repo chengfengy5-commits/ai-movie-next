@@ -95,3 +95,10 @@ haoai_backend.chat_data 将纯消息记录和统计合并放在 domain/statistic
 `canvas_data.domain` 负责纯转换和错误语义；`schemas` 定义兼容 DTO；`application` 按用例协调 UoW；`ports` 表达应用依赖；`persistence` 与 `tables` 以 SQLAlchemy Core 实现当前查询投影；`presentation` 投影响应，`http` 注册既有 GET/PUT 路由。应用工厂显式接线，不在模块导入时启动生产数据库。
 
 章节查找和公开 `series_access` 策略在同一业务 Session 中执行。GET 的缺省画布不落库；PUT 保持已读快照比较、按主键更新和单次提交，再在同一 UoW 刷新持久元数据。没有新增 revision CAS 或自动重试；提交后的确认失败必须按未知结果处理。完整边界见[画布后端架构](canvas-data-backend.md)，实际验证范围见[本批验收记录](../../openspec/changes/modularize-backend-canvas-data/verification.md)。
+
+
+## 第三十批：下载链接模块边界
+
+haoai_backend.download_links 将纯领域、应用用例和 resolver 端口与 Pydantic schema、FastAPI 路由适配分开；app factory 负责组合可信 actor resolver 和可选 URL resolver。下载接口复用活动会员身份校验，但不创建业务 Session，也不执行剧集访问策略；认证 resolver 自身仍可能维护认证会话并产生 SQL。
+
+默认 identity resolver 不读对象存储配置、不探测临时目录、不执行 HMAC 或文件下载。真实签名和存储 provider 需要另行显式接入。详见[下载链接架构](download-links-backend.md)与[验证记录](../../openspec/changes/modularize-backend-download-links/verification.md)。

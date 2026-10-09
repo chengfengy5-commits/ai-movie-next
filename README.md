@@ -366,3 +366,10 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 隔离后端的 `canvas_data` 模块承接章节共享画布的 `GET` 与 `PUT`。首次读取返回完整默认画布但不写入；保存沿用原有版本快照、本人锁续期和错误顺序，不增加数据库版本 CAS 或自动重试。成功提交后同一 UoW 重新读取持久行，响应元数据以刷新结果为准，画布正文回显本次请求。
 
 本批根验收包括 374 项后端测试和本地 SQLite/HTTP 验收；实际范围及 SQL 追踪边界见[画布后端说明](docs/architecture/canvas-data-backend.md)与[验收记录](openspec/changes/modularize-backend-canvas-data/verification.md)。这些证据不代表真实 PostgreSQL 并发、浏览器、生产部署或指定外部评审已完成。
+
+
+## 第三十批：后端下载链接
+
+隔离后端新增下载链接模块，提供 GET /api/download 与 POST /api/sign-download-urls。默认 resolver 原样返回 URL，不生成签名或承载下载；需要 URL 变换时由组合根显式注入异步实现。路由复用可信身份和活动会员校验，不使用业务 Session 或剧集访问策略。
+
+模块边界与 API 约定见[下载链接后端说明](docs/architecture/download-links-backend.md)，实际验证及未覆盖范围见[本批 verification](openspec/changes/modularize-backend-download-links/verification.md)。
