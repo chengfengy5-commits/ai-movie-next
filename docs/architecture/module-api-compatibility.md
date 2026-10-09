@@ -532,3 +532,14 @@ GET 普通聊天列表按章节、chat_mode 和可选 frame_index 查询，不�
 认证及活动会员校验后，保留旧新 ID 相同、类别、初始章节查找、普通剧集访问、新素材类别/剧集归属、内容格式和旧引用检查的优先级。只处理对象帧中目标类别列表，保留帧序、重复项、非对象帧及未知字段；目标列表已有新 ID 时删除该帧全部旧 ID，否则逐项替换。响应计数按受影响帧数，章节 JSON 使用兼容的非 ASCII 序列化。
 
 同一业务 Session 在章节 DML 前运行现有媒体协调器；协调器可按既有规则写入媒体状态和私人认可。阶段一只按章节主键更新 `content` 与 `updated_at`，零行或非预期行数按通用 500 回滚，不增加 CAS。阶段一提交后在同一 Session 的新事务中重新读取章节及当前 `series_id`，扫描该剧三类引用，候选先按剧集/类别/旧 ID 查询，再只按候选主键删除；零行删除仍保留旧 warning 语义并提交阶段二。阶段二之后先读回章节，再按原新素材主键读取展示名。任何提交确认或提交后读取失败均不自动重试，需显式读取核实。完整模块边界见[架构说明](chapter-asset-replacement-backend.md)，实测层次及限制见[验证记录](../../openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。
+
+
+## 团队 API 兼容记录
+
+团队后端增加 25 个显式路由，分为 management 13 个、series 7 个和 reporting 5 个。该数量是团队接口面；应用总计 82 个注册路由，注册数不代表本轮 TCP 覆盖数。
+
+claim=false 属于系列创建/分享请求，只关联团队，不清除已有 claimed_by/claimed_at；S05 团队认领路由不是该标志的入口。S01 列表包含 chapter_count 和 characters、scenes、props、storyboard 四类 asset_counts。写响应按路由来源处理：S02 读回新建 series 主键行，S03 读回 team 主键并返回 name/id，S05 读回认领字段；S04 和带 claim 的 S06 只返回 message，不执行来源不存在的刷新；S07 的 claimed_by 响应沿用原请求 body 意图。不存在统一的写后 PK 刷新约定。
+
+M06 退队和 M07 移除成员只清理对应 membership 与该成员的团队章节锁，保留 claimed_by/claimed_at；系列移出团队或取消分享只清理 team_id 和相关锁，不解除已有认领。普通剧集访问规则未增加团队认领门禁。
+
+事务兼容继续使用注入的同一 Session 和首次赋值净变化快照，不新增 CAS。dirty UPDATE 零行按通用失败回滚，合法 bulk DELETE 零行仍允许成功；历史无版本条件 DELETE 零行保留警告成功。S02/S03/S05 的指定读回、S04/S06 的 message 和 S07 的 body 意图响应按各自接口执行；提交结果未知或提交后读回失败时不自动重放写请求。

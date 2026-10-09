@@ -109,3 +109,10 @@ haoai_backend.download_links 将纯领域、应用用例和 resolver 端口与 P
 `chapter_asset_replacement` 将引用解析与变换、用例编排、Core 持久化、HTTP DTO 和路由适配分层。组合根显式提供可信 actor、普通 `series_access` 策略与业务 UoW；`media_writes` 复用同一业务 Session 内的 public notes coordinator，并在章节 DML 前完成协调。协调器可按既有规则维护媒体状态和私人认可，不应被描述为绝无媒体或 private 写入。
 
 该用例在同一 UoW 中执行两个独立提交阶段。阶段一更新章节内容并提交媒体协调写入；阶段二重新读取章节及当前剧集，扫描三类引用后按已选素材主键清理，再提交并读回真实章节与新素材展示名。阶段二失败不会撤销阶段一，提交确认未知时不自动重试。详见[模块架构](chapter-asset-replacement-backend.md)与[验证记录](../../openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。
+
+
+## 团队模块边界
+
+团队后端按 management、series、reporting 三个族拆分。management 维护团队、成员、权限、邀请与加入；series 维护团队和剧集之间的共享、认领及锁；reporting 读取团队任务与额度统计。三个族都通过显式工厂接入应用，不持有应用级认证、配置或数据库连接的隐式副本。
+
+团队族使用应用提供的单个 Session 与共享 Team Unit of Work。团队策略、会员上下文和可选加入额度由应用装配注入；剧集内容、媒体、私密笔记与任务账务仍属于各自原有业务边界。具体模块职责、路由和保留的历史行为见[团队后端接口说明](teams-backend.md)。

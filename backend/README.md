@@ -98,3 +98,10 @@ backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分
 `haoai_backend.chapter_asset_replacement` 通过一个 POST 路由替换章节中的角色、场景或道具引用。它复用可信 actor、普通剧集访问策略及 public notes 媒体协调器；源章节与必要的媒体/private 状态先在同一 Session 提交，之后按提交后的章节和当前 `series_id` 扫描并执行第二阶段清理。提交确认或提交后读回失败均按未知结果处理，不自动重放。
 
 组件职责与两阶段边界见[架构说明](../docs/architecture/chapter-asset-replacement-backend.md)，实际验证和限制见[本批验证记录](../openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。本地 SQLite/HTTP 验收不等于 PostgreSQL 并发或生产数据库验收。
+
+
+## 团队功能
+
+团队后端由 management、series、reporting 三个族组成，分别承接团队与邀请管理、剧集共享和认领、团队用量查询。每个族提供自己的 HTTP router、应用服务和持久化适配器；应用装配继续注入当前认证身份、团队策略和同一数据库 Session。
+
+团队接口共 25 个，完整路由、兼容行为和本轮证据见[团队后端接口说明](../docs/architecture/teams-backend.md)与[团队后端验证记录](../openspec/changes/modularize-backend-teams/verification.md)。创建应用时加入团队路由不改变原业务路由的认证与错误处理。

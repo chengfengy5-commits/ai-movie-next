@@ -380,3 +380,10 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 本批在 `backend/src/haoai_backend/chapter_asset_replacement/` 增加章节素材替换模块，并接入 `POST /api/chapters/{chapter_id}/replace-asset`。流程保留既有身份、剧集访问及校验顺序；同一业务 Session 先协调章节媒体状态，再提交章节引用替换，随后重新读取章节和当前剧集引用并独立清理素材。阶段一已提交后，阶段二或提交后读回失败仍可能留下持久写入；失败不代表未写入，也不会自动重试，应通过明确读取确认结果。
 
 模块边界见[章节素材替换后端架构](docs/architecture/chapter-asset-replacement-backend.md)，验证范围见[本批验证记录](openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。本批验证使用隔离 SQLite 和本地 HTTP，不代表真实 PostgreSQL 并发、浏览器、生产部署或指定外部评审已完成。
+
+
+## 团队后端
+
+团队能力按管理、剧集协作和用量统计三个边界组织。模块在应用装配时接入现有认证、会员和团队策略；共享数据库事务入口仍由应用提供。接口兼容面、权限与事务行为见[团队后端接口说明](docs/architecture/teams-backend.md)，本轮验证分层见[团队后端验证记录](openspec/changes/modularize-backend-teams/verification.md)。
+
+当前新增团队路由为 25 个：管理 13 个、剧集 7 个、统计 5 个。它们属于应用总计 82 个路由注册中的团队接口；82 是注册面数量，不代表本轮逐一进行了 TCP 验收。当前实现和验证状态以 OpenSpec 的 tasks 勾选与验证记录为准。
