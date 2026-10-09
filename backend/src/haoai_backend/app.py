@@ -17,6 +17,9 @@ from .download_links.ports import DownloadURLResolver
 from .canvas_data.http import mount_canvas_data_routes
 from .canvas_data.persistence import SqlAlchemyCanvasDataUnitOfWork
 from .canvas_data.ports import UnitOfWorkFactory as CanvasDataUnitOfWorkFactory
+from .chapter_asset_replacement.http import mount_chapter_asset_replacement_routes
+from .chapter_asset_replacement.persistence import SqlAlchemyChapterAssetReplacementUnitOfWork
+from .chapter_asset_replacement.ports import UnitOfWorkFactory as ChapterAssetReplacementUnitOfWorkFactory
 from .asset_data.persistence import SqlAlchemyAssetDataUnitOfWork
 from .asset_data.ports import AssetDataUnitOfWorkFactory
 from .authentication.configuration import AuthenticationRuntime
@@ -46,7 +49,7 @@ def create_app(
     authentication_runtime: AuthenticationRuntime | None = None,
     download_url_resolver: DownloadURLResolver | None = None,
 ) -> FastAPI:
-    """Compose 11 authentication and 45 business methods without startup I/O."""
+    """Compose 11 authentication and 46 business methods without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
@@ -172,5 +175,24 @@ def create_app(
             if download_url_resolver is not None
             else IdentityDownloadURLResolver()
         ),
+    )
+    replacement_uow_factory: ChapterAssetReplacementUnitOfWorkFactory | None = None
+    if (
+        effective_session_factory is not None
+        and effective_resolver is not None
+        and series_access_policy is not None
+    ):
+        def make_chapter_asset_replacement_uow() -> SqlAlchemyChapterAssetReplacementUnitOfWork:
+            return SqlAlchemyChapterAssetReplacementUnitOfWork(
+                session=effective_session_factory(),
+                series_access_check=series_access_policy,
+            )
+
+        replacement_uow_factory = make_chapter_asset_replacement_uow
+
+    mount_chapter_asset_replacement_routes(
+        app,
+        uow_factory=replacement_uow_factory,
+        resolve_actor=effective_resolver,
     )
     return app

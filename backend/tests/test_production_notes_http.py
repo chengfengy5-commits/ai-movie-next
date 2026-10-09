@@ -84,6 +84,7 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         (NOTES_PATH, frozenset({"PUT"})),
         ("/api/chapters/{chapter_id}/canvas", frozenset({"GET"})),
         ("/api/chapters/{chapter_id}/canvas", frozenset({"PUT"})),
+        ("/api/chapters/{chapter_id}/replace-asset", frozenset({"POST"})),
         ("/api/series", frozenset({"GET"})),
         ("/api/series/{series_id}", frozenset({"GET"})),
         ("/api/series", frozenset({"POST"})),

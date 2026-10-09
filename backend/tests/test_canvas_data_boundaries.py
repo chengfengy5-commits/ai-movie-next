@@ -37,5 +37,5 @@ def test_factory_registers_two_canvas_methods_without_startup_io() -> None:
     assert ("/api/chapters/{chapter_id}/canvas", "GET") in methods
     assert ("/api/chapters/{chapter_id}/canvas", "PUT") in methods
     assert {("/api/download", "GET"), ("/api/sign-download-urls", "POST")} <= methods
-    assert len(methods) == 56
+    assert len(methods) == 57
     assert app.docs_url is app.redoc_url is app.openapi_url is None
