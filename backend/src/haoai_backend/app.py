@@ -11,6 +11,9 @@ from .asset_data.http import mount_asset_data_routes
 from .chat_data.http import mount_chat_data_routes
 from .chat_data.persistence import SqlAlchemyChatDataUnitOfWork
 from .chat_data.ports import UnitOfWorkFactory as ChatDataUnitOfWorkFactory
+from .download_links.compatibility import IdentityDownloadURLResolver
+from .download_links.http import mount_download_links_routes
+from .download_links.ports import DownloadURLResolver
 from .canvas_data.http import mount_canvas_data_routes
 from .canvas_data.persistence import SqlAlchemyCanvasDataUnitOfWork
 from .canvas_data.ports import UnitOfWorkFactory as CanvasDataUnitOfWorkFactory
@@ -41,8 +44,9 @@ def create_app(
     resolve_actor: ActorResolver | None = None,
     series_access_policy: SeriesAccessCheck | None = None,
     authentication_runtime: AuthenticationRuntime | None = None,
+    download_url_resolver: DownloadURLResolver | None = None,
 ) -> FastAPI:
-    """Compose 11 authentication and 43 business methods without startup I/O."""
+    """Compose 11 authentication and 45 business methods without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
@@ -158,5 +162,15 @@ def create_app(
         app,
         uow_factory=canvas_data_uow_factory,
         resolve_actor=effective_resolver,
+    )
+
+    mount_download_links_routes(
+        app,
+        resolve_actor=effective_resolver,
+        url_resolver=(
+            download_url_resolver
+            if download_url_resolver is not None
+            else IdentityDownloadURLResolver()
+        ),
     )
     return app

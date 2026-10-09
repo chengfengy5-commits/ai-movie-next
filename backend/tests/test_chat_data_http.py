@@ -77,10 +77,15 @@ def test_factory_registers_exact_ten_chat_methods_and_fifty_four_total() -> None
         ("/api/chapters/{chapter_id}/canvas", "GET"),
         ("/api/chapters/{chapter_id}/canvas", "PUT"),
     }
+    expected_download_links = {
+        ("/api/download", "GET"),
+        ("/api/sign-download-urls", "POST"),
+    }
 
     assert expected <= paths
     assert expected_canvas <= paths
-    assert len(paths) == 54
+    assert expected_download_links <= paths
+    assert len(paths) == 56
 
 
 def test_http_status_filters_body_chapter_and_no_asset_discriminator(database: ChatDatabase) -> None:

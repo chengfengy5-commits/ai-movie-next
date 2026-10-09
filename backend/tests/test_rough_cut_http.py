@@ -111,6 +111,8 @@ def test_app_factory_registers_eleven_auth_ten_chat_four_personal_twelve_series_
         ("/api/chapters/{chapter_id}/chat-messages/single/{message_id}", frozenset({"DELETE"})),
         ("/api/chapters/{chapter_id}/asset-chat-messages/single/{message_id}", frozenset({"DELETE"})),
         ("/api/chapters/{chapter_id}/ai-stats", frozenset({"GET"})),
+        ("/api/download", frozenset({"GET"})),
+        ("/api/sign-download-urls", frozenset({"POST"})),
     }
 
 

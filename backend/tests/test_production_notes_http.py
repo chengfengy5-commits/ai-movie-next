@@ -121,6 +121,8 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/chapters/{chapter_id}/chat-messages/single/{message_id}", frozenset({"DELETE"})),
         ("/api/chapters/{chapter_id}/asset-chat-messages/single/{message_id}", frozenset({"DELETE"})),
         ("/api/chapters/{chapter_id}/ai-stats", frozenset({"GET"})),
+        ("/api/download", frozenset({"GET"})),
+        ("/api/sign-download-urls", frozenset({"POST"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 
