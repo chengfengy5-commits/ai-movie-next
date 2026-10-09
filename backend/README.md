@@ -91,3 +91,10 @@ PUT 按已读版本快照比较并按主键更新，不增加 SQL 版本 CAS；�
 backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分为领域、用例、端口、schema 与 HTTP 适配。应用工厂显式接入可信 actor resolver 和可选 URL resolver；模块不依赖业务 Session factory 或 series access policy。未接入身份时失败关闭。
 
 默认 resolver 是无存储副作用的 identity 实现，不读取环境配置、不探测临时目录、不生成 HMAC。要改变 URL，必须由应用组合根传入显式异步 resolver。详见[架构说明](../docs/architecture/download-links-backend.md)和[验证记录](../openspec/changes/modularize-backend-download-links/verification.md)。
+
+
+## 第三十一批：章节素材替换
+
+`haoai_backend.chapter_asset_replacement` 通过一个 POST 路由替换章节中的角色、场景或道具引用。它复用可信 actor、普通剧集访问策略及 public notes 媒体协调器；源章节与必要的媒体/private 状态先在同一 Session 提交，之后按提交后的章节和当前 `series_id` 扫描并执行第二阶段清理。提交确认或提交后读回失败均按未知结果处理，不自动重放。
+
+组件职责与两阶段边界见[架构说明](../docs/architecture/chapter-asset-replacement-backend.md)，实际验证和限制见[本批验证记录](../openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。本地 SQLite/HTTP 验收不等于 PostgreSQL 并发或生产数据库验收。

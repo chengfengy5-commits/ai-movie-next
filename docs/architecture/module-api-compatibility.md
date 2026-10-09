@@ -521,3 +521,14 @@ GET 普通聊天列表按章节、chat_mode 和可选 frame_index 查询，不�
 | POST | /api/sign-download-urls | items 为必需数组；每项 url 为普通字符串，filename 默认空字符串。默认忽略额外字段，不 trim、不验证 URL 格式；合法项目超过 500 项时返回固定 HTTP 400“单次最多 500 条”，无效 DTO 仍由标准 422 验证。 |
 
 批次按输入顺序逐项 await resolver，一项恰好调用一次；重复项保留。结果保留每项原 filename，并以 resolver 返回 URL 与输入 URL 是否不同计算 signed。resolver 异常产生通用 HTTP 500，不重试、不返回部分结果。未接线的 actor resolver 失败关闭为 503；两路均先执行活动会员身份校验。默认 resolver 是逐字 identity，不代表真实签名或下载。其他实现及证据见[下载链接后端说明](download-links-backend.md)。
+
+
+## 第三十一批：章节素材替换 API 兼容契约
+
+| 方法 | 路径 | 兼容要点 |
+| --- | --- | --- |
+| POST | `/api/chapters/{chapter_id}/replace-asset` | 必填普通字符串 `old_asset_id`、`new_asset_id`、`asset_type`；类别仅为 `character`、`scene`、`prop`。 |
+
+认证及活动会员校验后，保留旧新 ID 相同、类别、初始章节查找、普通剧集访问、新素材类别/剧集归属、内容格式和旧引用检查的优先级。只处理对象帧中目标类别列表，保留帧序、重复项、非对象帧及未知字段；目标列表已有新 ID 时删除该帧全部旧 ID，否则逐项替换。响应计数按受影响帧数，章节 JSON 使用兼容的非 ASCII 序列化。
+
+同一业务 Session 在章节 DML 前运行现有媒体协调器；协调器可按既有规则写入媒体状态和私人认可。阶段一只按章节主键更新 `content` 与 `updated_at`，零行或非预期行数按通用 500 回滚，不增加 CAS。阶段一提交后在同一 Session 的新事务中重新读取章节及当前 `series_id`，扫描该剧三类引用，候选先按剧集/类别/旧 ID 查询，再只按候选主键删除；零行删除仍保留旧 warning 语义并提交阶段二。阶段二之后先读回章节，再按原新素材主键读取展示名。任何提交确认或提交后读取失败均不自动重试，需显式读取核实。完整模块边界见[架构说明](chapter-asset-replacement-backend.md)，实测层次及限制见[验证记录](../../openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。

@@ -102,3 +102,10 @@ haoai_backend.chat_data 将纯消息记录和统计合并放在 domain/statistic
 haoai_backend.download_links 将纯领域、应用用例和 resolver 端口与 Pydantic schema、FastAPI 路由适配分开；app factory 负责组合可信 actor resolver 和可选 URL resolver。下载接口复用活动会员身份校验，但不创建业务 Session，也不执行剧集访问策略；认证 resolver 自身仍可能维护认证会话并产生 SQL。
 
 默认 identity resolver 不读对象存储配置、不探测临时目录、不执行 HMAC 或文件下载。真实签名和存储 provider 需要另行显式接入。详见[下载链接架构](download-links-backend.md)与[验证记录](../../openspec/changes/modularize-backend-download-links/verification.md)。
+
+
+## 第三十一批：章节素材替换模块边界
+
+`chapter_asset_replacement` 将引用解析与变换、用例编排、Core 持久化、HTTP DTO 和路由适配分层。组合根显式提供可信 actor、普通 `series_access` 策略与业务 UoW；`media_writes` 复用同一业务 Session 内的 public notes coordinator，并在章节 DML 前完成协调。协调器可按既有规则维护媒体状态和私人认可，不应被描述为绝无媒体或 private 写入。
+
+该用例在同一 UoW 中执行两个独立提交阶段。阶段一更新章节内容并提交媒体协调写入；阶段二重新读取章节及当前剧集，扫描三类引用后按已选素材主键清理，再提交并读回真实章节与新素材展示名。阶段二失败不会撤销阶段一，提交确认未知时不自动重试。详见[模块架构](chapter-asset-replacement-backend.md)与[验证记录](../../openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。

@@ -373,3 +373,10 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 隔离后端新增下载链接模块，提供 GET /api/download 与 POST /api/sign-download-urls。默认 resolver 原样返回 URL，不生成签名或承载下载；需要 URL 变换时由组合根显式注入异步实现。路由复用可信身份和活动会员校验，不使用业务 Session 或剧集访问策略。
 
 模块边界与 API 约定见[下载链接后端说明](docs/architecture/download-links-backend.md)，实际验证及未覆盖范围见[本批 verification](openspec/changes/modularize-backend-download-links/verification.md)。
+
+
+## 第三十一批：章节素材替换
+
+本批在 `backend/src/haoai_backend/chapter_asset_replacement/` 增加章节素材替换模块，并接入 `POST /api/chapters/{chapter_id}/replace-asset`。流程保留既有身份、剧集访问及校验顺序；同一业务 Session 先协调章节媒体状态，再提交章节引用替换，随后重新读取章节和当前剧集引用并独立清理素材。阶段一已提交后，阶段二或提交后读回失败仍可能留下持久写入；失败不代表未写入，也不会自动重试，应通过明确读取确认结果。
+
+模块边界见[章节素材替换后端架构](docs/architecture/chapter-asset-replacement-backend.md)，验证范围见[本批验证记录](openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。本批验证使用隔离 SQLite 和本地 HTTP，不代表真实 PostgreSQL 并发、浏览器、生产部署或指定外部评审已完成。
