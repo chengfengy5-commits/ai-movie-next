@@ -6,7 +6,7 @@
 - [x] 1.1 Root建立实际新基线和原9代码/原4文档，读取必要固定来源窗口及五份完整规划，核49+3候选52字节、精确45新/9旧/7文档范围与公开分工；独立审查并实际ordinary OpenSpec strict/status/apply后冻结批准。
 
 ## 2. Implementation
-- [ ] 2.1 唯一共享作者实现9公共生产及4共享测试/支持文件，仅实际验证不依赖未存在families的policy/config/firstsnapshot/DTO/clock/quota/UoW、真实owner DDL和shared冷导入/资源断言，collect无顶层family导入；按实际选择器记录结果，82/all25/完整factory延后not_run/not_yet_wired，不skip/xfail或虚称整文件通过；Root核对并冻结共享接口后才开放三族并行，不允许各族自改。
+- [x] 2.1 唯一共享作者实现9公共生产及4共享测试/支持文件，仅实际验证不依赖未存在families的policy/config/firstsnapshot/DTO/clock/quota/UoW、真实owner DDL和shared冷导入/资源断言，collect无顶层family导入；按实际选择器记录结果，82/all25/完整factory延后not_run/not_yet_wired，不skip/xfail或虚称整文件通过；Root核对并冻结共享接口后才开放三族并行，不允许各族自改。
 - [ ] 2.2 Management作者仅实现6生产+5测试，完整13接口保留权限错误顺序、邀请/加入/GET维护写、原限额/索引/约束、dirty与bulk/delete0/commit/readback、真实非目标守恒和故障反例，记录作者专项结果与失败。
 - [ ] 2.3 Series作者仅实现6生产+4测试，完整7接口保留列表/DTO、分享/认领权限与锁顺序、首次赋值净变更、实际提交读回/echo/unknown结果及普通access后效，不写content/media/private或任务账务。
 - [ ] 2.4 Reporting作者仅实现7生产+4测试，完整5只读接口复制必要任务纯投影和四种聚合/排序/日期/空shape及精确IN/DISTINCT type map、lower稳定tie与member.models普通sorted的非空反例，证明target全部task/总积分及完整history无写，不导入旧chat/provider/worker。
