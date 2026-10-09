@@ -1,0 +1,73 @@
+{
+  "source_commit": "23403806898550a7668a6ee7c0c457315655c39b",
+  "source_repository": "/Users/yanghaibo/data/projects/ai/haoai-修改版/haoai.zhuwh.com",
+  "created_at_utc": "2026-10-03T15:42:39.616051+00:00",
+  "source_review": {
+    "method": "frozen git show only",
+    "sensitive_pattern_scan": "No matches in the approved files for PEM private-key blocks, quoted credential literals, credential URIs, or provider-token patterns. This is a heuristic scan, not a complete secrets audit.",
+    "legacy_worktree_status_unchanged": true
+  },
+  "entries": [
+    {
+      "source_path": "backend/app/schemas/auth.py",
+      "source_commit": "23403806898550a7668a6ee7c0c457315655c39b",
+      "git_blob": "c23e10dfa3d4bfd60deb2b17bf014c6addb3f5e2",
+      "source_bytes": 2419,
+      "source_sha256": "faa48c5f3754d8a491d4310dc28133fa8e586f164af9356f94d1a419a87557f7",
+      "target_path": "legacy-reference/backend/app/schemas/auth.py",
+      "target_sha256": "faa48c5f3754d8a491d4310dc28133fa8e586f164af9356f94d1a419a87557f7",
+      "copied_full_file": true,
+      "target_bytes": 2419
+    },
+    {
+      "source_path": "backend/app/schemas/series.py",
+      "source_commit": "23403806898550a7668a6ee7c0c457315655c39b",
+      "git_blob": "9527d41091cecba9065c04a45f0df0c8f2c35309",
+      "source_bytes": 13748,
+      "source_sha256": "78b1aee6e31cc195fb9e9af7401738ed1c2b3a73a9563f196855dd9912e3bfb9",
+      "target_path": "legacy-reference/backend/app/schemas/series.py",
+      "target_sha256": "78b1aee6e31cc195fb9e9af7401738ed1c2b3a73a9563f196855dd9912e3bfb9",
+      "copied_full_file": true,
+      "target_bytes": 13748
+    },
+    {
+      "source_path": "backend/app/routes/auth.py",
+      "source_commit": "23403806898550a7668a6ee7c0c457315655c39b",
+      "git_blob": "f58aad8ec20eaeae6df6205624821fa4d3d7990b",
+      "source_bytes": 18221,
+      "source_sha256": "6cae3297fb5806c8668cbd245be974ff42ccf42999265440a6d6e27a7e6d1a78",
+      "target_path": "legacy-reference/backend/app/routes/auth.py",
+      "target_sha256": "6cae3297fb5806c8668cbd245be974ff42ccf42999265440a6d6e27a7e6d1a78",
+      "copied_full_file": true,
+      "target_bytes": 18221
+    },
+    {
+      "source_path": "js/auth.js",
+      "source_commit": "23403806898550a7668a6ee7c0c457315655c39b",
+      "git_blob": "088edb72c579f1f3cf0fe298070e2d79c2e46931",
+      "source_bytes": 5006,
+      "source_sha256": "1fcc256e1d6d985ca8d278f639ffe9bf9a243d4c3972d37f6f5f4a82f6b2771a",
+      "target_path": "legacy-reference/js/auth.js",
+      "target_sha256": "1fcc256e1d6d985ca8d278f639ffe9bf9a243d4c3972d37f6f5f4a82f6b2771a",
+      "copied_full_file": true,
+      "target_bytes": 5006
+    },
+    {
+      "source_path": "backend/app/routes/series.py",
+      "source_commit": "23403806898550a7668a6ee7c0c457315655c39b",
+      "git_blob": "6cd7f088ed3f6eb3250844cc0334597c7ffcc6ee",
+      "source_bytes": 115619,
+      "source_sha256": "db9721e34a3c5f22f81ce7cf4bc5434d9f3661d732ab1e8a79ba2e74852243cf",
+      "source_line_range": {
+        "start": 103,
+        "end": 174
+      },
+      "target_path": "legacy-reference/backend/app/routes/series.py.lines-0103-0174.txt",
+      "target_sha256": "b1eb133ed6005be1f925f345bd67dc410d9871cfc1bbcace2bf3265ad846aa6a",
+      "copied_full_file": false,
+      "source_excerpt_bytes": 3226,
+      "source_excerpt_sha256": "b1eb133ed6005be1f925f345bd67dc410d9871cfc1bbcace2bf3265ad846aa6a",
+      "target_bytes": 3226
+    }
+  ]
+}

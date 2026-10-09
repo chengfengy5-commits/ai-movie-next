@@ -1,0 +1,72 @@
+@router.get("/series", response_model=List[SeriesResponse])
+def get_series_list(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_active_membership)
+):
+    """获取当前用户的所有剧集（个人剧集 + 我参与的团队剧集）"""
+    from sqlalchemy import or_
+    from app.models.team import TeamMember, Team
+    from app.services.team_service import get_member_permissions
+
+    team_ids = [r[0] for r in db.query(TeamMember.team_id).filter(
+        TeamMember.user_id == current_user.id
+    ).all()]
+
+    if team_ids:
+        query = db.query(Series).filter(or_(
+            Series.user_id == current_user.id,
+            Series.team_id.in_(team_ids),
+        ))
+    else:
+        query = db.query(Series).filter(Series.user_id == current_user.id)
+    series_list = query.order_by(Series.updated_at.desc()).all()
+
+    # 团队名 / 用户名映射
+    team_map = {}
+    if team_ids:
+        for t in db.query(Team).filter(Team.id.in_(team_ids)).all():
+            team_map[t.id] = t.name
+    user_ids = {s.user_id for s in series_list}
+    user_map = {u.id: u.username for u in db.query(User).filter(User.id.in_(user_ids)).all()} if user_ids else {}
+    # 认领人（制作负责人）信息
+    claimed_ids = {s.claimed_by for s in series_list if s.claimed_by}
+    claimed_users = {u.id: u for u in db.query(User).filter(User.id.in_(claimed_ids)).all()} if claimed_ids else {}
+    # 当前用户在各团队的角色/权限（用于 can_enter 认领锁定判断）
+    team_role_map = {}
+    if team_ids:
+        for m in db.query(TeamMember).filter(
+            TeamMember.user_id == current_user.id,
+            TeamMember.team_id.in_(team_ids),
+        ).all():
+            team_role_map[m.team_id] = {"role": m.role, "perms": get_member_permissions(m)}
+
+    result = []
+    for s in series_list:
+        style_prompt_name, style_prompt_owner_name, style_prompt = _resolve_style_prompt(db, s.style_prompt_id)
+        # 认领锁定：未认领或认领者本人可进；否则看团队角色/权限
+        if not s.claimed_by or s.claimed_by == current_user.id:
+            can_enter = True
+        else:
+            tm = team_role_map.get(s.team_id)
+            can_enter = bool(tm and (tm["role"] == "owner" or "enter_claimed_series" in tm["perms"]))
+        result.append(SeriesResponse(
+            id=s.id,
+            user_id=s.user_id,
+            name=s.name,
+            description=s.description,
+            image_url=s.image_url,
+            style_prompt_id=s.style_prompt_id,
+            style_prompt_name=style_prompt_name,
+            style_prompt_owner_name=style_prompt_owner_name,
+            style_prompt=style_prompt,
+            created_at=s.created_at,
+            updated_at=s.updated_at,
+            team_id=s.team_id,
+            team_name=team_map.get(s.team_id),
+            owner_name=user_map.get(s.user_id),
+            claimed_by=s.claimed_by,
+            claimed_by_username=claimed_users[s.claimed_by].username if s.claimed_by in claimed_users else "",
+            claimed_by_avatar_url=resolve_avatar_url(claimed_users[s.claimed_by].email) if s.claimed_by in claimed_users else None,
+            can_enter=can_enter,
+        ))
+    return result
