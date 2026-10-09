@@ -4,11 +4,11 @@
 
 ## 1. Planning
 
-- [ ] 1.1 根读取本批必要固定来源窗、五完整规划/public契约，建立实际B/C/H、旧10/旧4原文和55保护图，独立审查+ordinaryCLI后批准31code/7doc/单一共享整合作者；EVID阶段teams54/52不改。
+- [x] 1.1 根读取本批必要固定来源窗、五完整规划/public契约，建立实际B/C/H、旧10/旧4原文和55保护图，独立审查+ordinaryCLI后批准31code/7doc/单一共享整合作者；EVID阶段teams54/52不改。
 
 ## 2. Implementation
 
-- [ ] 2.1 单一共享作者实现冻结typedreaders/UoW/两receipt/publicpurepolicy-payload/两auth合同、JSON/error/cold专测；应用无SQL/worker/provider/teams私有UoW/neutral提取，后续作者消费公开签名。
+- [x] 2.1 单一共享作者实现冻结typedreaders/UoW/两receipt/publicpurepolicy-payload/两auth合同、JSON/error/cold专测；应用无SQL/worker/provider/teams私有UoW/neutral提取，后续作者消费公开签名。
 - [ ] 2.2 supplied业务Session实现完整八GET Core/权限/first-vs-unique/list投影与域应用回执/真实SQLitefullowner非空守恒专测；零businesscommit/DML，SQLsuperuser、重复membership首次PK、JSON/错误/负值/宽int保真。
 - [ ] 2.3 独立cancelconnection+signal实现set→statusUPDATE→commit/terminal不writer/row0仍200，真实两connection消费交错、完整claim/updated_at/账务守恒、actualSQL/precommit/ackunknown且无replay。
 - [ ] 2.4 精确九HTTP/普通参数、两account七active/missing503零业务Session，用真实JWT/authSQL验证过期差异/权限/坏JSON500/static优先，auth先提交与业务Session分开。
