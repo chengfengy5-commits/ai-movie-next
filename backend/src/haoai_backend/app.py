@@ -40,6 +40,14 @@ from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
 from .teams import JoinQuota, build_teams_routers, create_team_uow_factory
 from .teams.management.persistence import create_management_uow_factory
 from .teams.series.persistence import create_series_uow_factory
+from .task_observation.authentication import (
+    resolve_account_actor as resolve_task_account_actor,
+    resolve_active_actor as resolve_task_active_actor,
+)
+from .task_observation.cancellation import SqlTaskCancellationWriter
+from .task_observation.http import build_task_observation_router
+from .task_observation.persistence import task_observation_unit_of_work_factory
+from .task_observation.ports import CancellationConnectionFactory, CancellationSignalRegistry
 
 SessionFactory = Callable[[], Session]
 
@@ -52,8 +60,12 @@ def create_app(
     authentication_runtime: AuthenticationRuntime | None = None,
     download_url_resolver: DownloadURLResolver | None = None,
     team_join_quota: JoinQuota | None = None,
+    resolve_task_account: ActorResolver | None = None,
+    resolve_task_active: ActorResolver | None = None,
+    task_cancellation_connection_factory: CancellationConnectionFactory | None = None,
+    task_cancellation_signals: CancellationSignalRegistry | None = None,
 ) -> FastAPI:
-    """Compose 11 authentication and 71 business methods without startup I/O."""
+    """Compose 11 authentication and 80 business methods without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
@@ -217,4 +229,48 @@ def create_app(
         join_quota=team_join_quota,
     ):
         app.include_router(router)
+
+    task_uow_factory = (
+        task_observation_unit_of_work_factory(effective_session_factory)
+        if effective_session_factory is not None
+        else None
+    )
+    account_actor_resolver = resolve_task_account
+    if account_actor_resolver is None:
+        async def resolve_configured_task_account(request: Request):
+            return await run_in_threadpool(
+                resolve_task_account_actor,
+                authentication_service,
+                request.headers.get("authorization", ""),
+            )
+
+        account_actor_resolver = resolve_configured_task_account
+
+    active_actor_resolver = resolve_task_active
+    if active_actor_resolver is None:
+        active_actor_resolver = effective_resolver
+    if active_actor_resolver is None:
+        async def resolve_configured_task_active(request: Request):
+            return await run_in_threadpool(
+                resolve_task_active_actor,
+                authentication_service,
+                request.headers.get("authorization", ""),
+            )
+
+        active_actor_resolver = resolve_configured_task_active
+
+    task_cancellation_writer = (
+        SqlTaskCancellationWriter(task_cancellation_connection_factory)
+        if task_cancellation_connection_factory is not None
+        else None
+    )
+    app.include_router(
+        build_task_observation_router(
+            uow_factory=task_uow_factory,
+            resolve_account_actor=account_actor_resolver,
+            resolve_active_actor=active_actor_resolver,
+            cancellation_signals=task_cancellation_signals,
+            cancellation_writer=task_cancellation_writer,
+        )
+    )
     return app

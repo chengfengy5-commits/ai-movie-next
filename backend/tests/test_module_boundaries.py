@@ -157,6 +157,15 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/teams/{team_id}/series/{series_id}/usage", frozenset({"GET"})),
         ("/api/teams/{team_id}/usage/model", frozenset({"GET"})),
         ("/api/teams/{team_id}/usage/export", frozenset({"GET"})),
+        ("/api/chat/tasks", frozenset({"GET"})),
+        ("/api/chat/submissions/{operation}", frozenset({"GET"})),
+        ("/api/chat/tasks/list", frozenset({"GET"})),
+        ("/api/chat/tasks/{task_id}/request", frozenset({"GET"})),
+        ("/api/chat/ai-review/counts", frozenset({"GET"})),
+        ("/api/chat/ai-review/{task_id}", frozenset({"GET"})),
+        ("/api/chat/batch-optimize/running", frozenset({"GET"})),
+        ("/api/chat/batch-optimize/{task_id}/status", frozenset({"GET"})),
+        ("/api/chat/batch-optimize/{task_id}/cancel", frozenset({"POST"})),
     }
     assert app.openapi_url is None
     assert app.docs_url is None
@@ -270,7 +279,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 82, [(route.path, route.methods) for route in app.routes]
+        assert len(app.routes) == 91, [(route.path, route.methods) for route in app.routes]
         assert effects == [], effects
         # Pydantic probes this optional schema flag; application modules must not read env.
         for key, caller, frames in environment_reads:

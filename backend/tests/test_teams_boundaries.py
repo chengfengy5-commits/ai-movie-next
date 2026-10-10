@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import os
 import subprocess
 import sys
+from contextlib import contextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
+import httpx
+import pytest
 from sqlalchemy import text
 
+from chapter_asset_replacement_support import create_owner_database
 from haoai_backend.teams import tables
 from teams_support import OWNER_METADATA, teams_database
 
@@ -84,7 +90,7 @@ def test_shared_owner_fixture_cleanup(teams_database):
     assert teams_database.engine.pool.checkedout() == 0
 
 
-def test_integrated_registry_has_82_methods():
+def test_integrated_registry_has_91_methods():
     from fastapi.routing import APIRoute
 
     from haoai_backend.app import create_app
@@ -97,7 +103,7 @@ def test_integrated_registry_has_82_methods():
         for method in route.methods
         if method not in {"HEAD", "OPTIONS"}
     }
-    assert len(registered_methods) == 82
+    assert len(registered_methods) == 91
 
 
 def test_integrated_all_25_team_methods_are_registered():
@@ -184,3 +190,202 @@ def test_integrated_default_factory_is_inert(monkeypatch):
     assert startup_calls == []
     assert session_factory_calls == []
     assert actor_resolver_calls == []
+
+
+@pytest.fixture
+def task_observation_owner_database(tmp_path):
+    database = create_owner_database(tmp_path / "task-observation-app.sqlite")
+    try:
+        yield database
+    finally:
+        database.close()
+
+
+def task_observation_request(app, method: str, path: str):
+    async def send():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://task-observation.test",
+        ) as client:
+            return await client.request(
+                method,
+                path,
+                headers={"authorization": "Bearer test-token"},
+            )
+
+    return asyncio.run(send())
+
+
+def test_task_observation_uses_distinct_account_and_active_authentication(
+    task_observation_owner_database,
+    monkeypatch,
+):
+    from haoai_backend.app import create_app
+    from haoai_backend.authentication.application import AuthenticationService
+    from haoai_backend.authentication.configuration import AuthenticationRuntime
+    from haoai_backend.shared.identity import TrustedActor
+
+    database = task_observation_owner_database
+    authentication_calls = []
+    authentication_lifecycle = []
+    active_resolver_calls = []
+    runtime_factory_calls = []
+    business_factory_calls = []
+
+    @contextmanager
+    def authenticated(self, authorization, *, require_membership=False):
+        authentication_calls.append((authorization, require_membership))
+        authentication_lifecycle.append("auth.enter")
+        try:
+            yield SimpleNamespace(user=SimpleNamespace(id="user-a"))
+        finally:
+            authentication_lifecycle.append("auth.exit")
+
+    monkeypatch.setattr(AuthenticationService, "authenticated", authenticated)
+
+    def unused_runtime_factory():
+        runtime_factory_calls.append(True)
+        raise AssertionError("explicit application Session factory must take precedence")
+
+    def explicit_session_factory():
+        business_factory_calls.append("business.session")
+        return database.session_factory()
+
+    async def resolve_legacy_active_actor(request):
+        active_resolver_calls.append(request.url.path)
+        return TrustedActor("user-b")
+
+    app = create_app(
+        session_factory=explicit_session_factory,
+        resolve_actor=resolve_legacy_active_actor,
+        authentication_runtime=AuthenticationRuntime(session_factory=unused_runtime_factory),
+    )
+
+    account_receipt = task_observation_request(app, "GET", "/api/chat/tasks?task_id=task-a")
+    assert account_receipt.status_code == 200
+    assert account_receipt.json()["id"] == "task-a"
+    assert account_receipt.json()["status"] == "processing"
+    assert authentication_lifecycle == ["auth.enter", "auth.exit"]
+    assert business_factory_calls == ["business.session"]
+
+    active_list = task_observation_request(app, "GET", "/api/chat/tasks/list")
+    assert active_list.status_code == 200
+    assert active_list.json()["total"] == 0
+    assert active_resolver_calls == ["/api/chat/tasks/list"]
+    assert authentication_calls == [("Bearer test-token", False)]
+    assert runtime_factory_calls == []
+
+    active_fallback_app = create_app(
+        session_factory=explicit_session_factory,
+        authentication_runtime=AuthenticationRuntime(session_factory=unused_runtime_factory),
+    )
+    active_fallback = task_observation_request(
+        active_fallback_app,
+        "GET",
+        "/api/chat/tasks/list",
+    )
+    assert active_fallback.status_code == 200
+    assert active_fallback.json()["total"] == 1
+    assert authentication_calls[-1] == ("Bearer test-token", True)
+    assert authentication_lifecycle[-2:] == ["auth.enter", "auth.exit"]
+    assert business_factory_calls == [
+        "business.session",
+        "business.session",
+        "business.session",
+    ]
+    assert runtime_factory_calls == []
+    assert all(session.close_calls == 1 for session in database.session_factory.created)
+
+
+def test_task_observation_preserves_falsey_adapters_and_cancel_order(
+    task_observation_owner_database,
+):
+    from haoai_backend.app import create_app
+    from haoai_backend.shared.identity import TrustedActor
+
+    database = task_observation_owner_database
+    events = []
+
+    class FalseyResolver:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+        def __bool__(self) -> bool:
+            return False
+
+        async def __call__(self, request):
+            events.append(f"{self.name}.resolve")
+            return TrustedActor("user-a")
+
+    class Signal:
+        def set(self) -> None:
+            events.append("signal.set")
+
+    class FalseySignalRegistry:
+        def __bool__(self) -> bool:
+            return False
+
+        def get(self, task_id: str):
+            events.append(("signal.get", task_id))
+            return Signal()
+
+    class Result:
+        rowcount = 0
+
+    class Connection:
+        def execute(self, statement, parameters):
+            events.append(("sql.execute", str(statement), parameters))
+            return Result()
+
+    class FalseyConnectionFactory:
+        def __bool__(self) -> bool:
+            return False
+
+        def __call__(self):
+            events.append("connection.factory")
+
+            @contextmanager
+            def connection_scope():
+                events.append("connection.open")
+                yield Connection()
+                events.append("connection.close")
+
+            return connection_scope()
+
+    connection_factory = FalseyConnectionFactory()
+    app = create_app(
+        session_factory=database.session_factory,
+        resolve_task_account=FalseyResolver("account"),
+        resolve_task_active=FalseyResolver("active"),
+        task_cancellation_connection_factory=connection_factory,
+        task_cancellation_signals=FalseySignalRegistry(),
+    )
+    assert events == []
+    assert database.session_factory.created == []
+
+    account_receipt = task_observation_request(app, "GET", "/api/chat/tasks?task_id=task-a")
+    assert account_receipt.status_code == 200
+    assert events == ["account.resolve"]
+
+    active_list = task_observation_request(app, "GET", "/api/chat/tasks/list")
+    assert active_list.status_code == 200
+    assert events[-1] == "active.resolve"
+
+    events.clear()
+    cancelled = task_observation_request(
+        app,
+        "POST",
+        "/api/chat/batch-optimize/task-a/cancel",
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json() == {"task_id": "task-a", "status": "cancelling"}
+    assert events[0] == "active.resolve"
+    assert events[1] == ("signal.get", "task-a")
+    assert events[2] == "signal.set"
+    assert events[3:6] == ["connection.factory", "connection.open", (
+        "sql.execute",
+        "UPDATE ai_tasks SET status='cancelling' WHERE id=:id AND status IN ('queued','processing')",
+        {"id": "task-a"},
+    )]
+    assert events[6] == "connection.close"
+    assert all(session.close_calls == 1 for session in database.session_factory.created)

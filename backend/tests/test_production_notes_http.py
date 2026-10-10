@@ -149,6 +149,15 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/teams/{team_id}/series/{series_id}/usage", frozenset({"GET"})),
         ("/api/teams/{team_id}/usage/model", frozenset({"GET"})),
         ("/api/teams/{team_id}/usage/export", frozenset({"GET"})),
+        ("/api/chat/tasks", frozenset({"GET"})),
+        ("/api/chat/submissions/{operation}", frozenset({"GET"})),
+        ("/api/chat/tasks/list", frozenset({"GET"})),
+        ("/api/chat/tasks/{task_id}/request", frozenset({"GET"})),
+        ("/api/chat/ai-review/counts", frozenset({"GET"})),
+        ("/api/chat/ai-review/{task_id}", frozenset({"GET"})),
+        ("/api/chat/batch-optimize/running", frozenset({"GET"})),
+        ("/api/chat/batch-optimize/{task_id}/status", frozenset({"GET"})),
+        ("/api/chat/batch-optimize/{task_id}/cancel", frozenset({"POST"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 
