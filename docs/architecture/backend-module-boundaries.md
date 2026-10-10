@@ -116,3 +116,14 @@ haoai_backend.download_links 将纯领域、应用用例和 resolver 端口与 P
 团队后端按 management、series、reporting 三个族拆分。management 维护团队、成员、权限、邀请与加入；series 维护团队和剧集之间的共享、认领及锁；reporting 读取团队任务与额度统计。三个族都通过显式工厂接入应用，不持有应用级认证、配置或数据库连接的隐式副本。
 
 团队族使用应用提供的单个 Session 与共享 Team Unit of Work。团队策略、会员上下文和可选加入额度由应用装配注入；剧集内容、媒体、私密笔记与任务账务仍属于各自原有业务边界。具体模块职责、路由和保留的历史行为见[团队后端接口说明](teams-backend.md)。
+
+
+## 任务观察与取消控制模块边界
+
+`task_observation` 的应用层只依赖本包窄 reader/UoW/cancellation 端口和公开的团队纯函数。列表复用 `teams.reporting.task_payload.collect_task_context/project_task_items`，请求查看复用 `teams.policy.has_team_permission`；不借用团队私有 persistence 或 UoW，也不修改团队模块。Core 表是查询投影，不是完整生产 schema 或 migration。
+
+八个 GET 在同一供应业务 Session 中查询，并在 finally 内 rollback/close，没有业务 commit/flush/DML。认证使用公开上下文；从上下文退出并完成认证维护后，resolver 才返回可信身份，随后进入业务用例。根实际 JWT/auth SQL 验收已用同一 request_id 的共享时间线确认认证 commit/close 成功先于业务读取；源码顺序、实际 Session 终态和业务只读分层记录。
+
+请求详情先全局查任务，再按本人、SQL superuser、团队成员和 `view_tasks` 权限、目标用户 membership 的顺序判断。superuser 特权只在该详情请求内从 SQL 读取；其它接口不因此获得跨用户能力。重复本人 membership SELECT 仍实际执行，同一主键保留首次观察字段；不增加团队存在性、剧集权限或任务类型门禁。
+
+取消由独立、显式配置的连接事务执行原 status-only UPDATE，应用先对 truthy 信号 `set()`，然后调用 writer。终态不调用 writer，零行更新仍可提交返回 200，未知提交不重放；业务读事务的 rollback 不撤销独立已提交写入。原 82 个接口、旧四个 notes/rough 私人接口及章节素材替换的显式 policy 接线规则保留。完整说明见[任务观察后端架构](task-observation-backend.md)，已证实和待验收层次见[本批验证记录](../../openspec/changes/modularize-backend-task-observation/verification.md)。

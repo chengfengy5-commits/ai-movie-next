@@ -105,3 +105,14 @@ backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分
 团队后端由 management、series、reporting 三个族组成，分别承接团队与邀请管理、剧集共享和认领、团队用量查询。每个族提供自己的 HTTP router、应用服务和持久化适配器；应用装配继续注入当前认证身份、团队策略和同一数据库 Session。
 
 团队接口共 25 个，完整路由、兼容行为和本轮证据见[团队后端接口说明](../docs/architecture/teams-backend.md)与[团队后端验证记录](../openspec/changes/modularize-backend-teams/verification.md)。创建应用时加入团队路由不改变原业务路由的认证与错误处理。
+
+
+## 任务观察与取消控制模块
+
+`backend/src/haoai_backend/task_observation` 将记录、窄端口、回执/JSON 投影、应用编排、认证适配、只读 Core 查询、独立取消写入和 HTTP 路由分开。八个 GET 使用应用供应的业务 Session，结束时 rollback/close，不提交或执行业务 DML；认证维护使用独立认证 Session，不能把业务只读描述成整个请求没有 SQL 或提交。
+
+组合根沿用有效的 `session_factory`，并提供 `resolve_task_account`、`resolve_task_active` 两个身份入口。缺省适配使用公开认证上下文的 `require_membership=False/True`；显式 account resolver 优先且不会退回活动会员 resolver。取消另需显式 `task_cancellation_connection_factory`，例如外部已配置 Engine 的 `begin`；模块不从业务 Session 私有 Engine 推断连接。`task_cancellation_signals` 只引用外部供应的本进程 registry。配置判断使用 `is None`，保留合法 falsey adapter；默认应用登记 91 个方法且不创建 Engine、Session、schema、provider 或 Worker 资源。缺少必要接线返回 503，并且不打开业务 Session。
+
+取消仅对初读状态为 `queued`/`processing` 的本人任务执行信号和独立 status UPDATE；终态不打开写事务，零行 UPDATE 仍正常提交并返回 200。已触发信号不会因写失败撤回；提交确认未知时状态可能已持久化，不自动重放请求，也不承诺 Worker 停止或退款。两回执的 first/unique 计费单元查询保持分开。
+
+完整九接口及这些边界见[架构说明](../docs/architecture/task-observation-backend.md)。根全量后端测试为 617 项通过；源码、作者测试、根实际运行、联合 JWT/SQL/TCP 和 TypeScript 消费的证据分别记录在[本批验证记录](../openspec/changes/modularize-backend-task-observation/verification.md)，后两项已由根实际运行通过；29 个 HTTP 请求与九方法覆盖分开计数，TypeScript 验证仅限真实正文的现有 parser 消费。七路径文档安装和独立文档审查已完成；普通 OpenSpec strict/status/apply 已在 11/13 状态通过，并在勾选 5.2 后的 12/13 状态再次全部通过；当前 tasks 为 12/13，本地 CLI 收口完成，运行收据见验证记录。

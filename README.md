@@ -387,3 +387,14 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 团队能力按管理、剧集协作和用量统计三个边界组织。模块在应用装配时接入现有认证、会员和团队策略；共享数据库事务入口仍由应用提供。接口兼容面、权限与事务行为见[团队后端接口说明](docs/architecture/teams-backend.md)，本轮验证分层见[团队后端验证记录](openspec/changes/modularize-backend-teams/verification.md)。
 
 当前新增团队路由为 25 个：管理 13 个、剧集 7 个、统计 5 个。它们属于应用总计 82 个路由注册中的团队接口；82 是注册面数量，不代表本轮逐一进行了 TCP 验收。当前实现和验证状态以 OpenSpec 的 tasks 勾选与验证记录为准。
+
+
+## 任务观察与取消控制后端
+
+隔离后端新增 `haoai_backend.task_observation`，承接本人任务回执、提交回执、任务分页、请求详情、AI 审核和批量优化观察，以及批量优化取消，共八个 GET 和一个 POST。当前应用精确登记 91 个方法，原 82 个方法保留；登记数量不代表这些方法都已经过 TCP 验收。前文各批的注册数与验证结果保留其历史含义。
+
+两个回执接口只要求有效登录，其余七个接口要求活动会员。任务回执取最早计费单元，提交回执要求恰好一个任务和一个计费单元。取消先触发本进程中已注册且 truthy 的信号，再通过显式独立连接申请状态更新；返回 `cancelling` 不证明 Worker 已停止或已退款。
+
+模块职责、权限和事务语义见[任务观察后端说明](docs/architecture/task-observation-backend.md)，实际验证与待办见[本批验证记录](openspec/changes/modularize-backend-task-observation/verification.md)。根已实际完成 617 项后端测试及 242 个 Python 文件的 AST/内存编译检查；真实 JWT/SQL/TCP 已完成 29 个请求，覆盖九个新增方法及关键拒绝/故障；现有 TypeScript parser 已实际消费 page_size=10 的响应正文并通过。七路径文档已按授权安装并经独立文档审查接受；普通 OpenSpec strict/status/apply 已先在 11/13 状态通过，并在勾选 5.2 后的 12/13 状态再次复核全部通过；当前 tasks 为 12/13，本地 OpenSpec CLI 收口已完成。
+
+完整后端模块化、完整 React 工作流和最后的语言评估仍在继续。SQLite 和本地测试不代表 PostgreSQL、真实供应商、Worker、SMTP、生产计费或部署验收；指定 GPT-5.6 Sol/xhigh Grillme 外审仍离线待办。

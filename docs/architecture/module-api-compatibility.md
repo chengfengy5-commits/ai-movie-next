@@ -543,3 +543,28 @@ claim=false 属于系列创建/分享请求，只关联团队，不清除已有 
 M06 退队和 M07 移除成员只清理对应 membership 与该成员的团队章节锁，保留 claimed_by/claimed_at；系列移出团队或取消分享只清理 team_id 和相关锁，不解除已有认领。普通剧集访问规则未增加团队认领门禁。
 
 事务兼容继续使用注入的同一 Session 和首次赋值净变化快照，不新增 CAS。dirty UPDATE 零行按通用失败回滚，合法 bulk DELETE 零行仍允许成功；历史无版本条件 DELETE 零行保留警告成功。S02/S03/S05 的指定读回、S04/S06 的 message 和 S07 的 body 意图响应按各自接口执行；提交结果未知或提交后读回失败时不自动重放写请求。
+
+
+## 任务观察与取消控制 API 兼容记录
+
+当前新增以下九个方法，成功状态均为 200。原 82 个方法保留，当前总登记为 91；原有批次中的 82 等数字是当时快照，不改写历史记录。
+
+| 方法 | 路径 | 身份 | 主要参数 |
+| --- | --- | --- | --- |
+| GET | `/api/chat/tasks` | 有效登录 | `task_id` 或 `message_id` query，互斥 |
+| GET | `/api/chat/submissions/{operation}` | 有效登录 | `operation` path；必填 `idempotency_key` query |
+| GET | `/api/chat/tasks/list` | 活动会员 | `page=1`、`page_size=50` 普通 int query |
+| GET | `/api/chat/tasks/{task_id}/request` | 活动会员 | `task_id` path；可选 `team_id` query |
+| GET | `/api/chat/ai-review/counts` | 活动会员 | 必填 `message_id` query |
+| GET | `/api/chat/ai-review/{task_id}` | 活动会员 | `task_id` path |
+| GET | `/api/chat/batch-optimize/running` | 活动会员 | 必填 `chapter_id` query |
+| GET | `/api/chat/batch-optimize/{task_id}/status` | 活动会员 | `task_id` path |
+| POST | `/api/chat/batch-optimize/{task_id}/cancel` | 活动会员 | `task_id` path |
+
+任务回执按原未 trim 的 selector 查询本人任务，`message_id` 多任务返回 409，无匹配保留 `{status: null, result: null}`。正常回执有十三个键；按 `created_at ASC` 取最早计费单元，只有没有单元时才回退任务字段，单元中的零值、空值不触发回退。提交回执先校验 operation 为 `image.single`/`video.single`，再按 Python 字符长度检查非空白 key 不超过 255；查询使用原 key、用户和 operation。`idempotency_key` 是必填 query，`Idempotency-Key` header 不能代替它。提交需恰好一个任务和一个计费单元，正常响应七键；两种回执不合并为一种计费单元读取，也不新增 digest 校验、受理、生成或退款。
+
+请求详情先全局检查任务存在，缺失先返回 404。本人可读，他人只能经本请求 SQL superuser，或本人团队成员、公开 `view_tasks` 权限与目标成员检查获准。列表保留普通 int 的零值、负值和宽范围，不加分页上限、任务类型或章节访问新门禁；静态 list/counts/running 路径优先。请求折叠、列表截断、审核 LIKE/JSON 复核、批量优化 JSON scalar/list 和原 generic 500 差异按来源保留，不统一改成新的 422 验证。
+
+取消读取本人任务的首次状态，仅 `queued`/`processing` 才先触发 truthy 信号并调用独立 writer。SQL 只改 status，WHERE 仅含任务 ID 和两个可取消状态，不加 owner/type/claim/CAS 条件，也不触发 Task 表的 onupdate。已接线时终态跳过 writer 仍回 `cancelling`；零行 UPDATE 仍提交并返回 200。信号不会撤回，提交确认未知可已持久化且不自动重放；响应不代表 Worker 已停或账务已退款。缺身份/业务接线返回 503，缺独立取消工厂返回取消服务 503，均不打开业务 Session；原 private policy 规则不弱化。
+
+按固定旧清单的 248 个显式方法及当前 91 个同方法、同路径登记，尚未登记 157 个显式方法，其中 154 个为业务/API 声明。这是接口面数量，不是完成率或验收覆盖数；本批九方法联合验收及真实 body 的局部 TS parser 消费已通过，七路径文档安装和独立文档审查已完成；普通 OpenSpec strict/status/apply 已在 11/13 状态通过，并在勾选 5.2 后的 12/13 状态再次全部通过；当前 tasks 为 12/13，本地 CLI 收口完成，运行收据见验证记录。下一候选 generic 4 个、admin 2 个方法及 13 类 provider 协议只有 EVID 分析/规划与共享候选准备，尚未安装或验收，不扣除这六个方法。详细语义见[任务观察后端说明](task-observation-backend.md)，当前证据与剩余完整后端、React 和语言评估见[本批验证记录](../../openspec/changes/modularize-backend-task-observation/verification.md)。
