@@ -148,6 +148,12 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/chat/batch-optimize/running", frozenset({"GET"})),
         ("/api/chat/batch-optimize/{task_id}/status", frozenset({"GET"})),
         ("/api/chat/batch-optimize/{task_id}/cancel", frozenset({"POST"})),
+        ("/api/tasks", frozenset({"POST"})),
+        ("/api/tasks/{task_id}", frozenset({"PUT"})),
+        ("/api/tasks/{task_id}/progress", frozenset({"PUT"})),
+        ("/api/tasks/{task_id}/external-status", frozenset({"GET"})),
+        ("/api/admin/tasks", frozenset({"GET"})),
+        ("/api/admin/tasks/{task_id}", frozenset({"GET"})),
     }
 
 

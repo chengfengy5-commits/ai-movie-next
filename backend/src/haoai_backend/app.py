@@ -7,6 +7,8 @@ from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
+from .admin_tasks.http import build_admin_task_router
+from .admin_tasks.persistence import admin_task_unit_of_work_factory
 from .asset_data.http import mount_asset_data_routes
 from .chat_data.http import mount_chat_data_routes
 from .chat_data.persistence import SqlAlchemyChatDataUnitOfWork
@@ -14,6 +16,8 @@ from .chat_data.ports import UnitOfWorkFactory as ChatDataUnitOfWorkFactory
 from .download_links.compatibility import IdentityDownloadURLResolver
 from .download_links.http import mount_download_links_routes
 from .download_links.ports import DownloadURLResolver
+from .generic_tasks.http import build_generic_tasks_router
+from .generic_tasks.persistence import create_generic_task_uow_factory
 from .canvas_data.http import mount_canvas_data_routes
 from .canvas_data.persistence import SqlAlchemyCanvasDataUnitOfWork
 from .canvas_data.ports import UnitOfWorkFactory as CanvasDataUnitOfWorkFactory
@@ -22,8 +26,11 @@ from .chapter_asset_replacement.persistence import SqlAlchemyChapterAssetReplace
 from .chapter_asset_replacement.ports import UnitOfWorkFactory as ChapterAssetReplacementUnitOfWorkFactory
 from .asset_data.persistence import SqlAlchemyAssetDataUnitOfWork
 from .asset_data.ports import AssetDataUnitOfWorkFactory
-from .authentication.configuration import AuthenticationRuntime
-from .authentication.errors import AuthenticationError
+from .authentication import (
+    AuthenticationError,
+    AuthenticationRuntime,
+    create_task_identity_resolvers,
+)
 from .authentication.http import mount_authentication_routes
 from .authentication.persistence import SqlAlchemyAuthenticationUnitOfWork
 from .authentication.ports import UnitOfWorkFactory as AuthenticationUnitOfWorkFactory
@@ -37,9 +44,11 @@ from .personal_production.rough_cut.persistence import (
 from .series_data.http import mount_series_data_routes
 from .series_data.persistence import SqlAlchemySeriesDataUnitOfWork
 from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
+from .provider_status import ProviderStatusRuntime
 from .teams import JoinQuota, build_teams_routers, create_team_uow_factory
 from .teams.management.persistence import create_management_uow_factory
 from .teams.series.persistence import create_series_uow_factory
+from .shared.identity import TrustedActor
 from .task_observation.authentication import (
     resolve_account_actor as resolve_task_account_actor,
     resolve_active_actor as resolve_task_active_actor,
@@ -50,6 +59,25 @@ from .task_observation.persistence import task_observation_unit_of_work_factory
 from .task_observation.ports import CancellationConnectionFactory, CancellationSignalRegistry
 
 SessionFactory = Callable[[], Session]
+
+
+def _public_task_actor_resolver(
+    resolve_identity: Callable[[str], TrustedActor],
+) -> ActorResolver:
+    async def resolve(request: Request) -> TrustedActor:
+        try:
+            return await run_in_threadpool(
+                resolve_identity,
+                request.headers.get("authorization", ""),
+            )
+        except AuthenticationError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=exc.detail,
+                headers=exc.headers,
+            ) from exc
+
+    return resolve
 
 
 def create_app(
@@ -64,8 +92,11 @@ def create_app(
     resolve_task_active: ActorResolver | None = None,
     task_cancellation_connection_factory: CancellationConnectionFactory | None = None,
     task_cancellation_signals: CancellationSignalRegistry | None = None,
+    resolve_generic_task_active: ActorResolver | None = None,
+    resolve_admin_task_actor: ActorResolver | None = None,
+    provider_status_runtime: ProviderStatusRuntime | None = None,
 ) -> FastAPI:
-    """Compose 11 authentication and 80 business methods without startup I/O."""
+    """Compose 11 authentication and 86 business methods without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
@@ -271,6 +302,48 @@ def create_app(
             resolve_active_actor=active_actor_resolver,
             cancellation_signals=task_cancellation_signals,
             cancellation_writer=task_cancellation_writer,
+        )
+    )
+
+    task_identity_resolvers = create_task_identity_resolvers(
+        runtime=authentication_runtime,
+        unit_of_work_factory=authentication_uow_factory,
+    )
+    generic_active_actor_resolver = resolve_generic_task_active
+    if generic_active_actor_resolver is None:
+        if resolve_actor is not None:
+            generic_active_actor_resolver = resolve_actor
+        else:
+            generic_active_actor_resolver = _public_task_actor_resolver(
+                task_identity_resolvers.active
+            )
+
+    admin_actor_resolver = resolve_admin_task_actor
+    if admin_actor_resolver is None:
+        admin_actor_resolver = _public_task_actor_resolver(
+            task_identity_resolvers.admin
+        )
+
+    generic_task_uow_factory = create_generic_task_uow_factory(
+        effective_session_factory
+    )
+    admin_task_uow_factory = None
+    if effective_session_factory is not None:
+        admin_task_uow_factory = admin_task_unit_of_work_factory(
+            effective_session_factory
+        )
+
+    app.include_router(
+        build_generic_tasks_router(
+            uow_factory=generic_task_uow_factory,
+            resolve_active_actor=generic_active_actor_resolver,
+            provider_status_runtime=provider_status_runtime,
+        )
+    )
+    app.include_router(
+        build_admin_task_router(
+            uow_factory=admin_task_uow_factory,
+            resolve_admin_actor=admin_actor_resolver,
         )
     )
     return app

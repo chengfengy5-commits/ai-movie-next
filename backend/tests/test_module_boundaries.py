@@ -166,6 +166,12 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/chat/batch-optimize/running", frozenset({"GET"})),
         ("/api/chat/batch-optimize/{task_id}/status", frozenset({"GET"})),
         ("/api/chat/batch-optimize/{task_id}/cancel", frozenset({"POST"})),
+        ("/api/tasks", frozenset({"POST"})),
+        ("/api/tasks/{task_id}", frozenset({"PUT"})),
+        ("/api/tasks/{task_id}/progress", frozenset({"PUT"})),
+        ("/api/tasks/{task_id}/external-status", frozenset({"GET"})),
+        ("/api/admin/tasks", frozenset({"GET"})),
+        ("/api/admin/tasks/{task_id}", frozenset({"GET"})),
     }
     assert app.openapi_url is None
     assert app.docs_url is None
@@ -279,7 +285,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 91, [(route.path, route.methods) for route in app.routes]
+        assert len(app.routes) == 97, [(route.path, route.methods) for route in app.routes]
         assert effects == [], effects
         # Pydantic probes this optional schema flag; application modules must not read env.
         for key, caller, frames in environment_reads:

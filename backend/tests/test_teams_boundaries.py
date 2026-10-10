@@ -103,7 +103,7 @@ def test_integrated_registry_has_91_methods():
         for method in route.methods
         if method not in {"HEAD", "OPTIONS"}
     }
-    assert len(registered_methods) == 91
+    assert len(registered_methods) == 97
 
 
 def test_integrated_all_25_team_methods_are_registered():
@@ -389,3 +389,337 @@ def test_task_observation_preserves_falsey_adapters_and_cancel_order(
     )]
     assert events[6] == "connection.close"
     assert all(session.close_calls == 1 for session in database.session_factory.created)
+
+
+def _generic_admin_request(app, method: str, path: str):
+    async def send():
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app),
+            base_url="http://generic-admin.test",
+        ) as client:
+            return await client.request(
+                method,
+                path,
+                headers={"authorization": "Bearer test-token"},
+            )
+
+    return asyncio.run(send())
+
+
+def test_generic_and_admin_public_identity_closes_before_business_uow(
+    monkeypatch,
+):
+    import haoai_backend.app as app_module
+    from haoai_backend.app import create_app
+    from haoai_backend.authentication.application import AuthenticationService
+    from haoai_backend.authentication.configuration import AuthenticationRuntime
+
+    events = []
+
+    @contextmanager
+    def authenticated(self, authorization, *, require_membership=False):
+        events.append(("auth.enter", authorization, require_membership))
+        try:
+            yield SimpleNamespace(
+                user=SimpleNamespace(id="user-a", is_superuser=True)
+            )
+        finally:
+            events.append("auth.close")
+
+    monkeypatch.setattr(AuthenticationService, "authenticated", authenticated)
+
+    class GenericTaskUnitOfWork:
+        def load_owned_task_first(self, actor_id, task_id):
+            events.append(("generic.read", actor_id, task_id))
+            return SimpleNamespace(
+                external_task_id=None,
+                external_provider=None,
+            )
+
+        def close(self):
+            events.append("generic.close")
+
+    def make_generic_uow():
+        events.append("generic.open")
+        return GenericTaskUnitOfWork()
+
+    class AdminTaskUnitOfWork:
+        def count_tasks(self, filters):
+            events.append("admin.count")
+            return 0
+
+        def list_tasks(self, filters, *, sort_field, sort_order, offset, limit):
+            events.append("admin.list")
+            return []
+
+        def rollback(self):
+            events.append("admin.rollback")
+
+        def close(self):
+            events.append("admin.close")
+
+    def make_admin_uow():
+        events.append("admin.open")
+        return AdminTaskUnitOfWork()
+
+    monkeypatch.setattr(
+        app_module,
+        "create_generic_task_uow_factory",
+        lambda _session_factory: make_generic_uow,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "admin_task_unit_of_work_factory",
+        lambda _session_factory: make_admin_uow,
+    )
+
+    app = create_app(
+        session_factory=lambda: None,
+        authentication_runtime=AuthenticationRuntime(
+            session_factory=lambda: None,
+        ),
+    )
+
+    generic_status = _generic_admin_request(
+        app,
+        "GET",
+        "/api/tasks/task-a/external-status",
+    )
+    assert generic_status.status_code == 200
+    assert generic_status.json() == {
+        "status": "unknown",
+        "detail": "该任务没有关联的外部任务",
+    }
+    assert events == [
+        ("auth.enter", "Bearer test-token", True),
+        "auth.close",
+        "generic.open",
+        ("generic.read", "user-a", "task-a"),
+        "generic.close",
+    ]
+
+    events.clear()
+    admin_list = _generic_admin_request(app, "GET", "/api/admin/tasks")
+    assert admin_list.status_code == 200
+    assert admin_list.json() == {"data": [], "total": 0}
+    assert events == [
+        ("auth.enter", "Bearer test-token", False),
+        "auth.close",
+        "admin.open",
+        "admin.count",
+        "admin.list",
+        "admin.rollback",
+        "admin.close",
+    ]
+
+
+def test_generic_and_admin_explicit_falsey_resolvers_keep_priority(monkeypatch):
+    import haoai_backend.app as app_module
+    from haoai_backend.app import create_app
+    from haoai_backend.authentication.application import AuthenticationService
+    from haoai_backend.authentication.configuration import AuthenticationRuntime
+    from haoai_backend.shared.identity import TrustedActor
+
+    events = []
+
+    @contextmanager
+    def unexpected_public_auth(self, authorization, *, require_membership=False):
+        raise AssertionError("explicit task resolvers must take priority")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(
+        AuthenticationService,
+        "authenticated",
+        unexpected_public_auth,
+    )
+
+    class FalseyResolver:
+        def __init__(self, name):
+            self.name = name
+
+        def __bool__(self):
+            return False
+
+        async def __call__(self, request):
+            events.append(self.name)
+            return TrustedActor("user-a")
+
+    async def legacy_resolver(_request):
+        events.append("legacy.resolve")
+        return TrustedActor("legacy-user")
+
+    class GenericTaskUnitOfWork:
+        def load_owned_task_first(self, actor_id, task_id):
+            events.append(("generic.read", actor_id, task_id))
+            return SimpleNamespace(
+                external_task_id=None,
+                external_provider=None,
+            )
+
+        def close(self):
+            events.append("generic.close")
+
+    def make_generic_uow():
+        events.append("generic.open")
+        return GenericTaskUnitOfWork()
+
+    class AdminTaskUnitOfWork:
+        def count_tasks(self, filters):
+            events.append("admin.count")
+            return 0
+
+        def list_tasks(self, filters, *, sort_field, sort_order, offset, limit):
+            events.append("admin.list")
+            return []
+
+        def rollback(self):
+            events.append("admin.rollback")
+
+        def close(self):
+            events.append("admin.close")
+
+    def make_admin_uow():
+        events.append("admin.open")
+        return AdminTaskUnitOfWork()
+
+    monkeypatch.setattr(
+        app_module,
+        "create_generic_task_uow_factory",
+        lambda _session_factory: make_generic_uow,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "admin_task_unit_of_work_factory",
+        lambda _session_factory: make_admin_uow,
+    )
+
+    app = create_app(
+        session_factory=lambda: None,
+        resolve_actor=legacy_resolver,
+        resolve_generic_task_active=FalseyResolver("generic.explicit"),
+        resolve_admin_task_actor=FalseyResolver("admin.explicit"),
+        authentication_runtime=AuthenticationRuntime(
+            session_factory=lambda: None,
+        ),
+    )
+
+    generic_status = _generic_admin_request(
+        app,
+        "GET",
+        "/api/tasks/task-a/external-status",
+    )
+    assert generic_status.status_code == 200
+    assert events[:4] == [
+        "generic.explicit",
+        "generic.open",
+        ("generic.read", "user-a", "task-a"),
+        "generic.close",
+    ]
+
+    events.clear()
+    admin_list = _generic_admin_request(app, "GET", "/api/admin/tasks")
+    assert admin_list.status_code == 200
+    assert events == [
+        "admin.explicit",
+        "admin.open",
+        "admin.count",
+        "admin.list",
+        "admin.rollback",
+        "admin.close",
+    ]
+
+    events.clear()
+    legacy_fallback_app = create_app(
+        session_factory=lambda: None,
+        resolve_actor=legacy_resolver,
+        authentication_runtime=AuthenticationRuntime(
+            session_factory=lambda: None,
+        ),
+    )
+    legacy_status = _generic_admin_request(
+        legacy_fallback_app,
+        "GET",
+        "/api/tasks/task-a/external-status",
+    )
+    assert legacy_status.status_code == 200
+    assert events == [
+        "legacy.resolve",
+        "generic.open",
+        ("generic.read", "legacy-user", "task-a"),
+        "generic.close",
+    ]
+
+
+def test_generic_and_admin_missing_uow_return_503():
+    from haoai_backend.app import create_app
+    from haoai_backend.shared.identity import TrustedActor
+
+    async def resolve_actor(_request):
+        return TrustedActor("user-a")
+
+    app = create_app(
+        resolve_generic_task_active=resolve_actor,
+        resolve_admin_task_actor=resolve_actor,
+    )
+
+    generic_status = _generic_admin_request(
+        app,
+        "GET",
+        "/api/tasks/task-a/external-status",
+    )
+    admin_list = _generic_admin_request(app, "GET", "/api/admin/tasks")
+
+    assert generic_status.status_code == 503
+    assert generic_status.json()["detail"] == "通用任务服务暂不可用"
+    assert admin_list.status_code == 503
+    assert admin_list.json()["detail"] == "管理员任务服务尚未接线"
+
+
+def test_public_task_authentication_error_preserves_http_challenge(monkeypatch):
+    import haoai_backend.app as app_module
+    from haoai_backend.app import create_app
+    from haoai_backend.authentication import AuthenticationError
+    from haoai_backend.authentication.application import AuthenticationService
+    from haoai_backend.authentication.configuration import AuthenticationRuntime
+
+    business_uow_calls = []
+
+    def reject_authentication(
+        self,
+        authorization,
+        *,
+        require_membership=False,
+    ):
+        raise AuthenticationError(
+            401,
+            "无法验证凭据",
+            authenticate=True,
+        )
+
+    monkeypatch.setattr(
+        AuthenticationService,
+        "authenticated",
+        reject_authentication,
+    )
+    monkeypatch.setattr(
+        app_module,
+        "create_generic_task_uow_factory",
+        lambda _session_factory: lambda: business_uow_calls.append(True),
+    )
+
+    app = create_app(
+        session_factory=lambda: None,
+        authentication_runtime=AuthenticationRuntime(
+            session_factory=lambda: None,
+        ),
+    )
+    response = _generic_admin_request(
+        app,
+        "GET",
+        "/api/tasks/task-a/external-status",
+    )
+
+    assert response.status_code == 401
+    assert response.json()["detail"] == "无法验证凭据"
+    assert response.headers["www-authenticate"] == "Bearer"
+    assert business_uow_calls == []
