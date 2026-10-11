@@ -1,6 +1,6 @@
 # Generic Admin Tasks Tasks
 
-本任务表记录通用/admin 任务验收证据与后续 OpenSpec 状态。Root run05（runId `dbcead9c-e236-4664-87c2-50280761c45b`）已按 matrix04 完成真实本地 acceptance：175/175（G119/A23/P33），362/362 cleanup reports 通过，target all646 SHA before/after/current 完全一致；受控 SQLite deferred-FK fixture 结果与产品 rollback/close、PostgreSQL 边界分开记录。run01–run04 的真实失败/部分结果保持原样。I60、G08、A07、P03 与 harness/runner source review 各自接受范围及 run05 实际结果分层见 verification.md。现有 route registry 97/248，151 项未登记（148 business + 3 infrastructure）；另有 12 个 React workflow 未完成，不推算项目完成比例或 ETA。文档包含五个旧文件追加与三个任务文档共 8 路径；五旧文件完整原字节前缀已校验。独立 Sol 文档 review02 已实际接受 stage03 八份文档用于 target documentation install（P1=0/P2=0、open IDs=[]；JSON SHA `67029fe624ec15ea3b625888cc66632bf7c8aaa5ab3d5db3c506fa1a66a3828e`）；当前 15/17 项已勾，6.1 对应的 review02 已接受。stage04 仅同步阶段状态，review02 未审阅本版差分；该差分另由 review03 窄审。6.2 等待最终 OpenSpec CLI/Git，7.1 指定 GPT-5.6 Sol/xhigh Grillme 保持 OFFLINE PENDING。普通 OpenSpec 流程保持不变，backend 全部完成后推进 React 全部，最后进行语言评估。
+本任务表记录通用/admin 任务验收证据与后续 OpenSpec 状态。Root run05（runId `dbcead9c-e236-4664-87c2-50280761c45b`）已按 matrix04 完成真实本地 acceptance：175/175（G119/A23/P33），362/362 cleanup reports 通过，target all646 SHA before/after/current 完全一致；受控 SQLite deferred-FK fixture 结果与产品 rollback/close、PostgreSQL 边界分开记录。run01–run04 的真实失败/部分结果保持原样。I60、G08、A07、P03 与 harness/runner source review 各自接受范围及 run05 实际结果分层见 verification.md。现有 route registry 97/248，151 项未登记（148 business + 3 infrastructure）；另有 12 个 React workflow 未完成，不推算项目完成比例或 ETA。文档包含五个旧文件追加与三个任务文档共 8 路径；五旧文件完整原字节前缀已校验。独立 Sol 文档 review02 已实际接受 stage03 八份文档用于 target documentation install（P1=0/P2=0、open IDs=[]；JSON SHA `67029fe624ec15ea3b625888cc66632bf7c8aaa5ab3d5db3c506fa1a66a3828e`）；stage04 阶段状态差分已由独立 Sol review03 实际接受（P1=0/P2=0、open IDs=[]；JSON SHA `24a9752fc82bcc6a6fad811c3cdbb2545f90dd8bed9d066ab791a8b9d60a0e7f`）。Root 收据记录八文档实际安装、普通 OpenSpec strict/status/apply 均真实 exit=0，以及中文 commit/push 后远端 main 确认为 `78f2a40485435653fd0831cd2df4cb5aa7bea6e2`。按这些实际收据闭合 6.2 后，本任务表当前 16/17 项已勾；7.1 指定 GPT-5.6 Sol/xhigh Grillme 保持 OFFLINE PENDING。普通 OpenSpec 流程保持不变，backend 全部完成后推进 React 全部，最后进行语言评估。
 
 ## 1. Planning and Shared Contracts
 
@@ -34,7 +34,7 @@
 ## 6. Seven Documents and CLI Closeout
 
 - [x] 6.1 按真实本地结果更新五旧EOF完整prefix、两new架构/verification与本tasks标记共8路径；独立Sol文档review，解释六方法/九字段/退款歧义/十三协议/authclose/unknown/层次限制，不预报外审或finalCLI。
-- [ ] 6.2 root实际普通OpenSpecstrict/status/apply及finalinventory/source/code/doc/resource守卫，按实际registered集合更新声明差集；中文阶段提交推送已授权新origin，本族完整本地验收后推进生成/Worker/backend全部→React全部→最后语言评估。
+- [x] 6.2 root实际普通OpenSpecstrict/status/apply及finalinventory/source/code/doc/resource守卫，按实际registered集合更新声明差集；中文阶段提交推送已授权新origin，本族完整本地验收后推进生成/Worker/backend全部→React全部→最后语言评估。
 
 ## 7. External Review
 
