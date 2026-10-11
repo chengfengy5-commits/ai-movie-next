@@ -398,3 +398,12 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 模块职责、权限和事务语义见[任务观察后端说明](docs/architecture/task-observation-backend.md)，实际验证与待办见[本批验证记录](openspec/changes/modularize-backend-task-observation/verification.md)。根已实际完成 617 项后端测试及 242 个 Python 文件的 AST/内存编译检查；真实 JWT/SQL/TCP 已完成 29 个请求，覆盖九个新增方法及关键拒绝/故障；现有 TypeScript parser 已实际消费 page_size=10 的响应正文并通过。七路径文档已按授权安装并经独立文档审查接受；普通 OpenSpec strict/status/apply 已先在 11/13 状态通过，并在勾选 5.2 后的 12/13 状态再次复核全部通过；当前 tasks 为 12/13，本地 OpenSpec CLI 收口已完成。
 
 完整后端模块化、完整 React 工作流和最后的语言评估仍在继续。SQLite 和本地测试不代表 PostgreSQL、真实供应商、Worker、SMTP、生产计费或部署验收；指定 GPT-5.6 Sol/xhigh Grillme 外审仍离线待办。
+
+
+## 通用任务与管理员任务本地验收记录（2026-10-11 UTC）
+
+本节记录 2026-10-11 的本族本地验收结果与证据边界。Root 于 2026-10-11 对冻结的 175 项矩阵完成真实本地验收：run05（runId `dbcead9c-e236-4664-87c2-50280761c45b`）由 child PID 2323 实际启动、wait 完成、exit 0，耗时 148.3319877909962 秒；G119、A23、P33 合计 175/175 通过。Root consumption 收据确认 case matrix 与 matrix04 匹配，362/362 个清理报告通过，并绑定 all646 目标文件 SHA before/after/current 完全一致。
+
+验收范围是受控本地证据。独立 post-exit 收据确认 159 个不同 loopback 端口均可重新绑定、child PID 已退出且 parent 临时目录已清除。G02 deferred-FK 场景在 SQLite fixture 的真实物理 COMMIT 因 FK 报 IntegrityError 后，由受限 fixture adapter 在同一 DBAPI handle 执行 rollback 并观察到事务 inactive；这不证明产品 Session.rollback/close 行为，也不构成 PostgreSQL 证据。详细边界与保留的 run01–run04 历史见[本变更验证记录](openspec/changes/modularize-backend-generic-admin-tasks/verification.md)。
+
+这组本地验收与此前 root 完整后端 pytest 的 732 passed、38 warnings、35.89 秒属于不同证据。真实外部供应商、真实凭据、PostgreSQL、完整 React 浏览器、部署及指定 GPT-5.6 Sol/xhigh Grillme 外审仍未由 run05 覆盖。当前路由登记为 97/248，未登记 151 项（148 业务/API、3 基础设施）；另有 12 个 React 工作流未完成。不开启完成百分比或新的日历 ETA 推断。

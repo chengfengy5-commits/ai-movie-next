@@ -127,3 +127,17 @@ haoai_backend.download_links 将纯领域、应用用例和 resolver 端口与 P
 请求详情先全局查任务，再按本人、SQL superuser、团队成员和 `view_tasks` 权限、目标用户 membership 的顺序判断。superuser 特权只在该详情请求内从 SQL 读取；其它接口不因此获得跨用户能力。重复本人 membership SELECT 仍实际执行，同一主键保留首次观察字段；不增加团队存在性、剧集权限或任务类型门禁。
 
 取消由独立、显式配置的连接事务执行原 status-only UPDATE，应用先对 truthy 信号 `set()`，然后调用 writer。终态不调用 writer，零行更新仍可提交返回 200，未知提交不重放；业务读事务的 rollback 不撤销独立已提交写入。原 82 个接口、旧四个 notes/rough 私人接口及章节素材替换的显式 policy 接线规则保留。完整说明见[任务观察后端架构](task-observation-backend.md)，已证实和待验收层次见[本批验证记录](../../openspec/changes/modularize-backend-task-observation/verification.md)。
+
+
+## 通用任务与管理员任务边界（2026-10-11 UTC）
+
+本段记录截至 2026-10-11 的通用任务与管理员任务边界。组合根继续通过 public exports 接入三个独立边界：
+
+- `generic_tasks` 持有四个通用任务 HTTP 方法、应用规则及 SQLAlchemy ORM 单位工作；创建、钱包扣款和 usage ledger 在同一业务事务内提交，失败任务只有在唯一 debit/refund 证据成立时才补款。
+- `admin_tasks` 持有两个全账户只读管理方法。身份要求真实 SQL superuser，但不要求 active membership；列表与详情分别输出九字段 DTO。
+- `provider_status` 只准备和执行一次外部状态 GET：配置读取使用独立 Session 和显式 secret key，不启动 runner、下载、OSS、队列或终态更新。
+- `authentication.task_identity` 是本族消费的公开窄 facade。TrustedActor 只在认证上下文正常退出且认证 Session 成功 close 后返回。
+
+Resolver 优先级、缺省值与 falsey callable 语义、兼容的旧 resolver/privatepolicy/Task Observation kwargs 见[通用任务与管理员任务架构](backend-generic-admin-tasks.md)。I11 registry 为 97 个精确 method/path，旧 91 项保留且新增 6 项。
+
+Root run05 对 175 个冻结矩阵 case 的真实本地验收为 175/175 通过（G119/A23/P33），362/362 cleanup reports 通过；post-exit 独立收据另确认 159 个不同 loopback 端口重绑定通过、child 已退出、parent tmp 已清除。该证据覆盖本族受控本地验收，不外推到 PostgreSQL、真实 provider、React browser、部署或整个 HaoAI 项目。

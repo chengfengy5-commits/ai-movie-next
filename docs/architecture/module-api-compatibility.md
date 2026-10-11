@@ -568,3 +568,21 @@ M06 退队和 M07 移除成员只清理对应 membership 与该成员的团队�
 取消读取本人任务的首次状态，仅 `queued`/`processing` 才先触发 truthy 信号并调用独立 writer。SQL 只改 status，WHERE 仅含任务 ID 和两个可取消状态，不加 owner/type/claim/CAS 条件，也不触发 Task 表的 onupdate。已接线时终态跳过 writer 仍回 `cancelling`；零行 UPDATE 仍提交并返回 200。信号不会撤回，提交确认未知可已持久化且不自动重放；响应不代表 Worker 已停或账务已退款。缺身份/业务接线返回 503，缺独立取消工厂返回取消服务 503，均不打开业务 Session；原 private policy 规则不弱化。
 
 按固定旧清单的 248 个显式方法及当前 91 个同方法、同路径登记，尚未登记 157 个显式方法，其中 154 个为业务/API 声明。这是接口面数量，不是完成率或验收覆盖数；本批九方法联合验收及真实 body 的局部 TS parser 消费已通过，七路径文档安装和独立文档审查已完成；普通 OpenSpec strict/status/apply 已在 11/13 状态通过，并在勾选 5.2 后的 12/13 状态再次全部通过；当前 tasks 为 12/13，本地 CLI 收口完成，运行收据见验证记录。下一候选 generic 4 个、admin 2 个方法及 13 类 provider 协议只有 EVID 分析/规划与共享候选准备，尚未安装或验收，不扣除这六个方法。详细语义见[任务观察后端说明](task-observation-backend.md)，当前证据与剩余完整后端、React 和语言评估见[本批验证记录](../../openspec/changes/modularize-backend-task-observation/verification.md)。
+
+
+## 通用任务与管理员任务的接口兼容记录（2026-10-11 UTC）
+
+本段记录截至 2026-10-11 的接口兼容边界。I11 冻结的精确 registry 为 97 个 method/path，原 91 项完整保留，新增接口如下：
+
+| 方法 | 路径 | 身份与兼容行为 |
+| --- | --- | --- |
+| POST | /api/tasks | active actor；精确五种受控类型先返回 422；费用允许零、负值；保留原 JSON model 字段优先级 |
+| PUT | /api/tasks/{task_id} | 仅本人；缺失任务先 404；三来源受控任务 guard 后更新 status/result；failed 时按唯一 debit 证据决定退款 |
+| PUT | /api/tasks/{task_id}/progress | 仅本人；缺失任务先 404；guard 后 progress clamp 到 0–100，None message 保留、空串清空 |
+| GET | /api/tasks/{task_id}/external-status | 仅本人；缺失外部 id/provider 返回原 unknown/detail；已配置时对完整 provider protocol 只查询一次 |
+| GET | /api/admin/tasks | 真实 SQL superuser；不要求 active membership；全账户 truthy 筛选、model_name 使用 SQL ILIKE，先 count 再按原 sort 取页 |
+| GET | /api/admin/tasks/{task_id} | 真实 SQL superuser；全库 id 查询；request_data/result 原样返回，不解析、不截断 |
+
+列表 DTO 固定九字段：id、user_id、type、status、credit_cost、message_id、model_name、created_at、updated_at。详情 DTO 也为九字段，包含 request_data 和 result，不含 credit_cost、model_name。admin sort 只对精确 desc 降序，其余升序；单字段排序、不加第二排序，不钳制负分页。
+
+Root run05 将冻结矩阵实际执行为 175/175（G119/A23/P33），并有 362/362 cleanup reports 通过、159 个 loopback 端口 post-exit rebind 通过的独立收据。G02 deferred-FK case 的失败物理 COMMIT 与 rollback 仅在受控 SQLite fixture 中完成，不推断产品 Session.rollback/close 或 PostgreSQL。外部 provider/真实凭据、React browser、部署和整体项目完成不在这些证据范围内。

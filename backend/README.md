@@ -116,3 +116,12 @@ backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分
 取消仅对初读状态为 `queued`/`processing` 的本人任务执行信号和独立 status UPDATE；终态不打开写事务，零行 UPDATE 仍正常提交并返回 200。已触发信号不会因写失败撤回；提交确认未知时状态可能已持久化，不自动重放请求，也不承诺 Worker 停止或退款。两回执的 first/unique 计费单元查询保持分开。
 
 完整九接口及这些边界见[架构说明](../docs/architecture/task-observation-backend.md)。根全量后端测试为 617 项通过；源码、作者测试、根实际运行、联合 JWT/SQL/TCP 和 TypeScript 消费的证据分别记录在[本批验证记录](../openspec/changes/modularize-backend-task-observation/verification.md)，后两项已由根实际运行通过；29 个 HTTP 请求与九方法覆盖分开计数，TypeScript 验证仅限真实正文的现有 parser 消费。七路径文档安装和独立文档审查已完成；普通 OpenSpec strict/status/apply 已在 11/13 状态通过，并在勾选 5.2 后的 12/13 状态再次全部通过；当前 tasks 为 12/13，本地 CLI 收口完成，运行收据见验证记录。
+
+
+## 通用任务、管理员任务与外部状态查询（2026-10-11 UTC）
+
+本段记录截至 2026-10-11 的本族验收事实与边界。通用任务四方法、管理员查询两方法和 provider status 只读适配已按 175 项冻结矩阵完成一次真实本地 root acceptance：run05（`dbcead9c-e236-4664-87c2-50280761c45b`）175/175 通过，其中 G119、A23、P33；root consumption 收据记录 362/362 个 cleanup reports 通过，matrix04 精确匹配，all646 target SHA before/after/current 一致。
+
+身份、ORM 事务、两种九字段管理员 DTO、十三种 provider protocol 和资源边界仍以[专门架构说明](../docs/architecture/backend-generic-admin-tasks.md)为准。G08、A07、P03 与 harness/runner 的窄 source reviews 是各自 source/consumer implementation 层证据，和 run05 的 root 实际执行记录分开保存。
+
+这项验收不包含 PostgreSQL、真实外部供应商/凭据、React 浏览器、部署或 named GPT-5.6 Sol/xhigh Grillme 外审。G02 deferred-FK 失败 COMMIT 的 SQLite fixture 归一化也不能推断产品 Session.rollback/close 保证。全站仍有 151/248 路由未登记和 12 个未完成 React 工作流；顺序保持 backend 全部完成后再做 React，语言评估最后。

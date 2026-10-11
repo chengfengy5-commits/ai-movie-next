@@ -52,3 +52,12 @@
 指定的 GPT-5.6 Sol/xhigh Grillme 评审当前离线，仍待执行；其等待时间不在 30–45 日中，因此这份估算不能保证整个目标一定在窗口内完成。真实 PostgreSQL 并发、供应商账号和 SMTP 交付验证仍是外部条件，本文不将其写成已经测试。部署不是原本本地迁移的完成门槛；如需部署，必须另行授权并单独安排。
 
 本计划基于 2026-10-09 的只读映射快照：EVID 收据 haoai-next-whole-project-ui-mapping-and-schedule-01.json（SHA-256: de14e77e115a5a2748cddb23301d49a1eaf8ea8a6aa7d12495cb304efe6cbe01）及 haoai-next-whole-backend-route-and-ui-remaining-inventory-01.json（SHA-256: cd0bcb4a7b285bb9919af2770e14444806099a11678c52c7c64a9b4bc81521cb）。库存数字只用于解释范围口径。
+
+
+## 2026-10-11 当前清单校准注记
+
+本段记录当前清单校准；上方原有日历窗口保持为旧计划数据，未按当前实际进展重新校准。I11 冻结的精确 method/path registry 为 97 项，原 91 项保留且恰增六项。固定来源声明 248 项，未登记差集 151 项，由 148 项业务/API 与 3 项基础设施声明组成。登记差集只描述接口库存，不代表验收数、实现比例、完成百分比或日期承诺。
+
+本族通用任务、管理员任务、provider status 的 175 项冻结矩阵已经由 Root 完成一次实际本地验收：run05 总计 175/175（G119/A23/P33），362/362 cleanup reports 通过，all646 target SHA before/after/current 完全一致。受控本地验收不证明真实 PostgreSQL、真实 provider、React browser 或部署状态。
+
+全站仍有十二类未完成的 React/端到端工作流（U01–U12）：账户登录；剧集章节；团队权限；分镜；素材；AI 生成与 Worker；创作画布；预览剪辑导出；制作便签；任务中心；模型/积分会员设置；九类管理资源与后台体验。旧快照日期与耗时未经重新校准，不据此推算完成日期或整体百分比。推进顺序保持全部 backend → 全部 React 工作流 → 最后进行后端语言评估。
