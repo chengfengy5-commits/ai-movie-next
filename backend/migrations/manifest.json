@@ -1,0 +1,20 @@
+{
+  "format_version": 1,
+  "migrations": [
+    {
+      "version": "0001_generation_shared_records",
+      "file": "0001_generation_shared_records.sql",
+      "sha256": "4a5555181658fae91d035235a021d06fdbf3dde4ad0271375498fa9e57736bfa",
+      "tables": [
+        "stream_fee_records",
+        "generation_result_receipts",
+        "application_records",
+        "unit_fee_decisions",
+        "execution_attempt_groups",
+        "poll_reservations",
+        "policy_stop_events",
+        "local_continuation_work"
+      ]
+    }
+  ]
+}
