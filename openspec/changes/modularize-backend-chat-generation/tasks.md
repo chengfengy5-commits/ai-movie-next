@@ -1,18 +1,18 @@
 # 实施任务
 
-全部任务未执行。当前仅五稿/receipts授权；T01完成前不启动下一批产品代码，T02是不同Sol技术复核和Root已有授权准备，不新增人工审批。实现gpt-6-luna/xhigh，评审GPT-6.1 Sol/xhigh，不可用报告不替换。
+T01、T02 已完成本地验收、文档及中文 Git 收尾，进入分批实现。公共契约与静态注册表已冻结并提交，OpenAI/HaoAI 图片适配器已复核、测试并推送；共享持久化、xAI 视频适配器和媒体暂存分别继续实施或复核。其余任务按完整范围保留，组件通过不代表整项或整体完成。实现 gpt-6-luna/xhigh，评审 GPT-6.1 Sol/xhigh，不可用报告不替换。
 
 关键路径：T01→T02/T03→共享headers+Rootschema/facade→三片独占T11/T12/T14（用publicfakes）→Root接线→独立源码/真实集成→React和浏览器→计数/文档。三原owned arrays与Root独占提议完整见design；shared schema/app/ORM/config/frontend仅原三Luna中一个被Root指定，不能第四写者。
 
-- [ ] **T01 — Root**：完成当前GAP175修复、真实适用175验收、中文文档和Git收尾；记录23G+2A处理及运行身份。
+- [x] **T01 — Root**：完成当前GAP175修复、真实适用175验收、中文文档和Git收尾；记录23G+2A处理及运行身份。
 
-  验证产物：下一批产品代码前置已完成证据；当前150/175不能称全通过。
+  验证产物：Root run05 实际 175/175 通过（G119、A23、P33），runId `dbcead9c-e236-4664-87c2-50280761c45b`；中文文档提交 `78f2a40`、本地任务收尾提交 `caf49bd` 已推送。旧 run03 的150/175与 run04 的174/175仍保留原结果，指定外审另列 T21。
 
   对应：当前GAP独立线。
 
-- [ ] **T02 — 不同GPT-6.1 Sol/xhigh + Root**：独审五稿全文SHA、39四字段、三path数组和完整已关闭修复义务，Root消费后在既有授权安装普通OpenSpec。
+- [x] **T02 — 不同GPT-6.1 Sol/xhigh + Root**：独审五稿全文SHA、39四字段、三path数组和完整已关闭修复义务，Root消费后在既有授权安装普通OpenSpec。
 
-  验证产物：不同作者review/Root receipt；不是新human approval，未运行产品。
+  验证产物：五稿独立复核通过，Root 已消费并安装普通 OpenSpec；严格校验、status、apply 实际退出0，规划提交 `f637815` 已推送。该前置任务不代表六入口产品运行验收。
 
   对应：A39。
 
@@ -158,4 +158,4 @@
 
 原39每项四字段/ports/owner/修复子例在spec，不删改分类或requiredCheck。A28包含queued未intent、startedretain、failure/deadline先成立、event-first settler迟、反序cancel-first、unknown/replay、mixedUnits、ALL Work、shutdown区别及全部HTTP/P2/P6消费者；signal或子集不算完成。A14公开reconnect/cursor未选，A38当前未执行，A39指定外审OFFLINE PENDING。
 
-0产品实现/0运行/0通过/0计数扣减。target/legacy/old artifacts未改；此稿不代表某项checkbox完成，也不以historical732后台测试或当前GAP175部分成功替代next-six验收。
+截至本次任务记录更新：公共契约与静态操作注册表提交 `b9f84ed`；图片、视频原始协议解析分别提交 `c77805f`、`662638f`；OpenAI/HaoAI 图片适配器提交 `e324070`。这些提交均已推送，并有各自独立源码复核与 Root 本地检查。T03 的公共 headers 已冻结；T05、T12、T13、T14 等只完成部分组件，保持未勾选。当前新六入口原39项真实集成尚未执行，通过数0，路由计数不扣减；React/browser及指定外审仍未通过。
