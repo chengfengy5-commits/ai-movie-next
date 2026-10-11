@@ -1,5 +1,6 @@
 """Provider-local video codecs."""
 
+from .xai_provider import XaiVideoProvider
 from .xai_codec import (
     XaiCreateResponse,
     XaiHTTPResponseError,
@@ -11,6 +12,7 @@ from .xai_codec import (
 )
 
 __all__ = [
+    "XaiVideoProvider",
     "XaiCreateResponse",
     "XaiHTTPResponseError",
     "XaiQueryResponse",
