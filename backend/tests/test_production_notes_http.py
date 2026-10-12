@@ -164,6 +164,8 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/tasks/{task_id}/external-status", frozenset({"GET"})),
         ("/api/admin/tasks", frozenset({"GET"})),
         ("/api/admin/tasks/{task_id}", frozenset({"GET"})),
+        ("/api/user/preferences", frozenset({"GET"})),
+        ("/api/user/preferences", frozenset({"PUT"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 

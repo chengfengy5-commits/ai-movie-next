@@ -45,6 +45,8 @@ from .series_data.http import mount_series_data_routes
 from .series_data.persistence import SqlAlchemySeriesDataUnitOfWork
 from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
 from .provider_status import ProviderStatusRuntime
+from .user_preferences.http import mount_user_preferences_routes
+from .user_preferences.persistence import SqlAlchemyUserPreferencesUnitOfWork
 from .teams import JoinQuota, build_teams_routers, create_team_uow_factory
 from .teams.management.persistence import create_management_uow_factory
 from .teams.series.persistence import create_series_uow_factory
@@ -95,6 +97,7 @@ def create_app(
     resolve_generic_task_active: ActorResolver | None = None,
     resolve_admin_task_actor: ActorResolver | None = None,
     provider_status_runtime: ProviderStatusRuntime | None = None,
+    resolve_user_preferences_account: ActorResolver | None = None,
 ) -> FastAPI:
     """Compose 11 authentication and 86 business methods without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -346,4 +349,30 @@ def create_app(
             resolve_admin_actor=admin_actor_resolver,
         )
     )
+    user_preferences_uow_factory = None
+    if effective_session_factory is not None:
+        def make_user_preferences_uow() -> SqlAlchemyUserPreferencesUnitOfWork:
+            return SqlAlchemyUserPreferencesUnitOfWork(effective_session_factory())
+
+        user_preferences_uow_factory = make_user_preferences_uow
+
+    user_preferences_account_resolver = resolve_user_preferences_account
+    if user_preferences_account_resolver is None:
+        user_preferences_account_resolver = resolve_task_account
+    if user_preferences_account_resolver is None:
+        async def resolve_configured_user_preferences_account(request):
+            return await run_in_threadpool(
+                resolve_task_account_actor,
+                authentication_service,
+                request.headers.get("authorization", ""),
+            )
+
+        user_preferences_account_resolver = resolve_configured_user_preferences_account
+
+    mount_user_preferences_routes(
+        app,
+        uow_factory=user_preferences_uow_factory,
+        resolve_account_actor=user_preferences_account_resolver,
+    )
+
     return app

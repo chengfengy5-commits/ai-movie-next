@@ -154,6 +154,8 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/tasks/{task_id}/external-status", frozenset({"GET"})),
         ("/api/admin/tasks", frozenset({"GET"})),
         ("/api/admin/tasks/{task_id}", frozenset({"GET"})),
+        ("/api/user/preferences", frozenset({"GET"})),
+        ("/api/user/preferences", frozenset({"PUT"})),
     }
 
 
