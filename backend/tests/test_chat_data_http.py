@@ -50,7 +50,7 @@ def request(app, method: str, path: str, *, user: str = "user-a", body: Any = No
     return asyncio.run(send())
 
 
-def test_factory_registers_exact_ten_chat_methods_and_ninety_nine_total() -> None:
+def test_factory_registers_exact_ten_chat_methods_and_one_hundred_two_total() -> None:
     app = create_app(
         session_factory=lambda: None,
         resolve_actor=lambda request: TrustedActor("user-a"),
@@ -81,11 +81,17 @@ def test_factory_registers_exact_ten_chat_methods_and_ninety_nine_total() -> Non
         ("/api/download", "GET"),
         ("/api/sign-download-urls", "POST"),
     }
+    expected_chapter_locks = {
+        ("/api/chapters/{chapter_id}/lock", "POST"),
+        ("/api/chapters/{chapter_id}/lock", "GET"),
+        ("/api/chapters/{chapter_id}/lock", "DELETE"),
+    }
 
     assert expected <= paths
     assert expected_canvas <= paths
     assert expected_download_links <= paths
-    assert len(paths) == 99
+    assert expected_chapter_locks <= paths
+    assert len(paths) == 102
 
 
 def test_http_status_filters_body_chapter_and_no_asset_discriminator(database: ChatDatabase) -> None:

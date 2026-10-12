@@ -24,6 +24,9 @@ from .canvas_data.ports import UnitOfWorkFactory as CanvasDataUnitOfWorkFactory
 from .chapter_asset_replacement.http import mount_chapter_asset_replacement_routes
 from .chapter_asset_replacement.persistence import SqlAlchemyChapterAssetReplacementUnitOfWork
 from .chapter_asset_replacement.ports import UnitOfWorkFactory as ChapterAssetReplacementUnitOfWorkFactory
+from .chapter_locks.authentication import resolve_chapter_lock_actor as resolve_authenticated_chapter_lock_actor
+from .chapter_locks.http import ChapterLockActorResolver, build_chapter_locks_router
+from .chapter_locks.persistence import SqlAlchemyChapterLocksUnitOfWork
 from .asset_data.persistence import SqlAlchemyAssetDataUnitOfWork
 from .asset_data.ports import AssetDataUnitOfWorkFactory
 from .authentication import (
@@ -86,6 +89,7 @@ def create_app(
     *,
     session_factory: SessionFactory | None = None,
     resolve_actor: ActorResolver | None = None,
+    resolve_chapter_lock_actor: ChapterLockActorResolver | None = None,
     series_access_policy: SeriesAccessCheck | None = None,
     authentication_runtime: AuthenticationRuntime | None = None,
     download_url_resolver: DownloadURLResolver | None = None,
@@ -99,7 +103,7 @@ def create_app(
     provider_status_runtime: ProviderStatusRuntime | None = None,
     resolve_user_preferences_account: ActorResolver | None = None,
 ) -> FastAPI:
-    """Compose 11 authentication and 86 business methods without startup I/O."""
+    """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
@@ -157,6 +161,38 @@ def create_app(
 
         rough_uow_factory = make_rough_uow
         notes_uow_factory = make_notes_uow
+
+    chapter_lock_uow_factory = None
+    if effective_session_factory is not None:
+        def make_chapter_lock_uow() -> SqlAlchemyChapterLocksUnitOfWork:
+            return SqlAlchemyChapterLocksUnitOfWork(effective_session_factory())
+
+        chapter_lock_uow_factory = make_chapter_lock_uow
+
+    chapter_lock_actor_resolver = resolve_chapter_lock_actor
+    if chapter_lock_actor_resolver is None:
+        async def resolve_configured_chapter_lock_actor(request: Request):
+            try:
+                return await run_in_threadpool(
+                    resolve_authenticated_chapter_lock_actor,
+                    authentication_service,
+                    request.headers.get("authorization", ""),
+                )
+            except AuthenticationError as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                    headers=exc.headers,
+                ) from exc
+
+        chapter_lock_actor_resolver = resolve_configured_chapter_lock_actor
+
+    app.include_router(
+        build_chapter_locks_router(
+            uow_factory=chapter_lock_uow_factory,
+            resolve_actor=chapter_lock_actor_resolver,
+        )
+    )
 
     mount_rough_cut_routes(
         app,
