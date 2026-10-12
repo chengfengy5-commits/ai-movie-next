@@ -38,5 +38,21 @@ def test_factory_registers_two_canvas_methods_without_startup_io() -> None:
     assert ("/api/chapters/{chapter_id}/canvas", "PUT") in methods
     assert {("/api/download", "GET"), ("/api/sign-download-urls", "POST")} <= methods
     assert {("/api/chapters/{chapter_id}/lock", method) for method in ("POST", "GET", "DELETE")} <= methods
-    assert len(methods) == 105
+    assert {
+        ("/api/prompts", "GET"),
+        ("/api/prompts/{prompt_id}", "GET"),
+        ("/api/prompts", "POST"),
+        ("/api/prompts/{prompt_id}", "PUT"),
+        ("/api/prompts/{prompt_id}", "DELETE"),
+        ("/api/prompts/{prompt_id}/promote-to-system", "POST"),
+        ("/api/prompts/{prompt_id}/demote-to-personal", "POST"),
+        ("/api/prompts/reorder", "POST"),
+        ("/api/users/{user_id}/card", "GET"),
+        ("/api/users/me/profile", "PUT"),
+    } <= {
+        (route.path, method)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+    assert len(methods) == 115
     assert app.docs_url is app.redoc_url is app.openapi_url is None

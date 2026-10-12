@@ -91,7 +91,23 @@ def test_factory_registers_exact_ten_chat_methods_and_one_hundred_two_total() ->
     assert expected_canvas <= paths
     assert expected_download_links <= paths
     assert expected_chapter_locks <= paths
-    assert len(paths) == 105
+    assert {
+        ("/api/prompts", "GET"),
+        ("/api/prompts/{prompt_id}", "GET"),
+        ("/api/prompts", "POST"),
+        ("/api/prompts/{prompt_id}", "PUT"),
+        ("/api/prompts/{prompt_id}", "DELETE"),
+        ("/api/prompts/{prompt_id}/promote-to-system", "POST"),
+        ("/api/prompts/{prompt_id}/demote-to-personal", "POST"),
+        ("/api/prompts/reorder", "POST"),
+        ("/api/users/{user_id}/card", "GET"),
+        ("/api/users/me/profile", "PUT"),
+    } <= {
+        (route.path, method)
+        for route in app.routes
+        for method in getattr(route, "methods", set())
+    }
+    assert len(paths) == 115
 
 
 def test_http_status_filters_body_chapter_and_no_asset_discriminator(database: ChatDatabase) -> None:

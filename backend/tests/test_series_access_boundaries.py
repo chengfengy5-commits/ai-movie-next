@@ -158,7 +158,23 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 105
+        assert {
+            ("/api/prompts", "GET"),
+            ("/api/prompts/{prompt_id}", "GET"),
+            ("/api/prompts", "POST"),
+            ("/api/prompts/{prompt_id}", "PUT"),
+            ("/api/prompts/{prompt_id}", "DELETE"),
+            ("/api/prompts/{prompt_id}/promote-to-system", "POST"),
+            ("/api/prompts/{prompt_id}/demote-to-personal", "POST"),
+            ("/api/prompts/reorder", "POST"),
+            ("/api/users/{user_id}/card", "GET"),
+            ("/api/users/me/profile", "PUT"),
+        } <= {
+            (route.path, method)
+            for route in app.routes
+            for method in getattr(route, "methods", set())
+        }
+        assert len(app.routes) == 115
         assert effects == [], effects
         for key, caller, stack in environment_reads:
             caller_path = pathlib.Path(caller).resolve()

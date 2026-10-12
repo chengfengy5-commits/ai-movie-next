@@ -122,7 +122,23 @@ def test_cold_app_import_and_unwired_factory_do_not_open_env_or_construct_sqlalc
         module = importlib.import_module('haoai_backend.app')
         app = module.create_app()
         paths = [(route.path, route.methods) for route in app.routes]
-        assert len(paths) == 105, paths
+        assert {
+            ("/api/prompts", "GET"),
+            ("/api/prompts/{prompt_id}", "GET"),
+            ("/api/prompts", "POST"),
+            ("/api/prompts/{prompt_id}", "PUT"),
+            ("/api/prompts/{prompt_id}", "DELETE"),
+            ("/api/prompts/{prompt_id}/promote-to-system", "POST"),
+            ("/api/prompts/{prompt_id}/demote-to-personal", "POST"),
+            ("/api/prompts/reorder", "POST"),
+            ("/api/users/{user_id}/card", "GET"),
+            ("/api/users/me/profile", "PUT"),
+        } <= {
+            (route.path, method)
+            for route in app.routes
+            for method in getattr(route, "methods", set())
+        }
+        assert len(paths) == 115, paths
         for module_name in ("passlib", "jose"):
             assert module_name not in sys.modules, module_name
         assert side_effects == [], side_effects

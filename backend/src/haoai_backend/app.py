@@ -51,6 +51,11 @@ from .provider_status import ProviderStatusRuntime
 from .user_preferences.http import mount_user_preferences_routes
 from .public_site_config.http import build_public_site_config_router
 from .public_site_config.persistence import public_site_config_unit_of_work_factory
+from .prompts.authentication import create_prompt_identity_resolvers
+from .prompts.domain import PromptActor
+from .prompts.http import PromptActorResolver, build_prompts_router
+from .prompts.persistence import prompts_unit_of_work_factory
+from .user_profiles.http import build_user_profiles_router
 from .user_preferences.persistence import SqlAlchemyUserPreferencesUnitOfWork
 from .teams import JoinQuota, build_teams_routers, create_team_uow_factory
 from .teams.management.persistence import create_management_uow_factory
@@ -104,6 +109,8 @@ def create_app(
     resolve_admin_task_actor: ActorResolver | None = None,
     provider_status_runtime: ProviderStatusRuntime | None = None,
     resolve_user_preferences_account: ActorResolver | None = None,
+    resolve_prompt_active_actor: PromptActorResolver | None = None,
+    resolve_prompt_administrator: PromptActorResolver | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -420,6 +427,54 @@ def create_app(
         app,
         uow_factory=user_preferences_uow_factory,
         resolve_account_actor=user_preferences_account_resolver,
+    )
+
+    prompt_uow_factory = (
+        prompts_unit_of_work_factory(effective_session_factory)
+        if effective_session_factory is not None
+        else None
+    )
+    prompt_identity_resolvers = create_prompt_identity_resolvers(authentication_service)
+
+    def public_prompt_resolver(
+        resolve_identity: Callable[[str], PromptActor],
+    ) -> PromptActorResolver:
+        async def resolve_prompt_actor(request: Request) -> PromptActor:
+            try:
+                return await run_in_threadpool(
+                    resolve_identity,
+                    request.headers.get("authorization", ""),
+                )
+            except AuthenticationError as exc:
+                raise HTTPException(
+                    status_code=exc.status_code,
+                    detail=exc.detail,
+                    headers=exc.headers,
+                ) from exc
+
+        return resolve_prompt_actor
+
+    prompt_active_resolver = resolve_prompt_active_actor
+    if prompt_active_resolver is None:
+        prompt_active_resolver = public_prompt_resolver(prompt_identity_resolvers.active)
+    prompt_administrator_resolver = resolve_prompt_administrator
+    if prompt_administrator_resolver is None:
+        prompt_administrator_resolver = public_prompt_resolver(
+            prompt_identity_resolvers.administrator
+        )
+
+    app.include_router(
+        build_prompts_router(
+            uow_factory=prompt_uow_factory,
+            resolve_active_actor=prompt_active_resolver,
+            resolve_administrator=prompt_administrator_resolver,
+        )
+    )
+    app.include_router(
+        build_user_profiles_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
     )
 
     return app
