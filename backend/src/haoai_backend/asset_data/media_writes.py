@@ -7,11 +7,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from haoai_backend.personal_production.notes.persistence import SqlAlchemyNotesUnitOfWork
-from haoai_backend.personal_production.notes.reconciliation import reconcile_chapter_media_state
+from haoai_backend.personal_production.notes import stage_media_reconciliation
+from haoai_backend.personal_production.notes.errors import NotesNotFound
 from haoai_backend.shared.identity import TrustedActor
 
 from .errors import AssetDataNotFound
+
 
 UNSET_CONTENT = object()
 
@@ -28,11 +29,6 @@ def reconcile_source_media_state(
 ):
     """Reconcile using the caller's Session; transaction ownership stays outside."""
     del actor  # Authorization is performed by the enclosing asset-data use case.
-    notes_uow = SqlAlchemyNotesUnitOfWork(session, series_access_check=None)
-    chapter = notes_uow.load_chapter(chapter_id, lock=True)
-    if chapter is None:
-        raise AssetDataNotFound("章节不存在")
-
     kwargs: dict[str, Any] = {}
     if content_override is not UNSET_CONTENT:
         kwargs["chapter_content_override"] = content_override
@@ -42,4 +38,7 @@ def reconcile_source_media_state(
         kwargs["asset_image_overrides"] = dict(asset_image_overrides)
     if deleted_asset_ids:
         kwargs["deleted_asset_ids"] = set(deleted_asset_ids)
-    return reconcile_chapter_media_state(notes_uow, chapter, **kwargs)
+    try:
+        return stage_media_reconciliation(session, chapter_id, **kwargs).snapshot
+    except NotesNotFound as exc:
+        raise AssetDataNotFound(exc.detail) from exc

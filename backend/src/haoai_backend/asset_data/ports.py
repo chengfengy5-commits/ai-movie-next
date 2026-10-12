@@ -6,6 +6,10 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
+from haoai_backend.generation_contracts.records import GenerationResultReceipt
+from haoai_backend.generation_contracts.ports import CallerTransaction
+from haoai_backend.generation_contracts.types import ApplicationOutcome, CanvasApplyAuthority, TargetSnapshot
+
 from haoai_backend.series_access.ports import SeriesAccessReader
 from haoai_backend.shared.identity import TrustedActor
 
@@ -92,3 +96,13 @@ class AssetDataUnitOfWork(SeriesAccessReader, Protocol):
 
 
 AssetDataUnitOfWorkFactory = Callable[[], AssetDataUnitOfWork]
+
+
+class AssetGenerationWriter(Protocol):
+    def stage_asset_image(
+        self,
+        shared_session: CallerTransaction,
+        authority: CanvasApplyAuthority,
+        receipt: GenerationResultReceipt,
+        target: TargetSnapshot,
+    ) -> ApplicationOutcome: ...

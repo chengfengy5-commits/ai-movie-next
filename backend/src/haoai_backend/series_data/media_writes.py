@@ -6,8 +6,8 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from haoai_backend.personal_production.notes.persistence import SqlAlchemyNotesUnitOfWork
-from haoai_backend.personal_production.notes.reconciliation import reconcile_chapter_media_state
+from haoai_backend.personal_production.notes import stage_media_reconciliation
+from haoai_backend.personal_production.notes.errors import NotesNotFound
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import ChapterRecord
@@ -27,10 +27,7 @@ def reconcile_source_media_state(
     deleted_asset_ids: set[object] | None = None,
 ) -> None:
     """Reconcile through the caller's Session without owning its transaction."""
-    notes_uow = SqlAlchemyNotesUnitOfWork(session, series_access_check=None)
-    notes_chapter = notes_uow.load_chapter(chapter.id, lock=True)
-    if notes_chapter is None:
-        raise SeriesDataNotFound("章节不存在")
+    del actor  # The enclosing series writer has already checked current access.
     kwargs: dict[str, Any] = {}
     if content_override is not UNSET_CONTENT:
         kwargs["chapter_content_override"] = content_override
@@ -38,4 +35,7 @@ def reconcile_source_media_state(
         kwargs["new_assets"] = new_assets
     if deleted_asset_ids:
         kwargs["deleted_asset_ids"] = set(deleted_asset_ids)
-    reconcile_chapter_media_state(notes_uow, notes_chapter, **kwargs)
+    try:
+        stage_media_reconciliation(session, chapter.id, **kwargs)
+    except NotesNotFound as exc:
+        raise SeriesDataNotFound(exc.detail) from exc

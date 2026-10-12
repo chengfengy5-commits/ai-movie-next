@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AbstractContextManager
-from typing import Any, Protocol, TypeAlias
+from typing import Any, Literal, Protocol, TypeAlias
+
+from haoai_backend.generation_contracts.ports import CallerTransaction
+from haoai_backend.generation_contracts.records import ApplicationRecord, GenerationResultReceipt
+from haoai_backend.generation_contracts.types import GenerationActor, OwnerTaskScope
 
 from .domain import BillingUnitRecord, TaskRecord, TaskSubmissionRecord, TeamMembershipRecord
 
@@ -101,3 +105,19 @@ class TaskCancellationWriter(Protocol):
 CancellationConnectionFactory: TypeAlias = Callable[
     [], AbstractContextManager[object]
 ]
+
+
+class GenerationResultReader(Protocol):
+    """Read canonical generation results and persisted application proof."""
+
+    def load_owned_completed_result(
+        self,
+        shared_tx: CallerTransaction,
+        actor: GenerationActor,
+        task_id: str,
+        result_ref: str,
+    ) -> GenerationResultReceipt | Literal["not_found", "unready"]: ...
+
+    def lookup_applied_result(
+        self, scope: OwnerTaskScope, result_ref: str
+    ) -> ApplicationRecord | None: ...

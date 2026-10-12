@@ -6,6 +6,13 @@ from collections.abc import Callable, Sequence
 from datetime import datetime
 from typing import Any, Protocol
 
+from haoai_backend.generation_contracts.records import GenerationResultReceipt
+from haoai_backend.generation_contracts.ports import CallerTransaction
+from haoai_backend.generation_contracts.types import (
+    ApplicationOutcome, CanvasApplyAuthority, ClaimAuthority,
+    ContinuationClaimAuthority, TargetSnapshot, ValidatedGenerationResult,
+)
+
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import ChapterRecord, SeriesRecord, StoryboardAssetRecord
@@ -44,3 +51,18 @@ class SeriesDataUnitOfWork(Protocol):
 UnitOfWorkFactory = Callable[[], SeriesDataUnitOfWork]
 Clock = Callable[[], datetime]
 IdFactory = Callable[[], str]
+
+
+class SeriesGenerationWriter(Protocol):
+    def stage_frame_result(
+        self, shared_session: CallerTransaction,
+        authority: ClaimAuthority | ContinuationClaimAuthority,
+        validated_result: ValidatedGenerationResult, target: TargetSnapshot,
+    ) -> ApplicationOutcome: ...
+
+    def stage_frame_preview(
+        self, shared_session: CallerTransaction,
+        authority: CanvasApplyAuthority,
+        receipt: GenerationResultReceipt,
+        target: TargetSnapshot,
+    ) -> ApplicationOutcome: ...

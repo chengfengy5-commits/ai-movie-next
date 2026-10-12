@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+from haoai_backend.generation_contracts.ports import CallerTransaction
+
+if TYPE_CHECKING:
+    from .facade import MediaReconciliationOutcome
 
 from haoai_backend.shared.identity import TrustedActor
 from .domain import ChapterRecord, MediaStateRecord, PersonalNotesRecord, SourceAsset
@@ -83,3 +88,21 @@ class NotesUnitOfWork(Protocol):
 
 NotesUnitOfWorkFactory = Callable[[], NotesUnitOfWork]
 SeriesAccessCheck = Callable[[object, TrustedActor, str], None]
+
+
+"""Public same-Session port for generation result writes into notes media state."""
+
+
+class NotesGenerationWriter(Protocol):
+    def stage_media_reconciliation(
+        self,
+        shared_session: CallerTransaction,
+        chapter_id: str,
+        *,
+        chapter_content_override: object,
+        chapter_content_before: object = ...,
+        new_assets: Sequence[Mapping[str, object]],
+        asset_image_overrides: Mapping[str, object] | None,
+        deleted_asset_ids: set[str] | None,
+        focus_storyboard_asset_id: str | None,
+    ) -> MediaReconciliationOutcome: ...

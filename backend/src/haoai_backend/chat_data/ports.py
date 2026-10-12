@@ -5,6 +5,9 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, Protocol
 
+from haoai_backend.generation_contracts.ports import CallerTransaction
+from haoai_backend.generation_contracts.types import ApplicationOutcome, TextResult, WebStreamAuthority
+
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import ChatMessageRecord, NewChatMessage
@@ -71,3 +74,12 @@ class ChatDataUnitOfWork(Protocol):
 
 
 UnitOfWorkFactory = Callable[[], ChatDataUnitOfWork]
+
+
+class ChatGenerationWriter(Protocol):
+    def apply_web_text(
+        self,
+        shared_session: CallerTransaction,
+        authority: WebStreamAuthority,
+        text_result: TextResult,
+    ) -> ApplicationOutcome: ...
