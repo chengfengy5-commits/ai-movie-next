@@ -49,6 +49,8 @@ from .series_data.persistence import SqlAlchemySeriesDataUnitOfWork
 from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
 from .provider_status import ProviderStatusRuntime
 from .user_preferences.http import mount_user_preferences_routes
+from .public_site_config.http import build_public_site_config_router
+from .public_site_config.persistence import public_site_config_unit_of_work_factory
 from .user_preferences.persistence import SqlAlchemyUserPreferencesUnitOfWork
 from .teams import JoinQuota, build_teams_routers, create_team_uow_factory
 from .teams.management.persistence import create_management_uow_factory
@@ -121,6 +123,15 @@ def create_app(
     effective_session_factory = session_factory
     if effective_session_factory is None and authentication_runtime is not None:
         effective_session_factory = authentication_runtime.session_factory
+
+    public_site_config_uow_factory = (
+        public_site_config_unit_of_work_factory(effective_session_factory)
+        if effective_session_factory is not None
+        else None
+    )
+    app.include_router(
+        build_public_site_config_router(uow_factory=public_site_config_uow_factory)
+    )
 
     effective_resolver = resolve_actor
     if effective_resolver is None and authentication_runtime is not None:
