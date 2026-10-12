@@ -1,0 +1,12 @@
+{
+  "version": "0001_credential_producer",
+  "sql_file": "0001_credential_producer.sql",
+  "sha256": "e4ff7b5c644048598257150fb86dc2d2551928f0cf45dd65e3027bd1ad2f3867",
+  "tables": [
+    "generation_credential_principals",
+    "generation_credential_bindings",
+    "generation_credential_versions",
+    "generation_prepared_payloads",
+    "generation_credential_schema_migrations"
+  ]
+}
