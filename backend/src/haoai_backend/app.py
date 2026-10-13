@@ -18,6 +18,8 @@ from .admin_users.http import build_admin_users_router
 from .admin_system_models.crypto import LegacyFernet
 from .admin_system_models.http import build_admin_system_models_router
 from .admin_model_configs.http import build_admin_model_configs_router
+from .model_configs.connection import ConnectionTester
+from .model_configs.http import build_model_configs_router
 from .admin_prompt_configs.http import build_admin_prompt_configs_router
 from .admin_chapter_character_queries.http import build_admin_chapter_character_queries_router
 from .admin_scene_prop_queries.http import build_admin_scene_prop_queries_router
@@ -130,6 +132,7 @@ def create_app(
     resolve_user_preferences_account: ActorResolver | None = None,
     resolve_prompt_active_actor: PromptActorResolver | None = None,
     resolve_prompt_administrator: PromptActorResolver | None = None,
+    model_connection_tester: ConnectionTester | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -613,6 +616,13 @@ def create_app(
         build_user_profiles_router(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_model_configs_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            connection_tester=model_connection_tester,
         )
     )
 

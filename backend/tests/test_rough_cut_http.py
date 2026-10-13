@@ -236,6 +236,15 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/admin/smtp-accounts/{account_id}", frozenset({"DELETE"})),
         ("/api/admin/smtp-accounts/{account_id}/reset-count", frozenset({"POST"})),
         ("/api/admin/stats", frozenset({"GET"})),
+        ("/api/models", frozenset({"GET"})),
+        ("/api/models/{model_id}", frozenset({"GET"})),
+        ("/api/models", frozenset({"POST"})),
+        ("/api/models/{model_id}", frozenset({"PUT"})),
+        ("/api/models/{model_id}", frozenset({"DELETE"})),
+        ("/api/models/{model_id}/promote-to-system", frozenset({"POST"})),
+        ("/api/models/{model_id}/demote-to-personal", frozenset({"POST"})),
+        ("/api/models/reorder", frozenset({"POST"})),
+        ("/api/models/test-connection", frozenset({"POST"})),
     }
 
 
