@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
@@ -20,6 +21,12 @@ from .admin_system_models.http import build_admin_system_models_router
 from .admin_model_configs.http import build_admin_model_configs_router
 from .model_configs.connection import ConnectionTester
 from .model_configs.http import build_model_configs_router
+from .redemption_codes.http import build_redemption_codes_router
+from .upload_files.authentication import create_upload_file_identity_resolver
+from .upload_files.domain import UploadFileActor
+from .upload_files.http import build_upload_files_router
+from .upload_files.local_files import LocalApprovedFileReader
+from .upload_files.persistence import upload_directory_provider
 from .admin_prompt_configs.http import build_admin_prompt_configs_router
 from .admin_chapter_character_queries.http import build_admin_chapter_character_queries_router
 from .admin_scene_prop_queries.http import build_admin_scene_prop_queries_router
@@ -133,6 +140,7 @@ def create_app(
     resolve_prompt_active_actor: PromptActorResolver | None = None,
     resolve_prompt_administrator: PromptActorResolver | None = None,
     model_connection_tester: ConnectionTester | None = None,
+    upload_directory: str | Path | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -623,6 +631,36 @@ def create_app(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
             connection_tester=model_connection_tester,
+        )
+    )
+    app.include_router(
+        build_redemption_codes_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+
+    upload_actor_resolver: Callable[[Request], UploadFileActor] | None = None
+    if authentication_service is not None:
+        resolve_upload_identity = create_upload_file_identity_resolver(
+            authentication_service
+        )
+
+        def resolve_upload_active_actor(request: Request) -> UploadFileActor:
+            return resolve_upload_identity(
+                request.headers.get("authorization", "")
+            )
+
+        upload_actor_resolver = resolve_upload_active_actor
+
+    app.include_router(
+        build_upload_files_router(
+            directory_provider=upload_directory_provider(
+                effective_session_factory,
+                upload_directory,
+            ),
+            file_reader=LocalApprovedFileReader(),
+            resolve_active_actor=upload_actor_resolver,
         )
     )
 

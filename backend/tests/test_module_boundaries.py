@@ -268,6 +268,9 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/models/{model_id}/demote-to-personal", frozenset({"POST"})),
         ("/api/models/reorder", frozenset({"POST"})),
         ("/api/models/test-connection", frozenset({"POST"})),
+        ("/api/redemption-codes/generate", frozenset({"POST"})),
+        ("/api/redemption-codes/redeem", frozenset({"POST"})),
+        ("/uploads/{file_path:path}", frozenset({"GET"})),
     }
     assert app.openapi_url is None
     assert app.docs_url is None
@@ -381,7 +384,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 188, [(route.path, route.methods) for route in app.routes]
+        assert len(app.routes) == 191, [(route.path, route.methods) for route in app.routes]
         assert effects == [], effects
         # Pydantic probes this optional schema flag; application modules must not read env.
         for key, caller, frames in environment_reads:

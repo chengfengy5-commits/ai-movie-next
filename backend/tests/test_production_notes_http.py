@@ -255,6 +255,9 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/models/{model_id}/demote-to-personal", frozenset({"POST"})),
         ("/api/models/reorder", frozenset({"POST"})),
         ("/api/models/test-connection", frozenset({"POST"})),
+        ("/api/redemption-codes/generate", frozenset({"POST"})),
+        ("/api/redemption-codes/redeem", frozenset({"POST"})),
+        ("/uploads/{file_path:path}", frozenset({"GET"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 

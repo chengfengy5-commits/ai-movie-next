@@ -245,6 +245,9 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/models/{model_id}/demote-to-personal", frozenset({"POST"})),
         ("/api/models/reorder", frozenset({"POST"})),
         ("/api/models/test-connection", frozenset({"POST"})),
+        ("/api/redemption-codes/generate", frozenset({"POST"})),
+        ("/api/redemption-codes/redeem", frozenset({"POST"})),
+        ("/uploads/{file_path:path}", frozenset({"GET"})),
     }
 
 
