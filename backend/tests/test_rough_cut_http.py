@@ -248,6 +248,23 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/redemption-codes/generate", frozenset({"POST"})),
         ("/api/redemption-codes/redeem", frozenset({"POST"})),
         ("/uploads/{file_path:path}", frozenset({"GET"})),
+        ("/api/provider-quota/accounts", frozenset({"GET"})),
+        ("/api/provider-quota/accounts", frozenset({"POST"})),
+        ("/api/provider-quota/accounts/{account_id}", frozenset({"PUT"})),
+        ("/api/provider-quota/accounts/{account_id}", frozenset({"DELETE"})),
+        ("/api/provider-quota/accounts/{account_id}/balance", frozenset({"GET"})),
+        ("/api/provider-quota/probe", frozenset({"POST"})),
+        ("/api/zhangyuge/balance", frozenset({"GET"})),
+        ("/api/zhangyuge/pat", frozenset({"GET"})),
+        ("/api/zhangyuge/pat", frozenset({"POST"})),
+        ("/api/aistarslab/config", frozenset({"GET"})),
+        ("/api/aistarslab/credits", frozenset({"GET"})),
+        ("/api/aistarslab/add-default", frozenset({"POST"})),
+        ("/api/aistarslab/build-image-params", frozenset({"POST"})),
+        ("/api/aistarslab/add-image-default", frozenset({"POST"})),
+        ("/api/aistarslab/estimate-cost", frozenset({"POST"})),
+        ("/api/aistarslab/build-params", frozenset({"POST"})),
+        ("/api/aistarslab/sync-all", frozenset({"POST"})),
     }
 
 

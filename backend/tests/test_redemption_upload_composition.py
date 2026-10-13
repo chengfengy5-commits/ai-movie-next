@@ -256,8 +256,14 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "resolve_prompt_administrator",
             "model_connection_tester",
             "upload_directory",
+            "provider_quota_transport",
+            "zhangyuge_balance_transport",
+            "aistarslab_transport",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
+        assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
+        assert inspect.signature(create_app).parameters["zhangyuge_balance_transport"].default is None
+        assert inspect.signature(create_app).parameters["aistarslab_transport"].default is None
 
         methods = {
             (method, route.path)
@@ -277,9 +283,26 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("POST", "/api/redemption-codes/generate", "generate_codes"),
             ("POST", "/api/redemption-codes/redeem", "redeem_code"),
             ("GET", "/uploads/{file_path:path}", "serve_file"),
+            ("GET", "/api/provider-quota/accounts", "list_accounts"),
+            ("POST", "/api/provider-quota/accounts", "create_account"),
+            ("PUT", "/api/provider-quota/accounts/{account_id}", "update_account"),
+            ("DELETE", "/api/provider-quota/accounts/{account_id}", "delete_account"),
+            ("GET", "/api/provider-quota/accounts/{account_id}/balance", "account_balance"),
+            ("POST", "/api/provider-quota/probe", "probe"),
+            ("GET", "/api/zhangyuge/balance", "zhangyuge_balance"),
+            ("GET", "/api/zhangyuge/pat", "zhangyuge_get_pat"),
+            ("POST", "/api/zhangyuge/pat", "zhangyuge_save_pat"),
+            ("GET", "/api/aistarslab/config", "config"),
+            ("GET", "/api/aistarslab/credits", "credits"),
+            ("POST", "/api/aistarslab/add-default", "add_default"),
+            ("POST", "/api/aistarslab/build-image-params", "build_image_params"),
+            ("POST", "/api/aistarslab/add-image-default", "add_image_default"),
+            ("POST", "/api/aistarslab/estimate-cost", "estimate_cost"),
+            ("POST", "/api/aistarslab/build-params", "build_video_params"),
+            ("POST", "/api/aistarslab/sync-all", "sync_all"),
         }
-        assert len(methods) == 191
-        assert len(triples) == 191
+        assert len(methods) == 208
+        assert len(triples) == 208
         assert len(triples - new_routes) == 188
         assert new_routes <= triples
         assert events == []

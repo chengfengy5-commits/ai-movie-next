@@ -18,9 +18,12 @@ from .admin_statistics.http import build_admin_statistics_router
 from .admin_users.http import build_admin_users_router
 from .admin_system_models.crypto import LegacyFernet
 from .admin_system_models.http import build_admin_system_models_router
+from .admin_system_models.persistence import SqlAlchemyAdminSystemModelUnitOfWork
+from .admin_system_config.persistence import SqlAlchemyAdminSystemConfigUnitOfWork
 from .admin_model_configs.http import build_admin_model_configs_router
 from .model_configs.connection import ConnectionTester
 from .model_configs.http import build_model_configs_router
+from .model_configs.persistence import model_configs_unit_of_work_factory
 from .redemption_codes.http import build_redemption_codes_router
 from .upload_files.authentication import create_upload_file_identity_resolver
 from .upload_files.domain import UploadFileActor
@@ -76,6 +79,18 @@ from .series_data.http import mount_series_data_routes
 from .series_data.persistence import SqlAlchemySeriesDataUnitOfWork
 from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
 from .provider_status import ProviderStatusRuntime
+from .provider_quota.crypto import LegacyFernetCipher as ProviderQuotaLegacyFernetCipher
+from .provider_quota.http import build_provider_quota_router
+from .provider_quota.ports import ProviderQuotaTransport
+from .provider_quota.transport import AiohttpProviderQuotaTransport
+from .zhangyuge.crypto import LegacyFernet as ZhangyugeLegacyFernet
+from .zhangyuge.http import build_zhangyuge_router
+from .zhangyuge.ports import BalanceTransport as ZhangyugeBalanceTransport
+from .zhangyuge.transport import AiohttpBalanceTransport
+from .aistarslab.http import build_aistarslab_router
+from .aistarslab.ports import AistarslabTransport
+from .aistarslab.provider import AioHttpTransport
+from .aistarslab.readers import build_sqlalchemy_aistarslab_legacy_reader_factory
 from .user_preferences.http import mount_user_preferences_routes
 from .public_site_config.http import build_public_site_config_router
 from .public_site_config.persistence import public_site_config_unit_of_work_factory
@@ -141,6 +156,9 @@ def create_app(
     resolve_prompt_administrator: PromptActorResolver | None = None,
     model_connection_tester: ConnectionTester | None = None,
     upload_directory: str | Path | None = None,
+    provider_quota_transport: ProviderQuotaTransport | None = None,
+    zhangyuge_balance_transport: ZhangyugeBalanceTransport | None = None,
+    aistarslab_transport: AistarslabTransport | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -661,6 +679,80 @@ def create_app(
             ),
             file_reader=LocalApprovedFileReader(),
             resolve_active_actor=upload_actor_resolver,
+        )
+    )
+
+    secret_key = (
+        authentication_runtime.secret_key
+        if authentication_runtime is not None
+        else None
+    )
+    app.include_router(
+        build_provider_quota_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            cipher=ProviderQuotaLegacyFernetCipher(secret_key),
+            transport=(
+                provider_quota_transport
+                if provider_quota_transport is not None
+                else AiohttpProviderQuotaTransport()
+            ),
+        )
+    )
+    app.include_router(
+        build_zhangyuge_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            balance_transport=(
+                zhangyuge_balance_transport
+                if zhangyuge_balance_transport is not None
+                else AiohttpBalanceTransport()
+            ),
+            cipher=ZhangyugeLegacyFernet(secret_key),
+        )
+    )
+
+    aistarslab_model_configs_uow_factory = (
+        model_configs_unit_of_work_factory(effective_session_factory)
+        if effective_session_factory is not None
+        else None
+    )
+    aistarslab_reader_session_factory = effective_session_factory
+    if aistarslab_reader_session_factory is None:
+        def unavailable_aistarslab_session_factory() -> Session:
+            raise RuntimeError("AIStarsLab persistence is not configured")
+
+        aistarslab_reader_session_factory = unavailable_aistarslab_session_factory
+    aistarslab_legacy_reader_factory = (
+        build_sqlalchemy_aistarslab_legacy_reader_factory(
+            aistarslab_reader_session_factory
+        )
+    )
+    aistarslab_system_config_uow_factory = None
+    aistarslab_system_model_uow_factory = None
+    if effective_session_factory is not None:
+        def make_aistarslab_system_config_uow() -> SqlAlchemyAdminSystemConfigUnitOfWork:
+            return SqlAlchemyAdminSystemConfigUnitOfWork(effective_session_factory())
+
+        def make_aistarslab_system_model_uow() -> SqlAlchemyAdminSystemModelUnitOfWork:
+            return SqlAlchemyAdminSystemModelUnitOfWork(effective_session_factory())
+
+        aistarslab_system_config_uow_factory = make_aistarslab_system_config_uow
+        aistarslab_system_model_uow_factory = make_aistarslab_system_model_uow
+
+    app.include_router(
+        build_aistarslab_router(
+            authentication_service=authentication_service,
+            model_configs_uow_factory=aistarslab_model_configs_uow_factory,
+            legacy_reader_factory=aistarslab_legacy_reader_factory,
+            system_config_uow_factory=aistarslab_system_config_uow_factory,
+            system_model_uow_factory=aistarslab_system_model_uow_factory,
+            cipher=LegacyFernet(secret_key),
+            transport=(
+                aistarslab_transport
+                if aistarslab_transport is not None
+                else AioHttpTransport()
+            ),
         )
     )
 
