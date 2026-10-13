@@ -220,6 +220,22 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"GET"})),
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"PUT"})),
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"DELETE"})),
+        ("/api/admin/users", frozenset({"GET"})),
+        ("/api/admin/users", frozenset({"POST"})),
+        ("/api/admin/users/{user_id}", frozenset({"PUT"})),
+        ("/api/admin/users/{user_id}", frozenset({"GET"})),
+        ("/api/admin/users/{user_id}", frozenset({"DELETE"})),
+        ("/api/admin/series", frozenset({"GET"})),
+        ("/api/admin/series/{series_id}", frozenset({"GET"})),
+        ("/api/admin/series/{series_id}", frozenset({"PUT"})),
+        ("/api/admin/series", frozenset({"POST"})),
+        ("/api/admin/smtp-accounts", frozenset({"GET"})),
+        ("/api/admin/smtp-accounts", frozenset({"POST"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"GET"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"PUT"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"DELETE"})),
+        ("/api/admin/smtp-accounts/{account_id}/reset-count", frozenset({"POST"})),
+        ("/api/admin/stats", frozenset({"GET"})),
     }
 
 

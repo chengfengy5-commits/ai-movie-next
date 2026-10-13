@@ -230,6 +230,22 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"GET"})),
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"PUT"})),
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"DELETE"})),
+        ("/api/admin/users", frozenset({"GET"})),
+        ("/api/admin/users", frozenset({"POST"})),
+        ("/api/admin/users/{user_id}", frozenset({"PUT"})),
+        ("/api/admin/users/{user_id}", frozenset({"GET"})),
+        ("/api/admin/users/{user_id}", frozenset({"DELETE"})),
+        ("/api/admin/series", frozenset({"GET"})),
+        ("/api/admin/series/{series_id}", frozenset({"GET"})),
+        ("/api/admin/series/{series_id}", frozenset({"PUT"})),
+        ("/api/admin/series", frozenset({"POST"})),
+        ("/api/admin/smtp-accounts", frozenset({"GET"})),
+        ("/api/admin/smtp-accounts", frozenset({"POST"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"GET"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"PUT"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"DELETE"})),
+        ("/api/admin/smtp-accounts/{account_id}/reset-count", frozenset({"POST"})),
+        ("/api/admin/stats", frozenset({"GET"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 

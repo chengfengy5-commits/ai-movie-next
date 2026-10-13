@@ -9,6 +9,12 @@ from sqlalchemy.orm import Session
 
 from .admin_purchase_packages.http import build_admin_purchase_packages_router
 from .admin_purchase_packages.persistence import purchase_packages_uow_factory
+from .admin_series.http import build_admin_series_router
+from .admin_smtp_accounts.crypto import LegacyFernet as SmtpLegacyFernet
+from .admin_smtp_accounts.daily_reset import DailyResetState, SqlAlchemyDailyReset
+from .admin_smtp_accounts.http import build_admin_smtp_accounts_router
+from .admin_statistics.http import build_admin_statistics_router
+from .admin_users.http import build_admin_users_router
 from .admin_system_models.crypto import LegacyFernet
 from .admin_system_models.http import build_admin_system_models_router
 from .admin_model_configs.http import build_admin_model_configs_router
@@ -225,6 +231,49 @@ def create_app(
     )
     app.include_router(
         build_admin_storyboard_chat_queries_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_users_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            password_hasher=(
+                authentication_runtime.get_password_hasher()
+                if authentication_runtime is not None
+                else None
+            ),
+        )
+    )
+    app.include_router(
+        build_admin_series_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    smtp_daily_reset = (
+        SqlAlchemyDailyReset(
+            effective_session_factory,
+            state=DailyResetState(),
+        )
+        if effective_session_factory is not None
+        else None
+    )
+    app.include_router(
+        build_admin_smtp_accounts_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            cipher=SmtpLegacyFernet(
+                authentication_runtime.secret_key
+                if authentication_runtime is not None
+                else None
+            ),
+            daily_reset=smtp_daily_reset,
+        )
+    )
+    app.include_router(
+        build_admin_statistics_router(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
         )

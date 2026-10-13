@@ -243,6 +243,22 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"GET"})),
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"PUT"})),
         ("/api/admin/prompt-configs/{prompt_id}", frozenset({"DELETE"})),
+        ("/api/admin/users", frozenset({"GET"})),
+        ("/api/admin/users", frozenset({"POST"})),
+        ("/api/admin/users/{user_id}", frozenset({"PUT"})),
+        ("/api/admin/users/{user_id}", frozenset({"GET"})),
+        ("/api/admin/users/{user_id}", frozenset({"DELETE"})),
+        ("/api/admin/series", frozenset({"GET"})),
+        ("/api/admin/series/{series_id}", frozenset({"GET"})),
+        ("/api/admin/series/{series_id}", frozenset({"PUT"})),
+        ("/api/admin/series", frozenset({"POST"})),
+        ("/api/admin/smtp-accounts", frozenset({"GET"})),
+        ("/api/admin/smtp-accounts", frozenset({"POST"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"GET"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"PUT"})),
+        ("/api/admin/smtp-accounts/{account_id}", frozenset({"DELETE"})),
+        ("/api/admin/smtp-accounts/{account_id}/reset-count", frozenset({"POST"})),
+        ("/api/admin/stats", frozenset({"GET"})),
     }
     assert app.openapi_url is None
     assert app.docs_url is None
@@ -356,7 +372,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 163, [(route.path, route.methods) for route in app.routes]
+        assert len(app.routes) == 179, [(route.path, route.methods) for route in app.routes]
         assert effects == [], effects
         # Pydantic probes this optional schema flag; application modules must not read env.
         for key, caller, frames in environment_reads:
