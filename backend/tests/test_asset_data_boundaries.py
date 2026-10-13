@@ -55,7 +55,7 @@ def test_factory_has_exact_asset_route_surface_with_canvas_methods() -> None:
         for route in app.routes
         for method in getattr(route, "methods", set())
     }
-    assert len(method_paths) == 222
+    assert len(method_paths) == 225
     assert ASSET_ROUTES <= method_paths
     assert app.openapi_url is None
     assert app.docs_url is None
@@ -101,7 +101,7 @@ app = create_app(
     resolve_actor=lambda request: TrustedActor('test-user'),
     series_access_policy=lambda session, actor, series_id: None,
 )
-assert len({(route.path, method) for route in app.routes for method in getattr(route, 'methods', set())}) == 222
+assert len({(route.path, method) for route in app.routes for method in getattr(route, 'methods', set())}) == 225
 assert calls == []
 """
     env = os.environ.copy()

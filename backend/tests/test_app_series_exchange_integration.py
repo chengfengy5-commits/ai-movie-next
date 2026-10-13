@@ -389,8 +389,11 @@ def test_cold_factory_registers_exact_exchange_routes_without_session_io() -> No
         ("DELETE", "/api/fused-assets/{asset_id}", "remove_fused_asset"),
         ("GET", "/api/series/{series_id}/export", "export_series"),
         ("POST", "/api/series/import", "import_series"),
+        ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
+        ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
+        ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
     }
-    assert len(routes) == 222
+    assert len(routes) == 225
     assert expected <= routes
 
     response = _request(

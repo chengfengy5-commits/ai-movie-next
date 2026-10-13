@@ -329,21 +329,35 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("GET", "/api/series/{series_id}/export", "export_series"),
             ("POST", "/api/series/import", "import_series"),
         }
-        assert len(methods) == 222
-        assert len(triples) == 222
+        storyboard_save_routes = {
+            ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
+            ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
+            ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
+        }
+        assert len(methods) == 225
+        assert len(triples) == 225
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
         assert len(series_exchange_routes) == 5
-        assert len(triples - new_routes) == 202
+        assert len(storyboard_save_routes) == 3
+        assert len(triples - new_routes) == 205
         assert len(
             triples
             - new_routes
             - runtime_and_maintenance_routes
             - series_exchange_routes
+        ) == 191
+        assert len(
+            triples
+            - new_routes
+            - runtime_and_maintenance_routes
+            - series_exchange_routes
+            - storyboard_save_routes
         ) == 188
         assert new_routes <= triples
         assert runtime_and_maintenance_routes <= triples
         assert series_exchange_routes <= triples
+        assert storyboard_save_routes <= triples
         assert events == []
 
         body = {"type": "membership", "value": 2, "count": 1}
