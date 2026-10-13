@@ -274,6 +274,11 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/series/{series_id}/assets/duplicates/ignore", frozenset({"POST"})),
         ("/api/series/{series_id}/assets/duplicates/ignored", frozenset({"GET"})),
         ("/api/series/{series_id}/assets/merge", frozenset({"POST"})),
+        ("/api/series/{series_id}/fused-assets", frozenset({"GET"})),
+        ("/api/fused-assets/{asset_id}", frozenset({"PUT"})),
+        ("/api/fused-assets/{asset_id}", frozenset({"DELETE"})),
+        ("/api/series/{series_id}/export", frozenset({"GET"})),
+        ("/api/series/import", frozenset({"POST"})),
     }
 
 

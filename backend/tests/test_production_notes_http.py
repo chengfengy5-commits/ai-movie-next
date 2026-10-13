@@ -284,6 +284,11 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/series/{series_id}/assets/duplicates/ignore", frozenset({"POST"})),
         ("/api/series/{series_id}/assets/duplicates/ignored", frozenset({"GET"})),
         ("/api/series/{series_id}/assets/merge", frozenset({"POST"})),
+        ("/api/series/{series_id}/fused-assets", frozenset({"GET"})),
+        ("/api/fused-assets/{asset_id}", frozenset({"PUT"})),
+        ("/api/fused-assets/{asset_id}", frozenset({"DELETE"})),
+        ("/api/series/{series_id}/export", frozenset({"GET"})),
+        ("/api/series/import", frozenset({"POST"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 

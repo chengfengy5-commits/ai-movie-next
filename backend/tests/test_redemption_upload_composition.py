@@ -322,13 +322,28 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("GET", "/api/series/{series_id}/assets/duplicates/ignored", "list_ignored"),
             ("POST", "/api/series/{series_id}/assets/merge", "merge_assets"),
         }
-        assert len(methods) == 217
-        assert len(triples) == 217
+        series_exchange_routes = {
+            ("GET", "/api/series/{series_id}/fused-assets", "get_fused_assets"),
+            ("PUT", "/api/fused-assets/{asset_id}", "put_fused_asset"),
+            ("DELETE", "/api/fused-assets/{asset_id}", "remove_fused_asset"),
+            ("GET", "/api/series/{series_id}/export", "export_series"),
+            ("POST", "/api/series/import", "import_series"),
+        }
+        assert len(methods) == 222
+        assert len(triples) == 222
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
-        assert len(triples - new_routes - runtime_and_maintenance_routes) == 188
+        assert len(series_exchange_routes) == 5
+        assert len(triples - new_routes) == 202
+        assert len(
+            triples
+            - new_routes
+            - runtime_and_maintenance_routes
+            - series_exchange_routes
+        ) == 188
         assert new_routes <= triples
         assert runtime_and_maintenance_routes <= triples
+        assert series_exchange_routes <= triples
         assert events == []
 
         body = {"type": "membership", "value": 2, "count": 1}

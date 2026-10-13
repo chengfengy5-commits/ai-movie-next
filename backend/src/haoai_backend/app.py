@@ -78,6 +78,8 @@ from .personal_production.rough_cut.persistence import (
 from .series_data.http import mount_series_data_routes
 from .series_data.persistence import SqlAlchemySeriesDataUnitOfWork
 from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
+from .series_exchange.http import mount_series_exchange_routes
+from .series_exchange.persistence import series_exchange_uow_factory
 from .provider_status import ProviderStatusRuntime
 from .runtime_status.authentication import create_account_only_current_user_resolver
 from .runtime_status.configuration import RuntimeStatusConfiguration
@@ -841,6 +843,17 @@ def create_app(
     mount_series_maintenance_routes(
         app,
         uow_factory=maintenance_uow_factory,
+        resolve_actor=effective_resolver,
+    )
+
+    exchange_uow_factory = (
+        series_exchange_uow_factory(effective_session_factory)
+        if effective_session_factory is not None
+        else None
+    )
+    mount_series_exchange_routes(
+        app,
+        uow_factory=exchange_uow_factory,
         resolve_actor=effective_resolver,
     )
 
