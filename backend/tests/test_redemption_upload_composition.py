@@ -259,11 +259,21 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "provider_quota_transport",
             "zhangyuge_balance_transport",
             "aistarslab_transport",
+            "runtime_status_configuration",
+            "runtime_status_image_fetcher",
+            "resolve_runtime_status_account",
+            "runtime_status_database_probe",
+            "runtime_status_storage_probe",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
         assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
         assert inspect.signature(create_app).parameters["zhangyuge_balance_transport"].default is None
         assert inspect.signature(create_app).parameters["aistarslab_transport"].default is None
+        assert inspect.signature(create_app).parameters["runtime_status_configuration"].default is None
+        assert inspect.signature(create_app).parameters["runtime_status_image_fetcher"].default is None
+        assert inspect.signature(create_app).parameters["resolve_runtime_status_account"].default is None
+        assert inspect.signature(create_app).parameters["runtime_status_database_probe"].default is None
+        assert inspect.signature(create_app).parameters["runtime_status_storage_probe"].default is None
 
         methods = {
             (method, route.path)
@@ -301,10 +311,24 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("POST", "/api/aistarslab/build-params", "build_video_params"),
             ("POST", "/api/aistarslab/sync-all", "sync_all"),
         }
-        assert len(methods) == 208
-        assert len(triples) == 208
-        assert len(triples - new_routes) == 188
+        runtime_and_maintenance_routes = {
+            ("GET", "/api/chat/proxy-image", "proxy_image"),
+            ("GET", "/", "read_root"),
+            ("GET", "/health", "health_check"),
+            ("GET", "/ready", "ready_check"),
+            ("POST", "/api/series/{series_id}/assets/orphan-check", "check_orphans"),
+            ("GET", "/api/series/{series_id}/assets/duplicates", "list_duplicates"),
+            ("POST", "/api/series/{series_id}/assets/duplicates/ignore", "ignore_duplicates"),
+            ("GET", "/api/series/{series_id}/assets/duplicates/ignored", "list_ignored"),
+            ("POST", "/api/series/{series_id}/assets/merge", "merge_assets"),
+        }
+        assert len(methods) == 217
+        assert len(triples) == 217
+        assert len(new_routes) == 20
+        assert len(runtime_and_maintenance_routes) == 9
+        assert len(triples - new_routes - runtime_and_maintenance_routes) == 188
         assert new_routes <= triples
+        assert runtime_and_maintenance_routes <= triples
         assert events == []
 
         body = {"type": "membership", "value": 2, "count": 1}

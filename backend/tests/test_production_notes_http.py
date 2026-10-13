@@ -275,6 +275,15 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/aistarslab/estimate-cost", frozenset({"POST"})),
         ("/api/aistarslab/build-params", frozenset({"POST"})),
         ("/api/aistarslab/sync-all", frozenset({"POST"})),
+        ("/api/chat/proxy-image", frozenset({"GET"})),
+        ("/", frozenset({"GET"})),
+        ("/health", frozenset({"GET"})),
+        ("/ready", frozenset({"GET"})),
+        ("/api/series/{series_id}/assets/orphan-check", frozenset({"POST"})),
+        ("/api/series/{series_id}/assets/duplicates", frozenset({"GET"})),
+        ("/api/series/{series_id}/assets/duplicates/ignore", frozenset({"POST"})),
+        ("/api/series/{series_id}/assets/duplicates/ignored", frozenset({"GET"})),
+        ("/api/series/{series_id}/assets/merge", frozenset({"POST"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 

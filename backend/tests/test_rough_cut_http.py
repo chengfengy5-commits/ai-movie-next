@@ -265,6 +265,15 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/aistarslab/estimate-cost", frozenset({"POST"})),
         ("/api/aistarslab/build-params", frozenset({"POST"})),
         ("/api/aistarslab/sync-all", frozenset({"POST"})),
+        ("/api/chat/proxy-image", frozenset({"GET"})),
+        ("/", frozenset({"GET"})),
+        ("/health", frozenset({"GET"})),
+        ("/ready", frozenset({"GET"})),
+        ("/api/series/{series_id}/assets/orphan-check", frozenset({"POST"})),
+        ("/api/series/{series_id}/assets/duplicates", frozenset({"GET"})),
+        ("/api/series/{series_id}/assets/duplicates/ignore", frozenset({"POST"})),
+        ("/api/series/{series_id}/assets/duplicates/ignored", frozenset({"GET"})),
+        ("/api/series/{series_id}/assets/merge", frozenset({"POST"})),
     }
 
 

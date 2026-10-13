@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
@@ -79,6 +79,19 @@ from .series_data.http import mount_series_data_routes
 from .series_data.persistence import SqlAlchemySeriesDataUnitOfWork
 from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
 from .provider_status import ProviderStatusRuntime
+from .runtime_status.authentication import create_account_only_current_user_resolver
+from .runtime_status.configuration import RuntimeStatusConfiguration
+from .runtime_status.http import build_runtime_status_router
+from .runtime_status.image_fetcher import build_aiohttp_public_image_fetcher
+from .runtime_status.ports import (
+    CurrentUserResolver,
+    DatabaseReadinessProbe,
+    ObjectStorageReadinessProbe,
+    PublicImageFetchResult,
+    PublicImageFetcher,
+)
+from .series_maintenance.http import mount_series_maintenance_routes
+from .series_maintenance.persistence import series_maintenance_uow_factory
 from .provider_quota.crypto import LegacyFernetCipher as ProviderQuotaLegacyFernetCipher
 from .provider_quota.http import build_provider_quota_router
 from .provider_quota.ports import ProviderQuotaTransport
@@ -114,6 +127,32 @@ from .task_observation.persistence import task_observation_unit_of_work_factory
 from .task_observation.ports import CancellationConnectionFactory, CancellationSignalRegistry
 
 SessionFactory = Callable[[], Session]
+
+
+class _LazyAiohttpPublicImageFetcher:
+    """Construct the HTTP client only when an authenticated proxy request uses it."""
+
+    def __init__(self) -> None:
+        self._fetcher: PublicImageFetcher | None = None
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        timeout_seconds: int,
+        allowed_content_prefixes: Sequence[str],
+    ) -> PublicImageFetchResult:
+        fetcher = self._fetcher
+        if fetcher is None:
+            fetcher = build_aiohttp_public_image_fetcher()
+            self._fetcher = fetcher
+        return await fetcher.fetch(
+            url,
+            max_bytes=max_bytes,
+            timeout_seconds=timeout_seconds,
+            allowed_content_prefixes=allowed_content_prefixes,
+        )
 
 
 def _public_task_actor_resolver(
@@ -159,6 +198,11 @@ def create_app(
     provider_quota_transport: ProviderQuotaTransport | None = None,
     zhangyuge_balance_transport: ZhangyugeBalanceTransport | None = None,
     aistarslab_transport: AistarslabTransport | None = None,
+    runtime_status_configuration: RuntimeStatusConfiguration | None = None,
+    runtime_status_image_fetcher: PublicImageFetcher | None = None,
+    resolve_runtime_status_account: CurrentUserResolver | None = None,
+    runtime_status_database_probe: DatabaseReadinessProbe | None = None,
+    runtime_status_storage_probe: ObjectStorageReadinessProbe | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -754,6 +798,50 @@ def create_app(
                 else AioHttpTransport()
             ),
         )
+    )
+
+    status_configuration = runtime_status_configuration
+    if status_configuration is None:
+        status_configuration = RuntimeStatusConfiguration(
+            service_name="Hao AI Backend",
+            version="0.1.0",
+            readiness_initialized=True,
+            object_storage_configured=False,
+            probe_timeout_seconds=1.0,
+            ready_cache_seconds=5.0,
+            initial_failure_backoff_seconds=1.0,
+            max_failure_backoff_seconds=30.0,
+        )
+
+    status_image_fetcher = runtime_status_image_fetcher
+    if status_image_fetcher is None:
+        status_image_fetcher = _LazyAiohttpPublicImageFetcher()
+
+    status_account_resolver = resolve_runtime_status_account
+    if status_account_resolver is None and authentication_service is not None:
+        status_account_resolver = create_account_only_current_user_resolver(
+            authentication_service
+        )
+
+    app.include_router(
+        build_runtime_status_router(
+            configuration=status_configuration,
+            image_fetcher=status_image_fetcher,
+            resolve_current_user=status_account_resolver,
+            database_probe=runtime_status_database_probe,
+            object_storage_probe=runtime_status_storage_probe,
+        )
+    )
+
+    maintenance_uow_factory = (
+        series_maintenance_uow_factory(effective_session_factory)
+        if effective_session_factory is not None
+        else None
+    )
+    mount_series_maintenance_routes(
+        app,
+        uow_factory=maintenance_uow_factory,
+        resolve_actor=effective_resolver,
     )
 
     return app
