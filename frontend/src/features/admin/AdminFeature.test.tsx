@@ -4,6 +4,8 @@ import userEvent from "@testing-library/user-event";
 import { AdminFeature } from "./AdminFeature";
 import type { AdminFetcher } from "./adminApi";
 import type { AdminModel, AdminStats, AdminStorage } from "./adminTypes";
+import type { AdminUserRecord } from "./usersTypes";
+import type { SystemPrompt } from "./systemPromptsTypes";
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -55,6 +57,35 @@ function model(overrides: Partial<AdminModel> = {}): AdminModel {
     params: null,
     created_at: "2026-10-01T00:00:00",
     updated_at: "2026-10-01T00:00:00",
+    ...overrides,
+  };
+}
+
+function prompt(overrides: Partial<SystemPrompt> = {}): SystemPrompt {
+  return {
+    id: "prompt-1",
+    category: "storyboard",
+    name: "分镜提示词",
+    system_prompt: "系统内容",
+    user_prompt: "用户内容",
+    sort_order: 0,
+    is_active: true,
+    created_at: "2026-10-01T00:00:00",
+    updated_at: "2026-10-01T00:00:00",
+    ...overrides,
+  };
+}
+
+function managedUser(overrides: Partial<AdminUserRecord> = {}): AdminUserRecord {
+  return {
+    id: "user-1",
+    username: "writer",
+    email: "writer@example.test",
+    is_superuser: false,
+    membership_type: "free",
+    membership_expires_at: null,
+    credits: 0,
+    created_at: "2026-10-01T00:00:00",
     ...overrides,
   };
 }
@@ -390,5 +421,199 @@ describe("admin feature user flows", () => {
     expect(fetcher.mock.calls.filter((call) => (
       requestPath(call[0]) === "/api/admin/system-models" && call[1]?.method === "POST"
     ))).toHaveLength(1);
+  });
+
+  it("connects system prompt navigation, create, edit, cancel and refreshed lists to the admin API", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    storage.setItem("access_token", "creative-account-token");
+    let currentPrompt = prompt();
+    let promptExists = false;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-prompts" && url.search) {
+        return promptExists
+          ? jsonResponse({ data: [currentPrompt], total: 1 })
+          : jsonResponse({ data: [], total: 0 });
+      }
+      if (url.pathname === "/api/admin/system-prompts" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Omit<SystemPrompt, "id" | "created_at" | "updated_at">;
+        currentPrompt = prompt({ ...body, id: "created-prompt" });
+        promptExists = true;
+        return jsonResponse(currentPrompt);
+      }
+      if (url.pathname === "/api/admin/system-prompts/created-prompt" && (init?.method ?? "GET") === "GET") {
+        return jsonResponse(currentPrompt);
+      }
+      if (url.pathname === "/api/admin/system-prompts/created-prompt" && init?.method === "PUT") {
+        const body = JSON.parse(String(init.body)) as Partial<SystemPrompt>;
+        currentPrompt = prompt({ ...currentPrompt, ...body });
+        return jsonResponse(currentPrompt);
+      }
+      throw new Error("Unexpected request: " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统提示词" }));
+    expect(await screen.findByText("共 0 个提示词")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "系统提示词" })).toHaveAttribute("aria-current", "page");
+
+    await user.click(screen.getByRole("button", { name: "新建提示词" }));
+    await user.selectOptions(screen.getByLabelText("分类"), "storyboard");
+    await user.type(screen.getByLabelText("名称"), "新建分镜");
+    await user.type(screen.getByLabelText("系统提示词", { selector: "textarea" }), "新的系统内容");
+    await user.type(screen.getByLabelText("用户提示词"), "新的用户内容");
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(await screen.findByText("共 0 个提示词")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "新建提示词" }));
+    await user.selectOptions(screen.getByLabelText("分类"), "storyboard");
+    await user.type(screen.getByLabelText("名称"), "新建分镜");
+    await user.type(screen.getByLabelText("系统提示词", { selector: "textarea" }), "新的系统内容");
+    await user.type(screen.getByLabelText("用户提示词"), "新的用户内容");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByRole("button", { name: "新建分镜" })).toBeInTheDocument();
+    expect(screen.getByText("共 1 个提示词")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "编辑" }));
+    expect(await screen.findByDisplayValue("新建分镜")).toBeInTheDocument();
+    await user.clear(screen.getByLabelText("名称"));
+    await user.type(screen.getByLabelText("名称"), "更新后的分镜");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByRole("button", { name: "更新后的分镜" })).toBeInTheDocument();
+
+    const promptRequests = fetcher.mock.calls.filter(([input]) => (
+      requestPath(input).startsWith("/api/admin/system-prompts")
+    ));
+    expect(promptRequests.some(([input, init]) => (
+      requestPath(input).startsWith("/api/admin/system-prompts?") && init?.method === undefined
+    ))).toBe(true);
+    expect(promptRequests.some(([input, init]) => (
+      requestPath(input) === "/api/admin/system-prompts" && init?.method === "POST"
+        && JSON.parse(String(init.body)).name === "新建分镜"
+    ))).toBe(true);
+    expect(promptRequests.some(([input, init]) => (
+      requestPath(input) === "/api/admin/system-prompts/created-prompt" && init?.method === "PUT"
+        && JSON.parse(String(init.body)).name === "更新后的分镜"
+    ))).toBe(true);
+    expect(promptRequests.every(([, init]) => (
+      new Headers(init?.headers).get("Authorization") === "Bearer admin-token"
+    ))).toBe(true);
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+  });
+
+  it("connects user navigation, create, edit and refreshed lists to the admin API", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    storage.setItem("access_token", "creative-account-token");
+    let currentUser = managedUser({ id: "created-user", username: "new-writer" });
+    let userExists = false;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/users" && url.search) {
+        return userExists
+          ? jsonResponse({ data: [currentUser], total: 1 })
+          : jsonResponse({ data: [], total: 0 });
+      }
+      if (url.pathname === "/api/admin/users" && init?.method === "POST") {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        currentUser = managedUser({
+          id: "created-user",
+          username: String(body.username),
+          email: String(body.email),
+          is_superuser: body.is_superuser === true,
+          membership_type: String(body.membership_type),
+          membership_expires_at: typeof body.membership_expires_at === "string" ? body.membership_expires_at : null,
+          credits: typeof body.credits === "number" ? body.credits : 0,
+        });
+        userExists = true;
+        return jsonResponse(currentUser);
+      }
+      if (url.pathname === "/api/admin/users/created-user" && (init?.method ?? "GET") === "GET") {
+        return jsonResponse(currentUser);
+      }
+      if (url.pathname === "/api/admin/users/created-user" && init?.method === "PUT") {
+        const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+        currentUser = managedUser({
+          ...currentUser,
+          username: typeof body.username === "string" ? body.username : currentUser.username,
+          email: typeof body.email === "string" ? body.email : currentUser.email,
+          is_superuser: typeof body.is_superuser === "boolean" ? body.is_superuser : currentUser.is_superuser,
+          membership_type: typeof body.membership_type === "string" ? body.membership_type : currentUser.membership_type,
+          membership_expires_at: typeof body.membership_expires_at === "string" ? body.membership_expires_at : currentUser.membership_expires_at,
+          credits: typeof body.credits === "number" ? body.credits : currentUser.credits,
+        });
+        return jsonResponse({ message: "用户更新成功" });
+      }
+      throw new Error("Unexpected request: " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(await screen.findByText("共 0 个用户")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "用户管理" })).toHaveAttribute("aria-current", "page");
+
+    await user.click(screen.getByRole("button", { name: "新建用户" }));
+    await user.type(screen.getByLabelText("用户名"), "new-writer");
+    await user.type(screen.getByLabelText("邮箱"), "new-writer@example.test");
+    await user.type(screen.getByLabelText("初始密码"), "private-password");
+    await user.clear(screen.getByLabelText("初始积分"));
+    await user.type(screen.getByLabelText("初始积分"), "35");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByRole("button", { name: "new-writer" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "编辑" }));
+    expect(await screen.findByDisplayValue("new-writer@example.test")).toBeInTheDocument();
+    await user.clear(screen.getByLabelText("邮箱"));
+    await user.type(screen.getByLabelText("邮箱"), "updated-writer@example.test");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByRole("button", { name: "new-writer" })).toBeInTheDocument();
+
+    const userRequests = fetcher.mock.calls.filter(([input]) => (
+      requestPath(input).startsWith("/api/admin/users")
+    ));
+    expect(userRequests.some(([input, init]) => (
+      requestPath(input).startsWith("/api/admin/users?") && init?.method === undefined
+    ))).toBe(true);
+    expect(userRequests.some(([input, init]) => (
+      requestPath(input) === "/api/admin/users" && init?.method === "POST"
+        && JSON.parse(String(init.body)).credits === 35
+    ))).toBe(true);
+    expect(userRequests.some(([input, init]) => (
+      requestPath(input) === "/api/admin/users/created-user" && init?.method === undefined
+    ))).toBe(true);
+    expect(userRequests.some(([input, init]) => (
+      requestPath(input) === "/api/admin/users/created-user" && init?.method === "PUT"
+        && JSON.parse(String(init.body)).email === "updated-writer@example.test"
+    ))).toBe(true);
+    expect(userRequests.every(([, init]) => (
+      new Headers(init?.headers).get("Authorization") === "Bearer admin-token"
+    ))).toBe(true);
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+  });
+
+  it.each([401, 403])("clears only the administrator session after a user-management request returns %s", async (status) => {
+    const storage = adminStorage();
+    storage.setItem("access_token", "creative-account-token");
+    const fetcher = vi.fn<AdminFetcher>(async (input) => (
+      requestPath(input) === "/api/admin/stats"
+        ? jsonResponse(stats())
+        : jsonResponse({ detail: "权限不足" }, status)
+    ));
+
+    const user = userEvent.setup();
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(await screen.findByRole("heading", { name: "管理后台" })).toBeInTheDocument();
+    expect(storage.getItem("admin_token")).toBeNull();
+    expect(storage.getItem("admin_user")).toBeNull();
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+    const usersRequest = fetcher.mock.calls.find(([input]) => (
+      requestPath(input).startsWith("/api/admin/users?")
+    ));
+    expect(usersRequest).toBeDefined();
+    expect(new Headers(usersRequest?.[1]?.headers).get("Authorization")).toBe("Bearer admin-token");
   });
 });

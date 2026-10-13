@@ -1,0 +1,141 @@
+.admin-users-page {
+  display: grid;
+  gap: 16px;
+}
+
+.admin-users-filters {
+  margin-bottom: 0;
+}
+
+.admin-users-filters label {
+  min-width: 145px;
+}
+
+.admin-users-filters input {
+  width: 100%;
+  min-height: 35px;
+  padding: 6px 9px;
+  border: 1px solid #393940;
+  border-radius: 8px;
+  color: #e4e4e7;
+  background: #1a1a1e;
+  font-size: 11px;
+}
+
+.admin-users-filters input:focus-visible {
+  border-color: #8b5cf6;
+}
+
+.admin-users-filter-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.admin-users-table-wrap {
+  min-width: 0;
+}
+
+.admin-users-table {
+  width: 100%;
+  border-collapse: collapse;
+  white-space: nowrap;
+}
+
+.admin-users-table th,
+.admin-users-table td {
+  padding: 12px 13px;
+  border-bottom: 1px solid #29292f;
+  text-align: left;
+}
+
+.admin-users-table th {
+  color: #777680;
+  background: #1c1c20;
+  font-size: 10px;
+  font-weight: 650;
+}
+
+.admin-users-table td {
+  color: #c0bec7;
+  font-size: 11px;
+}
+
+.admin-users-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.admin-users-table tbody tr:hover {
+  background: rgba(255, 255, 255, 0.018);
+}
+
+.admin-users-sort-button {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+
+.admin-users-sort-button:hover {
+  color: #d9d2f5;
+}
+
+.admin-users-id {
+  color: #898791 !important;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.admin-users-membership {
+  display: inline-flex;
+  padding: 4px 7px;
+  border: 1px solid #335e4b;
+  border-radius: 999px;
+  color: #91d4aa;
+  background: rgba(61, 137, 88, 0.1);
+  font-size: 9px;
+}
+
+.admin-users-row-actions {
+  min-width: 54px;
+}
+
+.admin-users-empty {
+  border: 0;
+  border-radius: 0;
+}
+
+.admin-users-empty strong {
+  color: #d8d6de;
+}
+
+.admin-users-form {
+  width: min(100%, 940px);
+}
+
+.admin-users-admin-field {
+  align-self: center;
+}
+
+@media (max-width: 760px) {
+  .admin-users-filters {
+    align-items: stretch;
+  }
+
+  .admin-users-filters label {
+    min-width: min(100%, 180px);
+    flex: 1 1 180px;
+  }
+
+  .admin-users-filter-actions {
+    align-self: end;
+  }
+
+  .admin-users-form .admin-form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .admin-users-form .admin-field-span {
+    grid-column: auto;
+  }
+}

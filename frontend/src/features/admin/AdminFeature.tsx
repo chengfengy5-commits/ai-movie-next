@@ -1,9 +1,13 @@
-import { useCallback, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../shared/api/errors";
 import { resolveApiBaseUrl } from "../../shared/api/config";
 import { AdminDashboard } from "./AdminDashboard";
 import { createAdminApi, type AdminFetcher } from "./adminApi";
 import type { AdminApi, AdminStorage, AdminUser } from "./adminTypes";
+import { SystemPrompts } from "./SystemPrompts";
+import { createSystemPromptsApi } from "./systemPromptsApi";
+import { Users } from "./Users";
+import { createAdminUsersApi } from "./usersApi";
 import { SystemModels } from "./SystemModels";
 import "./Admin.css";
 
@@ -22,7 +26,13 @@ type AdminView =
   | { kind: "dashboard" }
   | { kind: "system-models" }
   | { kind: "model-create" }
-  | { kind: "model-edit"; id: string };
+  | { kind: "model-edit"; id: string }
+  | { kind: "system-prompts" }
+  | { kind: "prompt-create" }
+  | { kind: "prompt-edit"; id: string }
+  | { kind: "users" }
+  | { kind: "user-create" }
+  | { kind: "user-edit"; id: string };
 
 interface AdminSession {
   token: string;
@@ -159,34 +169,64 @@ export function AdminFeature({
   );
   const [session, setSession] = useState<AdminSession | null>(() => restoreAdminSession(storage));
   const [view, setView] = useState<AdminView>({ kind: "dashboard" });
+  const viewIdentity = useRef(0);
   const [modelListVersion, setModelListVersion] = useState(0);
+  const [promptListVersion, setPromptListVersion] = useState(0);
+  const [userListVersion, setUserListVersion] = useState(0);
+
+  const navigate = useCallback((nextView: AdminView) => {
+    viewIdentity.current += 1;
+    setView(nextView);
+  }, []);
 
   const api = useMemo(
     () => createAdminApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
+  const promptsApi = useMemo(
+    () => createSystemPromptsApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
+  const usersApi = useMemo(
+    () => createAdminUsersApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
 
   const handleLogin = useCallback((nextSession: AdminSession) => {
     setSession(nextSession);
-    setView({ kind: "dashboard" });
-  }, []);
+    navigate({ kind: "dashboard" });
+  }, [navigate]);
 
   const handleUnauthorized = useCallback(() => {
     clearAdminSession(storage);
     setSession(null);
-    setView({ kind: "dashboard" });
-  }, [storage]);
+    navigate({ kind: "dashboard" });
+  }, [navigate, storage]);
 
   const handleLogout = useCallback(() => {
     clearAdminSession(storage);
     setSession(null);
-    setView({ kind: "dashboard" });
-  }, [storage]);
+    navigate({ kind: "dashboard" });
+  }, [navigate, storage]);
 
-  const handleSaved = useCallback(() => {
-    setView({ kind: "system-models" });
+  const handleModelsSaved = useCallback(() => {
+    navigate({ kind: "system-models" });
     setModelListVersion((value) => value + 1);
-  }, []);
+  }, [navigate]);
+
+  const activeViewIdentity = viewIdentity.current;
+  const handleResourceUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity) handleUnauthorized();
+  }, [activeViewIdentity, handleUnauthorized]);
+  const handleResourceSaved = useCallback((resource: "system-prompts" | "users") => {
+    if (viewIdentity.current !== activeViewIdentity) return;
+    if (resource === "system-prompts") {
+      setPromptListVersion((value) => value + 1);
+    } else {
+      setUserListVersion((value) => value + 1);
+    }
+    navigate({ kind: resource });
+  }, [activeViewIdentity, navigate]);
 
   if (!session) {
     return <AdminLogin api={api} storage={storage} onLogin={handleLogin} />;
@@ -195,7 +235,7 @@ export function AdminFeature({
   return (
     <div className="admin-shell">
       <aside className="admin-sidebar">
-        <a className="admin-workspace-brand" href="#" onClick={(event) => { event.preventDefault(); setView({ kind: "dashboard" }); }}>
+        <a className="admin-workspace-brand" href="#" onClick={(event) => { event.preventDefault(); navigate({ kind: "dashboard" }); }}>
           <span className="admin-brand-mark" aria-hidden="true">H</span>
           <span><strong>Hao AI</strong><small>管理后台</small></span>
         </a>
@@ -207,7 +247,7 @@ export function AdminFeature({
             aria-label="运营概览"
             title="运营概览"
             aria-current={view.kind === "dashboard" ? "page" : undefined}
-            onClick={() => setView({ kind: "dashboard" })}
+            onClick={() => navigate({ kind: "dashboard" })}
           >
             <span aria-hidden="true">◫</span>运营概览
           </button>
@@ -221,9 +261,37 @@ export function AdminFeature({
             aria-current={view.kind === "system-models" || view.kind === "model-create" || view.kind === "model-edit"
               ? "page"
               : undefined}
-            onClick={() => setView({ kind: "system-models" })}
+            onClick={() => navigate({ kind: "system-models" })}
           >
             <span aria-hidden="true">◈</span>系统模型
+          </button>
+          <button
+            className={view.kind === "system-prompts" || view.kind === "prompt-create" || view.kind === "prompt-edit"
+              ? "admin-nav-item is-active"
+              : "admin-nav-item"}
+            type="button"
+            aria-label="系统提示词"
+            title="系统提示词"
+            aria-current={view.kind === "system-prompts" || view.kind === "prompt-create" || view.kind === "prompt-edit"
+              ? "page"
+              : undefined}
+            onClick={() => navigate({ kind: "system-prompts" })}
+          >
+            <span aria-hidden="true">≋</span>系统提示词
+          </button>
+          <button
+            className={view.kind === "users" || view.kind === "user-create" || view.kind === "user-edit"
+              ? "admin-nav-item is-active"
+              : "admin-nav-item"}
+            type="button"
+            aria-label="用户管理"
+            title="用户管理"
+            aria-current={view.kind === "users" || view.kind === "user-create" || view.kind === "user-edit"
+              ? "page"
+              : undefined}
+            onClick={() => navigate({ kind: "users" })}
+          >
+            <span aria-hidden="true">♙</span>用户管理
           </button>
         </nav>
         <div className="admin-sidebar-account">
@@ -254,19 +322,45 @@ export function AdminFeature({
               onUnauthorized={handleUnauthorized}
               mode="list"
               modelId={undefined}
-              onCreate={() => setView({ kind: "model-create" })}
-              onEdit={(id) => setView({ kind: "model-edit", id })}
+              onCreate={() => navigate({ kind: "model-create" })}
+              onEdit={(id) => navigate({ kind: "model-edit", id })}
               reloadVersion={modelListVersion}
             />
-          ) : (
+          ) : view.kind === "model-create" || view.kind === "model-edit" ? (
             <SystemModels
               api={api}
               onUnauthorized={handleUnauthorized}
-              onCancel={() => setView({ kind: "system-models" })}
-              onSaved={handleSaved}
+              onCancel={() => navigate({ kind: "system-models" })}
+              onSaved={handleModelsSaved}
               mode={view.kind === "model-create" ? "create" : "edit"}
               modelId={view.kind === "model-edit" ? view.id : undefined}
               reloadVersion={modelListVersion}
+            />
+          ) : view.kind === "system-prompts" || view.kind === "prompt-create" || view.kind === "prompt-edit" ? (
+            <SystemPrompts
+              key={activeViewIdentity}
+              api={promptsApi}
+              onAuthenticationError={handleResourceUnauthorized}
+              mode={view.kind === "system-prompts" ? "list" : view.kind === "prompt-create" ? "create" : "edit"}
+              promptId={view.kind === "prompt-edit" ? view.id : undefined}
+              reloadVersion={promptListVersion}
+              onCreate={() => navigate({ kind: "prompt-create" })}
+              onEdit={(id) => navigate({ kind: "prompt-edit", id })}
+              onCancel={() => navigate({ kind: "system-prompts" })}
+              onSaved={() => handleResourceSaved("system-prompts")}
+            />
+          ) : (
+            <Users
+              key={activeViewIdentity}
+              api={usersApi}
+              onAuthenticationError={handleResourceUnauthorized}
+              mode={view.kind === "users" ? "list" : view.kind === "user-create" ? "create" : "edit"}
+              userId={view.kind === "user-edit" ? view.id : undefined}
+              listVersion={userListVersion}
+              onCreate={() => navigate({ kind: "user-create" })}
+              onEdit={(id) => navigate({ kind: "user-edit", id })}
+              onCancel={() => navigate({ kind: "users" })}
+              onSaved={() => handleResourceSaved("users")}
             />
           )}
         </div>
