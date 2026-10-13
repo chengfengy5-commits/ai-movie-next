@@ -205,6 +205,17 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/admin/system-prompts", frozenset({"POST"})),
         ("/api/admin/system-prompts/{prompt_id}", frozenset({"PUT"})),
         ("/api/admin/system-prompts/{prompt_id}", frozenset({"DELETE"})),
+        ("/api/admin/system-config", frozenset({"GET"})),
+        ("/api/admin/system-config/{config_id}", frozenset({"GET"})),
+        ("/api/admin/system-config/{config_id}", frozenset({"PUT"})),
+        ("/api/admin/user-credits", frozenset({"GET"})),
+        ("/api/admin/user-credits/{credit_id}", frozenset({"GET"})),
+        ("/api/admin/user-credits/{credit_id}", frozenset({"PUT"})),
+        ("/api/admin/credit-logs", frozenset({"GET"})),
+        ("/api/admin/redemption-codes", frozenset({"GET"})),
+        ("/api/admin/redemption-codes/{code_id}", frozenset({"GET"})),
+        ("/api/admin/redemption-codes", frozenset({"POST"})),
+        ("/api/admin/redemption-codes/{code_id}", frozenset({"DELETE"})),
         ("/api/admin/chapters", frozenset({"GET"})),
         ("/api/admin/chapters/{chapter_id}", frozenset({"GET"})),
         ("/api/admin/characters", frozenset({"GET"})),
@@ -345,7 +356,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 152, [(route.path, route.methods) for route in app.routes]
+        assert len(app.routes) == 163, [(route.path, route.methods) for route in app.routes]
         assert effects == [], effects
         # Pydantic probes this optional schema flag; application modules must not read env.
         for key, caller, frames in environment_reads:

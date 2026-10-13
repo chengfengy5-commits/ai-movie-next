@@ -17,6 +17,9 @@ from .admin_chapter_character_queries.http import build_admin_chapter_character_
 from .admin_scene_prop_queries.http import build_admin_scene_prop_queries_router
 from .admin_storyboard_chat_queries.http import build_admin_storyboard_chat_queries_router
 from .admin_system_prompts.http import build_admin_system_prompts_router
+from .admin_system_config.http import build_admin_system_config_router
+from .admin_credit_queries.http import build_admin_credit_queries_router
+from .admin_redemption_codes.http import build_admin_redemption_codes_router
 from .admin_tasks.http import build_admin_task_router
 from .admin_tasks.persistence import admin_task_unit_of_work_factory
 from .asset_data.http import mount_asset_data_routes
@@ -163,6 +166,24 @@ def create_app(
     )
     app.include_router(
         build_admin_system_prompts_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_system_config_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_credit_queries_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_redemption_codes_router(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
         )
