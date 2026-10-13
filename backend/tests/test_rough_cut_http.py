@@ -172,6 +172,16 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/prompts/reorder", frozenset({"POST"})),
         ("/api/users/{user_id}/card", frozenset({"GET"})),
         ("/api/users/me/profile", frozenset({"PUT"})),
+        ("/api/admin/purchase-packages", frozenset({"GET"})),
+        ("/api/admin/purchase-packages/{pkg_id}", frozenset({"GET"})),
+        ("/api/admin/purchase-packages", frozenset({"POST"})),
+        ("/api/admin/purchase-packages/{pkg_id}", frozenset({"PUT"})),
+        ("/api/admin/purchase-packages/{pkg_id}", frozenset({"DELETE"})),
+        ("/api/admin/system-prompts", frozenset({"GET"})),
+        ("/api/admin/system-prompts/{prompt_id}", frozenset({"GET"})),
+        ("/api/admin/system-prompts", frozenset({"POST"})),
+        ("/api/admin/system-prompts/{prompt_id}", frozenset({"PUT"})),
+        ("/api/admin/system-prompts/{prompt_id}", frozenset({"DELETE"})),
     }
 
 

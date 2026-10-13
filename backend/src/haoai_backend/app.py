@@ -7,6 +7,9 @@ from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
 
+from .admin_purchase_packages.http import build_admin_purchase_packages_router
+from .admin_purchase_packages.persistence import purchase_packages_uow_factory
+from .admin_system_prompts.http import build_admin_system_prompts_router
 from .admin_tasks.http import build_admin_task_router
 from .admin_tasks.persistence import admin_task_unit_of_work_factory
 from .asset_data.http import mount_asset_data_routes
@@ -138,6 +141,24 @@ def create_app(
     )
     app.include_router(
         build_public_site_config_router(uow_factory=public_site_config_uow_factory)
+    )
+
+    package_uow_factory = (
+        purchase_packages_uow_factory(effective_session_factory)
+        if effective_session_factory is not None
+        else None
+    )
+    app.include_router(
+        build_admin_purchase_packages_router(
+            authentication_service=authentication_service,
+            uow_factory=package_uow_factory,
+        )
+    )
+    app.include_router(
+        build_admin_system_prompts_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
     )
 
     effective_resolver = resolve_actor

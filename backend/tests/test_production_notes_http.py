@@ -182,6 +182,16 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/prompts/reorder", frozenset({"POST"})),
         ("/api/users/{user_id}/card", frozenset({"GET"})),
         ("/api/users/me/profile", frozenset({"PUT"})),
+        ("/api/admin/purchase-packages", frozenset({"GET"})),
+        ("/api/admin/purchase-packages/{pkg_id}", frozenset({"GET"})),
+        ("/api/admin/purchase-packages", frozenset({"POST"})),
+        ("/api/admin/purchase-packages/{pkg_id}", frozenset({"PUT"})),
+        ("/api/admin/purchase-packages/{pkg_id}", frozenset({"DELETE"})),
+        ("/api/admin/system-prompts", frozenset({"GET"})),
+        ("/api/admin/system-prompts/{prompt_id}", frozenset({"GET"})),
+        ("/api/admin/system-prompts", frozenset({"POST"})),
+        ("/api/admin/system-prompts/{prompt_id}", frozenset({"PUT"})),
+        ("/api/admin/system-prompts/{prompt_id}", frozenset({"DELETE"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 
