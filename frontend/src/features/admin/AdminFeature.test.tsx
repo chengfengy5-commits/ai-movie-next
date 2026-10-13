@@ -1,0 +1,394 @@
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { AdminFeature } from "./AdminFeature";
+import type { AdminFetcher } from "./adminApi";
+import type { AdminModel, AdminStats, AdminStorage } from "./adminTypes";
+
+function jsonResponse(payload: unknown, status = 200): Response {
+  return new Response(JSON.stringify(payload), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  });
+}
+
+class MemoryStorage implements AdminStorage {
+  private readonly values = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+
+  removeItem(key: string): void {
+    this.values.delete(key);
+  }
+}
+
+function adminStorage(): MemoryStorage {
+  const storage = new MemoryStorage();
+  storage.setItem("admin_token", "admin-token");
+  storage.setItem("admin_user", JSON.stringify({
+    id: "admin-1",
+    username: "operator",
+    is_superuser: true,
+  }));
+  return storage;
+}
+
+function model(overrides: Partial<AdminModel> = {}): AdminModel {
+  return {
+    id: "model-1",
+    category: "text",
+    name: "推理模型",
+    provider: "openai",
+    model: "gpt-4",
+    api_key: "decrypted-secret",
+    base_url: "",
+    cost_per_call: 5,
+    description: "默认文本模型",
+    is_active: true,
+    sort_order: 0,
+    params: null,
+    created_at: "2026-10-01T00:00:00",
+    updated_at: "2026-10-01T00:00:00",
+    ...overrides,
+  };
+}
+
+function stats(): AdminStats {
+  return {
+    upstream: { balance: 2400 },
+    users: { total: 100, premium: 20, active_members: 18, new_this_month: 8 },
+    credits: { total_balance: 1000, used_this_month: 300, charged_this_month: 120 },
+    tasks: { total: 60, this_month: 12, completed: 48, failed: 12 },
+    content: { series: 15, chapters: 40, characters: 22, scenes: 19, props: 7 },
+    revenue: { total: 0, this_month: 0, subscriptions: 20 },
+  };
+}
+
+function inputValue(fetcher: ReturnType<typeof vi.fn>, callNumber: number): string {
+  return requestPath(fetcher.mock.calls[callNumber]?.[0]);
+}
+
+function requestPath(input: RequestInfo | URL | undefined): string {
+  if (input === undefined) return "";
+  const url = new URL(String(input), window.location.href);
+  return url.pathname + url.search;
+}
+
+afterEach(() => cleanup());
+
+describe("admin feature user flows", () => {
+  it("keeps both admin destinations and logout reachable by their accessible names", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    storage.setItem("access_token", "creative-account-token");
+    const fetcher = vi.fn<AdminFetcher>(async (input) => {
+      const url = requestPath(input);
+      if (url === "/api/admin/stats") return jsonResponse(stats());
+      if (url.startsWith("/api/admin/system-models?")) return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected request: " + url);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    expect(await screen.findByRole("heading", { name: "运营概览" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    expect(await screen.findByRole("heading", { name: "系统模型" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "运营概览" }));
+    expect(await screen.findByRole("heading", { name: "运营概览" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(await screen.findByRole("heading", { name: "管理后台" })).toBeInTheDocument();
+    expect(storage.getItem("admin_token")).toBeNull();
+    expect(storage.getItem("admin_user")).toBeNull();
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+  });
+
+  it("rejects a non-admin login without writing admin credentials or clearing the creative token", async () => {
+    const user = userEvent.setup();
+    const storage = new MemoryStorage();
+    storage.setItem("access_token", "creative-account-token");
+    const fetcher = vi.fn<AdminFetcher>(async () => jsonResponse({
+      access_token: "member-token",
+      user: { id: "member-1", username: "member", is_superuser: false },
+    }));
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.type(screen.getByLabelText("用户名"), "member");
+    await user.type(screen.getByLabelText("密码"), "password");
+    await user.click(screen.getByRole("button", { name: "登录" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("权限不足，仅管理员可登录后台");
+    expect(storage.getItem("admin_token")).toBeNull();
+    expect(storage.getItem("admin_user")).toBeNull();
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("stores the full administrator identity separately and opens the dashboard", async () => {
+    const user = userEvent.setup();
+    const storage = new MemoryStorage();
+    storage.setItem("access_token", "creative-account-token");
+    const administrator = {
+      id: "admin-2",
+      username: "operator",
+      email: "operator@example.invalid",
+      is_superuser: true,
+      membership_type: "free",
+      membership_expires_at: null,
+      avatar_url: null,
+      bio: null,
+      created_at: "2026-10-01T00:00:00",
+    };
+    const fetcher = vi.fn<AdminFetcher>(async (input) => (
+      requestPath(input) === "/api/auth/login"
+        ? jsonResponse({ access_token: "admin-session", user: administrator })
+        : jsonResponse(stats())
+    ));
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.type(screen.getByLabelText("用户名"), "operator");
+    await user.type(screen.getByLabelText("密码"), "password");
+    await user.click(screen.getByRole("button", { name: "登录" }));
+
+    expect(await screen.findByRole("heading", { name: "运营概览" })).toBeInTheDocument();
+    expect(storage.getItem("admin_token")).toBe("admin-session");
+    expect(JSON.parse(storage.getItem("admin_user") ?? "null")).toEqual(administrator);
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("clears only administrator session state after a protected request returns 401", async () => {
+    const storage = adminStorage();
+    storage.setItem("access_token", "creative-account-token");
+    const fetcher = vi.fn<AdminFetcher>(async () => jsonResponse({ detail: "登录已过期" }, 401));
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    expect(await screen.findByRole("heading", { name: "管理后台" })).toBeInTheDocument();
+    await waitFor(() => expect(storage.getItem("admin_token")).toBeNull());
+    expect(storage.getItem("admin_user")).toBeNull();
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("Authorization")).toBe("Bearer admin-token");
+  });
+
+  it("creates a model, returns to the list and reads the saved row back with the server total", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    let created = false;
+    const saved = model({
+      id: "created-1",
+      category: "video",
+      name: "新模型",
+      provider: "zhangyuge",
+      api_key: "encrypted-key",
+    });
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = requestPath(input);
+      if (url === "/api/admin/stats") return jsonResponse(stats());
+      if (url.startsWith("/api/admin/system-models?")) {
+        return created
+          ? jsonResponse({ data: [saved], total: 22 })
+          : jsonResponse({ data: [], total: 21 });
+      }
+      if (url === "/api/admin/system-models" && init?.method === "POST") {
+        created = true;
+        return jsonResponse(saved);
+      }
+      throw new Error("Unexpected request: " + url);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    expect(await screen.findByText("共 21 个模型")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "新建模型" }));
+    await user.clear(screen.getByLabelText("模型名称"));
+    await user.type(screen.getByLabelText("模型名称"), "新模型");
+    await user.type(screen.getByLabelText("API Key"), "new-secret");
+    await user.selectOptions(screen.getByLabelText("分类"), "video");
+    expect(screen.getByLabelText("提供商")).toHaveValue("zhangyuge");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByRole("button", { name: "新模型" })).toBeInTheDocument();
+    expect(await screen.findByText("共 22 个模型")).toBeInTheDocument();
+
+    const createCall = fetcher.mock.calls.find((call) => (
+      requestPath(call[0]) === "/api/admin/system-models" && call[1]?.method === "POST"
+    ));
+    expect(createCall).toBeDefined();
+    expect(JSON.parse(String(createCall?.[1]?.body))).toMatchObject({
+      category: "video",
+      name: "新模型",
+      provider: "zhangyuge",
+      api_key: "new-secret",
+      is_active: true,
+      sort_order: 0,
+    });
+    expect(inputValue(fetcher, fetcher.mock.calls.length - 1)).toContain("skip=0&limit=10");
+  });
+
+  it("loads the detail view and omits a blank masked API key from the update payload", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    let updated = false;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = requestPath(input);
+      if (url === "/api/admin/stats") return jsonResponse(stats());
+      if (url.startsWith("/api/admin/system-models?")) {
+        return jsonResponse({
+          data: [model({ name: updated ? "修改后名称" : "推理模型", provider: "legacy-provider" })],
+          total: 1,
+        });
+      }
+      if (url === "/api/admin/system-models/model-1" && (init?.method ?? "GET") === "GET") {
+        return jsonResponse(model({ provider: "legacy-provider" }));
+      }
+      if (url === "/api/admin/system-models/model-1" && init?.method === "PUT") {
+        updated = true;
+        return jsonResponse(model({ name: "修改后名称", provider: "legacy-provider" }));
+      }
+      throw new Error("Unexpected request: " + url);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await user.click(await screen.findByRole("button", { name: "推理模型" }));
+    expect(screen.getByLabelText("提供商")).toHaveValue("legacy-provider");
+    expect(screen.getByRole("option", { name: "legacy-provider（当前值）" })).toBeInTheDocument();
+    const apiKey = await screen.findByLabelText("API Key");
+    expect(apiKey).toHaveAttribute("type", "password");
+    expect(apiKey).toHaveValue("");
+    expect(screen.getByText("已配置密钥；只有输入新值时才会提交 API Key。")).toBeInTheDocument();
+
+    await user.clear(screen.getByLabelText("模型名称"));
+    await user.type(screen.getByLabelText("模型名称"), "修改后名称");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByRole("button", { name: "修改后名称" })).toBeInTheDocument();
+    const updateCall = fetcher.mock.calls.find((call) => (
+      requestPath(call[0]) === "/api/admin/system-models/model-1" && call[1]?.method === "PUT"
+    ));
+    expect(updateCall).toBeDefined();
+    expect(JSON.parse(String(updateCall?.[1]?.body))).toMatchObject({ provider: "legacy-provider" });
+    expect(JSON.parse(String(updateCall?.[1]?.body))).not.toHaveProperty("api_key");
+    expect(fetcher.mock.calls.filter((call) => (
+      requestPath(call[0]) === "/api/admin/system-models/model-1" && (call[1]?.method ?? "GET") === "GET"
+    ))).toHaveLength(1);
+  });
+
+  it("refreshes the current query after a deferred delete instead of applying an old page rollback", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const defaultModels = Array.from({ length: 10 }, (_unused, index) => model({
+      id: `text-${index}`,
+      category: "text",
+      name: `文本模型${index}`,
+    }));
+    const videoModels = Array.from({ length: 10 }, (_unused, index) => model({
+      id: `video-${index}`,
+      category: "video",
+      name: `视频模型${index}`,
+      provider: "zhangyuge",
+    }));
+    const lastVideoModel = model({
+      id: "video-last",
+      category: "video",
+      name: "视频模型10",
+      provider: "zhangyuge",
+    });
+    let deleteResolved = false;
+    let allRefreshesAfterDelete = 0;
+    let finishDelete: ((response: Response) => void) | undefined;
+    const deleteResponse = new Promise<Response>((resolve) => { finishDelete = resolve; });
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models" && url.search) {
+        const skip = Number(url.searchParams.get("skip"));
+        if (url.searchParams.get("category") === "video") {
+          return skip === 10
+            ? jsonResponse({ data: [lastVideoModel], total: 11 })
+            : jsonResponse({ data: videoModels, total: 11 });
+        }
+        if (skip === 0) {
+          if (deleteResolved) {
+            allRefreshesAfterDelete += 1;
+            return jsonResponse({ data: defaultModels, total: 10 });
+          }
+          return jsonResponse({ data: defaultModels, total: 11 });
+        }
+        throw new Error("Unexpected list offset: " + skip);
+      }
+      if (url.pathname === "/api/admin/system-models/video-last" && init?.method === "DELETE") {
+        return deleteResponse;
+      }
+      throw new Error("Unexpected request: " + url.pathname + url.search);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await user.selectOptions(await screen.findByLabelText("分类"), "video");
+    await screen.findByRole("button", { name: "视频模型0" });
+    await user.click(await screen.findByRole("button", { name: "下一页" }));
+    await screen.findByRole("button", { name: "视频模型10" });
+
+    await user.click(screen.getByRole("button", { name: "删除" }));
+    await screen.findByRole("button", { name: "删除中…" });
+    await user.click(screen.getByRole("button", { name: "重置" }));
+    await screen.findByRole("button", { name: "文本模型0" });
+    expect(screen.getByText("第 1 / 2 页")).toBeInTheDocument();
+
+    deleteResolved = true;
+    await act(async () => {
+      finishDelete?.(jsonResponse({ message: "模型已删除" }));
+      await deleteResponse;
+    });
+
+    await waitFor(() => expect(screen.getByText("第 1 / 1 页")).toBeInTheDocument());
+    expect(allRefreshesAfterDelete).toBeGreaterThan(0);
+    const listCalls = fetcher.mock.calls.filter((call) => (
+      new URL(String(call[0]), window.location.href).pathname === "/api/admin/system-models"
+    ));
+    const lastListCall = listCalls[listCalls.length - 1];
+    expect(lastListCall).toBeDefined();
+    expect(new URL(String(lastListCall?.[0]), window.location.href).searchParams.get("skip")).toBe("0");
+    expect(listCalls.every((call) => (
+      Number(new URL(String(call[0]), window.location.href).searchParams.get("skip")) >= 0
+    ))).toBe(true);
+  });
+
+  it("does not replay a create after a network failure leaves the write outcome unknown", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = requestPath(input);
+      if (url === "/api/admin/stats") return jsonResponse(stats());
+      if (url.startsWith("/api/admin/system-models?")) return jsonResponse({ data: [], total: 0 });
+      if (url === "/api/admin/system-models" && init?.method === "POST") {
+        throw new TypeError("connection closed");
+      }
+      throw new Error("Unexpected request: " + url);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await screen.findByText("没有符合条件的模型");
+    await user.click(screen.getByRole("button", { name: "新建模型" }));
+    await user.type(screen.getByLabelText("模型名称"), "待创建");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法连接管理后台服务");
+    expect(fetcher.mock.calls.filter((call) => (
+      requestPath(call[0]) === "/api/admin/system-models" && call[1]?.method === "POST"
+    ))).toHaveLength(1);
+  });
+});

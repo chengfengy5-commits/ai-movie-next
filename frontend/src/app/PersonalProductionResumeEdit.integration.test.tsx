@@ -334,7 +334,7 @@ describe("personal production resume edits in Workspace", () => {
     renderWorkspace(services);
 
     const seriesList = await screen.findByRole("region", { name: "我的剧集" });
-    const card = within(seriesList).getByRole("heading", { name: testSeries.name }).closest("article");
+    const card = (await within(seriesList).findByRole("heading", { name: testSeries.name })).closest("article");
     if (!(card instanceof HTMLElement)) {
       throw new Error("The demo series card was not rendered.");
     }

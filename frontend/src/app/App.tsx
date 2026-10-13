@@ -1,5 +1,6 @@
 import { useState } from "react";
-import { ApiConfigurationError } from "../shared/api/config";
+import { AdminFeature } from "../features/admin/AdminFeature";
+import { ApiConfigurationError, resolveApiBaseUrl } from "../shared/api/config";
 import { AuthProvider } from "../features/auth/AuthProvider";
 import { Workspace } from "./Workspace";
 import {
@@ -26,9 +27,45 @@ function initializeServices(): ServiceInitialization {
   }
 }
 
+function isAdminPath(pathname: string): boolean {
+  return pathname === "/admin" || pathname.startsWith("/admin/");
+}
+
+function resolveAdminApiBaseUrl(services: WorkspaceServices | null): string | null {
+  if (services === null || services.mode !== "api" || services.apiBaseUrl === null) {
+    return null;
+  }
+  try {
+    return resolveApiBaseUrl(services.apiBaseUrl, window.location.href);
+  } catch (error) {
+    if (error instanceof ApiConfigurationError) return null;
+    throw error;
+  }
+}
+
+function AdminApiRequired() {
+  return (
+    <main className="admin-api-required-screen">
+      <section className="admin-api-required-card" role="status">
+        <span className="admin-brand-mark" aria-hidden="true">H</span>
+        <p className="admin-eyebrow">Hao AI 管理后台</p>
+        <h1>管理后台需要本地 API</h1>
+        <p>请启用 API 模式并配置本机 /api 服务后重试。</p>
+      </section>
+    </main>
+  );
+}
+
 export function App({ services: providedServices }: AppProps) {
   const [initialized] = useState(initializeServices);
   const services = providedServices ?? initialized.services;
+
+  if (isAdminPath(window.location.pathname)) {
+    const apiBaseUrl = resolveAdminApiBaseUrl(services);
+    return apiBaseUrl === null
+      ? <AdminApiRequired />
+      : <AdminFeature apiBaseUrl={apiBaseUrl} />;
+  }
 
   if (services === null) {
     return (
