@@ -204,6 +204,21 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/admin/storyboard-assets/{asset_id}", frozenset({"GET"})),
         ("/api/admin/chat-messages", frozenset({"GET"})),
         ("/api/admin/chat-messages/{message_id}", frozenset({"GET"})),
+        ("/api/admin/system-models", frozenset({"GET"})),
+        ("/api/admin/system-models", frozenset({"POST"})),
+        ("/api/admin/system-models/{model_id}", frozenset({"GET"})),
+        ("/api/admin/system-models/{model_id}", frozenset({"PUT"})),
+        ("/api/admin/system-models/{model_id}", frozenset({"DELETE"})),
+        ("/api/admin/model-configs", frozenset({"GET"})),
+        ("/api/admin/model-configs", frozenset({"POST"})),
+        ("/api/admin/model-configs/{model_id}", frozenset({"GET"})),
+        ("/api/admin/model-configs/{model_id}", frozenset({"PUT"})),
+        ("/api/admin/model-configs/{model_id}", frozenset({"DELETE"})),
+        ("/api/admin/prompt-configs", frozenset({"GET"})),
+        ("/api/admin/prompt-configs", frozenset({"POST"})),
+        ("/api/admin/prompt-configs/{prompt_id}", frozenset({"GET"})),
+        ("/api/admin/prompt-configs/{prompt_id}", frozenset({"PUT"})),
+        ("/api/admin/prompt-configs/{prompt_id}", frozenset({"DELETE"})),
     }
     assert app.openapi_url is None and app.docs_url is None and app.redoc_url is None
 

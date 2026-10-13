@@ -194,6 +194,21 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/admin/storyboard-assets/{asset_id}", frozenset({"GET"})),
         ("/api/admin/chat-messages", frozenset({"GET"})),
         ("/api/admin/chat-messages/{message_id}", frozenset({"GET"})),
+        ("/api/admin/system-models", frozenset({"GET"})),
+        ("/api/admin/system-models", frozenset({"POST"})),
+        ("/api/admin/system-models/{model_id}", frozenset({"GET"})),
+        ("/api/admin/system-models/{model_id}", frozenset({"PUT"})),
+        ("/api/admin/system-models/{model_id}", frozenset({"DELETE"})),
+        ("/api/admin/model-configs", frozenset({"GET"})),
+        ("/api/admin/model-configs", frozenset({"POST"})),
+        ("/api/admin/model-configs/{model_id}", frozenset({"GET"})),
+        ("/api/admin/model-configs/{model_id}", frozenset({"PUT"})),
+        ("/api/admin/model-configs/{model_id}", frozenset({"DELETE"})),
+        ("/api/admin/prompt-configs", frozenset({"GET"})),
+        ("/api/admin/prompt-configs", frozenset({"POST"})),
+        ("/api/admin/prompt-configs/{prompt_id}", frozenset({"GET"})),
+        ("/api/admin/prompt-configs/{prompt_id}", frozenset({"PUT"})),
+        ("/api/admin/prompt-configs/{prompt_id}", frozenset({"DELETE"})),
     }
 
 

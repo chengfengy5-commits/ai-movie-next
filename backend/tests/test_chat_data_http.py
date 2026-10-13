@@ -50,7 +50,7 @@ def request(app, method: str, path: str, *, user: str = "user-a", body: Any = No
     return asyncio.run(send())
 
 
-def test_factory_registers_exact_ten_chat_methods_and_one_hundred_two_total() -> None:
+def test_factory_registers_exact_ten_chat_methods_and_one_hundred_fifty_two_total() -> None:
     app = create_app(
         session_factory=lambda: None,
         resolve_actor=lambda request: TrustedActor("user-a"),
@@ -107,7 +107,7 @@ def test_factory_registers_exact_ten_chat_methods_and_one_hundred_two_total() ->
         for route in app.routes
         for method in getattr(route, "methods", set())
     }
-    assert len(paths) == 137
+    assert len(paths) == 152
 
 
 def test_http_status_filters_body_chapter_and_no_asset_discriminator(database: ChatDatabase) -> None:

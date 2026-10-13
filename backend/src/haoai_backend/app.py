@@ -9,6 +9,10 @@ from sqlalchemy.orm import Session
 
 from .admin_purchase_packages.http import build_admin_purchase_packages_router
 from .admin_purchase_packages.persistence import purchase_packages_uow_factory
+from .admin_system_models.crypto import LegacyFernet
+from .admin_system_models.http import build_admin_system_models_router
+from .admin_model_configs.http import build_admin_model_configs_router
+from .admin_prompt_configs.http import build_admin_prompt_configs_router
 from .admin_chapter_character_queries.http import build_admin_chapter_character_queries_router
 from .admin_scene_prop_queries.http import build_admin_scene_prop_queries_router
 from .admin_storyboard_chat_queries.http import build_admin_storyboard_chat_queries_router
@@ -159,6 +163,29 @@ def create_app(
     )
     app.include_router(
         build_admin_system_prompts_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_system_models_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            cipher=LegacyFernet(
+                authentication_runtime.secret_key
+                if authentication_runtime is not None
+                else None
+            ),
+        )
+    )
+    app.include_router(
+        build_admin_model_configs_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_prompt_configs_router(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
         )
