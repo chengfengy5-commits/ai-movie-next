@@ -9,6 +9,9 @@ from sqlalchemy.orm import Session
 
 from .admin_purchase_packages.http import build_admin_purchase_packages_router
 from .admin_purchase_packages.persistence import purchase_packages_uow_factory
+from .admin_chapter_character_queries.http import build_admin_chapter_character_queries_router
+from .admin_scene_prop_queries.http import build_admin_scene_prop_queries_router
+from .admin_storyboard_chat_queries.http import build_admin_storyboard_chat_queries_router
 from .admin_system_prompts.http import build_admin_system_prompts_router
 from .admin_tasks.http import build_admin_task_router
 from .admin_tasks.persistence import admin_task_unit_of_work_factory
@@ -156,6 +159,24 @@ def create_app(
     )
     app.include_router(
         build_admin_system_prompts_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_chapter_character_queries_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_scene_prop_queries_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+        )
+    )
+    app.include_router(
+        build_admin_storyboard_chat_queries_router(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
         )

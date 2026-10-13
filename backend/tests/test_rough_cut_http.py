@@ -182,6 +182,18 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/admin/system-prompts", frozenset({"POST"})),
         ("/api/admin/system-prompts/{prompt_id}", frozenset({"PUT"})),
         ("/api/admin/system-prompts/{prompt_id}", frozenset({"DELETE"})),
+        ("/api/admin/chapters", frozenset({"GET"})),
+        ("/api/admin/chapters/{chapter_id}", frozenset({"GET"})),
+        ("/api/admin/characters", frozenset({"GET"})),
+        ("/api/admin/characters/{character_id}", frozenset({"GET"})),
+        ("/api/admin/scenes", frozenset({"GET"})),
+        ("/api/admin/scenes/{scene_id}", frozenset({"GET"})),
+        ("/api/admin/props", frozenset({"GET"})),
+        ("/api/admin/props/{prop_id}", frozenset({"GET"})),
+        ("/api/admin/storyboard-assets", frozenset({"GET"})),
+        ("/api/admin/storyboard-assets/{asset_id}", frozenset({"GET"})),
+        ("/api/admin/chat-messages", frozenset({"GET"})),
+        ("/api/admin/chat-messages/{message_id}", frozenset({"GET"})),
     }
 
 
