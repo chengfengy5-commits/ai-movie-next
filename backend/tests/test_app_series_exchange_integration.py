@@ -404,8 +404,11 @@ def test_cold_factory_registers_exact_exchange_routes_without_session_io() -> No
         ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
         ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
         ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
+        ("POST", "/api/chat/image", "chat_image"),
+        ("POST", "/api/chat/video", "chat_video"),
+        ("POST", "/api/chat/batch-generate-images", "batch_generate_images"),
     }
-    assert len(routes) == 242
+    assert len(routes) == 245
     assert expected <= routes
 
     response = _request(

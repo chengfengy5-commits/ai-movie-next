@@ -441,8 +441,11 @@ def test_unwired_routes_remain_inert_and_register_exact_new_identities() -> None
         ("POST", "/api/storyboard/judge-scene-appearance-stream", "judge_scene_appearance_stream"),
         ("POST", "/api/storyboard/extract-props-stream", "extract_props_stream"),
         ("POST", "/api/storyboard/judge-prop-appearance-stream", "judge_prop_appearance_stream"),
+        ("POST", "/api/chat/image", "chat_image"),
+        ("POST", "/api/chat/video", "chat_video"),
+        ("POST", "/api/chat/batch-generate-images", "batch_generate_images"),
     }
-    assert len(routes) == 242
+    assert len(routes) == 245
     assert expected <= routes
     series_response = _request(
         app,

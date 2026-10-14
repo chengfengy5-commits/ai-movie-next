@@ -474,7 +474,7 @@ def test_create_app_composes_system_prompt_routes_with_public_auth_and_supplied_
         tmp_path / "admin-system-prompts-composed.sqlite", integrated=True
     )
     try:
-        assert len(app.routes) == 242
+        assert len(app.routes) == 245
         system_prompt_routes = {
             (method, route.path)
             for route in app.routes

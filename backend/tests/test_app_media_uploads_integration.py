@@ -47,6 +47,11 @@ MEDIA_ROUTES = {
     ("POST", "/api/upload/retry-oss", "retry_oss_upload"),
     ("GET", "/api/chat/proxy-download", "proxy_download"),
 }
+CHAT_MEDIA_ROUTES = {
+    ("POST", "/api/chat/image", "chat_image"),
+    ("POST", "/api/chat/video", "chat_video"),
+    ("POST", "/api/chat/batch-generate-images", "batch_generate_images"),
+}
 
 
 class _ObservedSession(Session):
@@ -367,8 +372,9 @@ def test_create_app_mounts_authenticated_upload_retry_and_disabled_proxy(
         for method in route.methods
         if method not in {"HEAD", "OPTIONS"}
     }
-    assert len(registered) == 242
+    assert len(registered) == 245
     assert MEDIA_ROUTES <= registered
+    assert CHAT_MEDIA_ROUTES <= registered
 
     upload_cases = (
         (

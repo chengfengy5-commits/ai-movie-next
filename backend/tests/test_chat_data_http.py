@@ -50,7 +50,7 @@ def request(app, method: str, path: str, *, user: str = "user-a", body: Any = No
     return asyncio.run(send())
 
 
-def test_factory_registers_exact_ten_chat_methods_and_two_hundred_eight_total() -> None:
+def test_factory_registers_thirteen_chat_methods_and_two_hundred_forty_five_total() -> None:
     app = create_app(
         session_factory=lambda: None,
         resolve_actor=lambda request: TrustedActor("user-a"),
@@ -71,6 +71,9 @@ def test_factory_registers_exact_ten_chat_methods_and_two_hundred_eight_total() 
         ("/api/chapters/{chapter_id}/chat-messages/single/{message_id}", "DELETE"),
         ("/api/chapters/{chapter_id}/asset-chat-messages/single/{message_id}", "DELETE"),
         ("/api/chapters/{chapter_id}/ai-stats", "GET"),
+        ("/api/chat/image", "POST"),
+        ("/api/chat/video", "POST"),
+        ("/api/chat/batch-generate-images", "POST"),
     }
 
     expected_canvas = {
@@ -107,7 +110,7 @@ def test_factory_registers_exact_ten_chat_methods_and_two_hundred_eight_total() 
         for route in app.routes
         for method in getattr(route, "methods", set())
     }
-    assert len(paths) == 242
+    assert len(paths) == 245
 
 
 def test_http_status_filters_body_chapter_and_no_asset_discriminator(database: ChatDatabase) -> None:

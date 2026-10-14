@@ -92,6 +92,10 @@ from .storyboard_generation.persistence import storyboard_generation_uow_factory
 from .storyboard_asset_generation.http import build_storyboard_asset_generation_router
 from .storyboard_asset_generation.ports import StoryboardAssetRuntime
 from .storyboard_asset_generation.persistence import storyboard_asset_uow_factory
+from .chat_media_admission import ChatMediaAdmissionConfiguration
+from .chat_media_admission.http import build_chat_media_admission_router
+from .generation_core.admission_staging import build_media_snapshot_producer
+from .generation_contracts.errors import GenerationError
 from .provider_status import ProviderStatusRuntime
 from .runtime_status.authentication import create_account_only_current_user_resolver
 from .runtime_status.configuration import RuntimeStatusConfiguration
@@ -222,6 +226,7 @@ def create_app(
     fused_generation_storage: FusedGenerationStorage | None = None,
     storyboard_generation_runtime: StoryboardGenerationRuntime | None = None,
     storyboard_asset_generation_runtime: StoryboardAssetRuntime | None = None,
+    chat_media_admission_configuration: ChatMediaAdmissionConfiguration | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -931,6 +936,28 @@ def create_app(
             uow_factory=storyboard_asset_uow_factory_value,
             resolve_actor=effective_resolver,
             runtime=storyboard_asset_generation_runtime,
+        )
+    )
+
+    chat_media_producer_binding = None
+    if chat_media_admission_configuration is not None:
+        try:
+            chat_media_producer_binding = build_media_snapshot_producer(
+                authentication_service,
+                chat_media_admission_configuration.registry_capabilities,
+                server_id_factory=(
+                    chat_media_admission_configuration.server_id_factory
+                ),
+                policies=chat_media_admission_configuration.policies,
+                versions=chat_media_admission_configuration.versions,
+            )
+        except GenerationError:
+            chat_media_producer_binding = None
+    app.include_router(
+        build_chat_media_admission_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            producer_binding=chat_media_producer_binding,
         )
     )
 
