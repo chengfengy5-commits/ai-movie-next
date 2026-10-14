@@ -264,6 +264,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "resolve_runtime_status_account",
             "runtime_status_database_probe",
             "runtime_status_storage_probe",
+            "media_upload_application",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
         assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
@@ -334,30 +335,55 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
             ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
         }
-        assert len(methods) == 225
-        assert len(triples) == 225
+        media_upload_routes = {
+            ("POST", "/api/upload/image", "upload_image"),
+            ("POST", "/api/upload/audio", "upload_audio"),
+            ("POST", "/api/upload/video", "upload_video"),
+            ("POST", "/api/upload/retry-oss", "retry_oss_upload"),
+            ("GET", "/api/chat/proxy-download", "proxy_download"),
+        }
+        route_groups = (
+            new_routes,
+            runtime_and_maintenance_routes,
+            series_exchange_routes,
+            storyboard_save_routes,
+            media_upload_routes,
+        )
+        assert len(methods) == 230
+        assert len(triples) == 230
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
         assert len(series_exchange_routes) == 5
         assert len(storyboard_save_routes) == 3
-        assert len(triples - new_routes) == 205
+        assert len(media_upload_routes) == 5
+        assert sum(map(len, route_groups)) == len(set().union(*route_groups))
+        assert len(triples - new_routes) == 210
         assert len(
             triples
             - new_routes
             - runtime_and_maintenance_routes
             - series_exchange_routes
-        ) == 191
+        ) == 196
         assert len(
             triples
             - new_routes
             - runtime_and_maintenance_routes
             - series_exchange_routes
             - storyboard_save_routes
+        ) == 193
+        assert len(
+            triples
+            - new_routes
+            - runtime_and_maintenance_routes
+            - series_exchange_routes
+            - storyboard_save_routes
+            - media_upload_routes
         ) == 188
         assert new_routes <= triples
         assert runtime_and_maintenance_routes <= triples
         assert series_exchange_routes <= triples
         assert storyboard_save_routes <= triples
+        assert media_upload_routes <= triples
         assert events == []
 
         body = {"type": "membership", "value": 2, "count": 1}

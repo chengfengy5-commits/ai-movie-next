@@ -81,6 +81,8 @@ from .series_data.ports import UnitOfWorkFactory as SeriesDataUnitOfWorkFactory
 from .series_exchange.http import mount_series_exchange_routes
 from .series_exchange.persistence import series_exchange_uow_factory
 from .storyboard_save.http import mount_storyboard_save_routes
+from .media_uploads import MediaUploadApplication, build_media_uploads_router
+from .media_uploads.authentication import create_media_upload_identity_resolver
 from .provider_status import ProviderStatusRuntime
 from .runtime_status.authentication import create_account_only_current_user_resolver
 from .runtime_status.configuration import RuntimeStatusConfiguration
@@ -206,6 +208,7 @@ def create_app(
     resolve_runtime_status_account: CurrentUserResolver | None = None,
     runtime_status_database_probe: DatabaseReadinessProbe | None = None,
     runtime_status_storage_probe: ObjectStorageReadinessProbe | None = None,
+    media_upload_application: MediaUploadApplication | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -861,6 +864,15 @@ def create_app(
         app,
         session_factory=effective_session_factory,
         resolve_actor=effective_resolver,
+    )
+    media_upload_identity_resolver = create_media_upload_identity_resolver(
+        authentication_service
+    )
+    app.include_router(
+        build_media_uploads_router(
+            application=media_upload_application,
+            resolve_active_member=media_upload_identity_resolver,
+        )
     )
 
     return app

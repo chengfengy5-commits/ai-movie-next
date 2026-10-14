@@ -393,7 +393,7 @@ def test_cold_factory_registers_exact_exchange_routes_without_session_io() -> No
         ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
         ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
     }
-    assert len(routes) == 225
+    assert len(routes) == 230
     assert expected <= routes
 
     response = _request(
