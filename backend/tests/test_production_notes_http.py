@@ -118,6 +118,7 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/storyboard-assets", frozenset({"POST"})),
         ("/api/storyboard-assets/{asset_id}", frozenset({"PUT"})),
         ("/api/storyboard-assets/{asset_id}", frozenset({"DELETE"})),
+        ("/api/storyboard/filter-and-save-characters", frozenset({"POST"})),
         ("/api/storyboard/filter-and-save-characters-stream", frozenset({"POST"})),
         ("/api/storyboard/filter-and-save-scenes-stream", frozenset({"POST"})),
         ("/api/storyboard/filter-and-save-props-stream", frozenset({"POST"})),

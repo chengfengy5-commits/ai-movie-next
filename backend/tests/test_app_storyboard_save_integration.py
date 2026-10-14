@@ -14,7 +14,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.routing import APIRoute
-from sqlalchemy import create_engine, insert, select
+from sqlalchemy import create_engine, insert, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from haoai_backend.app import create_app
@@ -50,6 +50,7 @@ from haoai_backend.teams.tables import (
 
 SECRET = "storyboard-save-app-integration-synthetic-secret"
 SAVE_ROUTES = {
+    ("POST", "/api/storyboard/filter-and-save-characters", "filter_and_save_characters"),
     ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
     ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
     ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
@@ -423,6 +424,117 @@ def test_composed_app_mounts_exact_save_routes_and_fails_closed_without_ports() 
     assert response.status_code == 503
     assert response.json() == {"detail": "分镜保存服务尚未接线"}
     assert session_calls == []
+
+
+def test_non_stream_route_uses_real_auth_before_body_and_persists_on_owned_worker(
+    app_system: AppSystem,
+) -> None:
+    system = app_system
+    path = "/api/storyboard/filter-and-save-characters"
+
+    missing = _request(system.app, path, raw_body=b"[")
+    assert missing.status_code == 401
+    assert missing.headers["www-authenticate"] == "Bearer"
+    assert system.business_sessions == []
+
+    expired_jwt = JoseTokenCodec(SECRET).encode(
+        {
+            "sub": "owner",
+            "jti": "jti-owner",
+            "exp": datetime.now(timezone.utc) - timedelta(minutes=1),
+        }
+    )
+    expired = _request(system.app, path, token=expired_jwt, raw_body=b"[")
+    assert expired.status_code == 401
+    assert expired.headers["www-authenticate"] == "Bearer"
+
+    with system.engine.begin() as connection:
+        connection.execute(
+            update(user_sessions)
+            .where(user_sessions.c.id == "auth-session-owner")
+            .values(is_active=False)
+        )
+    revoked = _request(
+        system.app, path, token=system.token_for("owner"), raw_body=b"["
+    )
+    assert revoked.status_code == 401
+    assert revoked.headers["www-authenticate"] == "Bearer"
+    with system.engine.begin() as connection:
+        connection.execute(
+            update(user_sessions)
+            .where(user_sessions.c.id == "auth-session-owner")
+            .values(is_active=True)
+        )
+
+    for user_id in ("free-user", "expired-user"):
+        event_start = len(system.events)
+        denied = _request(
+            system.app, path, token=system.token_for(user_id), raw_body=b"["
+        )
+        assert denied.status_code == 403
+        assert not any(
+            name == "business-open" for name, _ in system.events[event_start:]
+        )
+        assert system.auth_sessions[-1].close_count == 1
+
+    event_start = len(system.events)
+    malformed = _request(
+        system.app, path, token=system.token_for("owner"), raw_body=b"["
+    )
+    assert malformed.status_code == 500
+    assert malformed.json() == {"detail": "过滤角色失败"}
+    assert system.auth_sessions[-1].close_count == 1
+    assert not any(
+        name == "business-open" for name, _ in system.events[event_start:]
+    )
+
+    event_start = len(system.events)
+    loop_thread = threading.get_ident()
+    response = _request(
+        system.app,
+        path,
+        token=system.token_for("owner"),
+        body={
+            "chapter_id": "chapter-owned",
+            "characters": [
+                {
+                    "name": "林澈",
+                    "gender": "女",
+                    "age": "17",
+                    "role": "主角",
+                    "appearance": "短发",
+                }
+            ],
+            "appearances": [["林澈"]],
+        },
+    )
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["success"] is True
+    assert payload["total_count"] == 1
+    _assert_session_handoff(
+        system, system.events[event_start:], loop_thread=loop_thread
+    )
+    assert system.business_sessions[-1].commit_count == 2
+
+    with system.engine.connect() as connection:
+        character_id = connection.execute(
+            select(characters.c.id).where(
+                characters.c.series_id == "series-owned",
+                characters.c.name == "林澈",
+            )
+        ).scalar_one()
+        content = json.loads(
+            connection.execute(
+                select(chapters.c.content).where(chapters.c.id == "chapter-owned")
+            ).scalar_one()
+        )
+        assert content[0]["character"] == [character_id]
+        assert connection.execute(
+            select(storyboard_media_states.c.id).where(
+                storyboard_media_states.c.chapter_id == "chapter-owned"
+            )
+        ).first() is not None
 
 
 def test_all_save_routes_stream_and_persist_with_shared_auth_and_business_sessions(

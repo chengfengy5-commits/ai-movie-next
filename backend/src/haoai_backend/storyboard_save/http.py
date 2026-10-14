@@ -20,7 +20,12 @@ from haoai_backend.shared.errors import BusinessError
 from haoai_backend.shared.identity import TrustedActor
 
 from . import application
-from .errors import StoryboardSaveChapterNotFound, StoryboardSaveUnavailable
+from .errors import (
+    StoryboardSaveChapterNotFound,
+    StoryboardSaveForeignAssetReference,
+    StoryboardSaveUnavailable,
+)
+from .non_stream import filter_and_save_characters as run_filter_and_save_characters
 from .persistence import SqlAlchemyStoryboardSaveStore
 from .presentation import encode_sse
 
@@ -84,7 +89,7 @@ def build_storyboard_save_router(
     session_factory: SessionFactory | None,
     resolve_actor: ActorResolver | None,
 ) -> APIRouter:
-    """Build the three legacy save routes around public identity and SQL ports."""
+    """Build the four legacy save routes around public identity and SQL ports."""
     router = APIRouter(prefix="/api/storyboard", tags=["storyboard-save"])
 
     async def trusted_actor(request: Request) -> TrustedActor:
@@ -124,6 +129,94 @@ def build_storyboard_save_router(
             session_factory=session_factory,
             trusted_actor=trusted_actor,
         )
+
+    @router.post("/filter-and-save-characters")
+    async def filter_and_save_characters(
+        request: Request,
+        actor: TrustedActor = Depends(trusted_actor),
+    ) -> dict[str, Any]:
+        try:
+            raw_body = await request.json()
+            chapter_id = raw_body.get("chapter_id")
+            characters = raw_body.get("characters", [])
+            if not chapter_id:
+                raise HTTPException(status_code=400, detail="缺少章节ID")
+            if not characters:
+                raise HTTPException(status_code=400, detail="缺少角色列表")
+            appearances = raw_body.get("appearances", [])
+            if not appearances:
+                raise HTTPException(status_code=400, detail="缺少角色出场数据")
+        except HTTPException:
+            raise
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail="过滤角色失败") from exc
+
+        if session_factory is None:
+            error = StoryboardSaveUnavailable()
+            raise HTTPException(status_code=error.status_code, detail=error.detail)
+
+        loop = asyncio.get_running_loop()
+        executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="storyboard-save")
+        future = executor.submit(
+            _run_non_stream_request,
+            session_factory,
+            actor,
+            chapter_id,
+            characters,
+            appearances,
+        )
+        wrapped = asyncio.wrap_future(future, loop=loop)
+        cleanup_task: asyncio.Task[None] | None = None
+
+        async def drain_worker() -> None:
+            try:
+                await asyncio.to_thread(future.result)
+            except BaseException:
+                pass
+            await asyncio.to_thread(executor.shutdown, wait=True)
+
+        async def close_worker() -> None:
+            nonlocal cleanup_task
+            if cleanup_task is None:
+                cleanup_task = asyncio.create_task(drain_worker())
+            cancellation: asyncio.CancelledError | None = None
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError as exc:
+                    cancellation = cancellation or exc
+            cleanup_task.result()
+            if cancellation is not None:
+                raise cancellation
+
+        try:
+            result = await asyncio.shield(wrapped)
+        except asyncio.CancelledError as cancelled:
+            try:
+                await close_worker()
+            except asyncio.CancelledError:
+                pass
+            raise cancelled
+        except StoryboardSaveChapterNotFound as exc:
+            await close_worker()
+            raise HTTPException(status_code=404, detail="章节不存在") from exc
+        except SeriesNotFound as exc:
+            await close_worker()
+            raise HTTPException(status_code=404, detail=exc.args[0]) from exc
+        except SeriesAccessDenied as exc:
+            await close_worker()
+            raise HTTPException(status_code=403, detail=exc.detail) from exc
+        except StoryboardSaveForeignAssetReference as exc:
+            await close_worker()
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            await close_worker()
+            raise HTTPException(status_code=500, detail="过滤角色失败") from exc
+        except BaseException:
+            await close_worker()
+            raise
+        await close_worker()
+        return result
 
     return router
 
@@ -355,6 +448,30 @@ def _open_session_and_authorize(
         finally:
             session.close()
         raise
+
+
+def _run_non_stream_request(
+    session_factory: SessionFactory,
+    actor: TrustedActor,
+    chapter_id: str,
+    characters: Any,
+    appearances: Any,
+) -> dict[str, Any]:
+    session = session_factory()
+    try:
+        store = SqlAlchemyStoryboardSaveStore(session)
+        chapter = store.load_chapter(chapter_id)
+        if chapter is None:
+            raise StoryboardSaveChapterNotFound()
+        store.require_access(actor, chapter.series_id)
+        return run_filter_and_save_characters(
+            store, actor, chapter_id, characters, appearances
+        )
+    finally:
+        try:
+            session.rollback()
+        finally:
+            session.close()
 
 
 def _advance(iterator: Iterator[dict[str, Any]]) -> tuple[bool, dict[str, Any] | None]:

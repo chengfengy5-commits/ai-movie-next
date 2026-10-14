@@ -331,6 +331,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("POST", "/api/series/import", "import_series"),
         }
         storyboard_save_routes = {
+            ("POST", "/api/storyboard/filter-and-save-characters", "filter_and_save_characters"),
             ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
             ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
             ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
@@ -349,21 +350,21 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             storyboard_save_routes,
             media_upload_routes,
         )
-        assert len(methods) == 230
-        assert len(triples) == 230
+        assert len(methods) == 231
+        assert len(triples) == 231
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
         assert len(series_exchange_routes) == 5
-        assert len(storyboard_save_routes) == 3
+        assert len(storyboard_save_routes) == 4
         assert len(media_upload_routes) == 5
         assert sum(map(len, route_groups)) == len(set().union(*route_groups))
-        assert len(triples - new_routes) == 210
+        assert len(triples - new_routes) == 211
         assert len(
             triples
             - new_routes
             - runtime_and_maintenance_routes
             - series_exchange_routes
-        ) == 196
+        ) == 197
         assert len(
             triples
             - new_routes

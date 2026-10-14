@@ -108,6 +108,7 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/storyboard-assets", frozenset({"POST"})),
         ("/api/storyboard-assets/{asset_id}", frozenset({"PUT"})),
         ("/api/storyboard-assets/{asset_id}", frozenset({"DELETE"})),
+        ("/api/storyboard/filter-and-save-characters", frozenset({"POST"})),
         ("/api/storyboard/filter-and-save-characters-stream", frozenset({"POST"})),
         ("/api/storyboard/filter-and-save-scenes-stream", frozenset({"POST"})),
         ("/api/storyboard/filter-and-save-props-stream", frozenset({"POST"})),

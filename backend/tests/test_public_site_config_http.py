@@ -389,7 +389,7 @@ def test_create_app_mounts_public_routes_without_auth_and_uses_optional_session_
         series_access_policy=lambda session, actor, series_id: None,
     )
     assert sessions == []
-    assert len(app.routes) == 230
+    assert len(app.routes) == 231
     route_pairs = [
         (route.path, frozenset(getattr(route, "methods", set())))
         for route in app.routes
