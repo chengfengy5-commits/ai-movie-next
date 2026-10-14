@@ -3113,7 +3113,7 @@ describe("read-only workspace", () => {
     expect(window.localStorage.getItem(API_TOKEN_KEY)).toBe("valid-token");
   });
 
-  it("shows the empty-list state and keeps the readonly shell free of write actions", async () => {
+  it("shows the empty-list state and exposes series creation without opening unfinished production actions", async () => {
     const services = createApiServices("http://127.0.0.1:4175/api", {
       storage: window.localStorage,
       fetcher: vi.fn(async (input: RequestInfo | URL) => {
@@ -3128,7 +3128,8 @@ describe("read-only workspace", () => {
 
     expect(await screen.findByRole("heading", { name: "还没有剧集" })).toBeInTheDocument();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: /^(创建剧集|认领|制作|章节|生成)$/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "创建剧集" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /^(认领|制作|生成)$/ })).not.toBeInTheDocument();
   });
 
   it("enters tasks only on request, unloads chapter notes, and preserves series filters and count", async () => {

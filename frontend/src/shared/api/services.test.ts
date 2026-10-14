@@ -15,6 +15,7 @@ import type { PersonalRoughCutSnapshot } from "./personalRoughCut";
 import {
   createApiServices,
   createDemoServices,
+  normalizeApiError,
   type ServiceOptions,
 } from "./services";
 import {
@@ -535,4 +536,194 @@ describe("API services", () => {
     expect(storage.getItem(API_TOKEN_KEY)).toBeNull();
     expect(storage.getItem(MOCK_SESSION_KEY)).toBe("mock-session");
   });
+
+  it("uses exact series CRUD routes, isolated bearer auth, style catalogue and multipart cover upload", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "creative-token");
+    storage.setItem("admin_token", "admin-token-must-not-be-used");
+    const id = "series/α ?#";
+    const baseRow = {
+      ...demoSeries[0]!,
+      id,
+      name: "服务端剧集",
+      description: "原简介",
+      image_url: null,
+      style_prompt_id: null,
+      style_prompt_name: null,
+      style_prompt_owner_name: null,
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-01T00:00:00Z",
+    };
+    const calls: Array<{ url: URL; init: RequestInit }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      calls.push({ url, init });
+      if (url.pathname === "/api/prompts") {
+        return jsonResponse([{
+          id: "style-one",
+          name: "悬疑",
+          category: "style",
+          is_system: true,
+          system_prompt: "不得在选择器展示的提示词正文",
+        }]);
+      }
+      if (url.pathname === "/api/upload/image") {
+        return jsonResponse({ url: "http://127.0.0.1:4175/uploads/cover.webp" });
+      }
+      if (init.method === "DELETE") {
+        return new Response(null, { status: 204 });
+      }
+      if (init.method === "POST") {
+        return jsonResponse({ ...baseRow, ...(JSON.parse(String(init.body)) as object) }, 201);
+      }
+      if (init.method === "PUT") {
+        return jsonResponse({ ...baseRow, ...(JSON.parse(String(init.body)) as object) }, 200);
+      }
+      return jsonResponse(baseRow);
+    });
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const signal = new AbortController().signal;
+    const create = services.createSeries;
+    const get = services.getSeries;
+    const update = services.updateSeries;
+    const remove = services.deleteSeries;
+    const prompts = services.listSeriesStylePrompts;
+    const upload = services.uploadSeriesCover;
+    if (!create || !get || !update || !remove || !prompts || !upload) {
+      throw new Error("Series management API is unavailable.");
+    }
+
+    const detail = await get(id, signal);
+    expect(detail.id).toBe(id);
+    expect(calls[0]?.url.pathname).toBe("/api/series/series%2F%CE%B1%20%3F%23");
+    expect(calls[0]?.init.method).toBe("GET");
+    expect(new Headers(calls[0]?.init.headers).get("Authorization")).toBe("Bearer creative-token");
+
+    const created = await create({
+      name: "新剧",
+      description: "",
+      image_url: null,
+      style_prompt_id: "style-one",
+    }, signal);
+    expect(created.name).toBe("新剧");
+    expect(calls[1]?.url.pathname).toBe("/api/series");
+    expect(calls[1]?.init.method).toBe("POST");
+    expect(calls[1]?.init.body).toBe(JSON.stringify({
+      name: "新剧",
+      description: "",
+      image_url: null,
+      style_prompt_id: "style-one",
+    }));
+
+    const updated = await update(id, { image_url: "", style_prompt_id: "" }, signal);
+    expect(updated.image_url).toBeNull();
+    expect(updated.style_prompt_id).toBeNull();
+    expect(calls[2]?.url.pathname).toBe("/api/series/series%2F%CE%B1%20%3F%23");
+    expect(calls[2]?.init.method).toBe("PUT");
+    expect(calls[2]?.init.body).toBe(JSON.stringify({ image_url: "", style_prompt_id: "" }));
+
+    expect(await prompts(signal)).toEqual([{
+      id: "style-one",
+      name: "悬疑",
+      is_system: true,
+      user_id: null,
+    }]);
+    expect(calls[3]?.url.pathname).toBe("/api/prompts");
+    expect(calls[3]?.url.search).toBe("?category=style");
+
+    const file = new File(["cover"], "cover.webp", { type: "image/webp" });
+    expect(await upload(file, signal)).toBe("http://127.0.0.1:4175/uploads/cover.webp");
+    const coverCall = calls[4]!;
+    expect(coverCall.url.pathname).toBe("/api/upload/image");
+    expect(coverCall.init.method).toBe("POST");
+    expect(new Headers(coverCall.init.headers).get("Authorization")).toBe("Bearer creative-token");
+    expect(new Headers(coverCall.init.headers).has("Content-Type")).toBe(false);
+    expect(coverCall.init.body).toBeInstanceOf(FormData);
+    expect([...(coverCall.init.body as FormData).keys()]).toEqual(["file"]);
+
+    await remove(id, signal);
+    expect(calls[5]?.url.pathname).toBe("/api/series/series%2F%CE%B1%20%3F%23");
+    expect(calls[5]?.init.method).toBe("DELETE");
+    expect(new Headers(calls[5]?.init.headers).get("Authorization")).toBe("Bearer creative-token");
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("creative-token");
+    expect(storage.getItem("admin_token")).toBe("admin-token-must-not-be-used");
+  });
+
+  it("rejects a detail response bound to a different requested series id", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "creative-token");
+    const fetcher = vi.fn(async () => jsonResponse({ ...demoSeries[0]!, id: "another-series" }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const get = services.getSeries;
+    if (!get) throw new Error("Series detail API is unavailable.");
+
+    let failure: unknown;
+    try {
+      await get("requested-series", new AbortController().signal);
+    } catch (error) {
+      failure = error;
+    }
+
+    expect(failure).toBeInstanceOf(InvalidResponseError);
+    expect(failure).toMatchObject({ message: "服务器返回了其他剧集的详情。" });
+    expect(normalizeApiError(failure)).toMatchObject({
+      kind: "invalid-response",
+      message: "服务器返回了其他剧集的详情。",
+      status: null,
+      detail: null,
+    });
+  });
+
+  it("does not let a late 401 from an older creative token affect the current session", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "old-creative-token");
+    let resolveFetch!: (response: Response) => void;
+    const fetcher = vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const listStyles = services.listSeriesStylePrompts;
+    if (!listStyles) throw new Error("Series style API is unavailable.");
+
+    const pending = listStyles(new AbortController().signal);
+    storage.setItem(API_TOKEN_KEY, "new-creative-token");
+    resolveFetch(jsonResponse({ detail: "old session expired" }, 401));
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("new-creative-token");
+  });
+
+  it("keeps demo series mutations local to one service instance and gives new series empty production data", async () => {
+    const storage = new MemoryStorage();
+    const first = createDemoServices(storage);
+    const second = createDemoServices(storage);
+    const fetcher = vi.spyOn(globalThis, "fetch");
+    await first.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const create = first.createSeries;
+    const get = first.getSeries;
+    const update = first.updateSeries;
+    const remove = first.deleteSeries;
+    const listStyles = first.listSeriesStylePrompts;
+    if (!create || !get || !update || !remove || !listStyles) {
+      throw new Error("Demo series management is unavailable.");
+    }
+    const signal = new AbortController().signal;
+    const before = await first.listSeries(signal);
+    const created = await create({
+      name: "演示新剧",
+      description: "",
+      image_url: null,
+      style_prompt_id: null,
+    }, signal);
+    expect((await first.listSeries(signal))).toHaveLength(before.length + 1);
+    expect(await second.listSeries(signal)).toHaveLength(before.length);
+    expect(await get(created.id, signal)).toMatchObject({ name: "演示新剧", team_id: null });
+    expect(await first.listChapters(created.id, signal)).toEqual([]);
+    expect(await first.listStoryboardAssets(created.id, "new-chapter", signal)).toEqual([]);
+    await update(created.id, { name: "演示修改" }, signal);
+    expect((await get(created.id, signal)).name).toBe("演示修改");
+    expect((await listStyles(signal)).length).toBeGreaterThan(0);
+    await remove(created.id, signal);
+    await expect(get(created.id, signal)).rejects.toMatchObject({ status: 404 });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
 });

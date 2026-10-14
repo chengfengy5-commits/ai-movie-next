@@ -1,0 +1,358 @@
+.series-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.series-create-button {
+  min-height: 38px;
+  padding: 0 14px;
+}
+
+.series-mutation-notice {
+  margin: 12px 0 0;
+  padding: 10px 13px;
+  border: 1px solid #cfe5dc;
+  border-radius: 8px;
+  color: #28695e;
+  background: #f2faf6;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.series-card-actions .series-edit-action,
+.series-card-actions .series-delete-action {
+  min-height: 30px;
+  padding: 0 10px;
+  border: 1px solid #dce7e2;
+  border-radius: 7px;
+  color: #526864;
+  background: #fff;
+  font-size: 10px;
+  font-weight: 620;
+}
+
+.series-card-actions .series-edit-action:hover,
+.series-card-actions .series-delete-action:hover {
+  border-color: #a9d0c6;
+  background: #f3f9f6;
+}
+
+.series-card-actions .series-delete-action {
+  border-color: #ead8d5;
+  color: #985b51;
+}
+
+.series-card-actions .series-delete-action:hover {
+  border-color: #d8b0a8;
+  background: #fff8f6;
+}
+
+.series-empty-create {
+  margin-top: 14px;
+}
+
+.series-dialog-backdrop {
+  position: fixed;
+  z-index: 1000;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  overflow-y: auto;
+  padding: 24px;
+  background: rgba(22, 36, 34, 0.42);
+}
+
+.series-dialog {
+  width: min(100%, 560px);
+  max-height: min(92vh, 850px);
+  overflow-y: auto;
+  padding: 24px;
+  border: 1px solid #e2e9e5;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 24px 70px rgba(29, 52, 46, 0.22);
+}
+
+.series-dialog-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 15px;
+  margin-bottom: 18px;
+}
+
+.series-dialog-heading .eyebrow {
+  margin: 0 0 5px;
+  color: #6e8b82;
+  font-size: 10px;
+  letter-spacing: 0.08em;
+}
+
+.series-dialog-heading h2 {
+  margin: 0;
+  color: #293b39;
+  font-size: 20px;
+}
+
+.series-dialog .icon-button {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #e0e8e4;
+  border-radius: 8px;
+  color: #6b7a76;
+  background: #fff;
+  font-size: 21px;
+}
+
+.series-editor-form {
+  display: grid;
+  gap: 15px;
+}
+
+.series-editor-form > label,
+.series-editor-field,
+.series-delete-confirmation {
+  display: grid;
+  gap: 7px;
+  color: #425552;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.series-editor-form input:not([type="file"]),
+.series-editor-form textarea,
+.series-editor-form select,
+.series-delete-confirmation input {
+  width: 100%;
+  min-height: 38px;
+  padding: 9px 11px;
+  border: 1px solid #d8e2de;
+  border-radius: 8px;
+  color: #2c3d3a;
+  background: #fff;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 450;
+}
+
+.series-editor-form textarea {
+  min-height: 96px;
+  resize: vertical;
+}
+
+.series-editor-form input:focus-visible,
+.series-editor-form textarea:focus-visible,
+.series-editor-form select:focus-visible,
+.series-delete-confirmation input:focus-visible,
+.series-dialog button:focus-visible {
+  outline: 3px solid #a5d8cd;
+  outline-offset: 2px;
+}
+
+.series-editor-form small {
+  color: #788986;
+  font-size: 10px;
+  font-weight: 450;
+  line-height: 1.5;
+}
+
+.series-editor-form .series-field-warning {
+  color: #946b42;
+}
+
+.series-editor-form input[type="file"] {
+  max-width: 100%;
+  color: #60716d;
+  font-size: 10px;
+}
+
+.series-field-label {
+  color: #425552;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.series-cover-preview {
+  width: min(100%, 280px);
+  max-height: 170px;
+  object-fit: cover;
+  border-radius: 8px;
+  background: #f3f6f4;
+}
+
+.series-clear-cover {
+  justify-self: start;
+}
+
+.series-dialog-status {
+  color: #6e7d79;
+  font-size: 12px;
+}
+
+.series-dialog-error {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  color: #9a514c;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.series-dialog-error[role="alert"] {
+  padding: 10px 12px;
+  border: 1px solid #eed8d5;
+  border-radius: 8px;
+  background: #fff9f8;
+}
+
+.series-verification {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #e5e9df;
+  border-radius: 8px;
+  color: #64726e;
+  background: #fbfcf8;
+  font-size: 10px;
+  line-height: 1.6;
+}
+
+.series-verification p {
+  margin: 0;
+}
+
+.series-verification dl {
+  display: grid;
+  width: 100%;
+  gap: 5px;
+  margin: 0;
+}
+
+.series-verification dl > div {
+  display: grid;
+  grid-template-columns: 80px minmax(0, 1fr);
+  gap: 8px;
+}
+
+.series-verification dt {
+  color: #81908a;
+}
+
+.series-verification dd {
+  overflow-wrap: anywhere;
+  margin: 0;
+  color: #3c504a;
+}
+
+.series-dialog-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 9px;
+  margin-top: 4px;
+}
+
+.series-dialog-actions .primary-button,
+.series-dialog-actions .danger-button {
+  min-height: 37px;
+  padding: 0 15px;
+}
+
+.danger-button {
+  border: 1px solid #a8564d;
+  border-radius: 8px;
+  color: #fff;
+  background: #ae5e54;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.danger-button:hover:not(:disabled) {
+  background: #994b43;
+}
+
+.danger-button:disabled,
+.series-dialog button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.series-delete-copy {
+  margin: 0 0 18px;
+  color: #6f7b78;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.series-delete-copy strong {
+  color: #344640;
+}
+
+.series-delete-confirmation {
+  margin-bottom: 16px;
+}
+
+@media (max-width: 620px) {
+  .series-heading-actions {
+    align-items: flex-end;
+    flex-direction: column;
+  }
+
+  .series-dialog-backdrop {
+    align-items: end;
+    padding: 10px;
+  }
+
+  .series-dialog {
+    max-height: 94vh;
+    padding: 18px;
+    border-radius: 13px 13px 8px 8px;
+  }
+
+  .series-dialog-actions {
+    justify-content: stretch;
+  }
+
+  .series-dialog-actions button {
+    flex: 1;
+  }
+}
+
+.series-retry-confirmation {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  color: #785b37;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.series-retry-confirmation input,
+.series-editor-form .series-retry-confirmation input {
+  flex: 0 0 auto;
+  width: 15px;
+  min-height: 15px;
+  height: 15px;
+  margin: 1px 0 0;
+  padding: 0;
+  border-radius: 3px;
+}
+
+.series-retry-confirmation input:focus-visible {
+  outline: 3px solid #a5d8cd;
+  outline-offset: 2px;
+}
+
+.series-verification-list {
+  max-height: 150px;
+  overflow: auto;
+  margin: 8px 0 0;
+  padding-left: 20px;
+  color: #526864;
+  font-size: 10px;
+  line-height: 1.6;
+}

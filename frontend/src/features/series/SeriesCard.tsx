@@ -8,6 +8,8 @@ interface SeriesCardProps {
   apiBaseUrl: string | null;
   onViewChapters(series: Series): void;
   onViewAssets(series: Series): void;
+  onEdit?(series: Series): void;
+  onDelete?(series: Series): void;
 }
 
 function formatDateTime(value: string): string {
@@ -20,7 +22,15 @@ function formatDateTime(value: string): string {
   }).format(date);
 }
 
-export function SeriesCard({ series, currentUserId, apiBaseUrl, onViewChapters, onViewAssets }: SeriesCardProps) {
+export function SeriesCard({
+  series,
+  currentUserId,
+  apiBaseUrl,
+  onViewChapters,
+  onViewAssets,
+  onEdit,
+  onDelete,
+}: SeriesCardProps) {
   const [imageFailed, setImageFailed] = useState(false);
   const coverUrl = apiBaseUrl === null ? null : isSafeCoverUrl(series.image_url, apiBaseUrl);
   const showImage = coverUrl !== null && !imageFailed;
@@ -83,24 +93,48 @@ export function SeriesCard({ series, currentUserId, apiBaseUrl, onViewChapters, 
             {series.can_enter ? "制作功能待开放" : "暂时不能进入"}
           </span>
         </div>
-        {series.can_enter && (
+        {(series.can_enter || onDelete !== undefined) && (
           <div className="series-card-actions">
-            <button
-              aria-label={"只读查看章节：" + series.name}
-              className="chapter-entry-button"
-              onClick={() => onViewChapters(series)}
-              type="button"
-            >
-              只读查看章节 <span aria-hidden="true">→</span>
-            </button>
-            <button
-              aria-label={"只读查看素材库：" + series.name}
-              className="asset-entry-button"
-              onClick={() => onViewAssets(series)}
-              type="button"
-            >
-              只读查看素材库 <span aria-hidden="true">→</span>
-            </button>
+            {series.can_enter && (
+              <>
+                <button
+                  aria-label={"只读查看章节：" + series.name}
+                  className="chapter-entry-button"
+                  onClick={() => onViewChapters(series)}
+                  type="button"
+                >
+                  只读查看章节 <span aria-hidden="true">→</span>
+                </button>
+                <button
+                  aria-label={"只读查看素材库：" + series.name}
+                  className="asset-entry-button"
+                  onClick={() => onViewAssets(series)}
+                  type="button"
+                >
+                  只读查看素材库 <span aria-hidden="true">→</span>
+                </button>
+              </>
+            )}
+            {series.can_enter && onEdit !== undefined && (
+              <button
+                aria-label={"编辑剧集：" + series.name}
+                className="series-edit-action"
+                onClick={() => onEdit(series)}
+                type="button"
+              >
+                编辑
+              </button>
+            )}
+            {onDelete !== undefined && (
+              <button
+                aria-label={"删除剧集：" + series.name}
+                className="series-delete-action"
+                onClick={() => onDelete(series)}
+                type="button"
+              >
+                删除
+              </button>
+            )}
           </div>
         )}
       </div>

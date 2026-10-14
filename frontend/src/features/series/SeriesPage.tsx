@@ -5,6 +5,9 @@ import { normalizeApiError, type WorkspaceServices } from "../../shared/api/serv
 import type { MyTeam } from "../../shared/api/teams";
 import { filterSeries, SERIES_PAGE_SIZE, seriesFilters } from "./seriesFilters";
 import { SeriesCard } from "./SeriesCard";
+import { SeriesDeleteDialog } from "./SeriesDeleteDialog";
+import { SeriesEditorDialog } from "./SeriesEditorDialog";
+import "./SeriesManagement.css";
 
 interface SeriesPageProps {
   active: boolean;
@@ -13,6 +16,7 @@ interface SeriesPageProps {
   onUnauthorized(): void;
   onViewChapters(series: Series): void;
   onViewAssets(series: Series): void;
+  isSuperuser?: boolean;
 }
 
 type TeamDirectoryStatus = "idle" | "loading" | "ready" | "error";
@@ -114,9 +118,14 @@ export function SeriesPage({
   onUnauthorized,
   onViewChapters,
   onViewAssets,
+  isSuperuser = false,
 }: SeriesPageProps) {
   const [series, setSeries] = useState<Awaited<ReturnType<WorkspaceServices["listSeries"]>>>([]);
   const [seriesScope, setSeriesScope] = useState({ userId, services });
+  const [loadedSeriesScope, setLoadedSeriesScope] = useState<{
+    userId: string;
+    services: WorkspaceServices;
+  } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
   const [filter, setFilter] = useState<SeriesFilter>("all");
@@ -127,15 +136,20 @@ export function SeriesPage({
   const [teamDirectory, setTeamDirectory] = useState<TeamDirectoryState>(() =>
     emptyTeamDirectory(userId, services),
   );
+  const [editor, setEditor] = useState<{ mode: "create" | "edit"; series?: Series } | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<Series | null>(null);
+  const [mutationNotice, setMutationNotice] = useState<string | null>(null);
 
+  const identityRef = useRef({ userId, services });
   const requestGeneration = useRef(0);
   const teamRequestController = useRef<AbortController | null>(null);
   const contextRef = useRef<TeamRequestContext>({ userId, services, active, filter });
   contextRef.current = { userId, services, active, filter };
 
   const seriesMatchesScope = seriesScope.userId === userId && seriesScope.services === services;
+  const hasLoadedCurrentSeries = loadedSeriesScope?.userId === userId && loadedSeriesScope.services === services;
   const visibleSeries = seriesMatchesScope ? series : [];
-  const visibleLoading = !seriesMatchesScope || loading;
+  const visibleLoading = !seriesMatchesScope || (loading && !hasLoadedCurrentSeries);
   const visibleError = seriesMatchesScope ? error : null;
   const visibleFilter = seriesMatchesScope ? filter : "all";
   const scopedVisibleCount = seriesMatchesScope ? visibleCount : SERIES_PAGE_SIZE;
@@ -238,6 +252,19 @@ export function SeriesPage({
   }, [cancelTeamRequest, onUnauthorized]);
 
   useLayoutEffect(() => {
+    const identityChanged = identityRef.current.userId !== userId
+      || identityRef.current.services !== services;
+    identityRef.current = { userId, services };
+    if (!active || identityChanged) {
+      setEditor(null);
+      setDeleteTarget(null);
+    }
+    if (identityChanged) {
+      setMutationNotice(null);
+    }
+  }, [active, services, userId]);
+
+  useLayoutEffect(() => {
     if (!directoryMatchesScope) {
       cancelTeamRequest();
       setTeamDirectory(emptyTeamDirectory(userId, services));
@@ -280,6 +307,9 @@ export function SeriesPage({
   }, [active, directoryMatchesScope, filter, services, startTeamRequest, userId, visibleDirectory.status]);
 
   useEffect(() => {
+    if (!active) {
+      return;
+    }
     const controller = new AbortController();
     let current = true;
     setLoading(true);
@@ -289,6 +319,7 @@ export function SeriesPage({
       if (current && !controller.signal.aborted) {
         setSeries(result);
         setSeriesScope({ userId, services });
+        setLoadedSeriesScope({ userId, services });
         setLoading(false);
       }
     }).catch((cause: unknown) => {
@@ -312,7 +343,7 @@ export function SeriesPage({
       current = false;
       controller.abort();
     };
-  }, [onUnauthorized, reloadKey, services, userId]);
+  }, [active, onUnauthorized, reloadKey, services, userId]);
 
   useLayoutEffect(() => () => cancelTeamRequest(), [cancelTeamRequest]);
 
@@ -368,10 +399,27 @@ export function SeriesPage({
         <div>
           <p className="eyebrow">创作项目</p>
           <h1 id="series-heading">我的剧集</h1>
-          <p>查看个人持有、团队共享与认领的剧集。</p>
+          <p>管理个人剧集信息，查看团队共享与认领内容。</p>
         </div>
-        <div className="readonly-pill"><span aria-hidden="true">◉</span> 只读阶段</div>
+        {services.createSeries !== undefined
+          && (visibleLoading || visibleError !== null || visibleSeries.length > 0) && (
+          <div className="series-heading-actions">
+            <button
+              className="primary-button series-create-button"
+              onClick={() => {
+                setMutationNotice(null);
+                setEditor({ mode: "create" });
+              }}
+              type="button"
+            >
+              创建剧集
+            </button>
+          </div>
+        )}
       </div>
+      {mutationNotice !== null && (
+        <p className="series-mutation-notice" role="status">{mutationNotice}</p>
+      )}
 
       <div className="series-toolbar">
         <div>
@@ -467,7 +515,19 @@ export function SeriesPage({
         <div className="state-panel empty-panel" role="status">
           <div className="empty-icon" aria-hidden="true">◌</div>
           <h2>还没有剧集</h2>
-          <p>创建与导入功能暂未开放。</p>
+          <p>创建新剧集后，可以补充简介、封面和风格提示词。</p>
+          {services.createSeries !== undefined && (
+            <button
+              className="primary-button series-empty-create"
+              onClick={() => {
+                setMutationNotice(null);
+                setEditor({ mode: "create" });
+              }}
+              type="button"
+            >
+              创建剧集
+            </button>
+          )}
         </div>
       )}
 
@@ -491,16 +551,37 @@ export function SeriesPage({
       {!visibleLoading && visibleError === null && displayedSeries.length > 0 && (
         <>
           <div className="series-grid" aria-live="polite">
-            {displayedSeries.map((item) => (
-              <SeriesCard
-                apiBaseUrl={services.apiBaseUrl}
-                currentUserId={userId}
-                key={item.id}
-                onViewAssets={onViewAssets}
-                onViewChapters={onViewChapters}
-                series={item}
-              />
-            ))}
+            {displayedSeries.map((item) => {
+              const onEdit = item.can_enter
+                && services.getSeries !== undefined
+                && services.updateSeries !== undefined
+                ? (selected: Series) => {
+                  setMutationNotice(null);
+                  setEditor({ mode: "edit", series: selected });
+                }
+                : undefined;
+              const onDelete = services.deleteSeries !== undefined && (
+                isSuperuser || item.user_id === userId || item.team_id !== null
+              )
+                ? (selected: Series) => {
+                  setMutationNotice(null);
+                  setDeleteTarget(selected);
+                }
+                : undefined;
+
+              return (
+                <SeriesCard
+                  apiBaseUrl={services.apiBaseUrl}
+                  currentUserId={userId}
+                  key={item.id}
+                  onViewAssets={onViewAssets}
+                  onViewChapters={onViewChapters}
+                  {...(onEdit === undefined ? {} : { onEdit })}
+                  {...(onDelete === undefined ? {} : { onDelete })}
+                  series={item}
+                />
+              );
+            })}
           </div>
           <div className="pagination-row">
             <span>
@@ -517,6 +598,44 @@ export function SeriesPage({
             )}
           </div>
         </>
+      )}
+      {editor !== null && (
+        <SeriesEditorDialog
+          active={active}
+          mode={editor.mode}
+          onClose={() => setEditor(null)}
+          onSaved={(saved, mode) => {
+            setEditor(null);
+            setMutationNotice(mode === "create"
+              ? `已创建《${saved.name}》，正在刷新剧集列表。`
+              : `已保存《${saved.name}》的剧集信息，正在刷新剧集列表。`);
+            setReloadKey((key) => key + 1);
+          }}
+          onUnauthorized={onUnauthorized}
+          services={services}
+          userId={userId}
+          {...(editor.series === undefined ? {} : { series: editor.series })}
+        />
+      )}
+      {deleteTarget !== null && (
+        <SeriesDeleteDialog
+          active={active}
+          onClose={() => setDeleteTarget(null)}
+          onDeleted={() => {
+            setDeleteTarget(null);
+            setMutationNotice(`已删除《${deleteTarget.name}》，正在刷新剧集列表。`);
+            setReloadKey((key) => key + 1);
+          }}
+          onMissingConfirmed={() => {
+            setDeleteTarget(null);
+            setMutationNotice(`重新读取已确认《${deleteTarget.name}》不存在，正在刷新剧集列表。`);
+            setReloadKey((key) => key + 1);
+          }}
+          onUnauthorized={onUnauthorized}
+          series={deleteTarget}
+          services={services}
+          userId={userId}
+        />
       )}
     </section>
   );

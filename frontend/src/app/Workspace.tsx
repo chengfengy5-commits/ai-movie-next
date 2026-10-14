@@ -346,6 +346,7 @@ function Dashboard() {
               active={selectedSeries === null && selectedView === "series"}
               services={services}
               userId={state.user.id}
+              isSuperuser={state.user.is_superuser}
             />
           </div>
           {selectedSeries !== null && selectedView === "chapters" && (
@@ -403,7 +404,7 @@ function Dashboard() {
             {selectedView === "tasks"
               ? "任务记录只读预览"
               : selectedSeries === null
-                ? "剧集只读预览"
+                ? "剧集管理"
                 : selectedView === "assets"
                   ? "素材只读预览"
                   : "章节与分镜只读预览"}

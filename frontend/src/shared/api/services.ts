@@ -13,6 +13,7 @@ import {
   parseErrorDetail,
   parseLoginResponse,
   parsePropList,
+  parseSeries,
   parseSeriesList,
   parseSceneList,
   parseStoryboardAssetList,
@@ -46,6 +47,13 @@ import { getDemoMyTaskPage } from "../../features/tasks/demoTasks";
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
 import { parseMyTeamList, type MyTeam } from "./teams";
 import {
+  parseStylePromptChoices,
+  parseUploadedSeriesCover,
+  type CreateSeriesInput,
+  type StylePromptChoice,
+  type UpdateSeriesInput,
+} from "./seriesManagement";
+import {
   API_TOKEN_KEY,
   API_USER_KEY,
   browserStorage,
@@ -62,6 +70,12 @@ export interface WorkspaceServices {
   restore(signal: AbortSignal): Promise<User | null>;
   login(credentials: Credentials, signal: AbortSignal): Promise<User>;
   listSeries(signal: AbortSignal): Promise<Series[]>;
+  getSeries?(seriesId: string, signal: AbortSignal): Promise<Series>;
+  createSeries?(input: CreateSeriesInput, signal: AbortSignal): Promise<Series>;
+  updateSeries?(seriesId: string, update: UpdateSeriesInput, signal: AbortSignal): Promise<Series>;
+  deleteSeries?(seriesId: string, signal: AbortSignal): Promise<void>;
+  listSeriesStylePrompts?(signal: AbortSignal): Promise<StylePromptChoice[]>;
+  uploadSeriesCover?(file: File, signal: AbortSignal): Promise<string>;
   listMyTeams(signal: AbortSignal): Promise<MyTeam[]>;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   listStoryboardAssets(
@@ -140,6 +154,25 @@ function demoNotFound(): ApiError {
   return new ApiError("http", "当前内容不存在。", 404);
 }
 
+const demoSeriesStyles: StylePromptChoice[] = [
+  { id: "demo-style-urban", name: "都市悬疑", is_system: true, user_id: null },
+  { id: "demo-style-fantasy", name: "奇幻冒险", is_system: false, user_id: demoUser.id },
+];
+
+function requireApiToken(storage: StorageLike): string {
+  const token = storage.getItem(API_TOKEN_KEY);
+  if (!token) {
+    throw new ApiError("http", "登录状态已失效，请重新登录。", 401);
+  }
+  return token;
+}
+
+function ensureCurrentApiSession(storage: StorageLike, token: string, signal: AbortSignal): void {
+  if (signal.aborted || storage.getItem(API_TOKEN_KEY) !== token) {
+    throw new ApiError("aborted", "Request was cancelled.");
+  }
+}
+
 function cloneDemoNoteValue(value: unknown): unknown {
   if (Array.isArray(value)) {
     return value.map(cloneDemoNoteValue);
@@ -164,6 +197,9 @@ function cloneDemoPersonalProductionSnapshot(
 }
 
 export function createDemoServices(storage: StorageLike = browserStorage()): WorkspaceServices {
+  const seriesRows = demoSeries.map((series) => ({ ...series }));
+  const customSeriesIds = new Set<string>();
+  let nextSeriesId = 1;
   const personalNoteSnapshots = new Map<string, PersonalProductionSnapshot>();
   const personalRoughCutSnapshots = new Map<string, PersonalRoughCutSnapshot>();
 
@@ -199,7 +235,100 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      return demoSeries.map((series) => ({ ...series }));
+      return seriesRows.map((series) => ({ ...series }));
+    },
+    async getSeries(seriesId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const found = seriesRows.find((series) => series.id === seriesId);
+      if (found === undefined) {
+        throw demoNotFound();
+      }
+      return { ...found };
+    },
+    async createSeries(input, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const id = `demo-created-series-${nextSeriesId++}`;
+      const timestamp = new Date().toISOString();
+      const style = demoSeriesStyles.find((choice) => choice.id === input.style_prompt_id);
+      const created: Series = {
+        id,
+        user_id: demoUser.id,
+        name: input.name,
+        description: input.description,
+        image_url: input.image_url,
+        style_prompt_id: input.style_prompt_id,
+        style_prompt: null,
+        style_prompt_name: style?.name ?? null,
+        style_prompt_owner_name: style === undefined ? null : style.is_system ? "系统" : demoUser.username,
+        team_id: null,
+        team_name: null,
+        owner_name: demoUser.username,
+        claimed_by: null,
+        claimed_by_username: null,
+        claimed_by_avatar_url: null,
+        can_enter: true,
+        created_at: timestamp,
+        updated_at: timestamp,
+      };
+      customSeriesIds.add(id);
+      seriesRows.unshift(created);
+      return { ...created };
+    },
+    async updateSeries(seriesId, update, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const index = seriesRows.findIndex((series) => series.id === seriesId);
+      const current = seriesRows[index];
+      if (current === undefined) {
+        throw demoNotFound();
+      }
+      const nextStyleId = update.style_prompt_id === undefined ? current.style_prompt_id : update.style_prompt_id;
+      const style = demoSeriesStyles.find((choice) => choice.id === nextStyleId);
+      const updated: Series = {
+        ...current,
+        ...update,
+        style_prompt_id: nextStyleId,
+        style_prompt_name: update.style_prompt_id === undefined
+          ? current.style_prompt_name
+          : style?.name ?? (nextStyleId === "" ? null : current.style_prompt_name),
+        style_prompt_owner_name: update.style_prompt_id === undefined
+          ? current.style_prompt_owner_name
+          : nextStyleId === ""
+            ? null
+            : style === undefined
+              ? current.style_prompt_owner_name
+              : style.is_system ? "系统" : demoUser.username,
+        updated_at: new Date().toISOString(),
+      };
+      seriesRows[index] = updated;
+      return { ...updated };
+    },
+    async deleteSeries(seriesId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const index = seriesRows.findIndex((series) => series.id === seriesId);
+      if (index < 0) {
+        throw demoNotFound();
+      }
+      seriesRows.splice(index, 1);
+      customSeriesIds.delete(seriesId);
+    },
+    async listSeriesStylePrompts(signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      return demoSeriesStyles.map((choice) => ({ ...choice }));
     },
     async listChapters(seriesId, signal) {
       if (signal.aborted) {
@@ -207,6 +336,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const data = getDemoChapterData(seriesId);
+      if (data === null && customSeriesIds.has(seriesId)) {
+        return [];
+      }
       if (data === null) {
         throw demoNotFound();
       }
@@ -222,6 +354,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const data = getDemoChapterData(seriesId);
+      if (data === null && customSeriesIds.has(seriesId)) {
+        return [];
+      }
       if (data === null) {
         throw demoNotFound();
       }
@@ -233,6 +368,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const data = getDemoAssetLibraryData(seriesId);
+      if (data === null && customSeriesIds.has(seriesId)) {
+        return [];
+      }
       if (data === null) {
         throw demoNotFound();
       }
@@ -247,6 +385,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const data = getDemoAssetLibraryData(seriesId);
+      if (data === null && customSeriesIds.has(seriesId)) {
+        return [];
+      }
       if (data === null) {
         throw demoNotFound();
       }
@@ -261,6 +402,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const data = getDemoAssetLibraryData(seriesId);
+      if (data === null && customSeriesIds.has(seriesId)) {
+        return [];
+      }
       if (data === null) {
         throw demoNotFound();
       }
@@ -584,6 +728,12 @@ type ApiEndpoint =
   | "login"
   | "me"
   | "series"
+  | "seriesDetail"
+  | "createSeries"
+  | "updateSeries"
+  | "deleteSeries"
+  | "stylePrompts"
+  | "uploadSeriesCover"
   | "chapters"
   | "storyboardAssets"
   | "characters"
@@ -599,7 +749,8 @@ type ApiEndpoint =
 
 interface ApiRequestDefinition {
   path: string;
-  method: "GET" | "POST" | "PUT";
+  method: "GET" | "POST" | "PUT" | "DELETE";
+  expectedStatus?: number;
 }
 
 function apiRequestDefinition(
@@ -614,6 +765,24 @@ function apiRequestDefinition(
   }
   if (endpoint === "series") {
     return { path: "/series", method: "GET" };
+  }
+  if (endpoint === "createSeries") {
+    return { path: "/series", method: "POST", expectedStatus: 201 };
+  }
+  if (endpoint === "stylePrompts") {
+    return { path: "/prompts?category=style", method: "GET" };
+  }
+  if (endpoint === "uploadSeriesCover") {
+    return { path: "/upload/image", method: "POST" };
+  }
+  if (endpoint === "seriesDetail" || endpoint === "updateSeries" || endpoint === "deleteSeries") {
+    const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
+    return {
+      path: "/series/" + seriesId,
+      method: endpoint === "seriesDetail" ? "GET" : endpoint === "updateSeries" ? "PUT" : "DELETE",
+      ...(endpoint === "updateSeries" ? { expectedStatus: 200 } : {}),
+      ...(endpoint === "deleteSeries" ? { expectedStatus: 204 } : {}),
+    };
   }
   if (endpoint === "myTeams") {
     return { path: "/teams/my", method: "GET" };
@@ -669,7 +838,8 @@ export function createApiServices(
     endpoint: ApiEndpoint,
     token: string | null,
     signal: AbortSignal,
-    body?: Credentials | PersonalProductionNoteUpdate | PersonalProductionResumeUpdate | PersonalRoughCutUpdate,
+    body?: Credentials | PersonalProductionNoteUpdate | PersonalProductionResumeUpdate
+      | PersonalRoughCutUpdate | CreateSeriesInput | UpdateSeriesInput | FormData,
     identifiers?: { seriesId?: string; chapterId?: string; page?: number },
     requestBaseUrl = apiBaseUrl,
   ): Promise<unknown> {
@@ -677,7 +847,8 @@ export function createApiServices(
     const url = new URL(`${requestBaseUrl}${requestDefinition.path}`);
     const timed = timeoutSignal(signal, timeoutMs);
     const headers = new Headers({ Accept: "application/json" });
-    if (body !== undefined) {
+    const multipartBody = typeof FormData !== "undefined" && body instanceof FormData ? body : undefined;
+    if (body !== undefined && multipartBody === undefined) {
       headers.set("Content-Type", "application/json");
     }
     if (token !== null) {
@@ -689,7 +860,7 @@ export function createApiServices(
       response = await fetcher(url, {
         method: requestDefinition.method,
         headers,
-        ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        ...(body === undefined ? {} : { body: multipartBody ?? JSON.stringify(body) }),
         signal: timed.signal,
         credentials: "omit",
         cache: "no-store",
@@ -708,6 +879,35 @@ export function createApiServices(
         throw new ApiError("aborted", "Request was cancelled.");
       }
       throw new ApiError("network", "无法连接本地服务，请确认服务正在运行。");
+    }
+
+    if (
+      response.ok
+      && requestDefinition.expectedStatus !== undefined
+      && response.status !== requestDefinition.expectedStatus
+    ) {
+      timed.dispose();
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      if (timed.didTimeout()) {
+        throw new ApiError("timeout", "请求超时，请稍后重试。");
+      }
+      throw new ApiError("invalid-response", "服务器返回了与剧集操作不匹配的状态。");
+    }
+
+    if (response.status === 204) {
+      timed.dispose();
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      if (timed.didTimeout()) {
+        throw new ApiError("timeout", "请求超时，请稍后重试。");
+      }
+      if (!response.ok) {
+        throw new ApiError("http", errorMessageForStatus(response.status, null), response.status);
+      }
+      return undefined;
     }
 
     let payload: unknown;
@@ -754,6 +954,23 @@ export function createApiServices(
     storage.setItem(API_USER_KEY, JSON.stringify(user));
   }
 
+  async function requestForCurrentApiSession(
+    endpoint: ApiEndpoint,
+    token: string,
+    signal: AbortSignal,
+    body?: CreateSeriesInput | UpdateSeriesInput | FormData,
+    identifiers?: { seriesId?: string },
+  ): Promise<unknown> {
+    try {
+      const result = await request(endpoint, token, signal, body, identifiers);
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    } catch (error) {
+      ensureCurrentApiSession(storage, token, signal);
+      throw error;
+    }
+  }
+
   return {
     mode: "api",
     apiBaseUrl,
@@ -798,14 +1015,60 @@ export function createApiServices(
       if (!token) {
         throw new ApiError("http", "登录状态已失效，请重新登录。", 401);
       }
-      return parseMyTeamList(await request("myTeams", token, signal));
+      return parseMyTeamList(await requestForCurrentApiSession("myTeams", token, signal));
     },
     async listSeries(signal) {
       const token = storage.getItem(API_TOKEN_KEY);
       if (!token) {
         throw new ApiError("http", "登录状态已失效，请重新登录。", 401);
       }
-      return parseSeriesList(await request("series", token, signal));
+      return parseSeriesList(await requestForCurrentApiSession("series", token, signal));
+    },
+    async getSeries(seriesId, signal) {
+      const token = requireApiToken(storage);
+      const result = parseSeries(await requestForCurrentApiSession("seriesDetail", token, signal, undefined, { seriesId }));
+      ensureCurrentApiSession(storage, token, signal);
+      if (result.id !== seriesId) {
+        throw new InvalidResponseError("服务器返回了其他剧集的详情。");
+      }
+      return result;
+    },
+    async createSeries(input, signal) {
+      const token = requireApiToken(storage);
+      const result = parseSeries(await requestForCurrentApiSession("createSeries", token, signal, input));
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async updateSeries(seriesId, update, signal) {
+      const token = requireApiToken(storage);
+      const result = parseSeries(await requestForCurrentApiSession("updateSeries", token, signal, update, { seriesId }));
+      ensureCurrentApiSession(storage, token, signal);
+      if (result.id !== seriesId) {
+        throw new InvalidResponseError("服务器返回了其他剧集的详情。");
+      }
+      return result;
+    },
+    async deleteSeries(seriesId, signal) {
+      const token = requireApiToken(storage);
+      const result = await requestForCurrentApiSession("deleteSeries", token, signal, undefined, { seriesId });
+      ensureCurrentApiSession(storage, token, signal);
+      if (result !== undefined) {
+        throw new InvalidResponseError("服务器删除剧集时返回了非预期内容。");
+      }
+    },
+    async listSeriesStylePrompts(signal) {
+      const token = requireApiToken(storage);
+      const result = parseStylePromptChoices(await requestForCurrentApiSession("stylePrompts", token, signal));
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async uploadSeriesCover(file, signal) {
+      const token = requireApiToken(storage);
+      const form = new FormData();
+      form.append("file", file);
+      const result = parseUploadedSeriesCover(await requestForCurrentApiSession("uploadSeriesCover", token, signal, form));
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
     },
     async listChapters(seriesId, signal) {
       const token = storage.getItem(API_TOKEN_KEY);
