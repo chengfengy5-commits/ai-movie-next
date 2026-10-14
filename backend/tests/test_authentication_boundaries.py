@@ -138,12 +138,18 @@ def test_cold_app_import_and_unwired_factory_do_not_open_env_or_construct_sqlalc
             ("/api/storyboard/generate-stream", "POST"),
             ("/api/storyboard/create-chapter-with-storyboard", "POST"),
             ("/api/storyboard/two-pass", "POST"),
+            ("/api/storyboard/extract-characters-stream", "POST"),
+            ("/api/storyboard/judge-character-appearance-stream", "POST"),
+            ("/api/storyboard/extract-scenes-stream", "POST"),
+            ("/api/storyboard/judge-scene-appearance-stream", "POST"),
+            ("/api/storyboard/extract-props-stream", "POST"),
+            ("/api/storyboard/judge-prop-appearance-stream", "POST"),
         } <= {
             (route.path, method)
             for route in app.routes
             for method in getattr(route, "methods", set())
         }
-        assert len(paths) == 236, paths
+        assert len(paths) == 242, paths
         for module_name in ("passlib", "jose"):
             assert module_name not in sys.modules, module_name
         assert side_effects == [], side_effects

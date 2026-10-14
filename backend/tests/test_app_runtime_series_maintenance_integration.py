@@ -435,8 +435,14 @@ def test_unwired_routes_remain_inert_and_register_exact_new_identities() -> None
         ("POST", "/api/series/{series_id}/assets/duplicates/ignore", "ignore_duplicates"),
         ("GET", "/api/series/{series_id}/assets/duplicates/ignored", "list_ignored"),
         ("POST", "/api/series/{series_id}/assets/merge", "merge_assets"),
+        ("POST", "/api/storyboard/extract-characters-stream", "extract_characters_stream"),
+        ("POST", "/api/storyboard/judge-character-appearance-stream", "judge_character_appearance_stream"),
+        ("POST", "/api/storyboard/extract-scenes-stream", "extract_scenes_stream"),
+        ("POST", "/api/storyboard/judge-scene-appearance-stream", "judge_scene_appearance_stream"),
+        ("POST", "/api/storyboard/extract-props-stream", "extract_props_stream"),
+        ("POST", "/api/storyboard/judge-prop-appearance-stream", "judge_prop_appearance_stream"),
     }
-    assert len(routes) == 236
+    assert len(routes) == 242
     assert expected <= routes
     series_response = _request(
         app,

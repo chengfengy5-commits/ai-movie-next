@@ -54,5 +54,5 @@ def test_factory_registers_two_canvas_methods_without_startup_io() -> None:
         for route in app.routes
         for method in getattr(route, "methods", set())
     }
-    assert len(methods) == 236
+    assert len(methods) == 242
     assert app.docs_url is app.redoc_url is app.openapi_url is None
