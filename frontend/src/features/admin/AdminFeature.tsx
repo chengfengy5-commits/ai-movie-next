@@ -2,11 +2,14 @@ import { useCallback, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../shared/api/errors";
 import { resolveApiBaseUrl } from "../../shared/api/config";
 import { AdminDashboard } from "./AdminDashboard";
+import { CreditLogs } from "./CreditLogs";
+import { createAdminCreditsApi } from "./adminCreditsApi";
 import { createAdminApi, type AdminFetcher } from "./adminApi";
 import type { AdminApi, AdminStorage, AdminUser } from "./adminTypes";
 import { SystemPrompts } from "./SystemPrompts";
 import { createSystemPromptsApi } from "./systemPromptsApi";
 import { Users } from "./Users";
+import { UserCreditEditor, UserCreditsList } from "./UserCredits";
 import { createAdminUsersApi } from "./usersApi";
 import { SystemModels } from "./SystemModels";
 import "./Admin.css";
@@ -32,7 +35,10 @@ type AdminView =
   | { kind: "prompt-edit"; id: string }
   | { kind: "users" }
   | { kind: "user-create" }
-  | { kind: "user-edit"; id: string };
+  | { kind: "user-edit"; id: string }
+  | { kind: "user-credits" }
+  | { kind: "credit-edit"; id: string }
+  | { kind: "credit-logs" };
 
 interface AdminSession {
   token: string;
@@ -173,6 +179,7 @@ export function AdminFeature({
   const [modelListVersion, setModelListVersion] = useState(0);
   const [promptListVersion, setPromptListVersion] = useState(0);
   const [userListVersion, setUserListVersion] = useState(0);
+  const [creditListVersion, setCreditListVersion] = useState(0);
 
   const navigate = useCallback((nextView: AdminView) => {
     viewIdentity.current += 1;
@@ -189,6 +196,10 @@ export function AdminFeature({
   );
   const usersApi = useMemo(
     () => createAdminUsersApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
+  const creditsApi = useMemo(
+    () => createAdminCreditsApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
 
@@ -218,12 +229,14 @@ export function AdminFeature({
   const handleResourceUnauthorized = useCallback(() => {
     if (viewIdentity.current === activeViewIdentity) handleUnauthorized();
   }, [activeViewIdentity, handleUnauthorized]);
-  const handleResourceSaved = useCallback((resource: "system-prompts" | "users") => {
+  const handleResourceSaved = useCallback((resource: "system-prompts" | "users" | "user-credits") => {
     if (viewIdentity.current !== activeViewIdentity) return;
     if (resource === "system-prompts") {
       setPromptListVersion((value) => value + 1);
-    } else {
+    } else if (resource === "users") {
       setUserListVersion((value) => value + 1);
+    } else {
+      setCreditListVersion((value) => value + 1);
     }
     navigate({ kind: resource });
   }, [activeViewIdentity, navigate]);
@@ -293,6 +306,26 @@ export function AdminFeature({
           >
             <span aria-hidden="true">♙</span>用户管理
           </button>
+          <button
+            className={view.kind === "user-credits" || view.kind === "credit-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="用户积分"
+            title="用户积分"
+            aria-current={view.kind === "user-credits" || view.kind === "credit-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "user-credits" })}
+          >
+            <span aria-hidden="true">◉</span>用户积分
+          </button>
+          <button
+            className={view.kind === "credit-logs" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="积分流水"
+            title="积分流水"
+            aria-current={view.kind === "credit-logs" ? "page" : undefined}
+            onClick={() => navigate({ kind: "credit-logs" })}
+          >
+            <span aria-hidden="true">↕</span>积分流水
+          </button>
         </nav>
         <div className="admin-sidebar-account">
           <span className="admin-sidebar-avatar" aria-hidden="true">
@@ -348,6 +381,29 @@ export function AdminFeature({
               onEdit={(id) => navigate({ kind: "prompt-edit", id })}
               onCancel={() => navigate({ kind: "system-prompts" })}
               onSaved={() => handleResourceSaved("system-prompts")}
+            />
+          ) : view.kind === "user-credits" ? (
+            <UserCreditsList
+              key={activeViewIdentity}
+              api={creditsApi}
+              reloadVersion={creditListVersion}
+              onEdit={(id) => navigate({ kind: "credit-edit", id })}
+              onAuthenticationError={handleResourceUnauthorized}
+            />
+          ) : view.kind === "credit-edit" ? (
+            <UserCreditEditor
+              key={activeViewIdentity}
+              api={creditsApi}
+              creditId={view.id}
+              onCancel={() => navigate({ kind: "user-credits" })}
+              onSaved={() => handleResourceSaved("user-credits")}
+              onAuthenticationError={handleResourceUnauthorized}
+            />
+          ) : view.kind === "credit-logs" ? (
+            <CreditLogs
+              key={activeViewIdentity}
+              api={creditsApi}
+              onAuthenticationError={handleResourceUnauthorized}
             />
           ) : (
             <Users

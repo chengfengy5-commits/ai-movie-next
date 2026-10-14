@@ -594,6 +594,118 @@ describe("admin feature user flows", () => {
     expect(storage.getItem("access_token")).toBe("creative-account-token");
   });
 
+  it("navigates credit views, saves an absolute balance by credit id, and refreshes with the admin token", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    storage.setItem("access_token", "creative-account-token");
+    let currentCredit = {
+      id: "credit-row-7",
+      user_id: "writer-7",
+      credits: 12,
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-02T00:00:00Z",
+    };
+    let creditListCalls = 0;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/user-credits" && init?.method === undefined) {
+        creditListCalls += 1;
+        return jsonResponse({ data: [currentCredit], total: 1 });
+      }
+      if (url.pathname === "/api/admin/user-credits/credit-row-7" && init?.method === undefined) {
+        return jsonResponse(currentCredit);
+      }
+      if (url.pathname === "/api/admin/user-credits/credit-row-7" && init?.method === "PUT") {
+        const body = JSON.parse(String(init.body)) as { credits: number };
+        currentCredit = { ...currentCredit, credits: body.credits };
+        return jsonResponse(currentCredit);
+      }
+      if (url.pathname === "/api/admin/credit-logs") {
+        return jsonResponse({
+          data: [{
+            id: "log-1",
+            user_id: "writer-7",
+            amount: -7,
+            balance_after: 5,
+            type: "manual_adjustment",
+            description: "后台调整",
+            task_id: null,
+            created_at: "2026-10-03T00:00:00Z",
+          }],
+          total: 1,
+        });
+      }
+      throw new Error("Unexpected request: " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "用户积分" }));
+    expect(await screen.findByRole("button", { name: "编辑积分记录 credit-row-7" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "用户积分" })).toHaveAttribute("aria-current", "page");
+
+    await user.click(screen.getByRole("button", { name: "编辑积分记录 credit-row-7" }));
+    const amount = await screen.findByLabelText("积分数量");
+    await user.clear(amount);
+    await user.type(amount, "-9");
+    await user.click(screen.getByRole("button", { name: "保存" }));
+    expect(await screen.findByText("-9")).toBeInTheDocument();
+    expect(creditListCalls).toBe(2);
+    expect(fetcher.mock.calls.some(([input, init]) => (
+      new URL(String(input), window.location.href).pathname === "/api/admin/user-credits/credit-row-7"
+        && init?.method === "PUT"
+        && JSON.parse(String(init.body)).credits === -9
+    ))).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "积分流水" }));
+    expect(await screen.findByText("manual_adjustment")).toBeInTheDocument();
+    const creditRequests = fetcher.mock.calls.filter(([input]) => {
+      const pathname = new URL(String(input), window.location.href).pathname;
+      return pathname.startsWith("/api/admin/user-credits") || pathname === "/api/admin/credit-logs";
+    });
+    expect(creditRequests.length).toBeGreaterThanOrEqual(5);
+    expect(creditRequests.every(([, init]) => (
+      new Headers(init?.headers).get("Authorization") === "Bearer admin-token"
+    ))).toBe(true);
+    expect(creditRequests.some(([, init]) => (
+      new Headers(init?.headers).get("Authorization") === "Bearer creative-account-token"
+    ))).toBe(false);
+    expect(storage.getItem("access_token")).toBe("creative-account-token");
+  });
+
+  it("aborts a credit-list read on navigation and ignores its late authentication response", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    let finishCreditList: ((response: Response) => void) | undefined;
+    let creditListSignal: AbortSignal | null | undefined;
+    const creditListResponse = new Promise<Response>((resolve) => { finishCreditList = resolve; });
+    const fetcher = vi.fn<AdminFetcher>((input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return Promise.resolve(jsonResponse(stats()));
+      if (url.pathname === "/api/admin/user-credits") {
+        creditListSignal = init?.signal;
+        return creditListResponse;
+      }
+      if (url.pathname === "/api/admin/credit-logs") return Promise.resolve(jsonResponse({ data: [], total: 0 }));
+      return Promise.reject(new Error("Unexpected request: " + url.pathname));
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "用户积分" }));
+    expect(await screen.findByText("正在读取用户积分…")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "积分流水" }));
+    expect(await screen.findByRole("heading", { name: "积分流水" })).toBeInTheDocument();
+    expect(creditListSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      finishCreditList?.(jsonResponse({ detail: "登录已过期" }, 401));
+      await new Promise((resolve) => window.setTimeout(resolve, 0));
+    });
+    expect(storage.getItem("admin_token")).toBe("admin-token");
+    expect(storage.getItem("admin_user")).not.toBeNull();
+    expect(screen.getByRole("heading", { name: "积分流水" })).toBeInTheDocument();
+  });
+
   it.each([401, 403])("clears only the administrator session after a user-management request returns %s", async (status) => {
     const storage = adminStorage();
     storage.setItem("access_token", "creative-account-token");

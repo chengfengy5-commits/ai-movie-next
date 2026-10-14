@@ -1,0 +1,142 @@
+.admin-credits-page {
+  display: grid;
+  gap: 16px;
+}
+
+.admin-credit-sort-button {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+}
+
+.admin-credit-sort-button:hover {
+  color: #d9d2f5;
+}
+
+.admin-credit-filter {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid #29292f;
+  border-radius: 10px;
+  background: #18181b;
+}
+
+.admin-credit-filter label {
+  display: grid;
+  min-width: min(100%, 240px);
+  gap: 7px;
+  color: #c0c0c8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.admin-credit-filter input,
+.admin-credit-form input {
+  min-height: 40px;
+  padding: 8px 11px;
+  border: 1px solid #393940;
+  border-radius: 8px;
+  color: #e4e4e7;
+  background: #1a1a1e;
+  font: inherit;
+}
+
+.admin-credit-filter input:focus,
+.admin-credit-form input:focus {
+  border-color: #8b5cf6;
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12);
+}
+
+.admin-credit-form {
+  display: grid;
+  width: min(100%, 620px);
+  gap: 16px;
+  padding: 22px;
+  border: 1px solid #2a2a30;
+  border-radius: 11px;
+  background: #18181b;
+}
+
+.admin-credit-form .admin-field {
+  display: grid;
+  gap: 7px;
+}
+
+.admin-credit-form .admin-field > span {
+  color: #c0c0c8;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+.admin-credit-form .admin-field small {
+  color: #85838d;
+  font-size: 11px;
+}
+
+.admin-credit-form input[readonly] {
+  color: #a4a3ad;
+  background: #141416;
+}
+
+.admin-credit-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 9px;
+}
+
+.admin-credit-notice {
+  margin: 0;
+  color: #91d4aa;
+  font-size: 12px;
+}
+
+.admin-credit-error {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid rgba(240, 113, 120, 0.35);
+  border-radius: 8px;
+  color: #f0a0a4;
+  background: rgba(140, 42, 49, 0.12);
+}
+
+.admin-credit-error p {
+  margin: 0;
+}
+
+.admin-credit-error.is-uncertain {
+  border-color: rgba(237, 185, 102, 0.35);
+  color: #e6c48e;
+  background: rgba(143, 103, 42, 0.12);
+}
+
+.admin-credit-amount {
+  font-variant-numeric: tabular-nums;
+  font-weight: 650;
+}
+
+.admin-credit-amount.is-positive {
+  color: #91d4aa;
+}
+
+.admin-credit-amount.is-negative {
+  color: #f0a0a4;
+}
+
+@media (max-width: 640px) {
+  .admin-credit-filter label {
+    flex: 1 1 100%;
+  }
+
+  .admin-credit-form {
+    padding: 16px;
+  }
+}
