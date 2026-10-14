@@ -3,6 +3,8 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { getDemoChapterData } from "../../features/chapters/demoChapters";
+import { getDemoPersonalProductionNotes } from "../../features/chapters/demoPersonalProductionNotes";
+import { getDemoPersonalRoughCut } from "../../features/chapters/demoPersonalRoughCut";
 import {
   capturePersonalProductionMedia,
   projectPersonalProductionSnapshot,
@@ -691,6 +693,120 @@ describe("API services", () => {
     expect(storage.getItem(API_TOKEN_KEY)).toBe("new-creative-token");
   });
 
+  it("sends chapter create, title-only update, and empty 204 delete to the bound routes", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "creative-token");
+    const chapterId = "chapter/α ?#";
+    const seriesId = "series/β ?#";
+    const record = (title: string) => ({
+      id: chapterId,
+      series_id: seriesId,
+      title,
+      content: [{ text: "" }],
+      order: 4,
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-02T00:00:00Z",
+      lock: null,
+    });
+    const calls: Array<{ url: URL; init: RequestInit }> = [];
+    const responses = [
+      jsonResponse(record("新章节"), 201),
+      jsonResponse(record("修改名称"), 200),
+      { ok: true, status: 204, json: vi.fn(async () => { throw new Error("204 has no JSON body"); }) } as unknown as Response,
+    ];
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      calls.push({ url, init });
+      const next = responses.shift();
+      if (next === undefined) {
+        throw new Error("Unexpected extra chapter request.");
+      }
+      return next;
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const create = services.createChapter;
+    const update = services.updateChapter;
+    const remove = services.deleteChapter;
+    if (!create || !update || !remove) {
+      throw new Error("Chapter management API is unavailable.");
+    }
+    const signal = new AbortController().signal;
+
+    await expect(create(seriesId, { title: "新章节", content: [{ text: "" }], order: 0 }, signal))
+      .resolves.toMatchObject({ id: chapterId, series_id: seriesId, title: "新章节" });
+    await expect(update(seriesId, chapterId, { title: "修改名称" }, signal))
+      .resolves.toMatchObject({ id: chapterId, series_id: seriesId, title: "修改名称" });
+    await expect(remove(seriesId, chapterId, signal)).resolves.toBeUndefined();
+
+    expect(calls.map(({ url, init }) => [init.method, url.pathname])).toEqual([
+      ["POST", "/api/series/series%2F%CE%B2%20%3F%23/chapters"],
+      ["PUT", "/api/chapters/chapter%2F%CE%B1%20%3F%23"],
+      ["DELETE", "/api/chapters/chapter%2F%CE%B1%20%3F%23"],
+    ]);
+    expect(calls.map(({ init }) => new Headers(init.headers).get("Authorization")))
+      .toEqual(["Bearer creative-token", "Bearer creative-token", "Bearer creative-token"]);
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({
+      title: "新章节",
+      content: [{ text: "" }],
+      order: 0,
+    });
+    expect(JSON.parse(String(calls[1]?.init.body))).toEqual({ title: "修改名称" });
+    expect(calls[2]?.init.body).toBeUndefined();
+  });
+
+  it("UCHAP-03 preserves explicit demo order while auto-assigning order zero", async () => {
+    const first = createDemoServices(new MemoryStorage());
+    const second = createDemoServices(new MemoryStorage());
+    const signal = new AbortController().signal;
+    await first.login({ username: "demo", password: "demo123" }, signal);
+    await second.login({ username: "demo", password: "demo123" }, signal);
+    const firstSeries = demoSeries[0]!;
+    const seed = getDemoChapterData(firstSeries.id);
+    if (seed === null) throw new Error("Expected a seeded chapter fixture.");
+    const original = seed.chapters.find((chapter) => chapter.title.startsWith("第一章"));
+    if (original === undefined) throw new Error("Expected the first seeded chapter.");
+    const expectedNotes = getDemoPersonalProductionNotes(
+      original.id,
+      original,
+      seed.assetsByChapter[original.id] ?? [],
+    );
+    const expectedRoughCut = getDemoPersonalRoughCut(original, seed.assetsByChapter[original.id] ?? []);
+    const update = first.updateChapter;
+    const create = first.createChapter;
+    const remove = first.deleteChapter;
+    if (!update || !create || !remove) throw new Error("Demo chapter management is unavailable.");
+
+    await update(firstSeries.id, original.id, { title: "已改名章节" }, signal);
+    expect(await first.getPersonalProductionNotes(original.id, signal)).toEqual(expectedNotes);
+    expect(await first.getPersonalRoughCut(original.id, signal)).toEqual(expectedRoughCut);
+
+    const created = await create(firstSeries.id, {
+      title: "新建空白章",
+      content: [{ text: "" }],
+      order: 0,
+    }, signal);
+    expect(created.content).toEqual([{ text: "" }]);
+    expect(created.order).toBe(3);
+    expect((await first.listChapters(firstSeries.id, signal))[0]?.id).toBe(created.id);
+    const explicitlyOrdered = await create(firstSeries.id, {
+      title: "保留显式顺序",
+      content: [{ text: "" }],
+      order: 7,
+    }, signal);
+    expect(explicitlyOrdered.order).toBe(7);
+    expect((await first.listChapters(firstSeries.id, signal))[0]?.id).toBe(explicitlyOrdered.id);
+    expect((await second.listChapters(firstSeries.id, signal)).some((chapter) => chapter.id === created.id))
+      .toBe(false);
+    expect(await first.listStoryboardAssets(firstSeries.id, created.id, signal)).toEqual([]);
+    await remove(firstSeries.id, explicitlyOrdered.id, signal);
+
+    await remove(firstSeries.id, created.id, signal);
+    await expect(first.listStoryboardAssets(firstSeries.id, created.id, signal)).rejects.toMatchObject({ status: 404 });
+    await expect(first.getPersonalProductionNotes(created.id, signal)).rejects.toMatchObject({ status: 404 });
+    await expect(first.getPersonalRoughCut(created.id, signal)).rejects.toMatchObject({ status: 404 });
+    expect((await first.listChapters(firstSeries.id, signal)).some((chapter) => chapter.id === created.id)).toBe(false);
+  });
+
   it("keeps demo series mutations local to one service instance and gives new series empty production data", async () => {
     const storage = new MemoryStorage();
     const first = createDemoServices(storage);
@@ -717,7 +833,23 @@ describe("API services", () => {
     expect(await second.listSeries(signal)).toHaveLength(before.length);
     expect(await get(created.id, signal)).toMatchObject({ name: "演示新剧", team_id: null });
     expect(await first.listChapters(created.id, signal)).toEqual([]);
-    expect(await first.listStoryboardAssets(created.id, "new-chapter", signal)).toEqual([]);
+    const createChapter = first.createChapter;
+    if (createChapter === undefined) throw new Error("Demo chapter creation is unavailable.");
+    const blankChapter = await createChapter(created.id, {
+      title: "第一章",
+      content: [{ text: "" }],
+      order: 0,
+    }, signal);
+    expect((await first.listChapters(created.id, signal)).map((chapter) => chapter.id)).toEqual([blankChapter.id]);
+    expect(await first.listStoryboardAssets(created.id, blankChapter.id, signal)).toEqual([]);
+    const blankNotes = await first.getPersonalProductionNotes(blankChapter.id, signal);
+    expect(blankNotes.revision).toBe(0);
+    expect(blankNotes.frame_notes.size).toBe(0);
+    const blankRoughCut = await first.getPersonalRoughCut(blankChapter.id, signal);
+    expect(blankRoughCut.revision).toBe(0);
+    expect(blankRoughCut.saved).toBe(false);
+    await expect(first.listStoryboardAssets(created.id, "new-chapter", signal))
+      .rejects.toMatchObject({ status: 404 });
     await update(created.id, { name: "演示修改" }, signal);
     expect((await get(created.id, signal)).name).toBe("演示修改");
     expect((await listStyles(signal)).length).toBeGreaterThan(0);

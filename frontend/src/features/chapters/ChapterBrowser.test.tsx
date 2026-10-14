@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createElement, useLayoutEffect, type ComponentProps } from "react";
-import type { Character, Chapter, Series, StoryboardAsset } from "../../shared/api/contracts";
+import type { Character, Chapter, CreateChapterInput, Series, StoryboardAsset, UpdateChapterInput } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import type { PersonalRoughCutFrameTarget, PersonalRoughCutReadIdentity } from "./PersonalRoughCutPanel";
@@ -167,11 +167,34 @@ function character(id: string, seriesId: string, name: string): Character {
 function makeServices(
   chapters: Chapter[],
   assetsByChapter: Record<string, StoryboardAsset[]> = {},
+  enableManagement = false,
 ) {
+  let currentChapters = [...chapters];
   const listChapters = vi.fn(async () => chapters);
   const listStoryboardAssets = vi.fn(async (_seriesId: string, chapterId: string) => (
     assetsByChapter[chapterId] ?? []
   ));
+  const createChapter = vi.fn(async (seriesId: string, input: CreateChapterInput) => {
+    const created = chapter("chapter-created", input.title, input.content, { series_id: seriesId, order: 3 });
+    currentChapters = [...currentChapters, created];
+    return created;
+  });
+  const updateChapter = vi.fn(async (seriesId: string, chapterId: string, update: UpdateChapterInput) => {
+    const updated = currentChapters.map((row) => row.id === chapterId ? { ...row, ...update } : row);
+    currentChapters = updated;
+    const result = updated.find((row) => row.id === chapterId);
+    if (result === undefined || result.series_id !== seriesId) {
+      throw new ApiError("http", "missing", 404);
+    }
+    return result;
+  });
+  const deleteChapter = vi.fn(async (seriesId: string, chapterId: string) => {
+    if (!currentChapters.some((row) => row.id === chapterId && row.series_id === seriesId)) {
+      throw new ApiError("http", "missing", 404);
+    }
+    currentChapters = currentChapters.filter((row) => row.id !== chapterId);
+  });
+  listChapters.mockImplementation(async () => currentChapters);
   const services: WorkspaceServices = {
     mode: "api",
     apiBaseUrl,
@@ -182,6 +205,7 @@ function makeServices(
     listSeries: async () => [],
     listMyTeams: async () => [],
     listChapters,
+    ...(enableManagement ? { createChapter, updateChapter, deleteChapter } : {}),
     listStoryboardAssets,
     listCharacters: async () => [],
     listScenes: async () => [],
@@ -191,7 +215,7 @@ function makeServices(
         listMyTasks: async () => ({ total: 0, page: 1, page_size: 10, tasks: [] }),
     logout: vi.fn(),
   };
-  return { services, listChapters, listStoryboardAssets };
+  return { services, listChapters, listStoryboardAssets, createChapter, updateChapter, deleteChapter };
 }
 
 function renderBrowser(
@@ -2726,4 +2750,407 @@ describe("read-only chapter browser", () => {
     await waitFor(() => expect(onUnauthorized).toHaveBeenCalledTimes(1));
     expect(screen.queryByRole("button", { name: "重试读取" })).not.toBeInTheDocument();
   });
+
+  it("does not offer chapter management when the series is read-only", async () => {
+    const readOnlySeries = { ...series, can_enter: false };
+    const { services } = makeServices([chapter("chapter-read-only", "只读章节", [])], {}, true);
+    renderBrowser(services, vi.fn(), vi.fn(), readOnlySeries);
+
+    await screen.findByRole("heading", { level: 2, name: "只读章节" });
+    expect(screen.queryByRole("button", { name: "新建章节" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "修改名称" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "删除章节" })).not.toBeInTheDocument();
+  });
+
+  it("creates a blank chapter with the legacy payload and selects it after a fresh list read", async () => {
+    const user = userEvent.setup();
+    const { services, createChapter, listChapters } = makeServices([], {}, true);
+    renderBrowser(services);
+
+    await user.click(await screen.findByRole("button", { name: "新建章节" }));
+    await user.type(screen.getByRole("textbox", { name: "章节名称" }), "  新章节  ");
+    await user.click(screen.getByRole("button", { name: "创建章节" }));
+
+    expect(createChapter).toHaveBeenCalledWith(
+      series.id,
+      { title: "新章节", content: [{ text: "" }], order: 0 },
+      expect.any(AbortSignal),
+    );
+    expect(await screen.findByRole("heading", { level: 2, name: "新章节" })).toBeInTheDocument();
+    expect(listChapters).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText("《新章节》已创建")).toBeInTheDocument();
+  });
+
+  it("updates only the title and preserves the selected chapter after a fresh list read", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-rename", "旧名称", []);
+    const { services, updateChapter, listChapters } = makeServices([current], {}, true);
+    renderBrowser(services);
+
+    expect(await screen.findByRole("heading", { level: 2, name: "旧名称" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "修改名称" }));
+    const input = screen.getByRole("textbox", { name: "章节名称" });
+    await user.clear(input);
+    await user.type(input, "更新名称");
+    await user.click(screen.getByRole("button", { name: "保存名称" }));
+
+    expect(updateChapter).toHaveBeenCalledWith(
+      series.id,
+      current.id,
+      { title: "更新名称" },
+      expect.any(AbortSignal),
+    );
+    expect(await screen.findByRole("heading", { level: 2, name: "更新名称" })).toBeInTheDocument();
+    expect(listChapters).toHaveBeenCalledTimes(2);
+  });
+
+  it("confirms deletion and selects the next remaining chapter from the refreshed directory", async () => {
+    const user = userEvent.setup();
+    const first = chapter("chapter-delete-first", "将删除的章节", []);
+    const second = chapter("chapter-delete-second", "保留章节", []);
+    const { services, deleteChapter, listChapters } = makeServices([first, second], {}, true);
+    renderBrowser(services);
+
+    expect(await screen.findByRole("heading", { level: 2, name: "将删除的章节" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "删除章节" }));
+    expect(screen.getByRole("dialog").querySelector(".chapter-delete-copy")).toHaveTextContent(
+      "确认删除《将删除的章节》？此操作无法撤销，章节中的分镜、聊天等相关数据也会一并删除。",
+    );
+    await user.click(screen.getByRole("checkbox", { name: "我已核对章节名称，并确认删除。" }));
+    await user.click(screen.getByRole("button", { name: "确认删除章节" }));
+
+    expect(deleteChapter).toHaveBeenCalledWith(series.id, first.id, expect.any(AbortSignal));
+    expect(await screen.findByRole("heading", { level: 2, name: "保留章节" })).toBeInTheDocument();
+    expect(listChapters).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["   ", "legacy ".repeat(16)])("does not rewrite an untouched %s", async (legacyTitle) => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-legacy-title", legacyTitle, []);
+    const { services, updateChapter } = makeServices([current], {}, true);
+    renderBrowser(services);
+
+    await screen.findByRole("button", { name: "修改名称" });
+    await user.click(screen.getByRole("button", { name: "修改名称" }));
+    expect(screen.getByRole("textbox", { name: "章节名称" })).toHaveValue(legacyTitle);
+    await user.click(screen.getByRole("button", { name: "保存名称" }));
+
+    expect(updateChapter).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("does not apply a stale verification or 401 to a changed chapter draft", async () => {
+    const user = userEvent.setup();
+    const pendingRead = deferred<Chapter[]>();
+    const { services, listChapters, createChapter } = makeServices([], {}, true);
+    listChapters.mockImplementation(async () => (
+      listChapters.mock.calls.length === 1 ? [] : pendingRead.promise
+    ));
+    createChapter.mockRejectedValueOnce(new ApiError("network", "连接中断"));
+    const onUnauthorized = vi.fn();
+    renderBrowser(services, vi.fn(), onUnauthorized);
+
+    await user.click(await screen.findByRole("button", { name: "新建章节" }));
+    const input = screen.getByRole("textbox", { name: "章节名称" });
+    await user.type(input, "初始名称");
+    await user.click(screen.getByRole("button", { name: "创建章节" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+
+    await user.click(screen.getByRole("button", { name: "重新读取章节列表核对" }));
+    await waitFor(() => expect(listChapters).toHaveBeenCalledTimes(2));
+    await user.clear(input);
+    await user.type(input, "新草稿名称");
+    await act(async () => {
+      pendingRead.reject(new ApiError("http", "expired", 401));
+      await pendingRead.promise.catch(() => undefined);
+    });
+
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(createChapter).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("textbox", { name: "章节名称" })).toHaveValue("新草稿名称");
+    expect(screen.getByRole("button", { name: "创建章节" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "重新读取章节列表核对" })).toBeEnabled();
+    expect(within(screen.getByRole("dialog")).queryByRole("status")).not.toBeInTheDocument();
+  });
+
+  it("keeps an unknown rename retry tied to the freshly read chapter", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-retry-rename", "原章节名", []);
+    const { services, updateChapter, listChapters } = makeServices([current], {}, true);
+    const readCurrentDirectory = listChapters.getMockImplementation();
+    if (readCurrentDirectory === undefined) throw new Error("Chapter directory fixture is unavailable.");
+    listChapters.mockImplementation(async () => (await readCurrentDirectory()).map((row) => ({ ...row })));
+    updateChapter.mockRejectedValueOnce(new ApiError("http", "server error", 500));
+    renderBrowser(services);
+
+    await screen.findByRole("heading", { level: 2, name: "原章节名" });
+    await user.click(screen.getByRole("button", { name: "修改名称" }));
+    const input = screen.getByRole("textbox", { name: "章节名称" });
+    await user.clear(input);
+    await user.type(input, "修改后的名称");
+    await user.click(screen.getByRole("button", { name: "保存名称" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "重新读取章节列表核对" }));
+    expect(await within(screen.getByRole("dialog")).findByRole("status"))
+      .toHaveTextContent("最新列表仍包含《原章节名》");
+    await user.click(screen.getByRole("checkbox", { name: /我已重新核对列表/ }));
+    await user.click(screen.getByRole("button", { name: "保存名称" }));
+
+    expect(updateChapter).toHaveBeenCalledTimes(2);
+    expect(updateChapter).toHaveBeenLastCalledWith(
+      series.id,
+      current.id,
+      { title: "修改后的名称" },
+      expect.any(AbortSignal),
+    );
+    expect(await screen.findByRole("heading", { level: 2, name: "修改后的名称" })).toBeInTheDocument();
+  });
+
+  it("keeps an unknown delete retry tied to the freshly read chapter", async () => {
+    const user = userEvent.setup();
+    const target = chapter("chapter-retry-delete", "待删除章节", []);
+    const remaining = chapter("chapter-retry-delete-remaining", "保留章节", []);
+    const { services, deleteChapter, listChapters } = makeServices([target, remaining], {}, true);
+    const readCurrentDirectory = listChapters.getMockImplementation();
+    if (readCurrentDirectory === undefined) throw new Error("Chapter directory fixture is unavailable.");
+    listChapters.mockImplementation(async () => (await readCurrentDirectory()).map((row) => ({ ...row })));
+    deleteChapter.mockRejectedValueOnce(new ApiError("http", "server error", 500));
+    renderBrowser(services);
+
+    await screen.findByRole("heading", { level: 2, name: "待删除章节" });
+    await user.click(screen.getByRole("button", { name: "删除章节" }));
+    await user.click(screen.getByRole("checkbox", { name: "我已核对章节名称，并确认删除。" }));
+    await user.click(screen.getByRole("button", { name: "确认删除章节" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+    expect(deleteChapter).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "重新读取章节列表核对" }));
+    expect(await within(screen.getByRole("dialog")).findByRole("status"))
+      .toHaveTextContent("最新列表仍包含《待删除章节》");
+    await user.click(screen.getByRole("checkbox", { name: /我已重新核对列表/ }));
+    await user.click(screen.getByRole("button", { name: "确认删除章节" }));
+
+    expect(deleteChapter).toHaveBeenCalledTimes(2);
+    expect(deleteChapter).toHaveBeenLastCalledWith(series.id, target.id, expect.any(AbortSignal));
+    expect(await screen.findByRole("heading", { level: 2, name: "保留章节" })).toBeInTheDocument();
+  });
+
+  it("explains when the freshly read directory no longer contains the delete target", async () => {
+    const user = userEvent.setup();
+    const target = chapter("chapter-missing-after-delete", "待核对删除", []);
+    const { services, deleteChapter, listChapters } = makeServices([target], {}, true);
+    listChapters.mockImplementationOnce(async () => [target]).mockImplementationOnce(async () => []);
+    deleteChapter.mockRejectedValueOnce(new ApiError("http", "server error", 500));
+    renderBrowser(services);
+
+    await screen.findByRole("heading", { level: 2, name: "待核对删除" });
+    await user.click(screen.getByRole("button", { name: "删除章节" }));
+    await user.click(screen.getByRole("checkbox", { name: "我已核对章节名称，并确认删除。" }));
+    await user.click(screen.getByRole("button", { name: "确认删除章节" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+
+    await user.click(screen.getByRole("button", { name: "重新读取章节列表核对" }));
+    expect(await within(screen.getByRole("dialog")).findByRole("status"))
+      .toHaveTextContent("已不在最新列表中；无法确认原请求结果，也不能再次提交");
+
+    expect(deleteChapter).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("checkbox", { name: /我已重新核对列表/ })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认删除章节" })).toBeDisabled();
+  });
+
+  it("ignores a late chapter mutation 401 after switching to another series", async () => {
+    const user = userEvent.setup();
+    const pendingCreate = deferred<Chapter>();
+    const { services, createChapter } = makeServices([], {}, true);
+    createChapter.mockReturnValueOnce(pendingCreate.promise);
+    const onUnauthorized = vi.fn();
+    const view = renderBrowser(services, vi.fn(), onUnauthorized);
+
+    await user.click(await screen.findByRole("button", { name: "新建章节" }));
+    await user.type(screen.getByRole("textbox", { name: "章节名称" }), "旧剧集的新章");
+    await user.click(screen.getByRole("button", { name: "创建章节" }));
+    await waitFor(() => expect(createChapter).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={onUnauthorized}
+        series={{ ...series, id: "another-series" }}
+        services={services}
+        userId="demo-user"
+      />,
+    );
+    await act(async () => {
+      pendingCreate.reject(new ApiError("http", "expired", 401));
+      await pendingCreate.promise.catch(() => undefined);
+    });
+
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+    expect(createChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("requires a fresh directory read and a separate user confirmation before retrying an unknown create", async () => {
+    const user = userEvent.setup();
+    const { services, createChapter } = makeServices([], {}, true);
+    createChapter.mockRejectedValueOnce(new ApiError("network", "连接中断"));
+    renderBrowser(services);
+
+    await user.click(await screen.findByRole("button", { name: "新建章节" }));
+    await user.type(screen.getByRole("textbox", { name: "章节名称" }), "待核对章节");
+    await user.click(screen.getByRole("button", { name: "创建章节" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+    expect(screen.getByRole("button", { name: "创建章节" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "重新读取章节列表核对" }));
+    expect(await within(screen.getByRole("dialog")).findByRole("status"))
+      .toHaveTextContent("名称相同也不能证明是本次创建");
+    expect(await within(screen.getByRole("dialog")).findByRole("region", { name: "最新读取的章节目录" }))
+      .toHaveTextContent("最新列表暂无章节。");
+    await user.click(screen.getByRole("checkbox", { name: /我已重新核对列表/ }));
+    await user.click(screen.getByRole("button", { name: "创建章节" }));
+
+    expect(createChapter).toHaveBeenCalledTimes(2);
+    expect(await screen.findByRole("heading", { level: 2, name: "待核对章节" })).toBeInTheDocument();
+  });
+
+  it("UCHAP-01 revokes create retry confirmation after a later verification fails", async () => {
+    const user = userEvent.setup();
+    const sameName = chapter("chapter-same-name", "待核对章节", [], {
+      created_at: "2026-10-04T08:00:00Z",
+    });
+    const otherName = chapter("chapter-other-name", "另一个已存在章节", [], {
+      created_at: "2026-10-03T08:00:00Z",
+    });
+    const { services, listChapters, createChapter } = makeServices([], {}, true);
+    listChapters
+      .mockImplementationOnce(async () => [])
+      .mockImplementationOnce(async () => [sameName, otherName])
+      .mockRejectedValueOnce(new ApiError("network", "目录读取失败"))
+      .mockImplementationOnce(async () => [sameName, otherName]);
+    createChapter.mockRejectedValueOnce(new ApiError("network", "创建结果未知"));
+    renderBrowser(services);
+
+    await user.click(await screen.findByRole("button", { name: "新建章节" }));
+    await user.type(screen.getByRole("textbox", { name: "章节名称" }), "待核对章节");
+    await user.click(screen.getByRole("button", { name: "创建章节" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+
+    await user.click(screen.getByRole("button", { name: "重新读取章节列表核对" }));
+    const dialog = within(screen.getByRole("dialog"));
+    const firstDirectory = await dialog.findByRole("region", { name: "最新读取的章节目录" });
+    expect(within(firstDirectory).getByText("待核对章节")).toBeInTheDocument();
+    expect(within(firstDirectory).getByText("另一个已存在章节")).toBeInTheDocument();
+    expect(firstDirectory).toHaveTextContent("创建于 2026-10-04T08:00:00Z");
+    expect(firstDirectory).not.toHaveTextContent(sameName.id);
+    await user.click(dialog.getByRole("checkbox", { name: /我已重新核对列表/ }));
+
+    await user.click(dialog.getByRole("button", { name: "重新读取章节列表核对" }));
+    expect(await dialog.findByRole("status")).toHaveTextContent("暂时无法核实：目录读取失败");
+    expect(dialog.queryByRole("region", { name: "最新读取的章节目录" })).not.toBeInTheDocument();
+    expect(dialog.queryByRole("checkbox", { name: /我已重新核对列表/ })).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: "创建章节" })).toBeDisabled();
+    expect(createChapter).toHaveBeenCalledTimes(1);
+
+    await user.click(dialog.getByRole("button", { name: "重新读取章节列表核对" }));
+    expect(await dialog.findByRole("region", { name: "最新读取的章节目录" }))
+      .toHaveTextContent("另一个已存在章节");
+    expect(dialog.getByRole("checkbox", { name: /我已重新核对列表/ })).not.toBeChecked();
+    await user.click(dialog.getByRole("checkbox", { name: /我已重新核对列表/ }));
+    await user.click(dialog.getByRole("button", { name: "创建章节" }));
+
+    expect(createChapter).toHaveBeenCalledTimes(2);
+    expect(await screen.findByRole("heading", { level: 2, name: "待核对章节" })).toBeInTheDocument();
+  });
+
+  it("UCHAP-01/02 revokes delete retry after a failed verification and shows the current directory", async () => {
+    const user = userEvent.setup();
+    const target = chapter("chapter-delete-reverify", "需要再次核对", [], {
+      created_at: "2026-10-05T10:30:00Z",
+    });
+    const remaining = chapter("chapter-delete-reverify-remaining", "另一条目录记录", [], {
+      created_at: "2026-10-04T10:30:00Z",
+    });
+    const { services, listChapters, deleteChapter } = makeServices([target, remaining], {}, true);
+    listChapters
+      .mockImplementationOnce(async () => [target, remaining])
+      .mockImplementationOnce(async () => [target, remaining])
+      .mockRejectedValueOnce(new ApiError("network", "目录读取失败"))
+      .mockImplementationOnce(async () => [target, remaining]);
+    deleteChapter.mockRejectedValueOnce(new ApiError("http", "删除结果未知", 500));
+    renderBrowser(services);
+
+    await screen.findByRole("heading", { level: 2, name: "需要再次核对" });
+    await user.click(screen.getByRole("button", { name: "删除章节" }));
+    const dialog = within(screen.getByRole("dialog"));
+    await user.click(dialog.getByRole("checkbox", { name: "我已核对章节名称，并确认删除。" }));
+    await user.click(dialog.getByRole("button", { name: "确认删除章节" }));
+    expect(await dialog.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+    expect(deleteChapter).toHaveBeenCalledTimes(1);
+
+    await user.click(dialog.getByRole("button", { name: "重新读取章节列表核对" }));
+    const firstDirectory = await dialog.findByRole("region", { name: "最新读取的章节目录" });
+    expect(within(firstDirectory).getByText("需要再次核对")).toBeInTheDocument();
+    expect(within(firstDirectory).getByText("另一条目录记录")).toBeInTheDocument();
+    expect(firstDirectory).toHaveTextContent("创建于 2026-10-05T10:30:00Z");
+    await user.click(dialog.getByRole("checkbox", { name: /我已重新核对列表/ }));
+
+    await user.click(dialog.getByRole("button", { name: "重新读取章节列表核对" }));
+    expect(await dialog.findByRole("status")).toHaveTextContent("暂时无法核实：目录读取失败");
+    expect(dialog.queryByRole("region", { name: "最新读取的章节目录" })).not.toBeInTheDocument();
+    expect(dialog.queryByRole("checkbox", { name: /我已重新核对列表/ })).not.toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: "确认删除章节" })).toBeDisabled();
+    expect(deleteChapter).toHaveBeenCalledTimes(1);
+
+    await user.click(dialog.getByRole("button", { name: "重新读取章节列表核对" }));
+    const latestDirectory = await dialog.findByRole("region", { name: "最新读取的章节目录" });
+    expect(latestDirectory).toHaveTextContent("另一条目录记录");
+    expect(dialog.getByRole("checkbox", { name: /我已重新核对列表/ })).not.toBeChecked();
+    await user.click(dialog.getByRole("checkbox", { name: /我已重新核对列表/ }));
+    await user.click(dialog.getByRole("button", { name: "确认删除章节" }));
+
+    expect(deleteChapter).toHaveBeenCalledTimes(2);
+    expect(await screen.findByRole("heading", { level: 2, name: "另一条目录记录" })).toBeInTheDocument();
+  });
+
+  it("UCHAP-02 lets keyboard users enter the freshly read chapter directory", async () => {
+    const user = userEvent.setup();
+    const latestChapters = Array.from({ length: 20 }, (_, index) => chapter(
+      `fresh-directory-${index + 1}`,
+      `核对章节 ${index + 1}`,
+      [],
+      { created_at: `2026-10-15T00:${String(index).padStart(2, "0")}:00Z` },
+    ));
+    const { services, listChapters, createChapter } = makeServices([], {}, true);
+    listChapters
+      .mockImplementationOnce(async () => [])
+      .mockImplementationOnce(async () => latestChapters);
+    createChapter.mockRejectedValueOnce(new ApiError("network", "创建结果未知"));
+    renderBrowser(services);
+
+    await user.click(await screen.findByRole("button", { name: "新建章节" }));
+    await user.type(screen.getByRole("textbox", { name: "章节名称" }), "等待核对的新章");
+    await user.click(screen.getByRole("button", { name: "创建章节" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("本次请求结果未确认");
+
+    const dialog = within(screen.getByRole("dialog"));
+    const verifyButton = dialog.getByRole("button", { name: "重新读取章节列表核对" });
+    await user.click(verifyButton);
+    const directory = await dialog.findByRole("region", { name: "最新读取的章节目录" });
+    expect(within(directory).getAllByRole("listitem")).toHaveLength(20);
+    expect(within(directory).getByText("核对章节 1")).toBeInTheDocument();
+    expect(within(directory).getByText("核对章节 20")).toBeInTheDocument();
+    expect(directory).toHaveTextContent("创建于 2026-10-15T00:00:00Z");
+    expect(directory).toHaveTextContent("创建于 2026-10-15T00:19:00Z");
+    expect(screen.getByRole("heading", { level: 1, name: series.name })
+      .closest(".chapter-browser-heading")?.hasAttribute("inert")).toBe(true);
+    expect(verifyButton).toHaveFocus();
+
+    await user.tab({ shift: true });
+
+    expect(directory).toHaveFocus();
+  });
+
 });

@@ -53,6 +53,16 @@ export interface Chapter {
   lock: Record<string, unknown> | null;
 }
 
+export interface CreateChapterInput {
+  title: string;
+  content: StoryboardFrame[];
+  order: number;
+}
+
+export interface UpdateChapterInput {
+  title?: string;
+}
+
 export interface StoryboardAsset {
   id: string;
   series_id: string;
@@ -358,6 +368,21 @@ export function parseChapterList(value: unknown, expectedSeriesId: string): Chap
     ids.add(chapter.id);
   }
   return chapters;
+}
+
+export function parseChapterResponse(
+  value: unknown,
+  expectedSeriesId: string,
+  expectedChapterId?: string,
+): Chapter {
+  const chapter = parseChapter(value);
+  if (chapter.series_id !== expectedSeriesId) {
+    throw new InvalidResponseError("服务器返回了不属于当前剧集的章节。");
+  }
+  if (expectedChapterId !== undefined && chapter.id !== expectedChapterId) {
+    throw new InvalidResponseError("服务器返回了其他章节的信息。");
+  }
+  return chapter;
 }
 
 function parseStoryboardAsset(value: unknown): StoryboardAsset {

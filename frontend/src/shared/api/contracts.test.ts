@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import {
   InvalidResponseError,
   parseChapterList,
+  parseChapterResponse,
   parseCharacterList,
   parseLoginResponse,
   parsePropList,
@@ -263,6 +264,15 @@ describe("chapter and storyboard asset runtime contracts", () => {
     { label: "duplicate id", value: [validChapter(), validChapter({ title: "重复" })] },
   ])("rejects $label chapter data as an invalid response", ({ value }) => {
     expect(() => parseChapterList(value, "series-1")).toThrow(InvalidResponseError);
+  });
+
+  it("binds a single chapter response to the requested series and optional chapter identity", () => {
+    const response = validChapter({ id: "chapter-requested" });
+    expect(parseChapterResponse(response, "series-1", "chapter-requested")).toMatchObject(response);
+    expect(() => parseChapterResponse(response, "another-series", "chapter-requested"))
+      .toThrow("服务器返回了不属于当前剧集的章节。");
+    expect(() => parseChapterResponse(response, "series-1", "chapter-other"))
+      .toThrow("服务器返回了其他章节的信息。");
   });
 
   it("accepts nullable asset fields and an empty schema-valid asset name", () => {

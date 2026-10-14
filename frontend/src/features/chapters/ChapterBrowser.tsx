@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ApiError } from "../../shared/api/errors";
+import { ApiError } from "../../shared/api/errors";
 import type { Chapter, Series, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import {
@@ -26,6 +26,7 @@ import {
 import { projectStoryboardFrames, type TextField } from "./storyboardProjection";
 import { findRoughCutFramePosition } from "./roughCutFrameNavigation";
 import { resolveProductionNoteFrameTarget } from "./productionNoteFrameNavigation";
+import { ChapterManagementDialog, type ChapterManagementAction } from "./ChapterManagementDialog";
 
 interface ChapterBrowserProps {
   series: Series;
@@ -58,6 +59,19 @@ interface ChapterDirectorySnapshot {
   scope: ChapterBrowserScope;
   requestGeneration: number;
   chapters: Chapter[] | null;
+}
+
+interface ChapterMutationSelectionIntent {
+  scope: ChapterBrowserScope;
+  chapterId: string | null;
+  fallbackIndex: number;
+  message: string | null;
+}
+
+interface ChapterManagementRequest {
+  action: ChapterManagementAction;
+  scope: ChapterBrowserScope;
+  chapter: Chapter | null;
 }
 
 type NavigationIssue = "missing" | "duplicate" | "foreign" | "frame";
@@ -351,12 +365,15 @@ export function ChapterBrowser({
   const [chapters, setChapters] = useState<Chapter[] | null>(null);
   const [chaptersLoading, setChaptersLoading] = useState(true);
   const [chaptersError, setChaptersError] = useState<ApiError | null>(null);
+  const [chapterManagement, setChapterManagement] = useState<ChapterManagementRequest | null>(null);
+  const [chapterMutationNotice, setChapterMutationNotice] = useState<string | null>(null);
   const [navigationIssue, setNavigationIssue] = useState<{ epoch: number; issue: NavigationIssue } | null>(null);
   const [pendingFrameNavigation, setPendingFrameNavigation] = useState<PendingFrameNavigation | null>(null);
   const pendingFrameNavigationRef = useRef<PendingFrameNavigation | null>(null);
   pendingFrameNavigationRef.current = pendingFrameNavigation;
   const [frameNavigationFeedback, setFrameNavigationFeedback] = useState<FrameNavigationFeedback | null>(null);
   const [chapterReloadKey, setChapterReloadKey] = useState(0);
+  const chapterReloadSequence = useRef(0);
   const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null);
   const selectedChapterIdRef = useRef(selectedChapterId);
   selectedChapterIdRef.current = selectedChapterId;
@@ -378,6 +395,7 @@ export function ChapterBrowser({
   roughCutContextRef.current = personalRoughCutContext;
   const roughCutOpenEpoch = useRef(0);
   const chapterRequestGeneration = useRef(0);
+  const chapterMutationSelectionIntent = useRef<ChapterMutationSelectionIntent | null>(null);
   const assetRequestGeneration = useRef(0);
   const personalNotesOpenEpoch = useRef(0);
   const personalNotesContextRef = useRef<PersonalNotesContext | null>(null);
@@ -422,6 +440,9 @@ export function ChapterBrowser({
     setChapters(null);
     setChaptersLoading(true);
     setChaptersError(null);
+    setChapterManagement(null);
+    setChapterMutationNotice(null);
+    chapterMutationSelectionIntent.current = null;
     setNavigationIssue(null);
     setSelectedChapterId(null);
     selectedChapterIdRef.current = null;
@@ -488,16 +509,24 @@ export function ChapterBrowser({
       && !finalizedNavigationEpochsRef.current.has(suppliedIntent.navigationEpoch)
       ? suppliedIntent
       : null;
+    const mutationSelection = suppliedIntent === null
+      && chapterMutationSelectionIntent.current !== null
+      && sameChapterBrowserScope(chapterMutationSelectionIntent.current.scope, requestScope)
+      ? chapterMutationSelectionIntent.current
+      : null;
     const controller = new AbortController();
     let current = true;
     assetCache.current.clear();
-    setChapters(null);
-    setSelectedChapterId(null);
-    setAssetResult(null);
+    if (mutationSelection === null) {
+      setChapters(null);
+      setSelectedChapterId(null);
+      setAssetResult(null);
+    }
     setChaptersError(null);
     setNavigationIssue(null);
     setPendingFrameNavigation(null);
     setFrameNavigationFeedback(null);
+    setChapterMutationNotice(null);
     setChaptersLoading(true);
 
     const isCurrent = () => current
@@ -518,8 +547,27 @@ export function ChapterBrowser({
       setChapters(result);
       if (suppliedIntent === null) {
         setNavigationIssue(null);
-        setSelectedChapterId(result[0]?.id ?? null);
-        selectedChapterIdRef.current = result[0]?.id ?? null;
+        if (mutationSelection !== null) {
+          const selectedById = mutationSelection.chapterId === null
+            ? undefined
+            : result.find((chapter) => chapter.id === mutationSelection.chapterId);
+          const fallback = result.length === 0
+            ? undefined
+            : result[Math.min(mutationSelection.fallbackIndex, result.length - 1)];
+          const nextSelected = selectedById ?? fallback ?? null;
+          setSelectedChapterId(nextSelected?.id ?? null);
+          selectedChapterIdRef.current = nextSelected?.id ?? null;
+          setAssetResult(null);
+          if (mutationSelection.message !== null) {
+            setChapterMutationNotice(mutationSelection.message);
+          }
+          if (chapterMutationSelectionIntent.current === mutationSelection) {
+            chapterMutationSelectionIntent.current = null;
+          }
+        } else {
+          setSelectedChapterId(result[0]?.id ?? null);
+          selectedChapterIdRef.current = result[0]?.id ?? null;
+        }
       } else if (requestIntent === null) {
         setSelectedChapterId(null);
         selectedChapterIdRef.current = null;
@@ -576,6 +624,14 @@ export function ChapterBrowser({
       if (error.status === 401) {
         unauthorizedHandlerRef.current();
         return;
+      }
+      if (mutationSelection !== null) {
+        if (mutationSelection.message !== null) {
+          setChapterMutationNotice(`${mutationSelection.message}，但章节列表刷新失败，请重试读取。`);
+        }
+        if (chapterMutationSelectionIntent.current === mutationSelection) {
+          chapterMutationSelectionIntent.current = null;
+        }
       }
       if (suppliedIntent?.frameTarget !== undefined && requestIntent !== null) {
         setNavigationIssue({ epoch: requestIntent.navigationEpoch, issue: "frame" });
@@ -1212,7 +1268,13 @@ export function ChapterBrowser({
     setChapters(null);
     setSelectedChapterId(null);
     setAssetResult(null);
-    setChapterReloadKey((key) => key + 1);
+    requestChapterDirectoryReload(null);
+  }
+
+  function requestChapterDirectoryReload(selection: ChapterMutationSelectionIntent | null): void {
+    chapterMutationSelectionIntent.current = selection;
+    chapterReloadSequence.current += 1;
+    setChapterReloadKey(chapterReloadSequence.current);
   }
 
   function retryAssets() {
@@ -1361,6 +1423,225 @@ export function ChapterBrowser({
   }
 
   const selectedIndex = chapters?.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
+  const chapterManagementBlocked = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
+  const canManageChapters = series.can_enter
+    && services.createChapter !== undefined
+    && services.updateChapter !== undefined
+    && services.deleteChapter !== undefined;
+
+  function openChapterManagement(action: ChapterManagementAction, chapter: Chapter | null = null): void {
+    if (!canManageChapters || chapterManagementBlocked || chaptersLoading || chapters === null || chaptersError !== null) {
+      return;
+    }
+    if (chapter !== null && !isChapterSelectableFromDirectory(chapters, chapter.id, series.id)) {
+      return;
+    }
+    setChapterMutationNotice(null);
+    setChapterManagement({ action, scope: currentScope, chapter });
+  }
+
+  function managementRequestIsCurrent(
+    request: ChapterManagementRequest,
+    directory: ChapterDirectorySnapshot,
+    signal: AbortSignal,
+  ): boolean {
+    const latest = chapterDirectoryRef.current;
+    const matchingTargets = request.chapter === null
+      ? []
+      : latest.chapters?.filter((chapter) => chapter.id === request.chapter?.id) ?? [];
+    return !signal.aborted
+      && sameChapterBrowserScope(request.scope, activeScopeRef.current)
+      && sameChapterBrowserScope(directory.scope, latest.scope)
+      && directory.requestGeneration === latest.requestGeneration
+      && directory.requestGeneration === chapterRequestGeneration.current
+      && directory.chapters === latest.chapters
+      && (request.chapter === null || (
+        selectedChapterIdRef.current === request.chapter.id
+        && matchingTargets.length === 1
+        && matchingTargets[0]?.series_id === request.scope.seriesId
+        && matchingTargets[0]?.title === request.chapter.title
+      ));
+  }
+
+  async function confirmChapterManagement(
+    request: ChapterManagementRequest,
+    title: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const directory = chapterDirectoryRef.current;
+    const currentContext = !signal.aborted
+      && sameChapterBrowserScope(request.scope, activeScopeRef.current)
+      && sameChapterBrowserScope(request.scope, directory.scope)
+      && directory.requestGeneration === chapterRequestGeneration.current;
+    if (!currentContext) {
+      throw new ApiError("aborted", "Request was cancelled.");
+    }
+
+    const target = request.chapter;
+    const matchingTargets = target === null
+      ? []
+      : directory.chapters?.filter((chapter) => chapter.id === target.id) ?? [];
+    if (target !== null && matchingTargets.length !== 1) {
+      throw new ApiError("http", "当前章节已不在最新列表中，未发送本次操作。", 404);
+    }
+    const latestTarget = matchingTargets[0];
+    if (target !== null && (
+      latestTarget?.series_id !== request.scope.seriesId
+      || latestTarget.title !== target.title
+      || selectedChapterIdRef.current !== target.id
+    )) {
+      throw new ApiError("http", "当前章节信息已变化，未发送本次操作，请重新核对。", 409);
+    }
+    const currentIndex = target === null
+      ? directory.chapters?.length ?? 0
+      : directory.chapters?.findIndex((chapter) => chapter.id === target.id) ?? -1;
+    try {
+      if (request.action === "create") {
+        if (target !== null || services.createChapter === undefined) {
+          throw new ApiError("invalid-response", "当前无法创建章节。");
+        }
+        const created = await services.createChapter(
+          series.id,
+          { title, content: [{ text: "" }], order: 0 },
+          signal,
+        );
+        if (!managementRequestIsCurrent(request, directory, signal)) {
+          throw new ApiError("aborted", "Request was cancelled.");
+        }
+        setChapterMutationNotice(null);
+        requestChapterDirectoryReload({
+          scope: request.scope,
+          chapterId: created.id,
+          fallbackIndex: currentIndex,
+          message: `《${created.title}》已创建`,
+        });
+        return;
+      }
+      if (target === null || currentIndex < 0) {
+        throw new ApiError("invalid-response", "当前章节身份无法核对。");
+      }
+      if (request.action === "rename") {
+        if (services.updateChapter === undefined) {
+          throw new ApiError("invalid-response", "当前无法修改章节名称。");
+        }
+        await services.updateChapter(series.id, target.id, { title }, signal);
+        if (!managementRequestIsCurrent(request, directory, signal)) {
+          throw new ApiError("aborted", "Request was cancelled.");
+        }
+        setChapterMutationNotice(null);
+        requestChapterDirectoryReload({
+          scope: request.scope,
+          chapterId: target.id,
+          fallbackIndex: currentIndex,
+          message: `《${title}》名称已保存`,
+        });
+        return;
+      }
+      if (services.deleteChapter === undefined) {
+        throw new ApiError("invalid-response", "当前无法删除章节。");
+      }
+      await services.deleteChapter(series.id, target.id, signal);
+      if (!managementRequestIsCurrent(request, directory, signal)) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      assetCache.current.delete(target.id);
+      setChapterMutationNotice(null);
+      requestChapterDirectoryReload({
+        scope: request.scope,
+        chapterId: null,
+        fallbackIndex: currentIndex,
+        message: `《${target.title}》已删除`,
+      });
+    } catch (cause) {
+      if (managementRequestIsCurrent(request, directory, signal)) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401) {
+          unauthorizedHandlerRef.current();
+        }
+      }
+      throw cause;
+    }
+  }
+
+  async function verifyChapterManagement(
+    request: ChapterManagementRequest,
+    signal: AbortSignal,
+  ): Promise<{ message: string; canRetry: boolean; chapters: Chapter[] }> {
+    const directory = chapterDirectoryRef.current;
+    if (!managementRequestIsCurrent(request, directory, signal)) {
+      throw new ApiError("aborted", "Request was cancelled.");
+    }
+    const targetId = request.chapter?.id ?? selectedChapterIdRef.current;
+    const targetIndex = targetId === null
+      ? 0
+      : directory.chapters?.findIndex((chapter) => chapter.id === targetId) ?? 0;
+    try {
+      const result = await services.listChapters(series.id, signal);
+      if (!managementRequestIsCurrent(request, directory, signal)) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      const nextSelected = targetId === null
+        ? result[Math.min(Math.max(0, targetIndex), result.length - 1)]
+        : result.find((chapter) => chapter.id === targetId)
+          ?? result[Math.min(Math.max(0, targetIndex), result.length - 1)];
+      chapterRequestGeneration.current += 1;
+      chapterDirectoryRef.current = {
+        scope: request.scope,
+        requestGeneration: chapterRequestGeneration.current,
+        chapters: result,
+      };
+      setChapters(result);
+      setSelectedChapterId(nextSelected?.id ?? null);
+      selectedChapterIdRef.current = nextSelected?.id ?? null;
+      setChaptersError(null);
+      setChaptersLoading(false);
+      setAssetResult(null);
+      const refreshedTarget = request.chapter === null
+        ? undefined
+        : result.find((chapter) => chapter.id === request.chapter?.id);
+      if (request.action === "create") {
+        return {
+          message: "章节列表已重新读取；请自行核对新建结果，名称相同也不能证明是本次创建。",
+          canRetry: true,
+          chapters: result,
+        };
+      }
+      if (refreshedTarget === undefined) {
+        return {
+          message: `《${request.chapter?.title ?? "当前章节"}》已不在最新列表中；无法确认原请求结果，也不能再次提交。`,
+          canRetry: false,
+          chapters: result,
+        };
+      }
+      if (refreshedTarget.title !== request.chapter?.title) {
+        return {
+          message: `最新列表中的章节名称已变为《${refreshedTarget.title}》；请关闭窗口并重新核对当前章节。`,
+          canRetry: false,
+          chapters: result,
+        };
+      }
+      setChapterManagement((current) => (
+        current !== null
+        && current.action === request.action
+        && current.chapter?.id === request.chapter?.id
+        && sameChapterBrowserScope(current.scope, request.scope)
+          ? { ...current, chapter: refreshedTarget }
+          : current
+      ));
+      return {
+        message: `最新列表仍包含《${refreshedTarget.title}》。`,
+        canRetry: true,
+        chapters: result,
+      };
+    } catch (cause) {
+      const error = normalizeApiError(cause);
+      if (error.status === 401 && managementRequestIsCurrent(request, directory, signal)) {
+        unauthorizedHandlerRef.current();
+      }
+      throw cause;
+    }
+  }
+
   const currentNavigationIssue = navigationIssue !== null
     && navigationIntent?.navigationEpoch === navigationIssue.epoch
     ? navigationIssue.issue
@@ -1411,10 +1692,30 @@ export function ChapterBrowser({
               <p className="eyebrow">剧集章节</p>
               <h2>章节列表</h2>
             </div>
-            {!chaptersLoading && chaptersError === null && chapters !== null && (
-              <span className="chapter-count">{chapters.length} 章</span>
-            )}
+            <div className="chapter-list-heading-actions">
+              {!chaptersLoading && chaptersError === null && chapters !== null && (
+                <span className="chapter-count">{chapters.length} 章</span>
+              )}
+              {canManageChapters && (
+                <button
+                  className="primary-button chapter-create-button"
+                  disabled={chaptersLoading || chapters === null || chaptersError !== null || chapterManagementBlocked}
+                  onClick={() => openChapterManagement("create")}
+                  title={chapterManagementBlocked ? "请先关闭当前制作记录或原图引用面板" : undefined}
+                  type="button"
+                >新建章节</button>
+              )}
+            </div>
           </div>
+
+          {chapterManagementBlocked && (
+            <p className="chapter-management-blocked" role="status">
+              请先关闭当前制作记录或原图引用面板，再管理章节。
+            </p>
+          )}
+          {chapterMutationNotice !== null && (
+            <p className="chapter-management-notice" role="status">{chapterMutationNotice}</p>
+          )}
 
           {chaptersLoading && (
             <div className="chapter-list-state" role="status" aria-live="polite">
@@ -1516,6 +1817,24 @@ export function ChapterBrowser({
                 </div>
                 <div className="selected-chapter-actions">
                   <span className="readonly-pill">只读</span>
+                  {canManageChapters && (
+                    <>
+                      <button
+                        className="text-button"
+                        disabled={chaptersLoading || chapterManagementBlocked}
+                        onClick={() => openChapterManagement("rename", selectedChapter)}
+                        title={chapterManagementBlocked ? "请先关闭当前制作记录或原图引用面板" : undefined}
+                        type="button"
+                      >修改名称</button>
+                      <button
+                        className="text-button chapter-delete-action"
+                        disabled={chaptersLoading || chapterManagementBlocked}
+                        onClick={() => openChapterManagement("delete", selectedChapter)}
+                        title={chapterManagementBlocked ? "请先关闭当前制作记录或原图引用面板" : undefined}
+                        type="button"
+                      >删除章节</button>
+                    </>
+                  )}
                   <button
                     className="text-button chapter-refresh-button"
                     onClick={retryChapters}
@@ -1828,6 +2147,16 @@ export function ChapterBrowser({
           )}
         </div>
       </div>
+      {chapterManagement !== null && sameChapterBrowserScope(chapterManagement.scope, currentScope) && (
+        <ChapterManagementDialog
+          action={chapterManagement.action}
+          key={`${chapterManagement.scope.userId}:${chapterManagement.scope.seriesId}:${chapterManagement.action}:${chapterManagement.chapter?.id ?? "new"}`}
+          onClose={() => setChapterManagement(null)}
+          onConfirm={(title, signal) => confirmChapterManagement(chapterManagement, title, signal)}
+          onVerify={(signal) => verifyChapterManagement(chapterManagement, signal)}
+          {...(chapterManagement.chapter === null ? {} : { chapter: chapterManagement.chapter })}
+        />
+      )}
     </section>
   );
 }

@@ -1456,6 +1456,117 @@ a:focus-visible {
   font-weight: 680;
 }
 
+.chapter-list-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.chapter-create-button {
+  min-height: 31px;
+  padding: 0 11px;
+  font-size: 10px;
+}
+
+.chapter-management-blocked,
+.chapter-management-notice {
+  margin: 0;
+  padding: 10px 16px;
+  color: #687b77;
+  background: #f6faf8;
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.chapter-management-notice {
+  color: #267064;
+  background: #eef8f4;
+}
+
+.chapter-delete-action {
+  color: #a0524b;
+}
+
+.chapter-delete-copy {
+  margin: 0 0 18px;
+  color: #52625e;
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+.chapter-delete-copy strong {
+  color: #293b39;
+}
+
+.chapter-delete-confirmation {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 0 17px;
+  color: #52625e;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.chapter-delete-confirmation input {
+  width: 15px;
+  height: 15px;
+  flex: 0 0 auto;
+  margin: 1px 0 0;
+  accent-color: #267064;
+}
+
+.chapter-management-status {
+  margin: 0;
+  color: #6c7d79;
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+.chapter-management-directory {
+  display: grid;
+  gap: 8px;
+  max-height: 180px;
+  margin-top: 14px;
+  overflow-y: auto;
+  border-top: 1px solid #e4ebe8;
+  padding-top: 12px;
+}
+
+.chapter-management-directory h3 {
+  margin: 0;
+  color: #425652;
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.chapter-management-directory ul {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chapter-management-directory li {
+  display: grid;
+  gap: 3px;
+  border-radius: 8px;
+  padding: 8px 10px;
+  background: #f6faf8;
+}
+
+.chapter-management-directory li strong {
+  color: #354744;
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.chapter-management-directory time {
+  color: #83918e;
+  font-size: 10px;
+}
+
 .chapter-count {
   color: #7f9390;
   font-size: 10px;

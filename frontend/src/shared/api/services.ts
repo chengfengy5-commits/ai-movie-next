@@ -1,6 +1,6 @@
 import { demoSeries } from "../../features/series/demoSeries";
 import { demoTeams } from "../../features/series/demoTeams";
-import { getDemoChapterData } from "../../features/chapters/demoChapters";
+import { getDemoChapterData, type DemoChapterData } from "../../features/chapters/demoChapters";
 import { getDemoAssetLibraryData } from "../../features/assets/demoAssets";
 import { getDemoPersonalProductionNotes } from "../../features/chapters/demoPersonalProductionNotes";
 import { clonePersonalRoughCutSnapshot, getDemoPersonalRoughCut } from "../../features/chapters/demoPersonalRoughCut";
@@ -9,6 +9,7 @@ import { ApiError, isAbortError } from "./errors";
 import {
   InvalidResponseError,
   parseChapterList,
+  parseChapterResponse,
   parseCharacterList,
   parseErrorDetail,
   parseLoginResponse,
@@ -20,11 +21,14 @@ import {
   parseUser,
   type Character,
   type Chapter,
+  type CreateChapterInput,
   type Credentials,
   type Prop,
   type Scene,
   type Series,
   type StoryboardAsset,
+  type StoryboardFrame,
+  type UpdateChapterInput,
   type User,
 } from "./contracts";
 import {
@@ -78,6 +82,14 @@ export interface WorkspaceServices {
   uploadSeriesCover?(file: File, signal: AbortSignal): Promise<string>;
   listMyTeams(signal: AbortSignal): Promise<MyTeam[]>;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
+  createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
+  updateChapter?(
+    seriesId: string,
+    chapterId: string,
+    update: UpdateChapterInput,
+    signal: AbortSignal,
+  ): Promise<Chapter>;
+  deleteChapter?(seriesId: string, chapterId: string, signal: AbortSignal): Promise<void>;
   listStoryboardAssets(
     seriesId: string,
     chapterId: string,
@@ -183,6 +195,24 @@ function cloneDemoNoteValue(value: unknown): unknown {
   return value;
 }
 
+function cloneDemoChapter(chapter: Chapter): Chapter {
+  return {
+    ...chapter,
+    content: chapter.content?.map((frame) => cloneDemoNoteValue(frame) as StoryboardFrame) ?? null,
+    lock: chapter.lock === null ? null : { ...chapter.lock },
+  };
+}
+
+function cloneDemoChapterData(data: DemoChapterData): DemoChapterData {
+  return {
+    chapters: data.chapters.map(cloneDemoChapter),
+    assetsByChapter: Object.fromEntries(Object.entries(data.assetsByChapter).map(([chapterId, assets]) => [
+      chapterId,
+      assets.map((asset) => ({ ...asset })),
+    ])),
+  };
+}
+
 function cloneDemoPersonalProductionSnapshot(
   snapshot: PersonalProductionSnapshot,
 ): PersonalProductionSnapshot {
@@ -200,8 +230,26 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
   const seriesRows = demoSeries.map((series) => ({ ...series }));
   const customSeriesIds = new Set<string>();
   let nextSeriesId = 1;
+  let nextChapterId = 1;
+  const chapterDataBySeries = new Map<string, DemoChapterData>();
+  for (const series of demoSeries) {
+    const seed = getDemoChapterData(series.id);
+    if (seed !== null) {
+      chapterDataBySeries.set(series.id, cloneDemoChapterData(seed));
+    }
+  }
   const personalNoteSnapshots = new Map<string, PersonalProductionSnapshot>();
   const personalRoughCutSnapshots = new Map<string, PersonalRoughCutSnapshot>();
+
+  function findDemoChapter(chapterId: string): { seriesId: string; data: DemoChapterData; chapter: Chapter } | null {
+    for (const [seriesId, data] of chapterDataBySeries) {
+      const chapter = data.chapters.find((candidate) => candidate.id === chapterId);
+      if (chapter !== undefined) {
+        return { seriesId, data, chapter };
+      }
+    }
+    return null;
+  }
 
   return {
     mode: "demo",
@@ -277,6 +325,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         updated_at: timestamp,
       };
       customSeriesIds.add(id);
+      chapterDataBySeries.set(id, { chapters: [], assetsByChapter: {} });
       seriesRows.unshift(created);
       return { ...created };
     },
@@ -322,6 +371,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       seriesRows.splice(index, 1);
       customSeriesIds.delete(seriesId);
+      chapterDataBySeries.delete(seriesId);
     },
     async listSeriesStylePrompts(signal) {
       if (signal.aborted) {
@@ -335,29 +385,103 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      const data = getDemoChapterData(seriesId);
-      if (data === null && customSeriesIds.has(seriesId)) {
-        return [];
-      }
-      if (data === null) {
+      const data = chapterDataBySeries.get(seriesId);
+      if (data === undefined) {
         throw demoNotFound();
       }
-      return data.chapters.map((chapter) => ({
-        ...chapter,
-        content: chapter.content?.map((frame) => ({ ...frame })) ?? null,
-        lock: chapter.lock === null ? null : { ...chapter.lock },
-      }));
+      return cloneDemoChapterData(data).chapters.sort((left, right) => (
+        right.order - left.order || Date.parse(right.created_at) - Date.parse(left.created_at)
+      ));
+    },
+    async createChapter(seriesId, input, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const data = chapterDataBySeries.get(seriesId);
+      if (data === undefined) {
+        throw demoNotFound();
+      }
+      const timestamp = new Date().toISOString();
+      const chapter: Chapter = {
+        id: `demo-created-chapter-${nextChapterId++}`,
+        series_id: seriesId,
+        title: input.title,
+        content: input.content.map((frame) => cloneDemoNoteValue(frame) as StoryboardFrame),
+        order: input.order === 0
+          ? (data.chapters.length === 0
+            ? 0
+            : Math.max(...data.chapters.map((existing) => existing.order))) + 1
+          : input.order,
+        created_at: timestamp,
+        updated_at: timestamp,
+        lock: null,
+      };
+      data.chapters.push(chapter);
+      data.assetsByChapter[chapter.id] = [];
+      const snapshotKey = demoUser.id + ":" + chapter.id;
+      const withoutSeedOpening = { ...chapter, title: "" };
+      personalNoteSnapshots.set(snapshotKey, cloneDemoPersonalProductionSnapshot(
+        getDemoPersonalProductionNotes(chapter.id, withoutSeedOpening, []),
+      ));
+      personalRoughCutSnapshots.set(snapshotKey, clonePersonalRoughCutSnapshot(
+        getDemoPersonalRoughCut(withoutSeedOpening, []),
+      ));
+      return cloneDemoChapter(chapter);
+    },
+    async updateChapter(seriesId, chapterId, update, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const match = findDemoChapter(chapterId);
+      if (match === null || match.seriesId !== seriesId) {
+        throw demoNotFound();
+      }
+      const snapshotKey = demoUser.id + ":" + chapterId;
+      if (!personalNoteSnapshots.has(snapshotKey)) {
+        personalNoteSnapshots.set(snapshotKey, cloneDemoPersonalProductionSnapshot(
+          getDemoPersonalProductionNotes(
+            chapterId,
+            match.chapter,
+            match.data.assetsByChapter[chapterId] ?? [],
+          ),
+        ));
+      }
+      if (!personalRoughCutSnapshots.has(snapshotKey)) {
+        personalRoughCutSnapshots.set(snapshotKey, clonePersonalRoughCutSnapshot(
+          getDemoPersonalRoughCut(match.chapter, match.data.assetsByChapter[chapterId] ?? []),
+        ));
+      }
+      const updated = { ...match.chapter, ...update, updated_at: new Date().toISOString() };
+      match.data.chapters = match.data.chapters.map((chapter) => chapter.id === chapterId ? updated : chapter);
+      return cloneDemoChapter(updated);
+    },
+    async deleteChapter(seriesId, chapterId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const match = findDemoChapter(chapterId);
+      if (match === null || match.seriesId !== seriesId) {
+        throw demoNotFound();
+      }
+      match.data.chapters = match.data.chapters.filter((chapter) => chapter.id !== chapterId);
+      delete match.data.assetsByChapter[chapterId];
+      const key = demoUser.id + ":" + chapterId;
+      personalNoteSnapshots.delete(key);
+      personalRoughCutSnapshots.delete(key);
     },
     async listStoryboardAssets(seriesId, chapterId, signal) {
       if (signal.aborted) {
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      const data = getDemoChapterData(seriesId);
-      if (data === null && customSeriesIds.has(seriesId)) {
-        return [];
+      const data = chapterDataBySeries.get(seriesId);
+      if (data === undefined) {
+        throw demoNotFound();
       }
-      if (data === null) {
+      if (!data.chapters.some((chapter) => chapter.id === chapterId)) {
         throw demoNotFound();
       }
       return (data.assetsByChapter[chapterId] ?? []).map((asset) => ({ ...asset }));
@@ -418,10 +542,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      for (const series of demoSeries) {
-        const data = getDemoChapterData(series.id);
-        const chapter = data?.chapters.find((candidate) => candidate.id === chapterId);
-        if (data !== null && data !== undefined && chapter !== undefined) {
+      for (const [, data] of chapterDataBySeries) {
+        const chapter = data.chapters.find((candidate) => candidate.id === chapterId);
+        if (chapter !== undefined) {
           const key = demoUser.id + ":" + chapterId;
           let snapshot = personalNoteSnapshots.get(key);
           if (snapshot === undefined) {
@@ -441,10 +564,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const update = parsePersonalProductionNoteUpdate(updateValue);
-      for (const series of demoSeries) {
-        const data = getDemoChapterData(series.id);
-        const chapter = data?.chapters.find((candidate) => candidate.id === chapterId);
-        if (data === null || data === undefined || chapter === undefined) {
+      for (const [, data] of chapterDataBySeries) {
+        const chapter = data.chapters.find((candidate) => candidate.id === chapterId);
+        if (chapter === undefined) {
           continue;
         }
 
@@ -515,10 +637,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const update = parsePersonalProductionResumeUpdate(updateValue);
-      for (const series of demoSeries) {
-        const data = getDemoChapterData(series.id);
-        const chapter = data?.chapters.find((candidate) => candidate.id === chapterId);
-        if (data === null || data === undefined || chapter === undefined) {
+      for (const [seriesId, data] of chapterDataBySeries) {
+        const chapter = data.chapters.find((candidate) => candidate.id === chapterId);
+        if (chapter === undefined) {
           continue;
         }
 
@@ -552,11 +673,11 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
           const serverFrame = matchingFrames.length === 1 ? matchingFrames[0] : undefined;
           if (
             current.media_state !== "ready"
-            || chapter.series_id !== series.id
+            || chapter.series_id !== seriesId
             || frameIndex === undefined
             || asset === undefined
             || asset.chapter_id !== chapter.id
-            || asset.series_id !== series.id
+            || asset.series_id !== seriesId
             || serverFrame === undefined
             || serverFrame.frame_index !== frameIndex
             || serverFrame.source_valid !== true
@@ -585,10 +706,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      for (const series of demoSeries) {
-        const data = getDemoChapterData(series.id);
-        const chapter = data?.chapters.find((candidate) => candidate.id === chapterId);
-        if (data !== null && data !== undefined && chapter !== undefined) {
+      for (const [, data] of chapterDataBySeries) {
+        const chapter = data.chapters.find((candidate) => candidate.id === chapterId);
+        if (chapter !== undefined) {
           const key = demoUser.id + ":" + chapterId;
           const saved = personalRoughCutSnapshots.get(key);
           return clonePersonalRoughCutSnapshot(saved ?? getDemoPersonalRoughCut(
@@ -605,10 +725,9 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       ensureDemoSession(storage);
       const update = parsePersonalRoughCutUpdate(updateValue);
-      for (const series of demoSeries) {
-        const data = getDemoChapterData(series.id);
-        const chapter = data?.chapters.find((candidate) => candidate.id === chapterId);
-        if (data === null || data === undefined || chapter === undefined) {
+      for (const [, data] of chapterDataBySeries) {
+        const chapter = data.chapters.find((candidate) => candidate.id === chapterId);
+        if (chapter === undefined) {
           continue;
         }
 
@@ -735,6 +854,9 @@ type ApiEndpoint =
   | "stylePrompts"
   | "uploadSeriesCover"
   | "chapters"
+  | "createChapter"
+  | "updateChapter"
+  | "deleteChapter"
   | "storyboardAssets"
   | "characters"
   | "scenes"
@@ -786,6 +908,18 @@ function apiRequestDefinition(
   }
   if (endpoint === "myTeams") {
     return { path: "/teams/my", method: "GET" };
+  }
+  if (endpoint === "createChapter") {
+    const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
+    return { path: "/series/" + seriesId + "/chapters", method: "POST", expectedStatus: 201 };
+  }
+  if (endpoint === "updateChapter" || endpoint === "deleteChapter") {
+    const chapterId = encodeApiPathId(identifiers?.chapterId, "章节");
+    return {
+      path: "/chapters/" + chapterId,
+      method: endpoint === "updateChapter" ? "PUT" : "DELETE",
+      ...(endpoint === "updateChapter" ? { expectedStatus: 200 } : { expectedStatus: 204 }),
+    };
   }
   if (endpoint === "personalProductionNotes") {
     const chapterId = encodeApiPathId(identifiers?.chapterId, "章节");
@@ -839,7 +973,8 @@ export function createApiServices(
     token: string | null,
     signal: AbortSignal,
     body?: Credentials | PersonalProductionNoteUpdate | PersonalProductionResumeUpdate
-      | PersonalRoughCutUpdate | CreateSeriesInput | UpdateSeriesInput | FormData,
+      | PersonalRoughCutUpdate | CreateSeriesInput | UpdateSeriesInput
+      | CreateChapterInput | UpdateChapterInput | FormData,
     identifiers?: { seriesId?: string; chapterId?: string; page?: number },
     requestBaseUrl = apiBaseUrl,
   ): Promise<unknown> {
@@ -958,8 +1093,8 @@ export function createApiServices(
     endpoint: ApiEndpoint,
     token: string,
     signal: AbortSignal,
-    body?: CreateSeriesInput | UpdateSeriesInput | FormData,
-    identifiers?: { seriesId?: string },
+    body?: CreateSeriesInput | UpdateSeriesInput | CreateChapterInput | UpdateChapterInput | FormData,
+    identifiers?: { seriesId?: string; chapterId?: string },
   ): Promise<unknown> {
     try {
       const result = await request(endpoint, token, signal, body, identifiers);
@@ -1071,14 +1206,44 @@ export function createApiServices(
       return result;
     },
     async listChapters(seriesId, signal) {
-      const token = storage.getItem(API_TOKEN_KEY);
-      if (!token) {
-        throw new ApiError("http", "登录状态已失效，请重新登录。", 401);
-      }
+      const token = requireApiToken(storage);
       return parseChapterList(
-        await request("chapters", token, signal, undefined, { seriesId }),
+        await requestForCurrentApiSession("chapters", token, signal, undefined, { seriesId }),
         seriesId,
       );
+    },
+    async createChapter(seriesId, input, signal) {
+      const token = requireApiToken(storage);
+      return parseChapterResponse(
+        await requestForCurrentApiSession("createChapter", token, signal, input, { seriesId }),
+        seriesId,
+      );
+    },
+    async updateChapter(seriesId, chapterId, update, signal) {
+      const token = requireApiToken(storage);
+      const chapter = await requestForCurrentApiSession(
+        "updateChapter",
+        token,
+        signal,
+        update,
+        { seriesId, chapterId },
+      );
+      const parsed = parseChapterResponse(chapter, seriesId, chapterId);
+      ensureCurrentApiSession(storage, token, signal);
+      return parsed;
+    },
+    async deleteChapter(seriesId, chapterId, signal) {
+      const token = requireApiToken(storage);
+      const result = await requestForCurrentApiSession(
+        "deleteChapter",
+        token,
+        signal,
+        undefined,
+        { seriesId, chapterId },
+      );
+      if (result !== undefined) {
+        throw new InvalidResponseError("服务器删除章节时返回了非预期内容。");
+      }
     },
     async listStoryboardAssets(seriesId, chapterId, signal) {
       const token = storage.getItem(API_TOKEN_KEY);
