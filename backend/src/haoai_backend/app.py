@@ -86,6 +86,9 @@ from .media_uploads.authentication import create_media_upload_identity_resolver
 from .fused_generation import FusedGenerationRuntime, FusedGenerationStorage
 from .fused_generation.http import build_fused_generation_router
 from .fused_generation.persistence import fused_generation_uow_factory
+from .storyboard_generation import StoryboardGenerationRuntime
+from .storyboard_generation.http import build_storyboard_generation_router
+from .storyboard_generation.persistence import storyboard_generation_uow_factory
 from .provider_status import ProviderStatusRuntime
 from .runtime_status.authentication import create_account_only_current_user_resolver
 from .runtime_status.configuration import RuntimeStatusConfiguration
@@ -214,6 +217,7 @@ def create_app(
     media_upload_application: MediaUploadApplication | None = None,
     fused_generation_runtime: FusedGenerationRuntime | None = None,
     fused_generation_storage: FusedGenerationStorage | None = None,
+    storyboard_generation_runtime: StoryboardGenerationRuntime | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -893,6 +897,21 @@ def create_app(
             resolve_actor=effective_resolver,
             runtime=fused_generation_runtime,
             storage=fused_generation_storage,
+        )
+    )
+    storyboard_uow_factory = (
+        storyboard_generation_uow_factory(
+            effective_session_factory,
+            decrypt_api_key=LegacyFernet(secret_key).decrypt,
+        )
+        if effective_session_factory is not None
+        else None
+    )
+    app.include_router(
+        build_storyboard_generation_router(
+            uow_factory=storyboard_uow_factory,
+            resolve_actor=effective_resolver,
+            runtime=storyboard_generation_runtime,
         )
     )
 

@@ -90,7 +90,7 @@ def test_shared_owner_fixture_cleanup(teams_database):
     assert teams_database.engine.pool.checkedout() == 0
 
 
-def test_integrated_registry_has_232_methods():
+def test_integrated_registry_has_236_methods():
     from fastapi.routing import APIRoute
 
     from haoai_backend.app import create_app
@@ -103,7 +103,7 @@ def test_integrated_registry_has_232_methods():
         for method in route.methods
         if method not in {"HEAD", "OPTIONS"}
     }
-    assert len(registered_methods) == 232
+    assert len(registered_methods) == 236
     assert {
         (method, path)
         for path, method in (
@@ -119,6 +119,10 @@ def test_integrated_registry_has_232_methods():
             ("/api/users/me/profile", "PUT"),
             ("/api/redemption-codes/generate", "POST"),
             ("/api/fused-assets/generate", "POST"),
+            ("/api/storyboard/generate", "POST"),
+            ("/api/storyboard/generate-stream", "POST"),
+            ("/api/storyboard/create-chapter-with-storyboard", "POST"),
+            ("/api/storyboard/two-pass", "POST"),
             ("/api/redemption-codes/redeem", "POST"),
             ("/uploads/{file_path:path}", "GET"),
             ("/api/admin/chapters", "GET"),

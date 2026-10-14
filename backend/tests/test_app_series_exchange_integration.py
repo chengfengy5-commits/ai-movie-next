@@ -390,12 +390,16 @@ def test_cold_factory_registers_exact_exchange_routes_without_session_io() -> No
         ("GET", "/api/series/{series_id}/export", "export_series"),
         ("POST", "/api/series/import", "import_series"),
         ("POST", "/api/fused-assets/generate", "generate_fused_asset"),
+        ("POST", "/api/storyboard/generate", "generate_storyboard"),
+        ("POST", "/api/storyboard/generate-stream", "generate_storyboard_stream"),
+        ("POST", "/api/storyboard/create-chapter-with-storyboard", "create_chapter_with_storyboard"),
+        ("POST", "/api/storyboard/two-pass", "two_pass_storyboard"),
         ("POST", "/api/storyboard/filter-and-save-characters", "filter_and_save_characters"),
         ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
         ("POST", "/api/storyboard/filter-and-save-scenes-stream", "save_stream"),
         ("POST", "/api/storyboard/filter-and-save-props-stream", "save_stream"),
     }
-    assert len(routes) == 232
+    assert len(routes) == 236
     assert expected <= routes
 
     response = _request(
