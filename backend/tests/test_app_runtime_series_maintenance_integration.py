@@ -436,7 +436,7 @@ def test_unwired_routes_remain_inert_and_register_exact_new_identities() -> None
         ("GET", "/api/series/{series_id}/assets/duplicates/ignored", "list_ignored"),
         ("POST", "/api/series/{series_id}/assets/merge", "merge_assets"),
     }
-    assert len(routes) == 231
+    assert len(routes) == 232
     assert expected <= routes
     series_response = _request(
         app,

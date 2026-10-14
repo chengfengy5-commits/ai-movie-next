@@ -133,12 +133,13 @@ def test_cold_app_import_and_unwired_factory_do_not_open_env_or_construct_sqlalc
             ("/api/prompts/reorder", "POST"),
             ("/api/users/{user_id}/card", "GET"),
             ("/api/users/me/profile", "PUT"),
+            ("/api/fused-assets/generate", "POST"),
         } <= {
             (route.path, method)
             for route in app.routes
             for method in getattr(route, "methods", set())
         }
-        assert len(paths) == 231, paths
+        assert len(paths) == 232, paths
         for module_name in ("passlib", "jose"):
             assert module_name not in sys.modules, module_name
         assert side_effects == [], side_effects

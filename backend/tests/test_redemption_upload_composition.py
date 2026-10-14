@@ -265,6 +265,8 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "runtime_status_database_probe",
             "runtime_status_storage_probe",
             "media_upload_application",
+            "fused_generation_runtime",
+            "fused_generation_storage",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
         assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
@@ -330,6 +332,9 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("GET", "/api/series/{series_id}/export", "export_series"),
             ("POST", "/api/series/import", "import_series"),
         }
+        fused_generation_routes = {
+            ("POST", "/api/fused-assets/generate", "generate_fused_asset"),
+        }
         storyboard_save_routes = {
             ("POST", "/api/storyboard/filter-and-save-characters", "filter_and_save_characters"),
             ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
@@ -347,23 +352,26 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             new_routes,
             runtime_and_maintenance_routes,
             series_exchange_routes,
+            fused_generation_routes,
             storyboard_save_routes,
             media_upload_routes,
         )
-        assert len(methods) == 231
-        assert len(triples) == 231
+        assert len(methods) == 232
+        assert len(triples) == 232
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
         assert len(series_exchange_routes) == 5
         assert len(storyboard_save_routes) == 4
         assert len(media_upload_routes) == 5
+        assert len(fused_generation_routes) == 1
         assert sum(map(len, route_groups)) == len(set().union(*route_groups))
-        assert len(triples - new_routes) == 211
+        assert len(triples - new_routes - fused_generation_routes) == 211
         assert len(
             triples
             - new_routes
             - runtime_and_maintenance_routes
             - series_exchange_routes
+            - fused_generation_routes
         ) == 197
         assert len(
             triples
@@ -371,6 +379,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             - runtime_and_maintenance_routes
             - series_exchange_routes
             - storyboard_save_routes
+            - fused_generation_routes
         ) == 193
         assert len(
             triples
@@ -379,12 +388,14 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             - series_exchange_routes
             - storyboard_save_routes
             - media_upload_routes
+            - fused_generation_routes
         ) == 188
         assert new_routes <= triples
         assert runtime_and_maintenance_routes <= triples
         assert series_exchange_routes <= triples
         assert storyboard_save_routes <= triples
         assert media_upload_routes <= triples
+        assert fused_generation_routes <= triples
         assert events == []
 
         body = {"type": "membership", "value": 2, "count": 1}
