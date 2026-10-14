@@ -21,3 +21,8 @@ class AdminUserNotFound(BusinessError):
 class AdminUsersBadRequest(BusinessError):
     def __init__(self, detail: str) -> None:
         super().__init__(400, detail)
+
+
+class AdminUserDeleteConflict(BusinessError):
+    def __init__(self) -> None:
+        super().__init__(409, "当前用户不满足删除约束，暂时无法删除，请核对关联数据。")

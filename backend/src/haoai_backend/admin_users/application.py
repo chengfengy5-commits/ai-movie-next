@@ -190,5 +190,5 @@ def delete_user(
 
         unit_of_work.delete_related_user_data(user_id)
         unit_of_work.delete_user(row)
-        unit_of_work.commit()
+        unit_of_work.commit_user_deletion()
         return {"success": True, "message": f"用户 {row.username} 已删除"}

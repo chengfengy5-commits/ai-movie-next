@@ -502,6 +502,29 @@ describe("admin users views", () => {
     confirm.mockRestore();
   });
 
+  it("reports a protected delete as explicitly rejected without retrying", async () => {
+    const detail = "当前用户不满足删除约束，暂时无法删除，请核对关联数据。";
+    const user = userRecord({ id: "protected", username: "protected-user" });
+    const listUsers = vi.fn<AdminUsersApi["listUsers"]>(async () => ({ data: [user], total: 1 }));
+    const deleteUser = vi.fn<AdminUsersApi["deleteUser"]>(async () => {
+      throw new ApiError("http", detail, 409, detail);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const userActions = userEvent.setup();
+    render(<Users {...props(usersApi({ listUsers, deleteUser }))} />);
+
+    await screen.findByRole("button", { name: "protected-user" });
+    await userActions.click(screen.getByRole("button", { name: "删除用户 protected-user" }));
+
+    const alert = await screen.findByRole("alert");
+    expect(alert).toHaveTextContent("删除请求已被服务器明确拒绝");
+    expect(alert).toHaveTextContent(detail);
+    expect(alert).not.toHaveTextContent("删除结果未确认");
+    expect(screen.getByRole("button", { name: "protected-user" })).toBeInTheDocument();
+    expect(deleteUser).toHaveBeenCalledTimes(1);
+    expect(listUsers).toHaveBeenCalledTimes(1);
+  });
+
   it("falls back to the preceding page when deleting the last row on the final page", async () => {
     const firstPage = makeUsers(10);
     const lastUser = userRecord({ id: "last-user", username: "last-user" });

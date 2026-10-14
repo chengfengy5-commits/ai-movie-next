@@ -7,13 +7,27 @@ from pathlib import Path
 from typing import Any
 
 import httpx
+import pytest
 from fastapi import FastAPI
 from jose import jwt
-from sqlalchemy import create_engine, insert
+from sqlalchemy import create_engine, event, insert, select
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Session, sessionmaker
 
 from haoai_backend.app import create_app
-from haoai_backend.admin_users.tables import Base, UserCreditRow
+from haoai_backend.admin_users.tables import (
+    AITaskRow,
+    Base,
+    CreditLogRow,
+    ModelConfigRow,
+    PromptConfigRow,
+    RedemptionCodeRow,
+    SeriesRow,
+    TeamMemberRow,
+    TeamRow,
+    UserCreditRow,
+    UserRow,
+)
 from haoai_backend.authentication.configuration import AuthenticationRuntime
 from haoai_backend.authentication.tables import (
     metadata as authentication_metadata,
@@ -30,6 +44,7 @@ class ObservedSession(Session):
         self.commit_count = 0
         self.rollback_count = 0
         self.refresh_count = 0
+        self.close_count = 0
         self.closed_marker = False
         self.info["events"].append(
             (self.info["kind"], "open", id(self), threading.get_ident())
@@ -63,11 +78,27 @@ class ObservedSession(Session):
         super().refresh(instance, *args, **kwargs)
 
     def close(self) -> None:
+        self.close_count += 1
         self.closed_marker = True
         self.info["events"].append(
             (self.info["kind"], "close", id(self), threading.get_ident())
         )
         super().close()
+
+
+class OperationalErrorBeforeCommitSession(ObservedSession):
+    def commit(self) -> None:
+        self.commit_count += 1
+        self.info["events"].append(
+            (self.info["kind"], "commit", id(self), threading.get_ident())
+        )
+        raise OperationalError("COMMIT", {}, RuntimeError("connection unavailable"))
+
+
+class LostCommitAcknowledgementSession(ObservedSession):
+    def commit(self) -> None:
+        super().commit()
+        raise OperationalError("COMMIT", {}, RuntimeError("commit acknowledgement lost"))
 
 
 class FakePasswordHasher:
@@ -123,8 +154,20 @@ def _user(
     }
 
 
-def build_system(path: Path):
+def build_system(
+    path: Path,
+    *,
+    enable_foreign_keys: bool = False,
+    business_session_class: type[ObservedSession] = ObservedSession,
+):
     engine = create_engine(f"sqlite:///{path}")
+    if enable_foreign_keys:
+        @event.listens_for(engine, "connect")
+        def _enable_foreign_keys(connection: Any, _: Any) -> None:
+            cursor = connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
     authentication_metadata.create_all(engine)
     Base.metadata.create_all(engine)
     events: list[tuple[str, str, int, int]] = []
@@ -132,9 +175,10 @@ def build_system(path: Path):
     business_sessions: list[ObservedSession] = []
 
     def factory_for(kind: str, opened: list[ObservedSession]):
+        session_class = business_session_class if kind == "business" else ObservedSession
         maker = sessionmaker(
             engine,
-            class_=ObservedSession,
+            class_=session_class,
             expire_on_commit=False,
             future=True,
             info={"kind": kind, "events": events},
@@ -278,6 +322,335 @@ def _assert_business_worker_lifecycle(
     assert business_events[0][3] != request_thread
     assert business_session.closed_marker
     return business_session
+
+
+def _seed_protected_delete_case(engine: Any, association: str) -> None:
+    now = datetime.now(timezone.utc).replace(microsecond=0).replace(tzinfo=None)
+    with Session(engine) as session:
+        session.add_all(
+            [
+                UserCreditRow(
+                    id="admin-delete-control-credit",
+                    user_id="admin",
+                    credits=37,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                CreditLogRow(
+                    id="free-delete-log",
+                    user_id="free",
+                    amount=-2,
+                    balance_after=6,
+                    type="usage",
+                    description="target rollback control",
+                    task_id=None,
+                    business_key=None,
+                    billing_unit_id=None,
+                    related_debit_id=None,
+                    created_at=now,
+                ),
+                CreditLogRow(
+                    id="admin-delete-control-log",
+                    user_id="admin",
+                    amount=5,
+                    balance_after=42,
+                    type="charge",
+                    description="keeper control",
+                    task_id=None,
+                    business_key=None,
+                    billing_unit_id=None,
+                    related_debit_id=None,
+                    created_at=now,
+                ),
+                ModelConfigRow(
+                    id="free-delete-model",
+                    user_id="free",
+                    category="text",
+                    name="target model",
+                    provider="local",
+                    api_key="",
+                    model="fixture-model",
+                    base_url=None,
+                    sort_order=0,
+                    params=None,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                ModelConfigRow(
+                    id="admin-delete-control-model",
+                    user_id="admin",
+                    category="text",
+                    name="keeper model",
+                    provider="local",
+                    api_key="",
+                    model="fixture-model",
+                    base_url=None,
+                    sort_order=0,
+                    params=None,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                PromptConfigRow(
+                    id="free-delete-prompt",
+                    user_id="free",
+                    category="fixture",
+                    name="target prompt",
+                    system_prompt=None,
+                    user_prompt=None,
+                    sort_order=0,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                PromptConfigRow(
+                    id="admin-delete-control-prompt",
+                    user_id="admin",
+                    category="fixture",
+                    name="keeper prompt",
+                    system_prompt=None,
+                    user_prompt=None,
+                    sort_order=0,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                SeriesRow(
+                    id="free-delete-series",
+                    user_id="free",
+                    name="target series",
+                    description=None,
+                    image_url=None,
+                    team_id=None,
+                    created_at=now,
+                    updated_at=now,
+                ),
+                SeriesRow(
+                    id="admin-delete-control-series",
+                    user_id="admin",
+                    name="keeper series",
+                    description=None,
+                    image_url=None,
+                    team_id=None,
+                    created_at=now,
+                    updated_at=now,
+                ),
+            ]
+        )
+        if association == "ai_task":
+            session.add(
+                AITaskRow(
+                    id="protected-task",
+                    user_id="free",
+                    type="image",
+                    message_id="protected-task-message",
+                    billing_status="unbilled",
+                )
+            )
+        elif association == "team_member":
+            session.add(TeamRow(id="keeper-team", name="keeper team", owner_id="admin"))
+            session.flush()
+            session.add(
+                TeamMemberRow(
+                    id="protected-team-member",
+                    team_id="keeper-team",
+                    user_id="free",
+                    role="member",
+                    permissions=None,
+                )
+            )
+        elif association == "created_code":
+            session.add(
+                RedemptionCodeRow(
+                    id="protected-created-code",
+                    code="delete-constraint-code",
+                    type="credits",
+                    value=9,
+                    is_used=False,
+                    used_by=None,
+                    used_at=None,
+                    created_by="free",
+                    expires_at=None,
+                    created_at=now,
+                )
+            )
+        elif association == "external_task_quote":
+            quote_table = Base.metadata.tables["task_quotes"]
+            session.execute(
+                insert(quote_table).values(id="protected-task-quote", user_id="free")
+            )
+        else:
+            raise AssertionError(f"unknown protected association: {association}")
+        session.commit()
+
+    with engine.connect() as connection:
+        assert connection.exec_driver_sql("PRAGMA foreign_keys").scalar_one() == 1
+
+
+def _assert_protected_delete_state_unchanged(engine: Any, association: str) -> None:
+    with Session(engine) as session:
+        assert session.get(UserRow, "free") is not None
+        assert session.get(UserRow, "admin") is not None
+        assert session.get(UserCreditRow, "free-credit").credits == 8
+        assert session.get(UserCreditRow, "admin-delete-control-credit").credits == 37
+
+        def ids(model: Any, user_id: str) -> set[str]:
+            return {
+                row[0]
+                for row in session.query(model.id).filter(model.user_id == user_id).all()
+            }
+
+        assert ids(CreditLogRow, "free") == {"free-delete-log"}
+        assert ids(CreditLogRow, "admin") == {"admin-delete-control-log"}
+        assert ids(ModelConfigRow, "free") == {"free-delete-model"}
+        assert ids(ModelConfigRow, "admin") == {"admin-delete-control-model"}
+        assert ids(PromptConfigRow, "free") == {"free-delete-prompt"}
+        assert ids(PromptConfigRow, "admin") == {"admin-delete-control-prompt"}
+        assert ids(SeriesRow, "free") == {"free-delete-series"}
+        assert ids(SeriesRow, "admin") == {"admin-delete-control-series"}
+
+        if association == "ai_task":
+            assert session.get(AITaskRow, "protected-task").user_id == "free"
+        elif association == "team_member":
+            member = session.get(TeamMemberRow, "protected-team-member")
+            assert (member.team_id, member.user_id) == ("keeper-team", "free")
+            assert session.get(TeamRow, "keeper-team").owner_id == "admin"
+        elif association == "created_code":
+            assert session.get(RedemptionCodeRow, "protected-created-code").created_by == "free"
+        else:
+            quote_table = Base.metadata.tables["task_quotes"]
+            quote = session.execute(
+                select(quote_table.c.id, quote_table.c.user_id)
+                .where(quote_table.c.id == "protected-task-quote")
+            ).one()
+            assert tuple(quote) == ("protected-task-quote", "free")
+
+
+@pytest.mark.parametrize(
+    "association",
+    ["ai_task", "team_member", "created_code", "external_task_quote"],
+)
+def test_delete_protected_references_return_conflict_and_rollback_allowed_deletes(
+    tmp_path: Path,
+    association: str,
+) -> None:
+    engine, app, events, auth_sessions, business_sessions, token_for, _ = build_system(
+        tmp_path / f"admin-users-delete-{association}.sqlite",
+        enable_foreign_keys=True,
+    )
+    try:
+        _seed_protected_delete_case(engine, association)
+        start = len(events)
+        response = request(
+            app,
+            "DELETE",
+            "/api/admin/users/free",
+            headers=_headers(token_for("admin")),
+        )
+
+        delete_session = _assert_business_worker_lifecycle(
+            events,
+            start,
+            auth_sessions,
+            business_sessions,
+            request_thread=threading.get_ident(),
+        )
+        assert delete_session.commit_count == 1
+        assert delete_session.rollback_count == 1
+        assert delete_session.close_count == 1
+        _assert_protected_delete_state_unchanged(engine, association)
+
+        assert response.status_code == 409, response.text
+        assert response.json() == {
+            "detail": "当前用户不满足删除约束，暂时无法删除，请核对关联数据。"
+        }
+    finally:
+        engine.dispose()
+
+
+def test_delete_operational_commit_failure_stays_500_and_does_not_retry(
+    tmp_path: Path,
+) -> None:
+    engine, app, events, auth_sessions, business_sessions, token_for, _ = build_system(
+        tmp_path / "admin-users-delete-operational-error.sqlite",
+        enable_foreign_keys=True,
+        business_session_class=OperationalErrorBeforeCommitSession,
+    )
+    start = len(events)
+    try:
+        response = request(
+            app,
+            "DELETE",
+            "/api/admin/users/free",
+            headers=_headers(token_for("admin")),
+        )
+        assert response.status_code == 500
+        assert len(business_sessions) == 1
+        delete_session = _assert_business_worker_lifecycle(
+            events,
+            start,
+            auth_sessions,
+            business_sessions,
+            request_thread=threading.get_ident(),
+        )
+        assert delete_session.commit_count == 1
+        assert delete_session.rollback_count == 1
+        assert delete_session.close_count == 1
+        assert request(
+            app,
+            "GET",
+            "/api/admin/users/free",
+            headers=_headers(token_for("admin")),
+        ).status_code == 200
+        assert request(
+            app,
+            "GET",
+            "/api/admin/users/admin",
+            headers=_headers(token_for("admin")),
+        ).status_code == 200
+    finally:
+        engine.dispose()
+
+
+def test_delete_lost_commit_acknowledgement_stays_500_and_reads_committed_state(
+    tmp_path: Path,
+) -> None:
+    engine, app, events, auth_sessions, business_sessions, token_for, _ = build_system(
+        tmp_path / "admin-users-delete-ack-lost.sqlite",
+        enable_foreign_keys=True,
+        business_session_class=LostCommitAcknowledgementSession,
+    )
+    start = len(events)
+    try:
+        response = request(
+            app,
+            "DELETE",
+            "/api/admin/users/free",
+            headers=_headers(token_for("admin")),
+        )
+        assert response.status_code == 500
+        assert len(business_sessions) == 1
+        delete_session = _assert_business_worker_lifecycle(
+            events,
+            start,
+            auth_sessions,
+            business_sessions,
+            request_thread=threading.get_ident(),
+        )
+        assert delete_session.commit_count == 1
+        assert delete_session.rollback_count == 1
+        assert delete_session.close_count == 1
+        assert request(
+            app,
+            "GET",
+            "/api/admin/users/free",
+            headers=_headers(token_for("admin")),
+        ).status_code == 404
+        assert request(
+            app,
+            "GET",
+            "/api/admin/users/admin",
+            headers=_headers(token_for("admin")),
+        ).status_code == 200
+    finally:
+        engine.dispose()
 
 
 def test_real_routes_cover_user_crud_auth_dtos_and_worker_transactions(tmp_path: Path) -> None:

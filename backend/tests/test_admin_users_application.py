@@ -151,6 +151,10 @@ class FakeUnitOfWork:
         self.events.append("delete_user")
         self.delete_steps.append(f"user:{row.id}")
 
+    def commit_user_deletion(self) -> None:
+        self.events.append("commit_user_deletion")
+        self.commit_count += 1
+
     def commit(self) -> None:
         self.events.append("commit")
         self.commit_count += 1
@@ -380,6 +384,8 @@ def test_delete_runs_related_cleanup_then_user_delete_and_one_commit() -> None:
     assert unit.delete_steps == ["related:target", "user:target"]
     assert unit.commit_count == 1
     assert unit.refresh_count == 0
+    assert "commit_user_deletion" in unit.events
+    assert "commit" not in unit.events
     assert unit.events[-1] == "close"
 
 

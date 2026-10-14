@@ -7,9 +7,11 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import asc, desc
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from .domain import UserRecord
+from .errors import AdminUserDeleteConflict
 from .ports import AdminUsersUnitOfWork
 from .tables import (
     AssetDuplicateExclusionRow,
@@ -193,6 +195,12 @@ class SqlAlchemyAdminUsersUnitOfWork(AdminUsersUnitOfWork):
 
     def delete_user(self, row: UserRow) -> None:
         self._session.delete(row)
+
+    def commit_user_deletion(self) -> None:
+        try:
+            self._session.commit()
+        except IntegrityError as error:
+            raise AdminUserDeleteConflict() from error
 
     def commit(self) -> None:
         self._session.commit()

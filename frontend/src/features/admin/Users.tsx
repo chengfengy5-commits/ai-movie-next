@@ -285,7 +285,15 @@ function UserList({ api, onAuthenticationError, currentAdministratorId, onCreate
     } catch (cause) {
       if (!mounted.current) return;
       if (!handleAuthenticationError(cause, onAuthenticationError)) {
-        setDeleteError(`${errorMessage(cause)} 删除结果未确认，列表保持原样；请重新查询核对后再决定是否重试。系统不会自动重发删除请求。`);
+        if (cause instanceof ApiError
+          && cause.kind === "http"
+          && cause.status !== null
+          && cause.status >= 400
+          && cause.status < 500) {
+          setDeleteError(`删除请求已被服务器明确拒绝：${errorMessage(cause)}`);
+        } else {
+          setDeleteError(`${errorMessage(cause)} 删除结果未确认，列表保持原样；请重新查询核对后再决定是否重试。系统不会自动重发删除请求。`);
+        }
       }
     } finally {
       deleteInFlight.current = false;
