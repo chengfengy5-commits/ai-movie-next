@@ -445,7 +445,7 @@ def test_unwired_routes_remain_inert_and_register_exact_new_identities() -> None
         ("POST", "/api/chat/video", "chat_video"),
         ("POST", "/api/chat/batch-generate-images", "batch_generate_images"),
     }
-    assert len(routes) == 245
+    assert len(routes) == 248
     assert expected <= routes
     series_response = _request(
         app,

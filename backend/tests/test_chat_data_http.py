@@ -110,7 +110,7 @@ def test_factory_registers_thirteen_chat_methods_and_two_hundred_forty_five_tota
         for route in app.routes
         for method in getattr(route, "methods", set())
     }
-    assert len(paths) == 245
+    assert len(paths) == 248
 
 
 def test_http_status_filters_body_chapter_and_no_asset_discriminator(database: ChatDatabase) -> None:

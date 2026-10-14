@@ -94,6 +94,8 @@ from .storyboard_asset_generation.ports import StoryboardAssetRuntime
 from .storyboard_asset_generation.persistence import storyboard_asset_uow_factory
 from .chat_media_admission import ChatMediaAdmissionConfiguration
 from .chat_media_admission.http import build_chat_media_admission_router
+from .chat_text_generation import ChatTextGenerationConfiguration
+from .chat_text_generation.http import build_chat_text_generation_router
 from .generation_core.admission_staging import build_media_snapshot_producer
 from .generation_contracts.errors import GenerationError
 from .provider_status import ProviderStatusRuntime
@@ -227,6 +229,7 @@ def create_app(
     storyboard_generation_runtime: StoryboardGenerationRuntime | None = None,
     storyboard_asset_generation_runtime: StoryboardAssetRuntime | None = None,
     chat_media_admission_configuration: ChatMediaAdmissionConfiguration | None = None,
+    chat_text_generation_configuration: ChatTextGenerationConfiguration | None = None,
 ) -> FastAPI:
     """Compose authentication and business routes without startup I/O."""
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
@@ -959,6 +962,21 @@ def create_app(
             session_factory=effective_session_factory,
             producer_binding=chat_media_producer_binding,
         )
+    )
+    chat_text_generation_router = build_chat_text_generation_router(
+        authentication_service=authentication_service,
+        session_factory=effective_session_factory,
+        configuration=chat_text_generation_configuration,
+        decrypt_api_key=(
+            LegacyFernet(authentication_runtime.secret_key).decrypt
+            if authentication_runtime is not None
+            and authentication_runtime.secret_key
+            else None
+        ),
+    )
+    app.include_router(chat_text_generation_router)
+    app.state.chat_text_generation_execution = getattr(
+        chat_text_generation_router, "chat_text_generation_execution", None
     )
 
     return app

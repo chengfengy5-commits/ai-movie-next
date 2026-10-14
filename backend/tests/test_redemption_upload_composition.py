@@ -270,6 +270,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "storyboard_generation_runtime",
             "storyboard_asset_generation_runtime",
             "chat_media_admission_configuration",
+            "chat_text_generation_configuration",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
         assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
@@ -280,6 +281,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
         assert inspect.signature(create_app).parameters["resolve_runtime_status_account"].default is None
         assert inspect.signature(create_app).parameters["runtime_status_database_probe"].default is None
         assert inspect.signature(create_app).parameters["runtime_status_storage_probe"].default is None
+        assert inspect.signature(create_app).parameters["chat_text_generation_configuration"].default is None
 
         methods = {
             (method, route.path)
@@ -370,6 +372,11 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("POST", "/api/chat/video", "chat_video"),
             ("POST", "/api/chat/batch-generate-images", "batch_generate_images"),
         }
+        chat_text_routes = {
+            ("POST", "/api/chat/stream", "chat_stream"),
+            ("POST", "/api/chat/ai-review", "create_ai_review_task"),
+            ("POST", "/api/chat/batch-optimize", "batch_optimize_background"),
+        }
         route_groups = (
             new_routes,
             runtime_and_maintenance_routes,
@@ -380,15 +387,17 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             storyboard_save_routes,
             media_upload_routes,
             chat_media_routes,
+            chat_text_routes,
         )
-        assert len(methods) == 245
-        assert len(triples) == 245
+        assert len(methods) == 248
+        assert len(triples) == 248
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
         assert len(series_exchange_routes) == 5
         assert len(storyboard_save_routes) == 4
         assert len(media_upload_routes) == 5
         assert len(chat_media_routes) == 3
+        assert len(chat_text_routes) == 3
         assert len(fused_generation_routes) == 1
         assert len(storyboard_generation_routes) == 4
         assert len(storyboard_asset_generation_routes) == 6
@@ -399,6 +408,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             - fused_generation_routes
             - storyboard_generation_routes
             - chat_media_routes
+            - chat_text_routes
         ) == 217
         assert len(
             triples
@@ -408,6 +418,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             - fused_generation_routes
             - storyboard_generation_routes
             - chat_media_routes
+            - chat_text_routes
         ) == 203
         assert len(
             triples
@@ -418,6 +429,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             - fused_generation_routes
             - storyboard_generation_routes
             - chat_media_routes
+            - chat_text_routes
         ) == 199
         assert len(
             triples
@@ -430,6 +442,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             - storyboard_generation_routes
             - storyboard_asset_generation_routes
             - chat_media_routes
+            - chat_text_routes
         ) == 188
         assert new_routes <= triples
         assert runtime_and_maintenance_routes <= triples
@@ -437,6 +450,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
         assert storyboard_save_routes <= triples
         assert media_upload_routes <= triples
         assert chat_media_routes <= triples
+        assert chat_text_routes <= triples
         assert fused_generation_routes <= triples
         assert storyboard_generation_routes <= triples
         assert storyboard_asset_generation_routes <= triples
