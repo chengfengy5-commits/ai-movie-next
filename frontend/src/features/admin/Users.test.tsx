@@ -5,7 +5,14 @@ import { ApiError } from "../../shared/api/errors";
 import type { AdminUsersApi, AdminUserRecord } from "./usersTypes";
 import { Users, type UsersProps } from "./Users";
 
-afterEach(cleanup);
+let restoreDownloadUrls: (() => void) | null = null;
+
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  restoreDownloadUrls?.();
+  restoreDownloadUrls = null;
+});
 
 function userRecord(overrides: Partial<AdminUserRecord> = {}): AdminUserRecord {
   return {
@@ -27,6 +34,8 @@ function usersApi(overrides: Partial<AdminUsersApi> = {}): AdminUsersApi {
     getUser: vi.fn<AdminUsersApi["getUser"]>(async () => userRecord()),
     createUser: vi.fn<AdminUsersApi["createUser"]>(async () => userRecord()),
     updateUser: vi.fn<AdminUsersApi["updateUser"]>(async () => ({ message: "用户更新成功" })),
+    deleteUser: vi.fn<AdminUsersApi["deleteUser"]>(async () => ({ success: true, message: "用户已删除" })),
+    listRelatedRecords: vi.fn<AdminUsersApi["listRelatedRecords"]>(async () => ({ data: [], total: 0 })),
     ...overrides,
   };
 }
@@ -36,6 +45,7 @@ function props(api: AdminUsersApi, overrides: Partial<UsersProps> = {}): UsersPr
     api,
     onAuthenticationError: vi.fn(),
     mode: "list",
+    currentAdministratorId: "admin-current",
     listVersion: 0,
     onCreate: vi.fn(),
     onEdit: vi.fn(),
@@ -361,4 +371,204 @@ describe("admin users views", () => {
     });
     expect(callbacks.onAuthenticationError).not.toHaveBeenCalled();
   });
+
+
+  it("keeps the edit draft while related tabs use the fixed user id and cancel the prior read", async () => {
+    const creditRequest = deferred<{ data: [], total: number }>();
+    const listRelatedRecords = vi.fn<AdminUsersApi["listRelatedRecords"]>((resource, userId, _query, _signal) => {
+      if (resource === "credit-logs") return creditRequest.promise;
+      return Promise.resolve({
+        data: [{
+          id: "model-1",
+          user_id: userId,
+          category: "text",
+          name: "writer-model",
+          provider: "local",
+          model: "safe-model",
+          api_key: "never-render-this",
+          base_url: "",
+          sort_order: 0,
+          created_at: "2026-10-01T00:00:00Z",
+          updated_at: "2026-10-01T00:00:00Z",
+        }],
+        total: 1,
+      });
+    });
+    const updateUser = vi.fn<AdminUsersApi["updateUser"]>(async () => ({ message: "用户更新成功" }));
+    const api = usersApi({
+      getUser: vi.fn<AdminUsersApi["getUser"]>(async () => userRecord({ id: "fixed-user", username: "fixed-user" })),
+      listRelatedRecords,
+      updateUser,
+    });
+    const callbacks = props(api, { mode: "edit", userId: "fixed-user" });
+    const user = userEvent.setup();
+    render(<Users {...callbacks} />);
+
+    await waitFor(() => expect(screen.getByLabelText("用户名")).toHaveProperty("value", "fixed-user"));
+    await user.clear(screen.getByLabelText("邮箱"));
+    await user.type(screen.getByLabelText("邮箱"), "draft@example.test");
+    await user.click(screen.getByRole("tab", { name: "积分流水" }));
+    await waitFor(() => expect(listRelatedRecords).toHaveBeenCalledWith(
+      "credit-logs",
+      "fixed-user",
+      { skip: 0, limit: 10, sort_field: "created_at", sort_order: "desc" },
+      expect.any(AbortSignal),
+    ));
+
+    await user.click(screen.getByRole("tab", { name: "模型配置" }));
+    await screen.findByText("safe-model");
+    expect(listRelatedRecords.mock.calls[0]?.[3]?.aborted).toBe(true);
+    expect(screen.queryByText("never-render-this")).toBeNull();
+    await user.click(screen.getByRole("tab", { name: "基本信息" }));
+    expect(screen.getByLabelText("邮箱")).toHaveProperty("value", "draft@example.test");
+    expect(updateUser).not.toHaveBeenCalled();
+    expect(listRelatedRecords.mock.calls[1]?.[0]).toBe("model-configs");
+    expect(listRelatedRecords.mock.calls[1]?.[1]).toBe("fixed-user");
+  });
+
+  it("ignores a late related-page authorization failure after switching users", async () => {
+    const pending = deferred<{ data: [], total: number }>();
+    const onAuthenticationError = vi.fn();
+    const listRelatedRecords = vi.fn<AdminUsersApi["listRelatedRecords"]>(() => pending.promise);
+    const getUser = vi.fn<AdminUsersApi["getUser"]>(async (userId) => userRecord({ id: userId, username: userId }));
+    const api = usersApi({ getUser, listRelatedRecords });
+    const callbacks = props(api, { mode: "edit", userId: "user-A", onAuthenticationError });
+    const user = userEvent.setup();
+    const view = render(<Users {...callbacks} />);
+
+    await waitFor(() => expect(screen.getByLabelText("用户名")).toHaveProperty("value", "user-A"));
+    await user.click(screen.getByRole("tab", { name: "积分流水" }));
+    await waitFor(() => expect(listRelatedRecords).toHaveBeenCalledTimes(1));
+    const oldSignal = listRelatedRecords.mock.calls[0]?.[3];
+    view.rerender(<Users {...callbacks} userId="user-B" />);
+    await waitFor(() => expect(screen.getByLabelText("用户名")).toHaveProperty("value", "user-B"));
+    expect(oldSignal?.aborted).toBe(true);
+
+    await act(async () => {
+      pending.reject(new ApiError("http", "登录已失效", 401, "登录已失效"));
+      await pending.promise.catch(() => undefined);
+    });
+    expect(onAuthenticationError).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("用户名")).toHaveProperty("value", "user-B");
+  });
+
+  it("requires an explicit cascade confirmation, disables self-delete, and refreshes after success", async () => {
+    const pending = deferred<{ success: true; message: string }>();
+    const admin = userRecord({ id: "admin", username: "operator", is_superuser: true });
+    const writer = userRecord({ id: "writer-id", username: "writer" });
+    const listUsers = vi.fn<AdminUsersApi["listUsers"]>(async () => ({ data: [admin, writer], total: 2 }));
+    const deleteUser = vi.fn<AdminUsersApi["deleteUser"]>(() => pending.promise);
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const api = usersApi({ listUsers, deleteUser });
+    render(<Users {...props(api, { currentAdministratorId: "admin" })} />);
+
+    await screen.findByRole("button", { name: "writer" });
+    expect(screen.getByRole("button", { name: "删除当前管理员不可用" })).toBeDisabled();
+    expect(confirm).not.toHaveBeenCalled();
+    await userEvent.setup().click(screen.getByRole("button", { name: "删除用户 writer" }));
+    expect(confirm.mock.calls[0]?.[0]).toContain("积分流水、模型与提示词配置、剧集");
+    expect(deleteUser).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "删除用户 writer" })).toBeDisabled();
+
+    await act(async () => {
+      pending.resolve({ success: true, message: "用户 writer 已删除" });
+      await pending.promise;
+    });
+    await waitFor(() => expect(listUsers).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("button", { name: "writer" })).toBeInTheDocument();
+  });
+
+  it("keeps the row after an uncertain delete and only re-queries after explicit action", async () => {
+    const user = userRecord({ id: "uncertain", username: "uncertain-user" });
+    const listUsers = vi.fn<AdminUsersApi["listUsers"]>(async () => ({ data: [user], total: 1 }));
+    const deleteUser = vi.fn<AdminUsersApi["deleteUser"]>(async () => {
+      throw new ApiError("network", "网络中断");
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const api = usersApi({ listUsers, deleteUser });
+    const userActions = userEvent.setup();
+    render(<Users {...props(api)} />);
+
+    await screen.findByRole("button", { name: "uncertain-user" });
+    await userActions.click(screen.getByRole("button", { name: "删除用户 uncertain-user" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("系统不会自动重发删除请求");
+    expect(screen.getByRole("button", { name: "uncertain-user" })).toBeInTheDocument();
+    expect(deleteUser).toHaveBeenCalledTimes(1);
+    expect(listUsers).toHaveBeenCalledTimes(1);
+
+    await userActions.click(screen.getByRole("button", { name: "重新查询用户列表" }));
+    await waitFor(() => expect(listUsers).toHaveBeenCalledTimes(2));
+    expect(deleteUser).toHaveBeenCalledTimes(1);
+    confirm.mockRestore();
+  });
+
+  it("falls back to the preceding page when deleting the last row on the final page", async () => {
+    const firstPage = makeUsers(10);
+    const lastUser = userRecord({ id: "last-user", username: "last-user" });
+    let deleted = false;
+    const listUsers = vi.fn<AdminUsersApi["listUsers"]>(async (query) => query.skip === 0
+      ? { data: firstPage, total: deleted ? 10 : 11 }
+      : { data: deleted ? [] : [lastUser], total: 11 });
+    const deleteUser = vi.fn<AdminUsersApi["deleteUser"]>(async () => {
+      deleted = true;
+      return { success: true, message: "用户已删除" };
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const user = userEvent.setup();
+    render(<Users {...props(usersApi({ listUsers, deleteUser }))} />);
+
+    await screen.findByRole("button", { name: "writer-1" });
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByRole("button", { name: "last-user" });
+    await user.click(screen.getByRole("button", { name: "删除用户 last-user" }));
+    await waitFor(() => expect(listUsers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ skip: 0, limit: 10 }),
+      expect.any(AbortSignal),
+    ));
+    expect(screen.getByText("第 1 / 1 页")).toBeInTheDocument();
+  });
+
+  it("exports the active filter and sort with an explicit 1000-row cap", async () => {
+    const createObjectURL = vi.fn(() => "blob:users-export");
+    const revokeObjectURL = vi.fn();
+    const previousCreate = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const previousRevoke = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    restoreDownloadUrls = () => {
+      if (previousCreate) Object.defineProperty(URL, "createObjectURL", previousCreate);
+      else Reflect.deleteProperty(URL, "createObjectURL");
+      if (previousRevoke) Object.defineProperty(URL, "revokeObjectURL", previousRevoke);
+      else Reflect.deleteProperty(URL, "revokeObjectURL");
+    };
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => undefined);
+    const listUsers = vi.fn<AdminUsersApi["listUsers"]>(async (query) => ({
+      data: Array.from({ length: query.limit === 1000 ? 1000 : 1 }, (_, index) => userRecord({ id: "user-" + index })),
+      total: 1001,
+    }));
+    const api = usersApi({ listUsers });
+    const user = userEvent.setup();
+    render(<Users {...props(api)} />);
+
+    await screen.findByRole("button", { name: "writer" });
+    await user.type(screen.getByLabelText("用户名"), "writer");
+    await waitFor(() => expect(listUsers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ username: "writer", limit: 10, skip: 0 }),
+      expect.any(AbortSignal),
+    ));
+    await user.click(screen.getByRole("button", { name: "导出 CSV（最多 1000 条）" }));
+
+    await waitFor(() => expect(listUsers).toHaveBeenLastCalledWith(
+      expect.objectContaining({ username: "writer", sort_field: "id", sort_order: "desc", limit: 1000, skip: 0 }),
+      expect.any(AbortSignal),
+    ));
+    expect(await screen.findByRole("status")).toHaveTextContent("已导出前 1000 条，共有 1001 条");
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    expect(click).toHaveBeenCalledTimes(1);
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:users-export");
+    expect(screen.getByRole("button", { name: "writer" })).toBeInTheDocument();
+
+    click.mockRestore();
+  });
+
 });

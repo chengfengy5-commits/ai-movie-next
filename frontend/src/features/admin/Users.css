@@ -96,9 +96,7 @@
   font-size: 9px;
 }
 
-.admin-users-row-actions {
-  min-width: 54px;
-}
+
 
 .admin-users-empty {
   border: 0;
@@ -137,5 +135,122 @@
 
   .admin-users-form .admin-field-span {
     grid-column: auto;
+  }
+}
+
+.admin-users-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-users-feedback {
+  display: grid;
+  gap: 8px;
+}
+
+.admin-users-feedback:empty {
+  display: none;
+}
+
+.admin-users-notice {
+  margin: 0;
+  color: #91d4aa;
+  font-size: 12px;
+}
+
+.admin-users-delete-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid rgba(240, 113, 120, 0.35);
+  border-radius: 8px;
+  color: #f0a0a4;
+  background: rgba(140, 42, 49, 0.12);
+}
+
+.admin-users-delete-error p {
+  margin: 0;
+}
+
+.admin-users-row-actions {
+  min-width: 150px;
+  white-space: nowrap;
+}
+
+.admin-users-delete-button {
+  margin-left: 10px;
+  color: #e38d92;
+}
+
+.admin-users-delete-button:disabled {
+  cursor: not-allowed;
+}
+
+.admin-user-tabs {
+  display: flex;
+  gap: 4px;
+  overflow-x: auto;
+  border-bottom: 1px solid #2a2a30;
+}
+
+.admin-user-tabs button {
+  flex: 0 0 auto;
+  padding: 10px 13px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  color: #898992;
+  background: transparent;
+  font-size: 12px;
+}
+
+.admin-user-tabs button[aria-selected="true"] {
+  border-bottom-color: #8b5cf6;
+  color: #e4e4e7;
+}
+
+.admin-user-related {
+  display: grid;
+  gap: 12px;
+}
+
+.admin-user-related-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.admin-user-related-heading h2 {
+  margin: 0;
+  color: #dedde4;
+  font-size: 16px;
+}
+
+.admin-user-related-heading p {
+  margin: 5px 0 0;
+  color: #898992;
+  font-size: 11px;
+}
+
+.admin-user-related-table-wrap {
+  overflow-x: auto;
+}
+
+.admin-user-related-table-wrap .admin-users-table {
+  min-width: 640px;
+}
+
+@media (max-width: 760px) {
+  .admin-users-heading-actions {
+    width: 100%;
+  }
+
+  .admin-users-delete-error,
+  .admin-user-related-heading {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }

@@ -165,4 +165,68 @@ describe("admin users API client", () => {
       status: null,
     });
   });
+
+
+  it.each([
+    ["credit-logs", "/admin/credit-logs"],
+    ["model-configs", "/admin/model-configs"],
+    ["prompt-configs", "/admin/prompt-configs"],
+    ["tasks", "/admin/tasks"],
+    ["series", "/admin/series"],
+  ] as const)("loads %s using a fixed encoded user filter and the admin bearer", async (resource, path) => {
+    const fetcher = vi.fn<AdminFetcher>(async () => jsonResponse({ data: [], total: 0 }));
+    const api = createAdminUsersApi(fetcher, () => "admin-token", "/api");
+    const controller = new AbortController();
+
+    await expect(api.listRelatedRecords(resource, "user/一", {
+      skip: 10,
+      limit: 10,
+      sort_field: "created_at",
+      sort_order: "desc",
+    }, controller.signal)).resolves.toEqual({ data: [], total: 0 });
+
+    const [rawUrl, init] = fetcher.mock.calls[0]!;
+    const url = new URL(String(rawUrl), "http://localhost");
+    expect(url.pathname).toBe("/api" + path);
+    expect(url.searchParams.get("user_id")).toBe("user/一");
+    expect(url.searchParams.get("skip")).toBe("10");
+    expect(url.searchParams.get("limit")).toBe("10");
+    expect(url.searchParams.get("sort_field")).toBe("created_at");
+    expect(url.searchParams.get("sort_order")).toBe("desc");
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer admin-token");
+    expect(init?.signal).toBe(controller.signal);
+  });
+
+  it("encodes DELETE user ids and accepts only an explicit success result", async () => {
+    const fetcher = vi.fn<AdminFetcher>(async () => jsonResponse({ success: true, message: "用户已删除" }));
+    const api = createAdminUsersApi(fetcher, () => "admin-token", "/api");
+
+    await expect(api.deleteUser("user/一")).resolves.toEqual({ success: true, message: "用户已删除" });
+    expect(fetcher.mock.calls[0]?.[0]).toBe("/api/admin/users/user%2F%E4%B8%80");
+    expect(fetcher.mock.calls[0]?.[1]?.method).toBe("DELETE");
+
+    const uncertainApi = createAdminUsersApi(
+      vi.fn<AdminFetcher>(async () => jsonResponse({ message: "删除成功" })),
+      () => "admin-token",
+      "/api",
+    );
+    await expect(uncertainApi.deleteUser("user-1")).rejects.toMatchObject({
+      kind: "invalid-response",
+      status: null,
+    });
+  });
+
+  it("does not allow a related-data request to fall back to an unscoped global list", async () => {
+    const fetcher = vi.fn<AdminFetcher>();
+    const api = createAdminUsersApi(fetcher, () => "admin-token", "/api");
+
+    await expect(api.listRelatedRecords("series", "  ", {
+      skip: 0,
+      limit: 10,
+      sort_field: "created_at",
+      sort_order: "desc",
+    })).rejects.toMatchObject({ kind: "invalid-response" });
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
 });

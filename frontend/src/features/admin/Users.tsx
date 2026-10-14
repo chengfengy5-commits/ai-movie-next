@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../shared/api/errors";
+import { UserRelatedRecords } from "./UserRelatedRecords";
+import { downloadAdminUsersCsv, serializeAdminUsersCsv } from "./userExport";
 import type {
   AdminUserCreateInput,
   AdminUserListQuery,
   AdminUserRecord,
+  AdminUserRelatedResource,
   AdminUserSortField,
   AdminUserUpdateInput,
   AdminUsersApi,
@@ -19,6 +22,7 @@ export interface UsersProps {
   onAuthenticationError(): void;
   mode: AdminUsersViewMode;
   userId?: string | undefined;
+  currentAdministratorId: string;
   listVersion?: number;
   onCreate(): void;
   onEdit(userId: string): void;
@@ -141,12 +145,13 @@ function SortHeader({ field, label, activeField, order, onSort }: SortHeaderProp
 interface UserListProps {
   api: AdminUsersApi;
   onAuthenticationError(): void;
+  currentAdministratorId: string;
   onCreate(): void;
   onEdit(userId: string): void;
   listVersion: number;
 }
 
-function UserList({ api, onAuthenticationError, onCreate, onEdit, listVersion }: UserListProps) {
+function UserList({ api, onAuthenticationError, currentAdministratorId, onCreate, onEdit, listVersion }: UserListProps) {
   const [draftFilters, setDraftFilters] = useState<UserFilters>(EMPTY_FILTERS);
   const [page, setPage] = useState(1);
   const [sortField, setSortField] = useState<AdminUserSortField>("id");
@@ -156,6 +161,16 @@ function UserList({ api, onAuthenticationError, onCreate, onEdit, listVersion }:
   const [status, setStatus] = useState<PageStatus>("loading");
   const [loadError, setLoadError] = useState<string | null>(null);
   const [retry, setRetry] = useState(0);
+  const [deletingUserId, setDeletingUserId] = useState<string | null>(null);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [deleteNotice, setDeleteNotice] = useState<string | null>(null);
+  const [exportBusy, setExportBusy] = useState(false);
+  const [exportError, setExportError] = useState<string | null>(null);
+  const [exportNotice, setExportNotice] = useState<string | null>(null);
+  const deleteInFlight = useRef(false);
+  const mounted = useRef(false);
+  const exportController = useRef<AbortController | null>(null);
+  const exportSequence = useRef(0);
 
   const query = useMemo<AdminUserListQuery>(() => ({
     skip: (page - 1) * PAGE_SIZE,
@@ -164,6 +179,27 @@ function UserList({ api, onAuthenticationError, onCreate, onEdit, listVersion }:
     sort_order: sortOrder,
     ...queryFromFilters(draftFilters),
   }), [draftFilters, page, sortField, sortOrder]);
+  const currentQuery = useRef(query);
+  currentQuery.current = query;
+
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+      exportSequence.current += 1;
+      exportController.current?.abort();
+      exportController.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    exportController.current?.abort();
+    exportController.current = null;
+    exportSequence.current += 1;
+    setExportBusy(false);
+    setExportError(null);
+    setExportNotice(null);
+  }, [query]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -189,6 +225,73 @@ function UserList({ api, onAuthenticationError, onCreate, onEdit, listVersion }:
       controller.abort();
     };
   }, [api, onAuthenticationError, query, listVersion, retry]);
+
+  async function exportUsers() {
+    if (exportBusy) return;
+    const requestQuery = query;
+    const controller = new AbortController();
+    const sequence = exportSequence.current + 1;
+    exportSequence.current = sequence;
+    exportController.current = controller;
+    setExportBusy(true);
+    setExportError(null);
+    setExportNotice(null);
+
+    try {
+      const result = await api.listUsers({ ...requestQuery, skip: 0, limit: 1000 }, controller.signal);
+      if (controller.signal.aborted || currentQuery.current !== requestQuery || exportSequence.current !== sequence) return;
+      const records = result.data.slice(0, 1000);
+      downloadAdminUsersCsv(
+        serializeAdminUsersCsv(records),
+        "haoai-users-" + new Date().toISOString().slice(0, 10) + ".csv",
+      );
+      setExportNotice(result.total > records.length
+        ? `已导出前 ${records.length} 条，共有 ${result.total} 条符合当前筛选。`
+        : `已导出 ${records.length} 条用户记录。`);
+    } catch (cause) {
+      if (controller.signal.aborted || currentQuery.current !== requestQuery || exportSequence.current !== sequence) return;
+      if (!handleAuthenticationError(cause, onAuthenticationError)) {
+        setExportError(errorMessage(cause));
+      }
+    } finally {
+      if (mounted.current && exportSequence.current === sequence) {
+        exportController.current = null;
+        setExportBusy(false);
+      }
+    }
+  }
+
+  async function deleteUser(user: AdminUserRecord) {
+    if (user.id === currentAdministratorId || deleteInFlight.current) return;
+    const confirmed = window.confirm(
+      `确定删除用户“${user.username}”（${user.id}）吗？系统将删除该用户以及目前支持级联删除的积分流水、模型与提示词配置、剧集等关联数据，此操作无法撤销。`,
+    );
+    if (!confirmed || deleteInFlight.current) return;
+
+    const requestQuery = query;
+    deleteInFlight.current = true;
+    setDeletingUserId(user.id);
+    setDeleteError(null);
+    setDeleteNotice(null);
+    try {
+      const result = await api.deleteUser(user.id);
+      if (!mounted.current) return;
+      setDeleteNotice(result.message);
+      if (currentQuery.current === requestQuery && rows.length === 1 && page > 1) {
+        setPage((value) => value - 1);
+      } else {
+        setRetry((value) => value + 1);
+      }
+    } catch (cause) {
+      if (!mounted.current) return;
+      if (!handleAuthenticationError(cause, onAuthenticationError)) {
+        setDeleteError(`${errorMessage(cause)} 删除结果未确认，列表保持原样；请重新查询核对后再决定是否重试。系统不会自动重发删除请求。`);
+      }
+    } finally {
+      deleteInFlight.current = false;
+      if (mounted.current) setDeletingUserId(null);
+    }
+  }
 
   function changeFilter<K extends keyof UserFilters>(key: K, value: UserFilters[K]) {
     setDraftFilters((current) => ({ ...current, [key]: value }));
@@ -220,9 +323,14 @@ function UserList({ api, onAuthenticationError, onCreate, onEdit, listVersion }:
           <h1>用户管理</h1>
           <p>查看用户资料、会员状态和管理员设置。</p>
         </div>
-        <button className="admin-button admin-button-primary" type="button" onClick={onCreate}>
-          新建用户
-        </button>
+        <div className="admin-users-heading-actions">
+          <button className="admin-button admin-button-secondary" type="button" onClick={() => { void exportUsers(); }} disabled={exportBusy}>
+            {exportBusy ? "导出中…" : "导出 CSV（最多 1000 条）"}
+          </button>
+          <button className="admin-button admin-button-primary" type="button" onClick={onCreate}>
+            新建用户
+          </button>
+        </div>
       </header>
 
       <section className="admin-filter-panel admin-users-filters" aria-label="用户筛选">
@@ -255,6 +363,22 @@ function UserList({ api, onAuthenticationError, onCreate, onEdit, listVersion }:
         </div>
         <span className="admin-sort-note">按{sortField === "created_at" ? "注册时间" : sortField === "id" ? "用户 ID" : sortField} {sortOrder === "asc" ? "升序" : "降序"}</span>
       </section>
+
+      <div className="admin-users-feedback" aria-live="polite">
+        {exportError ? <p className="admin-form-error" role="alert">CSV 导出失败：{exportError}</p> : null}
+        {exportNotice ? <p className="admin-users-notice" role="status">{exportNotice}</p> : null}
+        {deleteError ? (
+          <section className="admin-users-delete-error" role="alert">
+            <p>删除未完成：{deleteError}</p>
+            <button className="admin-button admin-button-secondary" type="button" onClick={() => {
+              setDeleteError(null);
+              setDeleteNotice(null);
+              setRetry((value) => value + 1);
+            }}>重新查询用户列表</button>
+          </section>
+        ) : null}
+        {deleteNotice ? <p className="admin-users-notice" role="status">{deleteNotice}，正在刷新用户列表。</p> : null}
+      </div>
 
       {status === "loading" ? (
         <section className="admin-state-card" role="status">正在读取用户…</section>
@@ -304,6 +428,16 @@ function UserList({ api, onAuthenticationError, onCreate, onEdit, listVersion }:
                       <td>{formatDate(user.created_at)}</td>
                       <td className="admin-users-row-actions">
                         <button className="admin-text-button" type="button" onClick={() => onEdit(user.id)}>编辑</button>
+                        <button
+                          className="admin-text-button admin-users-delete-button"
+                          type="button"
+                          disabled={deletingUserId !== null || user.id === currentAdministratorId}
+                          title={user.id === currentAdministratorId ? "不能删除当前登录的管理员账号" : ""}
+                          aria-label={user.id === currentAdministratorId ? "删除当前管理员不可用" : "删除用户 " + user.username}
+                          onClick={() => { void deleteUser(user); }}
+                        >
+                          {user.id === currentAdministratorId ? "当前管理员" : deletingUserId === user.id ? "删除中…" : "删除"}
+                        </button>
                       </td>
                     </tr>
                   );
@@ -381,6 +515,7 @@ function UserForm({ api, onAuthenticationError, mode, userId, onCancel, onSaved 
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [retry, setRetry] = useState(0);
+  const [activeTab, setActiveTab] = useState<"basic" | AdminUserRelatedResource>("basic");
   const mounted = useRef(false);
   const saveController = useRef<AbortController | null>(null);
 
@@ -498,7 +633,18 @@ function UserForm({ api, onAuthenticationError, mode, userId, onCancel, onSaved 
         </div>
       </header>
 
-      <form className="admin-model-form admin-users-form" onSubmit={(event) => { void submit(event); }}>
+      {mode === "edit" && userId ? (
+        <nav className="admin-user-tabs" role="tablist" aria-label="用户资料页签">
+          <button type="button" role="tab" aria-selected={activeTab === "basic"} onClick={() => setActiveTab("basic")}>基本信息</button>
+          <button type="button" role="tab" aria-selected={activeTab === "credit-logs"} onClick={() => setActiveTab("credit-logs")}>积分流水</button>
+          <button type="button" role="tab" aria-selected={activeTab === "model-configs"} onClick={() => setActiveTab("model-configs")}>模型配置</button>
+          <button type="button" role="tab" aria-selected={activeTab === "prompt-configs"} onClick={() => setActiveTab("prompt-configs")}>提示词配置</button>
+          <button type="button" role="tab" aria-selected={activeTab === "tasks"} onClick={() => setActiveTab("tasks")}>AI 任务</button>
+          <button type="button" role="tab" aria-selected={activeTab === "series"} onClick={() => setActiveTab("series")}>剧集</button>
+        </nav>
+      ) : null}
+
+      <form className="admin-model-form admin-users-form" hidden={mode === "edit" && activeTab !== "basic"} onSubmit={(event) => { void submit(event); }}>
         <div className="admin-form-grid">
           <label className="admin-field">
             <span>用户名</span>
@@ -556,6 +702,16 @@ function UserForm({ api, onAuthenticationError, mode, userId, onCancel, onSaved 
           </button>
         </div>
       </form>
+
+      {mode === "edit" && userId && activeTab !== "basic" ? (
+        <UserRelatedRecords
+          key={activeTab}
+          api={api}
+          resource={activeTab}
+          userId={userId}
+          onAuthenticationError={onAuthenticationError}
+        />
+      ) : null}
     </section>
   );
 }
@@ -566,6 +722,7 @@ export function Users(props: UsersProps) {
       <UserList
         api={props.api}
         onAuthenticationError={props.onAuthenticationError}
+        currentAdministratorId={props.currentAdministratorId}
         onCreate={props.onCreate}
         onEdit={props.onEdit}
         listVersion={props.listVersion ?? 0}

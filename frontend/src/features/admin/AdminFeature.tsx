@@ -356,6 +356,7 @@ export function AdminFeature({
               onAuthenticationError={handleResourceUnauthorized}
               mode={view.kind === "users" ? "list" : view.kind === "user-create" ? "create" : "edit"}
               userId={view.kind === "user-edit" ? view.id : undefined}
+              currentAdministratorId={session.user.id}
               listVersion={userListVersion}
               onCreate={() => navigate({ kind: "user-create" })}
               onEdit={(id) => navigate({ kind: "user-edit", id })}

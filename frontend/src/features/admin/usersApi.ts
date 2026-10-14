@@ -2,9 +2,13 @@ import { ApiError } from "../../shared/api/errors";
 import type { AdminFetcher } from "./adminApi";
 import type {
   AdminUserCreateInput,
+  AdminUserDeleteResult,
   AdminUserListQuery,
   AdminUserPage,
   AdminUserRecord,
+  AdminUserRelatedPage,
+  AdminUserRelatedQuery,
+  AdminUserRelatedResource,
   AdminUserUpdateInput,
   AdminUsersApi,
 } from "./usersTypes";
@@ -36,6 +40,12 @@ async function readJson<T>(response: Response): Promise<T> {
   } catch {
     throw new ApiError("invalid-response", "服务返回的数据无法识别。");
   }
+}
+
+function isDeleteResult(value: unknown): value is AdminUserDeleteResult {
+  if (typeof value !== "object" || value === null) return false;
+  const result = value as Partial<AdminUserDeleteResult>;
+  return result.success === true && typeof result.message === "string";
 }
 
 function requestFailure(error: unknown): ApiError {
@@ -71,6 +81,14 @@ export function createAdminUsersApi(
     if (!response.ok) throw await readError(response);
     return readJson<T>(response);
   }
+
+  const relatedPaths: Record<AdminUserRelatedResource, string> = {
+    "credit-logs": "/admin/credit-logs",
+    "model-configs": "/admin/model-configs",
+    "prompt-configs": "/admin/prompt-configs",
+    tasks: "/admin/tasks",
+    series: "/admin/series",
+  };
 
   return {
     listUsers(query: AdminUserListQuery, signal?: AbortSignal) {
@@ -109,6 +127,36 @@ export function createAdminUsersApi(
           body: JSON.stringify(input),
           ...(signal ? { signal } : {}),
         },
+      );
+    },
+    async deleteUser(userId: string, signal?: AbortSignal) {
+      const result = await request<unknown>(
+        endpoint("/admin/users/") + encodeURIComponent(userId),
+        { method: "DELETE", ...(signal ? { signal } : {}) },
+      );
+      if (!isDeleteResult(result)) {
+        throw new ApiError("invalid-response", "服务返回的数据无法识别。");
+      }
+      return result;
+    },
+    async listRelatedRecords(
+      resource: AdminUserRelatedResource,
+      userId: string,
+      query: AdminUserRelatedQuery,
+      signal?: AbortSignal,
+    ) {
+      if (userId.trim() === "") {
+        throw new ApiError("invalid-response", "缺少用户编号，无法读取关联数据。");
+      }
+      const params = new URLSearchParams();
+      params.set("skip", String(query.skip));
+      params.set("limit", String(query.limit));
+      params.set("sort_field", query.sort_field);
+      params.set("sort_order", query.sort_order);
+      params.set("user_id", userId);
+      return request<AdminUserRelatedPage>(
+        endpoint(relatedPaths[resource]) + "?" + params.toString(),
+        signal ? { signal } : {},
       );
     },
   };
