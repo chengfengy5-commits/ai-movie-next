@@ -1,8 +1,8 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createElement, useLayoutEffect, type ComponentProps } from "react";
-import type { Character, Chapter, ChapterEditLockLeaseHandle, ChapterEditLockState, CreateChapterInput, Series, StoryboardAsset, UpdateChapterInput } from "../../shared/api/contracts";
+import { createElement, useLayoutEffect, useState, type ComponentProps } from "react";
+import type { Character, Chapter, ChapterEditLockAcquisition, ChapterEditLockLeaseHandle, ChapterEditLockState, CreateChapterInput, Series, StoryboardAsset, UpdateChapterInput } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import type { PersonalRoughCutFrameTarget, PersonalRoughCutReadIdentity } from "./PersonalRoughCutPanel";
@@ -211,7 +211,7 @@ function makeServices(
     _signal: AbortSignal,
     _lease?: ChapterEditLockLeaseHandle,
   ): Promise<ChapterEditLockState> => ({ locked: false }));
-  const acquireChapterEditLock = vi.fn(async (_chapterId: string, _signal: AbortSignal) => ({
+  const acquireChapterEditLock = vi.fn(async (_chapterId: string, _signal: AbortSignal): Promise<ChapterEditLockAcquisition> => ({
     state: {
       locked: true,
       user_id: "demo-user",
@@ -256,6 +256,7 @@ function makeServices(
     getChapterEditLock,
     acquireChapterEditLock,
     releaseChapterEditLock,
+    assetsByChapter,
     getCurrentChapters: () => currentChapters,
     setCurrentChapters: (next: Chapter[]) => { currentChapters = next; },
   };
@@ -333,6 +334,115 @@ function emptyPersonalNotesSnapshot(chapterId: string, note: string): PersonalPr
     frame_notes: { orphan: { status: "needs_revision", note } },
     resume_frame_id: null,
   }, chapterId);
+}
+
+function stableStoryboardId(frame: NonNullable<Chapter["content"]>[number]): string | null {
+  const references = frame.storyboard;
+  return Array.isArray(references) && typeof references[0] === "string" ? references[0] : null;
+}
+
+function frameStructureNotes(chapterValue: Chapter, resumeFrameId: string | null): PersonalProductionSnapshot {
+  const frames = chapterValue.content ?? [];
+  return parsePersonalProductionSnapshot({
+    chapter_id: chapterValue.id,
+    revision: 4,
+    media_state: frames.length === 0 ? "empty" : "ready",
+    frames: frames.map((frame, index) => ({
+      frame_index: index,
+      storyboard_asset_id: stableStoryboardId(frame),
+      media_revision: 1,
+      source_valid: true,
+      asset_image_digest: null,
+      preview_digest: null,
+      invalid_reason: null,
+    })),
+    frame_notes: resumeFrameId === null
+      ? { "legacy-frame-note": { status: "needs_revision", note: "保留历史记录" } }
+      : { [resumeFrameId]: { status: "unmarked", note: "删除后保留的历史备注" } },
+    resume_frame_id: resumeFrameId,
+  }, chapterValue.id);
+}
+
+function frameStructureRoughCut(chapterValue: Chapter, removedAssetIds: string[] = []): PersonalRoughCutSnapshot {
+  const frames = chapterValue.content ?? [];
+  return {
+    chapter_id: chapterValue.id,
+    revision: 3,
+    saved: true,
+    frames: frames.map((frame, index) => ({
+      asset_id: stableStoryboardId(frame) ?? "",
+      frame_index: index,
+      text: typeof frame.text === "string" ? frame.text : "",
+      preview_url: null,
+      missing_reason: null,
+      included: index === 0,
+      pending: false,
+    })),
+    removed_asset_ids: [...removedAssetIds],
+  };
+}
+
+function makeFrameStructureServices(initialChapter: Chapter, resumeFrameId: string | null = null) {
+  const initialAssets = (initialChapter.content ?? []).flatMap((frame, frameIndex) => {
+    const id = stableStoryboardId(frame);
+    return id === null ? [] : [{ ...asset(id, initialChapter.id), frame_index: frameIndex }];
+  });
+  const base = makeServices([initialChapter], { [initialChapter.id]: initialAssets }, false, true);
+  const { services, assetsByChapter } = base;
+  let nextAssetId = 1;
+  let removedAssetIds: string[] = [];
+
+  base.updateChapter.mockImplementation(async (seriesId, chapterId, update) => {
+    const current = base.getCurrentChapters().find((row) => row.id === chapterId);
+    if (current === undefined || current.series_id !== seriesId || update.content === undefined) {
+      throw new ApiError("http", "missing", 404);
+    }
+    const content = update.content.map((frame) => {
+      const references = frame.storyboard;
+      if (Array.isArray(references) && references.length === 0) {
+        return { ...frame, storyboard: [`${chapterId}-inserted-${nextAssetId++}`] };
+      }
+      return frame;
+    });
+    const updated = { ...current, content };
+    base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? updated : row));
+    assetsByChapter[chapterId] = content.flatMap((frame, frameIndex) => {
+      const id = stableStoryboardId(frame);
+      return id === null ? [] : [{ ...asset(id, chapterId), frame_index: frameIndex }];
+    });
+    return updated;
+  });
+
+  const deleteFrame = vi.fn(async (seriesId: string, chapterId: string, frameIndex: number) => {
+    const current = base.getCurrentChapters().find((row) => row.id === chapterId);
+    if (current === undefined || current.series_id !== seriesId || current.content === null
+      || current.content.length <= 1 || frameIndex < 0 || frameIndex >= current.content.length) {
+      throw new ApiError("http", "invalid delete", 422);
+    }
+    const removedId = stableStoryboardId(current.content[frameIndex]!);
+    if (removedId === null) throw new ApiError("http", "missing stable identity", 422);
+    removedAssetIds = [...removedAssetIds, removedId];
+    const content = current.content.filter((_frame, index) => index !== frameIndex);
+    const updated = { ...current, content };
+    base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? updated : row));
+    assetsByChapter[chapterId] = content.flatMap((frame, index) => {
+      const id = stableStoryboardId(frame);
+      return id === null ? [] : [{ ...asset(id, chapterId), frame_index: index }];
+    });
+    return updated;
+  });
+  services.deleteFrame = deleteFrame;
+  vi.spyOn(services, "getPersonalProductionNotes").mockImplementation(async (chapterId) => {
+    const current = base.getCurrentChapters().find((row) => row.id === chapterId);
+    if (current === undefined) throw new ApiError("http", "missing", 404);
+    return frameStructureNotes(current, resumeFrameId);
+  });
+  vi.spyOn(services, "getPersonalRoughCut").mockImplementation(async (chapterId) => {
+    const current = base.getCurrentChapters().find((row) => row.id === chapterId);
+    if (current === undefined) throw new ApiError("http", "missing", 404);
+    return frameStructureRoughCut(current, removedAssetIds);
+  });
+  return { ...base, deleteFrame, assetsByChapter };
 }
 
 describe("read-only chapter browser", () => {
@@ -3561,7 +3671,7 @@ describe("read-only chapter browser", () => {
     const { services, getChapterEditLock, releaseChapterEditLock, updateChapter } = makeServices(
       [current], { [current.id]: [asset("lock-refresh-asset", current.id)] }, false, true,
     );
-    const ownedLock: ChapterEditLockState = {
+    const ownedLock = {
       locked: true,
       user_id: "demo-user",
       username: "演示创作者",
@@ -3663,6 +3773,7 @@ describe("read-only chapter browser", () => {
         .mockResolvedValueOnce(ownedLock);
       if (failurePoint === "release") {
         releaseChapterEditLock.mockRejectedValueOnce(new ApiError("network", "release was not confirmed"));
+        getChapterEditLock.mockResolvedValueOnce(ownedLock);
       } else {
         getChapterEditLock.mockRejectedValueOnce(new ApiError("network", "lock state was not confirmed"));
       }
@@ -3677,7 +3788,8 @@ describe("read-only chapter browser", () => {
 
       await waitFor(() => expect(releaseChapterEditLock).toHaveBeenCalledTimes(1));
       if (failurePoint === "release") {
-        expect(getChapterEditLock).toHaveBeenCalledTimes(2);
+        await waitFor(() => expect(getChapterEditLock).toHaveBeenCalledTimes(3));
+        expect(getChapterEditLock.mock.calls[2]).toEqual([current.id, expect.any(AbortSignal)]);
       } else {
         await waitFor(() => expect(getChapterEditLock).toHaveBeenCalledTimes(3));
       }
@@ -3755,6 +3867,578 @@ describe("read-only chapter browser", () => {
 
     expect(screen.getByText(/你在其他位置持有编辑锁/)).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument();
+  });
+
+  it("inserts after the selected frame, preserves neighboring payloads, and confirms stable IDs on reread", async () => {
+    const user = userEvent.setup();
+    const first = {
+      text: "开场文字",
+      original_text: "开场原文",
+      storyboard: ["structure-first"],
+      character: ["character-existing"],
+      preview: "preview://keep",
+      fused: { source: "preserve" },
+      unknown_payload: { nested: ["untouched"] },
+    };
+    const second = { text: "后续文字", storyboard: ["structure-second"], future_flag: true };
+    const current = chapter("chapter-structure-insert", "分镜结构插入", [first, second]);
+    const { services, updateChapter, listStoryboardAssets, getCurrentChapters } = makeFrameStructureServices(current);
+    const listCharacters = vi.spyOn(services, "listCharacters").mockResolvedValue([
+      character("character-new", series.id, "林舟"),
+    ]);
+    renderBrowser(services);
+
+    const firstArticle = await screen.findByRole("article", { name: "分镜结构插入 · 镜头 1" });
+    await user.click(within(firstArticle).getByRole("button", { name: "在此镜头后插入" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "插入分镜" }));
+    expect(await screen.findByLabelText("林舟")).toBeInTheDocument();
+    expect(listCharacters).toHaveBeenCalledWith(series.id, expect.any(AbortSignal));
+    await user.type(dialog.getByRole("textbox", { name: "分镜文字" }), "新插入的镜头");
+    await user.click(dialog.getByLabelText("林舟"));
+    await user.click(dialog.getByRole("button", { name: "确认插入" }));
+
+    await waitFor(() => expect(updateChapter).toHaveBeenCalledTimes(1));
+    expect(updateChapter).toHaveBeenCalledWith(series.id, current.id, {
+      content: [
+        first,
+        {
+          text: "新插入的镜头",
+          character: ["character-new"],
+          scene: [],
+          prop: [],
+          storyboard: [],
+          preview: null,
+        },
+        second,
+      ],
+    }, expect.any(AbortSignal));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "插入分镜" })).not.toBeInTheDocument());
+    expect(getCurrentChapters()[0]?.content?.map(stableStoryboardId)).toEqual([
+      "structure-first",
+      `${current.id}-inserted-1`,
+      "structure-second",
+    ]);
+    expect(services.getPersonalProductionNotes).toHaveBeenCalledTimes(1);
+    expect(services.getPersonalRoughCut).toHaveBeenCalledTimes(1);
+    expect(listStoryboardAssets.mock.calls.length).toBeGreaterThanOrEqual(4);
+  });
+
+  it("uses dedicated delete-frame and rereads shifted stable identities and historical notes", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-delete", "分镜结构删除", [
+      { text: "前镜", storyboard: ["structure-delete-first"], original_text: "保留原文一" },
+      { text: "目标镜头", storyboard: ["structure-delete-target"], preview: "preview://target" },
+      { text: "后镜", storyboard: ["structure-delete-last"], fused: { keep: true } },
+    ]);
+    const { services, updateChapter, deleteFrame, getCurrentChapters } = makeFrameStructureServices(
+      current,
+      "structure-delete-target",
+    );
+    renderBrowser(services);
+
+    const targetArticle = await screen.findByRole("article", { name: "分镜结构删除 · 镜头 2" });
+    await user.click(within(targetArticle).getByRole("button", { name: "删除镜头" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "删除分镜" }));
+    await user.click(dialog.getByRole("button", { name: "确认删除" }));
+
+    await waitFor(() => expect(deleteFrame).toHaveBeenCalledTimes(1));
+    expect(deleteFrame).toHaveBeenCalledWith(series.id, current.id, 1, expect.any(AbortSignal));
+    expect(updateChapter).not.toHaveBeenCalled();
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "删除分镜" })).not.toBeInTheDocument());
+    expect(getCurrentChapters()[0]?.content).toEqual([
+      { text: "前镜", storyboard: ["structure-delete-first"], original_text: "保留原文一" },
+      { text: "后镜", storyboard: ["structure-delete-last"], fused: { keep: true } },
+    ]);
+    expect(services.getPersonalProductionNotes).toHaveBeenCalledTimes(1);
+    expect(services.getPersonalRoughCut).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps a delete draft and does not write when the target stable ID drifts before submit", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-drift", "删除身份漂移", [
+      { text: "前镜", storyboard: ["structure-drift-first"] },
+      { text: "目标镜头", storyboard: ["structure-drift-target"] },
+      { text: "后镜", storyboard: ["structure-drift-last"] },
+    ]);
+    const { services, updateChapter, deleteFrame, setCurrentChapters, assetsByChapter } = makeFrameStructureServices(current);
+    renderBrowser(services);
+
+    const targetArticle = await screen.findByRole("article", { name: "删除身份漂移 · 镜头 2" });
+    await user.click(within(targetArticle).getByRole("button", { name: "删除镜头" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "删除分镜" }));
+    const drifted = {
+      ...current,
+      content: current.content?.map((frame, index) => index === 1
+        ? { ...frame, storyboard: ["structure-drift-replacement"] }
+        : frame) ?? null,
+    };
+    setCurrentChapters([drifted]);
+    assetsByChapter[current.id] = [
+      { ...asset("structure-drift-first", current.id), frame_index: 0 },
+      { ...asset("structure-drift-replacement", current.id), frame_index: 1 },
+      { ...asset("structure-drift-last", current.id), frame_index: 2 },
+    ];
+
+    await user.click(dialog.getByRole("button", { name: "确认删除" }));
+    expect(await screen.findByText(/章节内容或镜头顺序已变化；草稿保留/)).toBeInTheDocument();
+    expect(deleteFrame).not.toHaveBeenCalled();
+    expect(updateChapter).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "删除分镜" })).toBeInTheDocument();
+  });
+
+  it("keeps an insert draft and sends no write when a non-target asset position drifts", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-insert-position-drift", "插入位置漂移", [
+      { text: "前镜", storyboard: ["insert-position-first"] },
+      { text: "后镜", storyboard: ["insert-position-last"] },
+    ]);
+    const { services, updateChapter, assetsByChapter } = makeFrameStructureServices(current);
+    renderBrowser(services);
+
+    await screen.findByRole("heading", { name: "插入位置漂移" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "插入分镜" }));
+    const textbox = dialog.getByRole("textbox", { name: "分镜文字" });
+    await user.type(textbox, "草稿保留");
+    const nonTargetAsset = assetsByChapter[current.id]?.find((value) => value.id === "insert-position-last");
+    if (nonTargetAsset === undefined) throw new Error("Expected the non-target frame asset.");
+    nonTargetAsset.frame_index = 8;
+
+    await user.click(dialog.getByRole("button", { name: "确认插入" }));
+    expect(await screen.findByText(/素材位置在编辑期间发生变化；未发送修改/)).toBeInTheDocument();
+    expect(updateChapter).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "插入分镜" })).toBeInTheDocument();
+    expect(textbox).toHaveValue("草稿保留");
+  });
+
+  it("keeps a delete draft and sends no delete when a non-target asset position drifts", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-delete-position-drift", "删除位置漂移", [
+      { text: "前镜", storyboard: ["delete-position-first"] },
+      { text: "目标镜头", storyboard: ["delete-position-target"] },
+      { text: "后镜", storyboard: ["delete-position-last"] },
+    ]);
+    const { services, deleteFrame, updateChapter, assetsByChapter } = makeFrameStructureServices(current);
+    renderBrowser(services);
+
+    const targetArticle = await screen.findByRole("article", { name: "删除位置漂移 · 镜头 2" });
+    await user.click(within(targetArticle).getByRole("button", { name: "删除镜头" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "删除分镜" }));
+    const nonTargetAsset = assetsByChapter[current.id]?.find((value) => value.id === "delete-position-first");
+    if (nonTargetAsset === undefined) throw new Error("Expected the non-target frame asset.");
+    nonTargetAsset.frame_index = 8;
+
+    await user.click(dialog.getByRole("button", { name: "确认删除" }));
+    expect(await screen.findByText(/素材位置在编辑期间发生变化；未发送修改/)).toBeInTheDocument();
+    expect(deleteFrame).not.toHaveBeenCalled();
+    expect(updateChapter).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "删除分镜" })).toBeInTheDocument();
+  });
+
+  it("guards same-scope navigation until a dirty structure draft is discarded", async () => {
+    const user = userEvent.setup();
+    const first = chapter("chapter-draft-navigation-first", "草稿来源章节", [{ text: "首镜" }]);
+    const target = chapter("chapter-draft-navigation-target", "导航目标章节", [{ text: "目标镜头" }], { order: 2 });
+    const { services, listChapters } = makeFrameStructureServices(first);
+    listChapters.mockImplementation(async () => [first, target]);
+    const onAbandoned = vi.fn();
+    const onBack = vi.fn();
+    const onUnauthorized = vi.fn();
+    let setNavigationIntent: ((intent: ChapterNavigationIntent | null) => void) | null = null;
+    function NavigationHarness() {
+      const [navigationIntent, updateNavigationIntent] = useState<ChapterNavigationIntent | null>(null);
+      setNavigationIntent = updateNavigationIntent;
+      return (
+        <ChapterBrowser
+          onBack={onBack}
+          onNavigationAbandoned={onAbandoned}
+          onUnauthorized={onUnauthorized}
+          navigationIntent={navigationIntent}
+          series={series}
+          services={services}
+          userId="demo-user"
+        />
+      );
+    }
+    render(<NavigationHarness />);
+
+    await screen.findByRole("heading", { name: "草稿来源章节" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    const editor = within(await screen.findByRole("dialog", { name: "插入分镜" }));
+    const textbox = editor.getByRole("textbox", { name: "分镜文字" });
+    await user.type(textbox, "尚未保存的内容");
+
+    const intent = (navigationEpoch: number): ChapterNavigationIntent => ({
+      userId: "demo-user",
+      services,
+      seriesId: series.id,
+      chapterId: target.id,
+      navigationEpoch,
+    });
+    await act(async () => {
+      setNavigationIntent?.(intent(701));
+    });
+    const firstConfirmation = await screen.findByRole("alertdialog", { name: "放弃分镜草稿？" });
+    await user.click(within(firstConfirmation).getByRole("button", { name: "继续编辑" }));
+    expect(onAbandoned).toHaveBeenCalledWith(701);
+    expect(screen.getByRole("dialog", { name: "插入分镜" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "分镜文字" })).toHaveValue("尚未保存的内容");
+
+    await act(async () => {
+      setNavigationIntent?.(intent(702));
+    });
+    const secondConfirmation = await screen.findByRole("alertdialog", { name: "放弃分镜草稿？" });
+    await user.click(within(secondConfirmation).getByRole("button", { name: "放弃草稿并离开" }));
+
+    await screen.findByRole("heading", { name: "导航目标章节" });
+    expect(screen.queryByRole("dialog", { name: "插入分镜" })).not.toBeInTheDocument();
+  });
+
+  it("freezes after a failed post-write read and retries by verification without resending", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-read-failure", "提交后重读失败", [
+      { text: "前镜", storyboard: ["structure-read-first"] },
+      { text: "后镜", storyboard: ["structure-read-last"] },
+    ]);
+    const { services, updateChapter } = makeFrameStructureServices(current);
+    vi.spyOn(services, "getPersonalProductionNotes")
+      .mockRejectedValueOnce(new ApiError("http", "snapshot unavailable", 503));
+    renderBrowser(services);
+
+    await screen.findByRole("heading", { name: "提交后重读失败" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "插入分镜" }));
+    await user.type(dialog.getByRole("textbox", { name: "分镜文字" }), "新增镜头");
+    await user.click(dialog.getByRole("button", { name: "确认插入" }));
+
+    expect(await screen.findByText(/请求已发送，但章节、素材或制作映射无法重新读取/)).toBeInTheDocument();
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("button", { name: "确认插入" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "只核对服务器状态" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "插入分镜" })).not.toBeInTheDocument());
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+    expect(services.getPersonalProductionNotes).toHaveBeenCalledTimes(2);
+  });
+
+  it("reloads the selected chapter and its assets after closing unknown-write verification", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-close-unknown", "关闭未知核对", [
+      { text: "前镜", storyboard: ["close-unknown-first"] },
+      { text: "后镜", storyboard: ["close-unknown-last"] },
+    ]);
+    const { services, updateChapter, listChapters, listStoryboardAssets } = makeFrameStructureServices(current);
+    vi.spyOn(services, "getPersonalProductionNotes")
+      .mockRejectedValueOnce(new ApiError("http", "snapshot unavailable", 503));
+    renderBrowser(services);
+
+    await screen.findByRole("heading", { name: "关闭未知核对" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "插入分镜" }));
+    await user.type(dialog.getByRole("textbox", { name: "分镜文字" }), "待核对镜头");
+    await user.click(dialog.getByRole("button", { name: "确认插入" }));
+    expect(await screen.findByText(/请求已发送，但章节、素材或制作映射无法重新读取/)).toBeInTheDocument();
+    const directoryReadsBeforeClose = listChapters.mock.calls.length;
+    const assetReadsBeforeClose = listStoryboardAssets.mock.calls.length;
+
+    await user.click(screen.getByRole("button", { name: "结束本次核对并关闭" }));
+    const discard = await screen.findByRole("alertdialog", { name: "放弃分镜草稿？" });
+    expect(discard).toHaveTextContent("原请求仍可能迟到完成");
+    await user.click(within(discard).getByRole("button", { name: "放弃草稿并离开" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "插入分镜" })).not.toBeInTheDocument());
+    await screen.findByText("写入结果仍未确认，章节与素材已重新读取；请核对当前状态。");
+    await screen.findByRole("article", { name: "关闭未知核对 · 镜头 1" });
+    await waitFor(() => expect(listChapters.mock.calls.length).toBeGreaterThan(directoryReadsBeforeClose));
+    await waitFor(() => expect(listStoryboardAssets.mock.calls.length).toBeGreaterThan(assetReadsBeforeClose));
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an ambiguous delete frozen when a baseline read precedes a delayed write", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-delayed-delete", "迟到删除核对", [
+      { text: "前镜", storyboard: ["structure-delayed-first"] },
+      { text: "目标镜头", storyboard: ["structure-delayed-target"] },
+      { text: "后镜", storyboard: ["structure-delayed-last"] },
+    ]);
+    const { services, deleteFrame, getCurrentChapters, setCurrentChapters, assetsByChapter } = makeFrameStructureServices(
+      current,
+      "structure-delayed-target",
+    );
+    deleteFrame.mockRejectedValueOnce(new ApiError("network", "connection lost", null));
+    renderBrowser(services);
+
+    const targetArticle = await screen.findByRole("article", { name: "迟到删除核对 · 镜头 2" });
+    await user.click(within(targetArticle).getByRole("button", { name: "删除镜头" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "删除分镜" }));
+    await user.click(dialog.getByRole("button", { name: "确认删除" }));
+
+    expect(await screen.findByText(/无法证明请求不会迟到落库/)).toBeInTheDocument();
+    expect(deleteFrame).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "只核对服务器状态" }));
+    expect(await screen.findByText(/无法证明原请求不会迟到落库/)).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "删除分镜" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "确认删除" })).not.toBeInTheDocument();
+    expect(deleteFrame).toHaveBeenCalledTimes(1);
+
+    const baseline = getCurrentChapters()[0]!;
+    const lateContent = baseline.content?.filter((_frame, index) => index !== 1) ?? [];
+    setCurrentChapters([{ ...baseline, content: lateContent }]);
+    assetsByChapter[current.id] = lateContent.flatMap((frame, frameIndex) => {
+      const id = stableStoryboardId(frame);
+      return id === null ? [] : [{ ...asset(id, current.id), frame_index: frameIndex }];
+    });
+    await user.click(screen.getByRole("button", { name: "只核对服务器状态" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "删除分镜" })).not.toBeInTheDocument());
+    expect(deleteFrame).toHaveBeenCalledTimes(1);
+    expect(getCurrentChapters()[0]?.content).toEqual([
+      { text: "前镜", storyboard: ["structure-delayed-first"] },
+      { text: "后镜", storyboard: ["structure-delayed-last"] },
+    ]);
+  });
+
+  it("ignores a late readback 401 after the user scope changes", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-late-401", "迟到401的分镜", [
+      { text: "前镜", storyboard: ["structure-late-first"] },
+      { text: "后镜", storyboard: ["structure-late-last"] },
+    ]);
+    const { services, updateChapter } = makeFrameStructureServices(current);
+    const pendingNotes = deferred<PersonalProductionSnapshot>();
+    vi.spyOn(services, "getPersonalProductionNotes").mockReturnValue(pendingNotes.promise);
+    const onUnauthorized = vi.fn();
+    const view = renderBrowser(services, vi.fn(), onUnauthorized);
+
+    await screen.findByRole("heading", { name: "迟到401的分镜" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "插入分镜" }));
+    await user.type(dialog.getByRole("textbox", { name: "分镜文字" }), "迟到结果镜头");
+    await user.click(dialog.getByRole("button", { name: "确认插入" }));
+    await waitFor(() => expect(services.getPersonalProductionNotes).toHaveBeenCalledTimes(1));
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={view.onBack}
+        onUnauthorized={onUnauthorized}
+        series={series}
+        services={services}
+        userId="another-user"
+      />,
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "插入分镜" })).not.toBeInTheDocument());
+    await act(async () => {
+      pendingNotes.reject(new ApiError("http", "expired", 401));
+      await pendingNotes.promise.catch(() => undefined);
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("releases a newly acquired structure lock with an unleased refresh and keeps an existing lock", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-lock", "分镜团队锁", [
+      { text: "前镜", storyboard: ["structure-lock-first"] },
+      { text: "后镜", storyboard: ["structure-lock-last"] },
+    ]);
+    const newlyAcquired = makeFrameStructureServices(current);
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    newlyAcquired.getChapterEditLock.mockImplementation(async (_chapterId, _signal, lease) => (
+      lease !== undefined ? ownedLock : { locked: false }
+    ));
+    newlyAcquired.releaseChapterEditLock.mockImplementation(async () => {
+      return { message: "锁已释放" };
+    });
+    const teamSeries = { ...series, team_id: "team-structure-lock" };
+    renderBrowser(newlyAcquired.services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByRole("heading", { name: "分镜团队锁" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    await screen.findByRole("dialog", { name: "插入分镜" });
+    await user.click(screen.getByRole("button", { name: "关闭分镜结构编辑" }));
+    await waitFor(() => expect(newlyAcquired.releaseChapterEditLock).toHaveBeenCalledTimes(1));
+    expect(newlyAcquired.acquireChapterEditLock).toHaveBeenCalledTimes(1);
+    expect(newlyAcquired.getChapterEditLock).toHaveBeenLastCalledWith(
+      current.id,
+      expect.any(AbortSignal),
+    );
+    expect(newlyAcquired.getCurrentChapters()[0]?.lock).toBeNull();
+
+    cleanup();
+    const existing = makeFrameStructureServices({
+      ...current,
+      id: "chapter-structure-existing-lock",
+      title: "分镜已有本人锁",
+    });
+    existing.getChapterEditLock.mockResolvedValue(ownedLock);
+    renderBrowser(existing.services, vi.fn(), vi.fn(), teamSeries);
+    await screen.findByRole("heading", { name: "分镜已有本人锁" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    await screen.findByRole("dialog", { name: "插入分镜" });
+    await user.click(screen.getByRole("button", { name: "关闭分镜结构编辑" }));
+    expect(existing.acquireChapterEditLock).not.toHaveBeenCalled();
+    expect(existing.releaseChapterEditLock).not.toHaveBeenCalled();
+  });
+
+  it("keeps a team lock without a proven lease and refreshes its badge on close", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-unproven-lock", "来源未证实的团队锁", [
+      { text: "前镜", storyboard: ["unproven-lock-first"] },
+      { text: "后镜", storyboard: ["unproven-lock-last"] },
+    ]);
+    const frame = makeFrameStructureServices(current);
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    frame.getChapterEditLock.mockResolvedValueOnce({ locked: false }).mockResolvedValue(ownedLock);
+    frame.acquireChapterEditLock.mockResolvedValue({ state: ownedLock, lease: null });
+    const teamSeries = { ...series, team_id: "team-unproven-lock" };
+    renderBrowser(frame.services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByRole("heading", { name: "来源未证实的团队锁" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    expect(await screen.findByRole("dialog", { name: "插入分镜" })).toHaveTextContent("取得来源无法确认");
+    await user.click(screen.getByRole("button", { name: "关闭分镜结构编辑" }));
+
+    await waitFor(() => expect(frame.getChapterEditLock).toHaveBeenCalledTimes(3));
+    expect(frame.releaseChapterEditLock).not.toHaveBeenCalled();
+    const calls = frame.getChapterEditLock.mock.calls;
+    expect(calls[1]).toHaveLength(2);
+    expect(calls[2]).toHaveLength(2);
+    expect(screen.getByText(/你在其他位置持有编辑锁/)).toBeInTheDocument();
+  });
+
+  it("keeps a structure draft and sends no write when an unleased team lock identity changes", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-structure-lock-drift", "结构锁身份漂移", [
+      { text: "已有镜头", storyboard: ["structure-lock-drift-first"] },
+      { text: "后续镜头", storyboard: ["structure-lock-drift-last"] },
+    ]);
+    const frame = makeFrameStructureServices(current);
+    const originalLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-16T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    const replacementLock: ChapterEditLockState = {
+      ...originalLock,
+      acquired_at: "2026-10-16T10:05:00Z",
+      expires_at: new Date(Date.now() + 20 * 60_000).toISOString(),
+    };
+    frame.getChapterEditLock
+      .mockResolvedValueOnce({ locked: false })
+      .mockResolvedValueOnce(originalLock)
+      .mockResolvedValueOnce(replacementLock);
+    frame.acquireChapterEditLock.mockResolvedValue({ state: originalLock, lease: null });
+    const teamSeries = { ...series, team_id: "team-structure-lock-drift" };
+    renderBrowser(frame.services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByRole("heading", { name: "结构锁身份漂移" });
+    await user.click(screen.getByRole("button", { name: "在开头插入分镜" }));
+    const editor = within(await screen.findByRole("dialog", { name: "插入分镜" }));
+    const draftText = "保留的结构草稿";
+    await user.type(editor.getByRole("textbox", { name: "分镜文字" }), draftText);
+    await user.click(editor.getByRole("button", { name: "确认插入" }));
+
+    expect(await editor.findByText("提交前无法确认当前账号仍持有有效章节锁；草稿仍保留。")).toBeInTheDocument();
+    expect(editor.getByRole("textbox", { name: "分镜文字" })).toHaveValue(draftText);
+    expect(frame.updateChapter).not.toHaveBeenCalled();
+    expect(frame.deleteFrame).not.toHaveBeenCalled();
+    expect(frame.releaseChapterEditLock).not.toHaveBeenCalled();
+    expect(frame.getChapterEditLock).toHaveBeenCalledTimes(3);
+    expect(frame.getChapterEditLock.mock.calls.every((call) => call.length === 2)).toBe(true);
+  });
+
+  it("keeps a text draft and sends no write when an unleased team lock identity changes", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-text-lock-drift", "文字锁身份漂移", [
+      { text: "原始文字", storyboard: ["text-lock-drift-asset"] },
+    ]);
+    const frame = makeFrameStructureServices(current);
+    const originalLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-16T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    const replacementLock: ChapterEditLockState = {
+      ...originalLock,
+      acquired_at: "2026-10-16T10:05:00Z",
+      expires_at: new Date(Date.now() + 20 * 60_000).toISOString(),
+    };
+    frame.getChapterEditLock
+      .mockResolvedValueOnce({ locked: false })
+      .mockResolvedValueOnce(originalLock)
+      .mockResolvedValueOnce(replacementLock);
+    frame.acquireChapterEditLock.mockResolvedValue({ state: originalLock, lease: null });
+    const teamSeries = { ...series, team_id: "team-text-lock-drift" };
+    renderBrowser(frame.services, vi.fn(), vi.fn(), teamSeries);
+
+    const article = await screen.findByRole("article", { name: "文字锁身份漂移 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const draftText = "保留的文字草稿";
+    await user.clear(editor.getByRole("textbox", { name: "镜头文字" }));
+    await user.type(editor.getByRole("textbox", { name: "镜头文字" }), draftText);
+    await user.click(editor.getByRole("button", { name: "保存文字" }));
+
+    expect(await editor.findByRole("alert")).toHaveTextContent("保存前无法确认当前账号仍持有有效章节锁；草稿已保留。");
+    expect(editor.getByRole("textbox", { name: "镜头文字" })).toHaveValue(draftText);
+    expect(frame.updateChapter).not.toHaveBeenCalled();
+    expect(frame.getChapterEditLock).toHaveBeenCalledTimes(3);
+    expect(frame.getChapterEditLock.mock.calls.every((call) => call.length === 2)).toBe(true);
+    expect(frame.releaseChapterEditLock).not.toHaveBeenCalled();
+  });
+
+  it("allows existing text editing with an unproven API lock without releasing it", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-text-unproven-lock", "文字沿用未证锁", [
+      { text: "原始文字", storyboard: ["text-unproven-lock-asset"] },
+    ]);
+    const frame = makeFrameStructureServices(current);
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    frame.getChapterEditLock.mockResolvedValueOnce({ locked: false }).mockResolvedValue(ownedLock);
+    frame.acquireChapterEditLock.mockResolvedValue({ state: ownedLock, lease: null });
+    const teamSeries = { ...series, team_id: "team-text-unproven-lock" };
+    renderBrowser(frame.services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByRole("heading", { name: "文字沿用未证锁" });
+    const article = await screen.findByRole("article", { name: "文字沿用未证锁 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = editor.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "保存新文字");
+    await user.click(editor.getByRole("button", { name: "保存文字" }));
+
+    await screen.findByText("保存新文字");
+    expect(frame.updateChapter).toHaveBeenCalledTimes(1);
+    expect(frame.releaseChapterEditLock).not.toHaveBeenCalled();
+    expect(frame.getChapterEditLock.mock.calls.every((call) => call.length === 2)).toBe(true);
   });
 
 });

@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement, useEffect } from "react";
@@ -19,6 +19,7 @@ import { digestPersonalProductionMediaIdentity } from "../features/chapters/pers
 import type { PersonalRoughCutSnapshot } from "../shared/api/personalRoughCut";
 import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../shared/api/myTasks";
 import type { MyTeam } from "../shared/api/teams";
+import type { CreatorModel, CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 
 type AssetLibraryCategory = "characters" | "scenes" | "props";
 
@@ -542,6 +543,26 @@ function renderWorkspace(services: WorkspaceServices) {
   );
 }
 
+function emptyCreatorSettingsService(): CreatorSettingsServicePort {
+  const unexpected = async (): Promise<never> => {
+    throw new Error("Unexpected creator settings write or detail request.");
+  };
+  return {
+    listModels: vi.fn(async () => []),
+    getModel: unexpected,
+    createModel: unexpected,
+    updateModel: unexpected,
+    deleteModel: unexpected,
+    reorderModels: unexpected,
+    listPrompts: vi.fn(async () => []),
+    getPrompt: unexpected,
+    createPrompt: unexpected,
+    updatePrompt: unexpected,
+    deletePrompt: unexpected,
+    reorderPrompts: unexpected,
+  };
+}
+
 function authenticatedFixtureUser(id = "fixture-user", username = "演示创作者"): User {
   return {
     ...fixtureUser,
@@ -746,6 +767,120 @@ describe("read-only workspace", () => {
     assetNavigationProbe.consumedEpochs.length = 0;
     assetNavigationProbe.abandonedEpochs.length = 0;
     assetNavigationProbe.sourcePanelCloseCallback = null;
+  });
+
+  it("routes from the mobile topbar and guards navigation and logout while a draft is dirty", async () => {
+    const user = userEvent.setup();
+    const creatorSettings = emptyCreatorSettingsService();
+    const services = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings,
+    };
+    renderWorkspace(services);
+
+    await screen.findByRole("heading", { name: "欢迎回来" });
+    await user.type(screen.getByLabelText("账号"), "demo");
+    await user.type(screen.getByLabelText("密码"), "demo123");
+    await user.click(screen.getByRole("button", { name: "登录工作台" }));
+    await screen.findAllByRole("article");
+    const mobileSettingsEntry = within(screen.getByRole("banner"))
+      .getByRole("button", { name: "创作者设置", hidden: true });
+    expect(mobileSettingsEntry).toBeInTheDocument();
+    fireEvent.click(mobileSettingsEntry);
+
+    expect(await screen.findByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    await waitFor(() => expect(creatorSettings.listModels).toHaveBeenCalled());
+    await user.click(screen.getByRole("button", { name: "新建模型" }));
+    expect(await screen.findByLabelText("名称")).toBeInTheDocument();
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const taskNav = within(screen.getByRole("navigation", { name: "主要导航" }))
+      .getByRole("button", { name: "我的任务" });
+    await user.click(taskNav);
+    expect(confirm).toHaveBeenCalledWith("当前有未保存的创作者设置草稿或待核对操作，离开将丢弃页面状态。继续吗？");
+    expect(screen.getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "我的任务" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+
+    confirm.mockReturnValue(true);
+    await user.click(taskNav);
+    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+
+    fireEvent.click(within(screen.getByRole("banner"))
+      .getByRole("button", { name: "创作者设置", hidden: true }));
+    expect(await screen.findByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "返回工作空间" }));
+    expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
+  });
+
+  it("keeps the workspace leave guard after cancelling an editor while ordering is still dirty", async () => {
+    const user = userEvent.setup();
+    const creatorSettings = emptyCreatorSettingsService();
+    const models: CreatorModel[] = [
+      {
+        id: "system-text",
+        category: "text",
+        name: "系统文本模型",
+        provider: "openai",
+        model: "fixture-model",
+        base_url: null,
+        params: null,
+        sort_order: 0,
+        is_system: true,
+        user_id: "system",
+      },
+      {
+        id: "owner-text",
+        category: "text",
+        name: "我的文本模型",
+        provider: "openai",
+        model: "fixture-model",
+        base_url: null,
+        params: null,
+        sort_order: 1,
+        is_system: false,
+        user_id: "demo-user",
+      },
+    ];
+    vi.mocked(creatorSettings.listModels).mockResolvedValue(models);
+    const services = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings,
+    };
+    renderWorkspace(services);
+
+    await screen.findByRole("heading", { name: "欢迎回来" });
+    await user.type(screen.getByLabelText("账号"), "demo");
+    await user.type(screen.getByLabelText("密码"), "demo123");
+    await user.click(screen.getByRole("button", { name: "登录工作台" }));
+    await screen.findAllByRole("article");
+    fireEvent.click(within(screen.getByRole("banner"))
+      .getByRole("button", { name: "创作者设置", hidden: true }));
+    await screen.findByRole("heading", { name: "创作者设置" });
+    await screen.findByText("我的文本模型");
+
+    await user.click(screen.getByRole("button", { name: "新建模型" }));
+    await user.type(await screen.findByLabelText("名称"), "未完成的模型草稿");
+    const personalCard = screen.getByText("我的文本模型").closest("article");
+    expect(personalCard).not.toBeNull();
+    await user.click(within(personalCard!).getByRole("button", { name: "将我的文本模型设为默认" }));
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "保存排序" })).toBeEnabled();
+
+    confirm.mockReturnValue(false);
+    const taskNav = within(screen.getByRole("navigation", { name: "主要导航" }))
+      .getByRole("button", { name: "我的任务" });
+    await user.click(taskNav);
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(confirm).toHaveBeenCalledTimes(3);
+    expect(screen.getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
   });
 
   it("keeps demo auth local, preserves source order, and applies the four filters", async () => {

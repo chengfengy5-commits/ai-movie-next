@@ -12,6 +12,8 @@ import type {
 import type { FrameAssetReferenceAssetTarget } from "../features/chapters/FrameAssetReferencesPanel";
 import { SeriesPage } from "../features/series/SeriesPage";
 import { MyTasksPage } from "../features/tasks/MyTasksPage";
+import { CreatorSettingsPage } from "../features/creator-settings/CreatorSettingsPage";
+import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 
 function restoreErrorMessage(error: ApiError): string {
   if (error.status === 401) {
@@ -29,7 +31,7 @@ function restoreErrorMessage(error: ApiError): string {
 function Dashboard() {
   const { services, state, logout } = useAuth();
   const [selectedSeries, setSelectedSeries] = useState<Series | null>(null);
-  const [selectedView, setSelectedView] = useState<"series" | "chapters" | "assets" | "tasks">("series");
+  const [selectedView, setSelectedView] = useState<"series" | "chapters" | "assets" | "tasks" | "creator-settings">("series");
   const [chapterNavigationIntent, setChapterNavigationIntent] = useState<ChapterNavigationIntent | null>(null);
   const [assetNavigationIntent, setAssetNavigationIntent] = useState<AssetNavigationIntent | null>(null);
   const navigationIntentRef = useRef<ChapterNavigationIntent | null>(null);
@@ -42,11 +44,12 @@ function Dashboard() {
   });
   const dashboardScopeEpoch = useRef(0);
   const dashboardMounted = useRef(false);
+  const creatorSettingsDirtyRef = useRef(false);
   const currentNavigationContext = useRef<{
     userId: string;
     services: typeof services;
     selectedSeries: Series | null;
-    selectedView: "series" | "chapters" | "assets" | "tasks";
+    selectedView: "series" | "chapters" | "assets" | "tasks" | "creator-settings";
     scopeEpoch: number;
   } | null>(null);
 
@@ -110,6 +113,25 @@ function Dashboard() {
     setSelectedSeries(null);
     setSelectedView("series");
     logout();
+  }
+
+  function confirmLeaveCreatorSettings(): boolean {
+    if (selectedView !== "creator-settings" || !creatorSettingsDirtyRef.current) {
+      return true;
+    }
+    return window.confirm("当前有未保存的创作者设置草稿或待核对操作，离开将丢弃页面状态。继续吗？");
+  }
+
+  function navigateToCreatorSettings() {
+    if (selectedView === "creator-settings" || !confirmLeaveCreatorSettings()) return;
+    clearChapterNavigationIntent();
+    clearAssetNavigationIntent();
+    setSelectedSeries(null);
+    setSelectedView("creator-settings");
+  }
+
+  function leaveWorkspace() {
+    if (confirmLeaveCreatorSettings()) logoutFromWorkspace();
   }
 
   function acceptAssetChapterTarget(target: AssetFrameUsageChapterTarget) {
@@ -232,6 +254,10 @@ function Dashboard() {
     setSelectedView("chapters");
   }
 
+  const creatorSettingsService = (services as typeof services & {
+    creatorSettings?: CreatorSettingsServicePort;
+  }).creatorSettings;
+
   return (
     <div className="workspace-shell">
       <aside className="workspace-sidebar">
@@ -250,6 +276,7 @@ function Dashboard() {
             className={selectedView === "tasks" ? "nav-item active" : "nav-item"}
             onClick={() => {
               if (selectedView !== "tasks") {
+                if (!confirmLeaveCreatorSettings()) return;
                 clearChapterNavigationIntent();
                 clearAssetNavigationIntent();
                 setSelectedSeries(null);
@@ -261,6 +288,15 @@ function Dashboard() {
             <span className="nav-icon" aria-hidden="true">☷</span>
             <span>我的任务</span>
           </button>
+          <button
+            aria-current={selectedView === "creator-settings" ? "page" : undefined}
+            className={selectedView === "creator-settings" ? "nav-item active" : "nav-item"}
+            onClick={navigateToCreatorSettings}
+            type="button"
+          >
+            <span className="nav-icon" aria-hidden="true">⚙</span>
+            <span>创作者设置</span>
+          </button>
           <div className="nav-item future" aria-label="章节制作，后续开放">
             <span className="nav-icon" aria-hidden="true">▧</span>
             <span>章节制作</span>
@@ -271,7 +307,7 @@ function Dashboard() {
             <span>素材库</span>
             <span className="nav-status">后续开放</span>
           </div>
-          <p className="sidebar-note">剧集、章节、素材与任务记录仅供只读查看。</p>
+          <p className="sidebar-note">在创作者设置中管理个人模型与提示词。</p>
         </nav>
         <div className="sidebar-bottom">
           <span className="sidebar-avatar" aria-hidden="true">
@@ -284,7 +320,7 @@ function Dashboard() {
           <button
             aria-label="退出登录"
             className="icon-button logout-icon"
-            onClick={logoutFromWorkspace}
+            onClick={leaveWorkspace}
             title="退出登录"
             type="button"
           >
@@ -298,13 +334,14 @@ function Dashboard() {
           <div className="breadcrumb">
             <span>工作空间</span>
             <span aria-hidden="true">/</span>
-            <strong>{selectedView === "tasks" ? "我的任务" : selectedSeries === null ? "我的剧集" : selectedSeries.name}</strong>
+            <strong>{selectedView === "creator-settings" ? "创作者设置" : selectedView === "tasks" ? "我的任务" : selectedSeries === null ? "我的剧集" : selectedSeries.name}</strong>
           </div>
           <div className="topbar-actions">
             {selectedView !== "tasks" && (
               <button
                 className="mobile-task-entry"
                 onClick={() => {
+                  if (!confirmLeaveCreatorSettings()) return;
                   clearChapterNavigationIntent();
                   clearAssetNavigationIntent();
                   setSelectedSeries(null);
@@ -315,11 +352,21 @@ function Dashboard() {
                 我的任务
               </button>
             )}
+            {selectedView !== "creator-settings" && (
+              <button
+                aria-label="创作者设置"
+                className="mobile-task-entry creator-settings-mobile-entry"
+                onClick={navigateToCreatorSettings}
+                type="button"
+              >
+                创作者设置
+              </button>
+            )}
             <span className={services.mode === "demo" ? "mode-chip demo-chip" : "mode-chip api-chip"}>
               <span className="status-dot" aria-hidden="true" />
               {services.mode === "demo" ? "演示模式" : "隔离 API"}
             </span>
-            <button className="text-button" onClick={logoutFromWorkspace} type="button">退出</button>
+            <button className="text-button" onClick={leaveWorkspace} type="button">退出</button>
           </div>
         </header>
         <main className="workspace-content">
@@ -397,11 +444,26 @@ function Dashboard() {
               userId={state.user.id}
             />
           )}
+          {selectedView === "creator-settings" && (
+            <CreatorSettingsPage
+              key={state.user.id + ":" + dashboardScopeEpoch.current}
+              {...(creatorSettingsService === undefined ? {} : { service: creatorSettingsService })}
+              userId={state.user.id}
+              onUnauthorized={logoutFromWorkspace}
+              onBack={() => {
+                setSelectedSeries(null);
+                setSelectedView("series");
+              }}
+              onDirtyChange={(dirty) => { creatorSettingsDirtyRef.current = dirty; }}
+            />
+          )}
         </main>
         <footer className="workspace-footer">
           <span>Hao AI · 新版工作台</span>
           <span>
-            {selectedView === "tasks"
+            {selectedView === "creator-settings"
+              ? "个人模型与提示词"
+              : selectedView === "tasks"
               ? "任务记录只读预览"
               : selectedSeries === null
                 ? "剧集管理"

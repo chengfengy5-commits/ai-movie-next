@@ -122,62 +122,12 @@ async function startFixture(overrides: Record<string, string> = {}): Promise<Fix
 describe("API services", () => {
   afterEach(() => vi.restoreAllMocks());
 
-  it("keeps delayed cleanup bound to its acquisition after a newer lock is created", async () => {
-    const storage = new MemoryStorage();
-    storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
-    const firstExpiry = "2099-01-01T00:15:00Z";
-    const secondExpiry = "2099-01-01T00:30:00Z";
-    let currentLock: Record<string, unknown> | null = null;
-    let acquisitionCount = 0;
-    const requests: string[] = [];
-    const fetcher: typeof fetch = async (input, init) => {
-      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
-      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
-      requests.push(method + " " + url.pathname);
-      if (method === "POST") {
-        acquisitionCount += 1;
-        const acquiredAt = acquisitionCount === 1 ? "2098-12-31T23:00:00Z" : "2098-12-31T23:15:00Z";
-        const expiresAt = acquisitionCount === 1 ? firstExpiry : secondExpiry;
-        currentLock = {
-          locked: true,
-          user_id: "demo-user",
-          username: "演示创作者",
-          is_mine: true,
-          acquired_at: acquiredAt,
-          last_active_at: acquiredAt,
-          expires_at: expiresAt,
-        };
-        return jsonResponse({ locked: true, username: "演示创作者", expires_at: expiresAt, idle_minutes: 15 });
-      }
-      if (method === "GET") return jsonResponse(currentLock ?? { locked: false });
-      return jsonResponse({ message: "锁已释放" });
-    };
-    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
-    const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
-    const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
-    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
-    const signal = new AbortController().signal;
-    const first = await acquireLock("chapter-lease", signal);
-    if (first.lease === null) throw new Error("Expected the first acquisition lease.");
-    await getLock("chapter-lease", signal, first.lease);
-    const second = await acquireLock("chapter-lease", signal);
-    if (second.lease === null) throw new Error("Expected the second acquisition lease.");
-    await getLock("chapter-lease", signal, second.lease);
-
-    await expect(releaseLock("chapter-lease", signal, first.lease))
-      .rejects.toMatchObject({ kind: "aborted" });
-    await releaseLock("chapter-lease", signal, second.lease);
-
-    expect(requests.filter((request) => request.startsWith("DELETE "))).toEqual([
-      "DELETE /api/chapters/chapter-lease/lock",
-    ]);
-  });
-
-  it("does not replace a recorded same-user acquired_at when a later GET sees a new lock", async () => {
+  it("does not claim a releasable lease when POST may have renewed another window's lock", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
     const requests: string[] = [];
-    const firstLock = {
+    let lockExists = false;
+    const currentLock = {
       locked: true,
       user_id: "demo-user",
       username: "演示创作者",
@@ -186,37 +136,32 @@ describe("API services", () => {
       last_active_at: "2098-12-31T23:00:00Z",
       expires_at: "2099-01-01T00:15:00Z",
     };
-    let currentLock: Record<string, unknown> = firstLock;
     const fetcher: typeof fetch = async (input, init) => {
       const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
       const method = init?.method ?? (input instanceof Request ? input.method : "GET");
       requests.push(method + " " + url.pathname);
       if (method === "POST") {
-        return jsonResponse({ locked: true, username: "演示创作者", expires_at: firstLock.expires_at, idle_minutes: 15 });
+        lockExists = true;
+        // Legacy renewal response has no owner or acquired_at creation proof.
+        return jsonResponse({ locked: true, username: "演示创作者", expires_at: currentLock.expires_at, idle_minutes: 15 });
       }
-      if (method === "GET") return jsonResponse(currentLock);
+      if (method === "GET") return jsonResponse(lockExists ? currentLock : { locked: false });
       return jsonResponse({ message: "锁已释放" });
     };
     const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
     const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
     const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
-    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
     const signal = new AbortController().signal;
-    const acquisition = await acquireLock("chapter-lock-renewed", signal);
-    if (acquisition.lease === null) throw new Error("Expected an acquisition lease.");
-    await getLock("chapter-lock-renewed", signal, acquisition.lease);
-    currentLock = {
-      ...firstLock,
-      acquired_at: "2098-12-31T23:30:00Z",
-      last_active_at: "2098-12-31T23:30:00Z",
-      expires_at: "2099-01-01T00:45:00Z",
-    };
-
-    await expect(getLock("chapter-lock-renewed", signal, acquisition.lease))
-      .rejects.toMatchObject({ kind: "aborted" });
-    await expect(releaseLock("chapter-lock-renewed", signal, acquisition.lease))
-      .rejects.toMatchObject({ kind: "aborted" });
-    expect(requests.some((request) => request.startsWith("DELETE "))).toBe(false);
+    expect((await getLock("chapter-lock-race", signal)).locked).toBe(false);
+    const acquisition = await acquireLock("chapter-lock-race", signal);
+    expect(acquisition.lease).toBeNull();
+    const verified = await getLock("chapter-lock-race", signal);
+    expect(verified).toMatchObject({ locked: true, user_id: "demo-user", acquired_at: currentLock.acquired_at });
+    expect(requests).toEqual([
+      "GET /api/chapters/chapter-lock-race/lock",
+      "POST /api/chapters/chapter-lock-race/lock",
+      "GET /api/chapters/chapter-lock-race/lock",
+    ]);
   });
 
   it("uses only the compatible login, session and series contracts over real HTTP", async () => {
@@ -854,6 +799,175 @@ describe("API services", () => {
     });
     expect(JSON.parse(String(calls[1]?.init.body))).toEqual({ title: "修改名称" });
     expect(calls[2]?.init.body).toBeUndefined();
+  });
+
+  it("deletes a frame through the dedicated chapter route and returns the refreshed chapter", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "creative-token");
+    const chapterId = "chapter/α ?#";
+    const seriesId = "series/β ?#";
+    const savedChapter = {
+      id: chapterId,
+      series_id: seriesId,
+      title: "删除后章节",
+      content: [{ text: "保留镜头", storyboard: ["asset-1"] }],
+      order: 4,
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-02T00:00:00Z",
+      lock: null,
+    };
+    const calls: Array<{ url: URL; init: RequestInit }> = [];
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      calls.push({ url, init });
+      return jsonResponse(savedChapter);
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const removeFrame = requireServiceMethod(services.deleteFrame, "deleteFrame");
+
+    await expect(removeFrame(seriesId, chapterId, 0, new AbortController().signal))
+      .resolves.toMatchObject({ id: chapterId, series_id: seriesId, content: savedChapter.content });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.init.method).toBe("PUT");
+    expect(calls[0]?.url.pathname).toBe("/api/chapters/chapter%2F%CE%B1%20%3F%23/delete-frame");
+    expect(new Headers(calls[0]?.init.headers).get("Authorization")).toBe("Bearer creative-token");
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({ frame_index: 0 });
+  });
+
+  it("keeps demo storyboard assets aligned when a frame is deleted", async () => {
+    const services = createDemoServices(new MemoryStorage());
+    const signal = new AbortController().signal;
+    await services.login({ username: "demo", password: "demo123" }, signal);
+    const create = requireServiceMethod(services.createChapter, "createChapter");
+    const update = requireServiceMethod(services.updateChapter, "updateChapter");
+    const removeFrame = requireServiceMethod(services.deleteFrame, "deleteFrame");
+    const saveNote = requireServiceMethod(services.savePersonalProductionNote, "savePersonalProductionNote");
+    const saveResume = requireServiceMethod(services.savePersonalProductionResume, "savePersonalProductionResume");
+    const saveRoughCut = requireServiceMethod(services.savePersonalRoughCut, "savePersonalRoughCut");
+    const seriesId = demoSeries[0]!.id;
+    const created = await create(seriesId, {
+      title: "第一章删除镜头的演示章节",
+      content: [
+        { text: "保留一", original_text: "原文一", preview: "preview-ready", fused: { keep: true } },
+        { text: "待删除", original_text: "原文二", preview: "preview-ready", fused: { keep: true } },
+        { text: "保留三", original_text: "原文三", preview: "preview-ready", fused: { keep: true } },
+      ],
+      order: 0,
+    }, signal);
+    await update(seriesId, created.id, { content: created.content ?? [] }, signal);
+    const beforeAssets = await services.listStoryboardAssets(seriesId, created.id, signal);
+    const firstId = beforeAssets.find((asset) => asset.frame_index === 0)?.id;
+    const deletedId = beforeAssets.find((asset) => asset.frame_index === 1)?.id;
+    const thirdId = beforeAssets.find((asset) => asset.frame_index === 2)?.id;
+    if (firstId === undefined || deletedId === undefined || thirdId === undefined) {
+      throw new Error("Expected demo frame assets.");
+    }
+
+    const initialNotes = await services.getPersonalProductionNotes(created.id, signal);
+    const targetNoteFrame = initialNotes.frames.find((frame) => frame.storyboard_asset_id === deletedId);
+    if (targetNoteFrame?.media_revision === null || targetNoteFrame === undefined) {
+      throw new Error("Expected the target frame to have a readable media revision.");
+    }
+    const noted = await saveNote(created.id, {
+      expected_revision: initialNotes.revision,
+      frames: [{
+        storyboard_asset_id: deletedId,
+        expected_media_revision: targetNoteFrame.media_revision,
+        status: "approved",
+        note: "保留为历史记录",
+      }],
+    }, signal);
+    const savedNotes = await saveResume(created.id, {
+      expected_revision: noted.revision,
+      resume_frame_id: deletedId,
+    }, signal);
+    expect(savedNotes.resume_frame_id).toBe(deletedId);
+    const initialRoughCut = await services.getPersonalRoughCut(created.id, signal);
+    const savedRoughCut = await saveRoughCut(created.id, {
+      expected_revision: initialRoughCut.revision,
+      frames: [
+        { asset_id: thirdId, included: true },
+        { asset_id: firstId, included: false },
+        { asset_id: deletedId, included: true },
+      ],
+    }, signal);
+    const result = await removeFrame(seriesId, created.id, 1, signal);
+    const assets = await services.listStoryboardAssets(seriesId, created.id, signal);
+    const notes = await services.getPersonalProductionNotes(created.id, signal);
+    const roughCut = await services.getPersonalRoughCut(created.id, signal);
+
+    expect(result.content).toHaveLength(2);
+    expect(result.content).toEqual([
+      expect.objectContaining({ text: "保留一", original_text: "原文一", storyboard: [firstId] }),
+      expect.objectContaining({ text: "保留三", original_text: "原文三", storyboard: [thirdId] }),
+    ]);
+    expect(assets).toEqual([
+      expect.objectContaining({ id: firstId, frame_index: 0 }),
+      expect.objectContaining({ id: thirdId, frame_index: 1 }),
+    ]);
+    expect(assets.some((asset) => asset.id === deletedId)).toBe(false);
+    expect(notes.frames).toEqual([
+      expect.objectContaining({ frame_index: 0, storyboard_asset_id: firstId }),
+      expect.objectContaining({ frame_index: 1, storyboard_asset_id: thirdId }),
+    ]);
+    expect(notes.resume_frame_id).toBe(deletedId);
+    expect(notes.frame_notes.get(deletedId)).toMatchObject({
+      status: "unmarked",
+      approved_media_revision: null,
+      needs_reconfirmation: true,
+    });
+    expect(roughCut.frames).toEqual([
+      expect.objectContaining({ asset_id: thirdId, frame_index: 1, included: true }),
+      expect.objectContaining({ asset_id: firstId, frame_index: 0, included: false }),
+    ]);
+    expect(roughCut.frames.some((frame) => frame.asset_id === deletedId)).toBe(false);
+    expect(roughCut.removed_asset_ids).toEqual([deletedId]);
+    expect(roughCut.revision).toBe(savedRoughCut.revision);
+    await removeFrame(seriesId, created.id, 1, signal);
+    await expect(removeFrame(seriesId, created.id, 0, signal)).rejects.toMatchObject({ status: 422 });
+  });
+
+  it("assigns a stable demo asset to an inserted frame and shifts notes and rough-cut indices", async () => {
+    const services = createDemoServices(new MemoryStorage());
+    const signal = new AbortController().signal;
+    await services.login({ username: "demo", password: "demo123" }, signal);
+    const create = requireServiceMethod(services.createChapter, "createChapter");
+    const update = requireServiceMethod(services.updateChapter, "updateChapter");
+    const seriesId = demoSeries[0]!.id;
+    const created = await create(seriesId, {
+      title: "插入镜头的演示章节",
+      content: [{ text: "前镜", original_text: "前镜原文", preview: "preview-ready", fused: { keep: true } }],
+      order: 0,
+    }, signal);
+    await update(seriesId, created.id, { content: created.content ?? [] }, signal);
+    const baseAssets = await services.listStoryboardAssets(seriesId, created.id, signal);
+    const baseId = baseAssets[0]?.id;
+    if (baseId === undefined) throw new Error("Expected a stable base-frame identity.");
+
+    const result = await update(seriesId, created.id, {
+      content: [
+        { text: "前镜", original_text: "前镜原文", preview: "preview-ready", fused: { keep: true }, storyboard: [baseId] },
+        { text: "新镜", character: ["character-a"], scene: [], prop: [], storyboard: [], preview: null },
+      ],
+    }, signal);
+    const assets = await services.listStoryboardAssets(seriesId, created.id, signal);
+    const notes = await services.getPersonalProductionNotes(created.id, signal);
+    const roughCut = await services.getPersonalRoughCut(created.id, signal);
+    const insertedReferences = result.content?.[1]?.storyboard;
+    const insertedId = Array.isArray(insertedReferences) && typeof insertedReferences[0] === "string"
+      ? insertedReferences[0]
+      : null;
+
+    expect(insertedId).toEqual(expect.any(String));
+    expect(result.content?.[0]).toMatchObject({
+      text: "前镜", original_text: "前镜原文", preview: "preview-ready", fused: { keep: true }, storyboard: [baseId],
+    });
+    expect(assets.map((asset) => [asset.id, asset.frame_index])).toEqual([[baseId, 0], [insertedId, 1]]);
+    expect(notes.frames.map((frame) => [frame.storyboard_asset_id, frame.frame_index]))
+      .toEqual([[baseId, 0], [insertedId, 1]]);
+    expect(roughCut.frames.map((frame) => [frame.asset_id, frame.frame_index]))
+      .toEqual([[baseId, 0], [insertedId, 1]]);
   });
 
   it("UCHAP-03 preserves explicit demo order while auto-assigning order zero", async () => {

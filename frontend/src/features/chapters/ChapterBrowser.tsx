@@ -1,6 +1,18 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../../shared/api/errors";
-import type { Chapter, ChapterEditLockLeaseHandle, ChapterEditLockState, Series, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
+import type {
+  Chapter,
+  ChapterEditLockLeaseHandle,
+  ChapterEditLockState,
+  Character,
+  Prop,
+  Scene,
+  Series,
+  StoryboardAsset,
+  StoryboardFrame,
+} from "../../shared/api/contracts";
+import type { PersonalProductionSnapshot } from "../../shared/api/personalProductionNotes";
+import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import {
   FrameAssetReferencesPanel,
@@ -29,6 +41,20 @@ import { resolveProductionNoteFrameTarget } from "./productionNoteFrameNavigatio
 import { ChapterManagementDialog, type ChapterManagementAction } from "./ChapterManagementDialog";
 import { ChapterOrderDialog } from "./ChapterOrderDialog";
 import { FrameTextEditor, type FrameTextSaveResult } from "./FrameTextEditor";
+import {
+  FrameStructureEditor,
+  type FrameStructureMode,
+  type FrameStructureSubmitResult,
+  type FrameStructureVerifyResult,
+} from "./frame-structure/FrameStructureEditor";
+import {
+  areFrameStructureMappingsValid,
+  buildInsertedFrameContent,
+  firstStoryboardAssetId,
+  isFrameStructureReadbackValid,
+  resolveDeletableFrameTarget,
+  type FrameStructureDraft,
+} from "./frame-structure/contract";
 import { StoryboardGenerationDialog } from "../storyboard-generation/StoryboardGenerationDialog";
 import {
   buildChapterReorderInput,
@@ -96,17 +122,37 @@ interface ChapterOrderEditorContext {
   requestGeneration: number;
 }
 
-interface FrameTextEditorContext {
+type ChapterEditLockIdentity = { acquiredAt: string; userId: string } | null;
+
+interface ChapterEditLockOwner {
   scope: ChapterBrowserScope;
   chapter: Chapter;
-  position: number;
-  initialText: string;
   requestGeneration: number;
   lifecycleController: AbortController;
   newlyAcquiredLock: boolean;
+  refreshLockOnClose: boolean;
   lockNotice: string | null;
   lockLease: ChapterEditLockLeaseHandle | null;
-  lockIdentity: { acquiredAt: string; userId: string } | null;
+  lockIdentity: ChapterEditLockIdentity;
+}
+
+interface FrameTextEditorContext extends ChapterEditLockOwner {
+  position: number;
+  initialText: string;
+}
+
+interface FrameStructureEditorContext extends ChapterEditLockOwner {
+  mode: FrameStructureMode;
+  characters: Character[];
+  scenes: Scene[];
+  props: Prop[];
+  baseDirectory: Chapter[];
+  baseContent: StoryboardFrame[] | null;
+  baseAssets: StoryboardAsset[];
+  deleteTarget: { frameIndex: number; storyboardAssetId: string } | null;
+  writeAttemptStarted: boolean;
+  pendingExpectedContent: StoryboardFrame[] | null;
+  pendingRemovedAssetId: string | null;
 }
 
 interface FrameEditingInvalidationOptions {
@@ -136,6 +182,59 @@ function sameChapterBrowserScope(left: ChapterBrowserScope, right: ChapterBrowse
   return left.userId === right.userId
     && left.services === right.services
     && left.seriesId === right.seriesId;
+}
+
+function sameStoryboardAssetPositions(left: StoryboardAsset[], right: StoryboardAsset[]): boolean {
+  if (left.length !== right.length) return false;
+  const assetsById = new Map<string, StoryboardAsset[]>();
+  for (const asset of right) {
+    const matches = assetsById.get(asset.id) ?? [];
+    matches.push(asset);
+    assetsById.set(asset.id, matches);
+  }
+  return left.every((asset) => {
+    const matches = assetsById.get(asset.id);
+    const current = matches?.length === 1 ? matches[0] : undefined;
+    return current !== undefined && current.frame_index === asset.frame_index
+      && current.series_id === asset.series_id && current.chapter_id === asset.chapter_id;
+  });
+}
+
+function snapshotStoryboardAssetPositions(assets: StoryboardAsset[]): StoryboardAsset[] {
+  return assets.map((asset) => ({ ...asset }));
+}
+
+function areReferencedFrameAssetPositionsValid(
+  chapter: Chapter,
+  assets: StoryboardAsset[],
+  seriesId: string,
+): boolean {
+  if (!Array.isArray(chapter.content)) return false;
+  const seenIds = new Set<string>();
+  return chapter.content.every((frame, frameIndex) => {
+    const references = frame.storyboard;
+    if (references === undefined || references === null
+      || (Array.isArray(references) && references.length === 0)) return true;
+    const assetId = firstStoryboardAssetId(frame);
+    if (assetId === null || seenIds.has(assetId)) return false;
+    seenIds.add(assetId);
+    const matches = assets.filter((asset) => asset.id === assetId);
+    return matches.length === 1
+      && matches[0]?.series_id === seriesId
+      && matches[0]?.chapter_id === chapter.id
+      && matches[0]?.frame_index === frameIndex;
+  });
+}
+
+function hasUniqueOwnedAssetIds(
+  assets: Array<{ id: string; series_id: string }>,
+  ids: string[],
+  seriesId: string,
+): boolean {
+  return new Set(ids).size === ids.length && ids.every((id) => {
+    const matches = assets.filter((asset) => asset.id === id);
+    return matches.length === 1 && matches[0]?.series_id === seriesId;
+  });
 }
 
 function samePersonalNotesReadIdentity(
@@ -302,7 +401,7 @@ function validOwnedChapterLock(lock: ChapterEditLockState, userId: string): bool
     && utcTimestampMilliseconds(lock.expires_at) > Date.now();
 }
 
-function chapterEditLockIdentity(lock: ChapterEditLockState): FrameTextEditorContext["lockIdentity"] {
+function chapterEditLockIdentity(lock: ChapterEditLockState): ChapterEditLockIdentity {
   if (lock.acquired_at === undefined || lock.user_id === undefined) return null;
   return { acquiredAt: lock.acquired_at, userId: lock.user_id };
 }
@@ -317,7 +416,7 @@ function chapterLockSnapshot(lock: ChapterEditLockState): Record<string, unknown
 }
 
 function sameChapterEditLockIdentity(
-  left: FrameTextEditorContext["lockIdentity"],
+  left: ChapterEditLockIdentity,
   lock: ChapterEditLockState,
 ): boolean {
   return left !== null
@@ -458,11 +557,17 @@ export function ChapterBrowser({
   const [frameTextEditor, setFrameTextEditor] = useState<FrameTextEditorContext | null>(null);
   const frameTextEditorRef = useRef<FrameTextEditorContext | null>(null);
   frameTextEditorRef.current = frameTextEditor;
+  const [frameStructureEditor, setFrameStructureEditor] = useState<FrameStructureEditorContext | null>(null);
+  const frameStructureEditorRef = useRef<FrameStructureEditorContext | null>(null);
+  frameStructureEditorRef.current = frameStructureEditor;
+  const frameStructureDraftDirtyRef = useRef(false);
+  const frameStructureDiscardRequestRef = useRef<(() => Promise<boolean>) | null>(null);
+  const guardedNavigationSequence = useRef(0);
   const [frameEditOpening, setFrameEditOpening] = useState(false);
   const frameEditOpeningController = useRef<AbortController | null>(null);
   const frameEditOpeningChapterIdRef = useRef<string | null>(null);
   const invalidateFrameEditingWorkflowRef = useRef<(options?: FrameEditingInvalidationOptions) => void>(() => undefined);
-  const pendingFrameLockReleaseRef = useRef<FrameTextEditorContext | null>(null);
+  const pendingFrameLockReleaseRef = useRef<ChapterEditLockOwner | null>(null);
   const [chapterMutationNotice, setChapterMutationNotice] = useState<string | null>(null);
   const [navigationIssue, setNavigationIssue] = useState<{ epoch: number; issue: NavigationIssue } | null>(null);
   const [pendingFrameNavigation, setPendingFrameNavigation] = useState<PendingFrameNavigation | null>(null);
@@ -732,9 +837,6 @@ export function ChapterBrowser({
       if (mutationSelection !== null) {
         if (mutationSelection.message !== null) {
           setChapterMutationNotice(`${mutationSelection.message}，但章节列表刷新失败，请重试读取。`);
-        }
-        if (chapterMutationSelectionIntent.current === mutationSelection) {
-          chapterMutationSelectionIntent.current = null;
         }
       }
       if (suppliedIntent?.frameTarget !== undefined && requestIntent !== null) {
@@ -1359,6 +1461,15 @@ export function ChapterBrowser({
     : null;
 
   function retryChapters() {
+    guardStructureDraftNavigation(() => retryChaptersNow());
+  }
+
+  function retryChaptersNow() {
+    const pendingSelection = chapterMutationSelectionIntent.current;
+    const selection = pendingSelection !== null
+      && sameChapterBrowserScope(pendingSelection.scope, activeScopeRef.current)
+      ? pendingSelection
+      : null;
     invalidateFrameEditingWorkflow();
     chapterRequestGeneration.current += 1;
     assetRequestGeneration.current += 1;
@@ -1373,13 +1484,45 @@ export function ChapterBrowser({
     setChapters(null);
     setSelectedChapterId(null);
     setAssetResult(null);
-    requestChapterDirectoryReload(null);
+    requestChapterDirectoryReload(selection);
   }
 
   function requestChapterDirectoryReload(selection: ChapterMutationSelectionIntent | null): void {
     chapterMutationSelectionIntent.current = selection;
     chapterReloadSequence.current += 1;
     setChapterReloadKey(chapterReloadSequence.current);
+  }
+
+  function abandonNavigationIntent(epoch: number): void {
+    if (finalizedNavigationEpochsRef.current.has(epoch)) return;
+    finalizedNavigationEpochsRef.current.add(epoch);
+    navigationAbandonedHandlerRef.current?.(epoch);
+  }
+
+  function guardStructureDraftNavigation(action: () => void, onCancel: () => void = () => undefined): void {
+    const owner = frameStructureEditorRef.current;
+    if (owner === null || !frameStructureDraftDirtyRef.current) {
+      action();
+      return;
+    }
+    const requestDiscard = frameStructureDiscardRequestRef.current;
+    if (requestDiscard === null) return;
+
+    const requestId = ++guardedNavigationSequence.current;
+    const ownerScope = owner.scope;
+    const ownerChapterId = owner.chapter.id;
+    const ownerGeneration = owner.requestGeneration;
+    void requestDiscard().then((discard) => {
+      if (requestId !== guardedNavigationSequence.current
+        || !sameChapterBrowserScope(ownerScope, activeScopeRef.current)
+        || ownerGeneration !== chapterRequestGeneration.current
+        || selectedChapterIdRef.current !== ownerChapterId) return;
+      if (!discard) {
+        onCancel();
+        return;
+      }
+      action();
+    }).catch(() => undefined);
   }
 
   useLayoutEffect(() => {
@@ -1395,7 +1538,10 @@ export function ChapterBrowser({
         seriesId: intent.seriesId,
       }, activeScopeRef.current)) return;
 
-    retryChapters();
+    guardStructureDraftNavigation(
+      () => retryChaptersNow(),
+      () => abandonNavigationIntent(intent.navigationEpoch),
+    );
   }, [navigationIntentEpoch]);
 
   function retryAssets() {
@@ -1430,6 +1576,19 @@ export function ChapterBrowser({
     ) {
       return;
     }
+
+    guardStructureDraftNavigation(() => selectChapterNow(chapterId, expectedRequestGeneration));
+  }
+
+  function selectChapterNow(chapterId: string, expectedRequestGeneration: number): void {
+    const directory = chapterDirectoryRef.current;
+    if (
+      expectedRequestGeneration !== chapterRequestGeneration.current
+      || expectedRequestGeneration !== directory.requestGeneration
+      || !sameChapterBrowserScope(directory.scope, activeScopeRef.current)
+      || !isChapterSelectableFromDirectory(directory.chapters, chapterId, directory.scope.seriesId)
+      || selectedChapterIdRef.current === chapterId
+    ) return;
 
     invalidateFrameEditingWorkflow();
 
@@ -1529,6 +1688,10 @@ export function ChapterBrowser({
   }
 
   function backToSeries() {
+    guardStructureDraftNavigation(() => backToSeriesNow());
+  }
+
+  function backToSeriesNow(): void {
     const pendingIntent = navigationIntentRef.current;
     if (pendingIntent !== null && !finalizedNavigationEpochsRef.current.has(pendingIntent.navigationEpoch)) {
       finalizedNavigationEpochsRef.current.add(pendingIntent.navigationEpoch);
@@ -1562,12 +1725,13 @@ export function ChapterBrowser({
     setChapterOrderEditor(refreshed);
   }
 
-  async function releaseNewlyAcquiredChapterLock(
-    owner: FrameTextEditorContext,
+  async function releaseOrRefreshChapterEditLock(
+    owner: ChapterEditLockOwner,
     options: { refreshLockSnapshot?: boolean } = {},
   ): Promise<void> {
-    if (!owner.newlyAcquiredLock || owner.lockLease === null
-      || owner.scope.services.releaseChapterEditLock === undefined) return;
+    const canRelease = owner.newlyAcquiredLock && owner.lockLease !== null
+      && owner.scope.services.releaseChapterEditLock !== undefined;
+    if (!canRelease && !(options.refreshLockSnapshot && owner.refreshLockOnClose)) return;
     const controller = new AbortController();
     const directoryAtRelease = options.refreshLockSnapshot ? chapterDirectoryRef.current : null;
     const workflowEpoch = frameEditWorkflowEpoch.current;
@@ -1588,26 +1752,31 @@ export function ChapterBrowser({
         && matchingChapters[0]?.series_id === owner.scope.seriesId
         && frameEditWorkflowEpoch.current === workflowEpoch
         && frameTextEditorRef.current === null
-        && frameEditOpeningController.current === null
-        && frameEditOpeningChapterIdRef.current === null
+        && frameStructureEditorRef.current === null
+        && ((frameEditOpeningController.current === null && frameEditOpeningChapterIdRef.current === null)
+          || (frameEditOpeningController.current === owner.lifecycleController
+            && frameEditOpeningChapterIdRef.current === owner.chapter.id))
         && chapterOrderEditorRef.current === null;
     };
-    try {
-      await owner.scope.services.releaseChapterEditLock(owner.chapter.id, controller.signal, owner.lockLease);
-    } catch (cause) {
-      const error = normalizeApiError(cause);
-      if (error.status === 401 && sameChapterBrowserScope(owner.scope, activeScopeRef.current)) {
-        unauthorizedHandlerRef.current();
+    if (canRelease) {
+      try {
+        await owner.scope.services.releaseChapterEditLock!(owner.chapter.id, controller.signal, owner.lockLease!);
+      } catch (cause) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401 && sameChapterBrowserScope(owner.scope, activeScopeRef.current)) {
+          unauthorizedHandlerRef.current();
+          return;
+        }
+        // A failed release is followed by a read when the closing view requested a badge refresh.
+        if (!options.refreshLockSnapshot) return;
       }
-      // Release is best-effort; a failed release must not hide the editing result.
-      return;
     }
 
     const getChapterEditLock = owner.scope.services.getChapterEditLock;
     if (getChapterEditLock === undefined || !canRefreshLockSnapshot()) return;
     let currentLock: ChapterEditLockState;
     try {
-      // The successful DELETE consumes the opaque lease, so this read is deliberately unleased.
+      // Lock reads after close are deliberately unleased so the badge reflects server state.
       currentLock = await getChapterEditLock(owner.chapter.id, controller.signal);
     } catch (cause) {
       if (normalizeApiError(cause).status === 401 && canRefreshLockSnapshot()) {
@@ -1635,20 +1804,31 @@ export function ChapterBrowser({
     openingController?.abort();
 
     const owner = frameTextEditorRef.current;
+    const structureOwner = frameStructureEditorRef.current;
     const pendingOwner = pendingFrameLockReleaseRef.current;
     frameTextEditorRef.current = null;
+    frameStructureEditorRef.current = null;
     pendingFrameLockReleaseRef.current = null;
     owner?.lifecycleController.abort();
-    const cleanupOwner = owner ?? pendingOwner;
-    if (cleanupOwner?.newlyAcquiredLock) {
-      if (options.deferLockRelease) pendingFrameLockReleaseRef.current = cleanupOwner;
-      else void releaseNewlyAcquiredChapterLock(cleanupOwner, {
-        refreshLockSnapshot: options.refreshLockSnapshot === true && owner === cleanupOwner,
-      });
+    structureOwner?.lifecycleController.abort();
+    const cleanupOwner = owner ?? structureOwner ?? pendingOwner;
+    frameStructureDraftDirtyRef.current = false;
+    frameStructureDiscardRequestRef.current = null;
+    guardedNavigationSequence.current += 1;
+    if (cleanupOwner !== null) {
+      const hasProvenLease = cleanupOwner.newlyAcquiredLock && cleanupOwner.lockLease !== null;
+      const refreshLockSnapshot = options.refreshLockSnapshot === true
+        && (owner === cleanupOwner || structureOwner === cleanupOwner);
+      if (options.deferLockRelease && hasProvenLease) {
+        pendingFrameLockReleaseRef.current = cleanupOwner;
+      } else if (hasProvenLease || (refreshLockSnapshot && cleanupOwner.refreshLockOnClose)) {
+        void releaseOrRefreshChapterEditLock(cleanupOwner, { refreshLockSnapshot });
+      }
     }
 
     if (options.updateState !== false) {
       setFrameTextEditor(null);
+      setFrameStructureEditor(null);
       setFrameEditOpening(false);
     }
   }
@@ -1657,8 +1837,10 @@ export function ChapterBrowser({
 
   useLayoutEffect(() => {
     const owner = frameTextEditorRef.current;
+    const structureOwner = frameStructureEditorRef.current;
     const openingChapterId = frameEditOpeningChapterIdRef.current;
     if ((owner !== null && owner.chapter.id !== selectedChapterId)
+      || (structureOwner !== null && structureOwner.chapter.id !== selectedChapterId)
       || (openingChapterId !== null && openingChapterId !== selectedChapterId)) {
       invalidateFrameEditingWorkflowRef.current();
     }
@@ -1671,13 +1853,28 @@ export function ChapterBrowser({
   useEffect(() => {
     const owner = pendingFrameLockReleaseRef.current;
     pendingFrameLockReleaseRef.current = null;
-    if (owner !== null) void releaseNewlyAcquiredChapterLock(owner);
+    if (owner !== null) void releaseOrRefreshChapterEditLock(owner);
   }, [services, series.id, userId]);
 
   function closeFrameTextEditor(expected?: FrameTextEditorContext): void {
     const current = frameTextEditorRef.current;
     if (current === null || (expected !== undefined && current !== expected)) return;
     invalidateFrameEditingWorkflow({ refreshLockSnapshot: true });
+  }
+
+  function closeFrameStructureEditor(expected?: FrameStructureEditorContext): void {
+    const current = frameStructureEditorRef.current;
+    if (current === null || (expected !== undefined && current !== expected)) return;
+    invalidateFrameEditingWorkflow({ refreshLockSnapshot: true });
+    if (current.writeAttemptStarted) {
+      const currentIndex = current.baseDirectory.findIndex((chapter) => chapter.id === current.chapter.id);
+      requestChapterDirectoryReload({
+        scope: current.scope,
+        chapterId: current.chapter.id,
+        fallbackIndex: Math.max(0, currentIndex),
+        message: "写入结果仍未确认，章节与素材已重新读取；请核对当前状态。",
+      });
+    }
   }
 
   function openChapterOrderEditor(): void {
@@ -1812,6 +2009,76 @@ export function ChapterBrowser({
     setAssetResult({ chapterId, status: "ready", assets });
   }
 
+  function isFrameStructureEditorCurrent(owner: FrameStructureEditorContext, signal: AbortSignal): boolean {
+    const directory = chapterDirectoryRef.current;
+    const matchingChapters = directory.chapters?.filter((chapter) => chapter.id === owner.chapter.id) ?? [];
+    const directoryMatches = owner.writeAttemptStarted
+      ? directory.chapters === null || (matchingChapters.length === 1
+        && matchingChapters[0]?.series_id === owner.scope.seriesId)
+      : matchingChapters.length === 1 && matchingChapters[0]?.series_id === owner.scope.seriesId;
+    return !signal.aborted
+      && !owner.lifecycleController.signal.aborted
+      && frameStructureEditorRef.current === owner
+      && sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+      && owner.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === owner.chapter.id
+      && sameChapterBrowserScope(directory.scope, owner.scope)
+      && directory.requestGeneration === owner.requestGeneration
+      && directoryMatches;
+  }
+
+  function refreshFrameStructureBase(
+    owner: FrameStructureEditorContext,
+    directory: Chapter[],
+    latestChapter: Chapter,
+    assets: StoryboardAsset[],
+    resetWriteAttempt: boolean,
+  ): FrameStructureEditorContext {
+    applyFreshChapterDirectory(directory, owner.scope);
+    refreshAssetsAfterFrameRead(owner.chapter.id, assets);
+    const nextOwner: FrameStructureEditorContext = {
+      ...owner,
+      chapter: latestChapter,
+      baseDirectory: directory,
+      baseContent: latestChapter.content,
+      baseAssets: snapshotStoryboardAssetPositions(assets),
+      writeAttemptStarted: resetWriteAttempt ? false : owner.writeAttemptStarted,
+      pendingExpectedContent: resetWriteAttempt ? null : owner.pendingExpectedContent,
+      pendingRemovedAssetId: resetWriteAttempt ? null : owner.pendingRemovedAssetId,
+    };
+    if (frameStructureEditorRef.current === owner) {
+      frameStructureEditorRef.current = nextOwner;
+      setFrameStructureEditor(nextOwner);
+    }
+    return nextOwner;
+  }
+
+  function invalidateFrameStructureProjections(owner: FrameStructureEditorContext): void {
+    const chapterId = owner.chapter.id;
+    assetCache.current.delete(chapterId);
+    assetRequestGeneration.current += 1;
+    setAssetResult({ chapterId, status: "loading" });
+    setFailedImagePositions(new Set());
+    closePersonalNotes();
+    closeFrameAssetReferences();
+    closePersonalRoughCut();
+    setResumeLocation(null);
+    setPersonalNotesReadRegistration(null);
+    personalNotesReadRegistrationRef.current = null;
+    personalNotesReadWatermarkRef.current = { owner: null, requestGeneration: -1, invalidatedGenerations: new Set() };
+    setPersonalNoteFrameFeedback(null);
+    setRoughCutFrameFeedback(null);
+    setFrameNavigationFeedback(null);
+    chapterDirectoryRef.current = {
+      scope: owner.scope,
+      requestGeneration: owner.requestGeneration,
+      chapters: null,
+    };
+    setChapters(null);
+    setChaptersError(null);
+    setChaptersLoading(true);
+  }
+
   async function openFrameTextEditor(position: number): Promise<void> {
     const directory = chapterDirectoryRef.current;
     if (!canEditStoryboard || chapterManagement !== null || chapterManagementBlocked || chapterOrderEditorRef.current !== null
@@ -1835,6 +2102,7 @@ export function ChapterBrowser({
       requestGeneration: directory.requestGeneration,
       lifecycleController: controller,
       newlyAcquiredLock: false,
+      refreshLockOnClose: false,
       lockNotice: null as string | null,
       lockLease: null as ChapterEditLockLeaseHandle | null,
       lockIdentity: null as FrameTextEditorContext["lockIdentity"],
@@ -1844,6 +2112,7 @@ export function ChapterBrowser({
     setFrameEditOpening(true);
     setChapterMutationNotice(null);
     let newlyAcquiredLock = false;
+    let refreshLockOnClose = false;
     let lockLease: ChapterEditLockLeaseHandle | null = null;
     let lockIdentity: FrameTextEditorContext["lockIdentity"] = null;
     const isCurrent = () => frameEditOpeningController.current === controller
@@ -1870,28 +2139,36 @@ export function ChapterBrowser({
               : "当前章节由其他创作者编辑，暂不能修改。", 409);
           }
           lockIdentity = chapterEditLockIdentity(existing);
+          refreshLockOnClose = true;
           lockNotice = "当前账号已持有有效编辑锁。";
         } else {
-          newlyAcquiredLock = true;
           const acquisition = await acquireChapterEditLock(base.chapter.id, controller.signal);
           const acquired = acquisition.state;
           lockLease = acquisition.lease;
           if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
-          if (!acquired.locked || lockLease === null || typeof acquired.expires_at !== "string"
+          if (!acquired.locked || typeof acquired.expires_at !== "string"
             || utcTimestampMilliseconds(acquired.expires_at) <= Date.now()) {
             throw new ApiError("http", acquired.message ?? "未能取得有效章节编辑锁。", 409);
           }
-          const verified = await getChapterEditLock(base.chapter.id, controller.signal, lockLease);
+          newlyAcquiredLock = lockLease !== null;
+          refreshLockOnClose = lockLease === null;
+          const verified = lockLease === null
+            ? await getChapterEditLock(base.chapter.id, controller.signal)
+            : await getChapterEditLock(base.chapter.id, controller.signal, lockLease);
           if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
           if (!validOwnedChapterLock(verified, userId)) {
             throw new ApiError("http", "取得锁后无法核对当前账号、所有权和有效期限，已停止编辑。", 409);
           }
           lockIdentity = chapterEditLockIdentity(verified);
-          lockNotice = "已取得章节编辑锁，有效期至 " + verified.expires_at;
+          lockNotice = lockLease === null
+            ? `当前账号持有有效章节编辑锁；取得来源无法确认，关闭后保留至服务器过期（${verified.expires_at}）。`
+            : "已取得章节编辑锁，有效期至 " + verified.expires_at;
         }
       }
       if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
-      const context: FrameTextEditorContext = { ...base, newlyAcquiredLock, lockNotice, lockLease, lockIdentity };
+      const context: FrameTextEditorContext = {
+        ...base, newlyAcquiredLock, refreshLockOnClose, lockNotice, lockLease, lockIdentity,
+      };
       frameTextEditorRef.current = context;
       setFrameTextEditor(context);
     } catch (cause) {
@@ -1900,10 +2177,10 @@ export function ChapterBrowser({
         if (error.status === 401) unauthorizedHandlerRef.current();
         else if (error.kind !== "aborted") setChapterMutationNotice(error.detail ?? error.message);
       }
-      if (newlyAcquiredLock) {
-        await releaseNewlyAcquiredChapterLock({
-          ...base, newlyAcquiredLock, lockNotice: null, lockLease, lockIdentity,
-        });
+      if (newlyAcquiredLock || refreshLockOnClose) {
+        await releaseOrRefreshChapterEditLock({
+          ...base, newlyAcquiredLock, refreshLockOnClose, lockNotice: null, lockLease, lockIdentity,
+        }, { refreshLockSnapshot: refreshLockOnClose });
       }
     } finally {
       if (frameEditOpeningController.current === controller) {
@@ -1911,6 +2188,472 @@ export function ChapterBrowser({
         frameEditOpeningChapterIdRef.current = null;
         setFrameEditOpening(false);
       }
+    }
+  }
+
+  async function openFrameStructureEditor(mode: FrameStructureMode): Promise<void> {
+    const directoryAtOpen = chapterDirectoryRef.current;
+    if (!canEditFrameStructure || chapterManagement !== null || chapterManagementBlocked
+      || chapterOrderEditorRef.current !== null || frameTextEditorRef.current !== null
+      || frameStructureEditorRef.current !== null || frameEditOpening || chaptersLoading
+      || chapters === null || chaptersError !== null || selectedChapter === null
+      || directoryAtOpen.chapters !== chapters
+      || !sameChapterBrowserScope(directoryAtOpen.scope, currentScope)
+      || directoryAtOpen.requestGeneration !== chapterRequestGeneration.current
+      || !isChapterSelectableFromDirectory(directoryAtOpen.chapters, selectedChapter.id, series.id)) return;
+    if (mode.kind === "delete" && selectedChapter.content !== null && selectedChapter.content.length <= 1) {
+      setChapterMutationNotice("章节至少保留一个镜头，当前操作未打开。");
+      return;
+    }
+
+    frameEditWorkflowEpoch.current += 1;
+    const controller = new AbortController();
+    const base = {
+      scope: currentScope,
+      chapter: selectedChapter,
+      requestGeneration: directoryAtOpen.requestGeneration,
+      lifecycleController: controller,
+      newlyAcquiredLock: false,
+      refreshLockOnClose: false,
+      lockNotice: null as string | null,
+      lockLease: null as ChapterEditLockLeaseHandle | null,
+      lockIdentity: null as ChapterEditLockIdentity,
+    };
+    frameEditOpeningController.current = controller;
+    frameEditOpeningChapterIdRef.current = base.chapter.id;
+    setFrameEditOpening(true);
+    setChapterMutationNotice(null);
+    const isCurrent = () => frameEditOpeningController.current === controller
+      && frameEditOpeningChapterIdRef.current === base.chapter.id
+      && !controller.signal.aborted
+      && sameChapterBrowserScope(base.scope, activeScopeRef.current)
+      && base.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === base.chapter.id
+      && chapterDirectoryRef.current.chapters?.filter((chapter) => chapter.id === base.chapter.id).length === 1;
+    let newlyAcquiredLock = false;
+    let refreshLockOnClose = false;
+    let lockLease: ChapterEditLockLeaseHandle | null = null;
+    let lockIdentity: ChapterEditLockIdentity = null;
+    try {
+      let lockNotice: string | null = null;
+      if (typeof series.team_id === "string" && series.team_id !== "") {
+        const { getChapterEditLock, acquireChapterEditLock } = services;
+        if (getChapterEditLock === undefined || acquireChapterEditLock === undefined
+          || services.releaseChapterEditLock === undefined) {
+          throw new ApiError("invalid-response", "团队章节锁能力未就绪，已停止修改分镜结构。", null);
+        }
+        const existing = await getChapterEditLock(base.chapter.id, controller.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        if (existing.locked) {
+          if (!validOwnedChapterLock(existing, userId)) {
+            throw new ApiError("http", existing.username
+              ? `当前章节由 ${existing.username} 编辑，暂不能修改。`
+              : "当前章节由其他创作者编辑，暂不能修改。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(existing);
+          refreshLockOnClose = true;
+          lockNotice = "当前账号已持有有效编辑锁。";
+        } else {
+          const acquisition = await acquireChapterEditLock(base.chapter.id, controller.signal);
+          lockLease = acquisition.lease;
+          if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+          if (!acquisition.state.locked || typeof acquisition.state.expires_at !== "string"
+            || utcTimestampMilliseconds(acquisition.state.expires_at) <= Date.now()) {
+            throw new ApiError("http", acquisition.state.message ?? "未能取得有效章节编辑锁。", 409);
+          }
+          newlyAcquiredLock = lockLease !== null;
+          refreshLockOnClose = lockLease === null;
+          const verified = lockLease === null
+            ? await getChapterEditLock(base.chapter.id, controller.signal)
+            : await getChapterEditLock(base.chapter.id, controller.signal, lockLease);
+          if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+          if (!validOwnedChapterLock(verified, userId)) {
+            throw new ApiError("http", "取得锁后无法核对当前账号、所有权和有效期限，已停止修改。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(verified);
+          lockNotice = lockLease === null
+            ? `当前账号持有有效章节编辑锁；取得来源无法确认，关闭后保留至服务器过期（${verified.expires_at}）。`
+            : "已取得章节编辑锁，有效期至 " + verified.expires_at;
+        }
+      }
+
+      const [latestDirectory, assets, characters, scenes, props] = await Promise.all([
+        services.listChapters(base.scope.seriesId, controller.signal),
+        services.listStoryboardAssets(base.scope.seriesId, base.chapter.id, controller.signal),
+        services.listCharacters(base.scope.seriesId, controller.signal),
+        services.listScenes(base.scope.seriesId, controller.signal),
+        services.listProps(base.scope.seriesId, controller.signal),
+      ]);
+      if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+      const matching = latestDirectory.filter((chapter) => chapter.id === base.chapter.id);
+      const latestChapter = matching[0];
+      if (!sameChapterOrderSnapshot(directoryAtOpen.chapters, latestDirectory, base.scope.seriesId)
+        || matching.length !== 1 || latestChapter === undefined
+        || latestChapter.order !== base.chapter.order
+        || !sameChapterContent(latestChapter.content, base.chapter.content)) {
+        applyFreshChapterDirectory(latestDirectory, base.scope);
+        throw new ApiError("http", "章节内容或镜头顺序已变化；未打开结构编辑，请核对最新章节后重试。", 409);
+      }
+      const references = inspectStoryboardReferences(latestChapter.content, assets, base.scope.seriesId, base.chapter.id);
+      if (!references.ok) throw new ApiError("http", references.message, 409);
+      if (!areReferencedFrameAssetPositionsValid(latestChapter, assets, base.scope.seriesId)) {
+        throw new ApiError("http", "分镜素材位置与当前章节不一致；未打开结构编辑，请核对最新素材。", 409);
+      }
+      const deleteTarget = mode.kind === "delete"
+        ? resolveDeletableFrameTarget(latestChapter, mode.position - 1, assets)
+        : null;
+      if (mode.kind === "delete" && deleteTarget === null) {
+        throw new ApiError("http", "目标镜头的稳定素材 ID、章节归属或索引无法唯一核对，未打开删除操作。", 409);
+      }
+      const positionCount = latestChapter.content?.length ?? 0;
+      if (mode.kind === "insert" && (!Number.isSafeInteger(mode.afterPosition)
+        || mode.afterPosition < 0 || mode.afterPosition > positionCount)) {
+        throw new ApiError("http", "插入位置已变化，请重新读取章节后再试。", 409);
+      }
+      const context: FrameStructureEditorContext = {
+        ...base,
+        chapter: latestChapter,
+        newlyAcquiredLock,
+        refreshLockOnClose,
+        lockNotice,
+        lockLease,
+        lockIdentity,
+        mode,
+        characters: characters.filter((asset) => asset.series_id === base.scope.seriesId),
+        scenes: scenes.filter((asset) => asset.series_id === base.scope.seriesId),
+        props: props.filter((asset) => asset.series_id === base.scope.seriesId),
+        baseDirectory: latestDirectory,
+        baseContent: latestChapter.content,
+        baseAssets: snapshotStoryboardAssetPositions(assets),
+        deleteTarget,
+        writeAttemptStarted: false,
+        pendingExpectedContent: null,
+        pendingRemovedAssetId: null,
+      };
+      frameStructureEditorRef.current = context;
+      setFrameStructureEditor(context);
+    } catch (cause) {
+      if (isCurrent()) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401) unauthorizedHandlerRef.current();
+        else if (error.kind !== "aborted") setChapterMutationNotice(error.detail ?? error.message);
+      }
+      if (newlyAcquiredLock || refreshLockOnClose) {
+        await releaseOrRefreshChapterEditLock({
+          ...base, newlyAcquiredLock, refreshLockOnClose, lockNotice: null, lockLease, lockIdentity,
+        }, { refreshLockSnapshot: refreshLockOnClose });
+      }
+    } finally {
+      if (frameEditOpeningController.current === controller) {
+        frameEditOpeningController.current = null;
+        frameEditOpeningChapterIdRef.current = null;
+        setFrameEditOpening(false);
+      }
+    }
+  }
+
+  async function copyFrameText(position: number): Promise<void> {
+    if (selectedChapter === null) return;
+    const text = readEditableFrameText(selectedChapter, position);
+    if (text === null) {
+      setChapterMutationNotice("当前镜头文字无法识别，未复制内容。");
+      return;
+    }
+    try {
+      if (typeof navigator.clipboard?.writeText !== "function") {
+        throw new Error("clipboard unavailable");
+      }
+      await navigator.clipboard.writeText(text);
+      setChapterMutationNotice(`镜头 ${position} 的文字已复制。`);
+    } catch {
+      setChapterMutationNotice("无法访问剪贴板；请检查浏览器权限后重试。");
+    }
+  }
+
+  async function readFrameStructureSnapshot(
+    owner: FrameStructureEditorContext,
+    signal: AbortSignal,
+  ): Promise<{
+    directory: Chapter[];
+    chapter: Chapter;
+    assets: StoryboardAsset[];
+    notes: PersonalProductionSnapshot;
+    roughCut: PersonalRoughCutSnapshot;
+  }> {
+    const [initialDirectory, initialAssets, notes, roughCut] = await Promise.all([
+      owner.scope.services.listChapters(owner.scope.seriesId, signal),
+      owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+      owner.scope.services.getPersonalProductionNotes(owner.chapter.id, signal),
+      owner.scope.services.getPersonalRoughCut(owner.chapter.id, signal),
+    ]);
+    if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    const [directory, assets] = await Promise.all([
+      owner.scope.services.listChapters(owner.scope.seriesId, signal),
+      owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+    ]);
+    if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    const initialMatches = initialDirectory.filter((chapter) => chapter.id === owner.chapter.id);
+    const matches = directory.filter((chapter) => chapter.id === owner.chapter.id);
+    const chapter = matches[0];
+    const initialChapter = initialMatches[0];
+    if (initialMatches.length !== 1 || initialChapter === undefined
+      || matches.length !== 1 || chapter === undefined || chapter.series_id !== owner.scope.seriesId
+      || initialChapter.order !== chapter.order
+      || !sameChapterContent(initialChapter.content, chapter.content)
+      || !sameChapterOrderSnapshot(initialDirectory, directory, owner.scope.seriesId)
+      || !sameStoryboardAssetPositions(initialAssets, assets)) {
+      throw new ApiError("invalid-response", "读取期间章节或素材关系再次变化，结果无法确认。", null);
+    }
+    return { directory, chapter, assets, notes, roughCut };
+  }
+
+  function structureReadbackMatches(
+    owner: FrameStructureEditorContext,
+    snapshot: Awaited<ReturnType<typeof readFrameStructureSnapshot>>,
+    expectedContent: StoryboardFrame[],
+  ): boolean {
+    return snapshot.chapter.order === owner.chapter.order
+      && isFrameStructureReadbackValid(
+        expectedContent,
+        snapshot.chapter.content,
+        snapshot.assets,
+        owner.scope.seriesId,
+        owner.chapter.id,
+      )
+      && areFrameStructureMappingsValid(snapshot.chapter, snapshot.notes, snapshot.roughCut);
+  }
+
+  function structureBaselineMatches(
+    owner: FrameStructureEditorContext,
+    snapshot: Awaited<ReturnType<typeof readFrameStructureSnapshot>>,
+  ): boolean {
+    return snapshot.chapter.order === owner.chapter.order
+      && sameChapterOrderSnapshot(owner.baseDirectory, snapshot.directory, owner.scope.seriesId)
+      && sameChapterContent(owner.baseContent, snapshot.chapter.content)
+      && sameStoryboardAssetPositions(owner.baseAssets, snapshot.assets);
+  }
+
+  function setStructureWriteAttempt(
+    owner: FrameStructureEditorContext,
+    started: boolean,
+    expectedContent: StoryboardFrame[] | null,
+    removedAssetId: string | null,
+  ): FrameStructureEditorContext {
+    const next = {
+      ...owner,
+      writeAttemptStarted: started,
+      pendingExpectedContent: expectedContent,
+      pendingRemovedAssetId: removedAssetId,
+    };
+    if (frameStructureEditorRef.current === owner) {
+      frameStructureEditorRef.current = next;
+      setFrameStructureEditor(next);
+    }
+    return next;
+  }
+
+  async function submitFrameStructure(
+    expectedOwner: FrameStructureEditorContext,
+    draft: FrameStructureDraft | null,
+    signal: AbortSignal,
+  ): Promise<FrameStructureSubmitResult> {
+    const activeOwner = frameStructureEditorRef.current;
+    if (activeOwner === null || activeOwner !== expectedOwner
+      || !isFrameStructureEditorCurrent(activeOwner, signal)) {
+      throw new ApiError("aborted", "编辑内容已切换。", null);
+    }
+    let owner = activeOwner;
+    if ((owner.mode.kind === "insert") !== (draft !== null)) {
+      return { status: "conflict", message: "分镜草稿类型与当前操作不一致，未发送修改。" };
+    }
+
+    let directory: Chapter[];
+    let assets: StoryboardAsset[];
+    let characters: Character[];
+    let scenes: Scene[];
+    let props: Prop[];
+    try {
+      [directory, assets, characters, scenes, props] = await Promise.all([
+        owner.scope.services.listChapters(owner.scope.seriesId, signal),
+        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+        owner.scope.services.listCharacters(owner.scope.seriesId, signal),
+        owner.scope.services.listScenes(owner.scope.seriesId, signal),
+        owner.scope.services.listProps(owner.scope.seriesId, signal),
+      ]);
+    } catch (cause) {
+      if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (normalizeApiError(cause).status === 401) unauthorizedHandlerRef.current();
+      throw cause;
+    }
+    if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    const chapterMatches = directory.filter((chapter) => chapter.id === owner.chapter.id);
+    const latestChapter = chapterMatches[0];
+    if (chapterMatches.length !== 1 || latestChapter === undefined || latestChapter.series_id !== owner.scope.seriesId) {
+      return { status: "conflict", message: "最新目录无法唯一确认当前章节，草稿仍保留。" };
+    }
+    const directoryUnchanged = sameChapterOrderSnapshot(owner.baseDirectory, directory, owner.scope.seriesId);
+    const chapterUnchanged = latestChapter.order === owner.chapter.order
+      && sameChapterContent(latestChapter.content, owner.baseContent);
+    if (!directoryUnchanged || !chapterUnchanged) {
+      refreshFrameStructureBase(owner, directory, latestChapter, assets, false);
+      return { status: "conflict", message: "章节内容或镜头顺序已变化；草稿保留，请核对最新章节后再编辑。" };
+    }
+
+    const references = inspectStoryboardReferences(latestChapter.content, assets, owner.scope.seriesId, owner.chapter.id);
+    if (!references.ok) return { status: "conflict", message: references.message };
+    if (!sameStoryboardAssetPositions(owner.baseAssets, assets)
+      || !areReferencedFrameAssetPositionsValid(latestChapter, assets, owner.scope.seriesId)) {
+      return { status: "conflict", message: "分镜素材位置在编辑期间发生变化；未发送修改，草稿仍保留，请核对最新素材。" };
+    }
+    let expectedContent: StoryboardFrame[] | null = null;
+    let removedAssetId: string | null = null;
+    let targetIndex: number | null = null;
+    if (owner.mode.kind === "insert") {
+      const selectedCharacterIds = draft?.characterAssetIds ?? [];
+      const selectedSceneIds = draft?.sceneAssetIds ?? [];
+      const selectedPropIds = draft?.propAssetIds ?? [];
+      if (!hasUniqueOwnedAssetIds(characters, selectedCharacterIds, owner.scope.seriesId)
+        || !hasUniqueOwnedAssetIds(scenes, selectedSceneIds, owner.scope.seriesId)
+        || !hasUniqueOwnedAssetIds(props, selectedPropIds, owner.scope.seriesId)) {
+        return { status: "conflict", message: "所选角色、场景或道具已变化，未发送修改；请重新选择当前剧集素材。" };
+      }
+      const afterIndex = owner.mode.afterPosition - 1;
+      expectedContent = buildInsertedFrameContent(latestChapter.content, afterIndex, draft!);
+      if (expectedContent === null) return { status: "conflict", message: "插入位置已变化，未发送修改。" };
+      targetIndex = afterIndex + 1;
+    } else {
+      const currentTarget = resolveDeletableFrameTarget(latestChapter, owner.mode.position - 1, assets);
+      if (currentTarget === null || owner.deleteTarget === null
+        || currentTarget.frameIndex !== owner.deleteTarget.frameIndex
+        || currentTarget.storyboardAssetId !== owner.deleteTarget.storyboardAssetId) {
+        return { status: "conflict", message: "目标镜头的稳定素材身份或索引已变化，未发送删除。草稿仍保留。" };
+      }
+      if (latestChapter.content === null || latestChapter.content.length <= 1) {
+        return { status: "conflict", message: "章节至少保留一个镜头；最新章节不满足删除条件。" };
+      }
+      targetIndex = currentTarget.frameIndex;
+      removedAssetId = currentTarget.storyboardAssetId;
+      expectedContent = latestChapter.content.filter((_frame, index) => index !== currentTarget.frameIndex);
+    }
+    if (expectedContent === null || targetIndex === null) {
+      return { status: "conflict", message: "当前分镜操作无法构造完整章节内容，未发送修改。" };
+    }
+
+    if (typeof series.team_id === "string" && series.team_id !== "") {
+      const getChapterEditLock = owner.scope.services.getChapterEditLock;
+      if (getChapterEditLock === undefined) {
+        return { status: "conflict", message: "团队章节锁能力不可用，草稿仍保留。" };
+      }
+      let lock: ChapterEditLockState;
+      try {
+        lock = owner.lockLease === null
+          ? await getChapterEditLock(owner.chapter.id, signal)
+          : await getChapterEditLock(owner.chapter.id, signal, owner.lockLease);
+      } catch (cause) {
+        if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+        if (normalizeApiError(cause).status === 401) unauthorizedHandlerRef.current();
+        throw cause;
+      }
+      if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (!validOwnedChapterLock(lock, owner.scope.userId)
+        || !sameChapterEditLockIdentity(owner.lockIdentity, lock)) {
+        return { status: "conflict", message: "提交前无法确认当前账号仍持有有效章节锁；草稿仍保留。" };
+      }
+    }
+
+    owner = setStructureWriteAttempt(owner, true, expectedContent, removedAssetId);
+    invalidateFrameStructureProjections(owner);
+    let writeError: ApiError | null = null;
+    try {
+      if (owner.mode.kind === "insert") {
+        if (owner.scope.services.updateChapter === undefined) {
+          throw new ApiError("invalid-response", "当前服务不支持插入分镜。", null);
+        }
+        await owner.scope.services.updateChapter(
+          owner.scope.seriesId,
+          owner.chapter.id,
+          { content: expectedContent },
+          signal,
+        );
+      } else {
+        if (owner.scope.services.deleteFrame === undefined || targetIndex === null) {
+          throw new ApiError("invalid-response", "当前服务不支持安全删除分镜。", null);
+        }
+        await owner.scope.services.deleteFrame(owner.scope.seriesId, owner.chapter.id, targetIndex, signal);
+      }
+    } catch (cause) {
+      const error = normalizeApiError(cause);
+      if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      if (error.kind === "aborted") throw cause;
+      writeError = error;
+    }
+    if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+
+    let snapshot: Awaited<ReturnType<typeof readFrameStructureSnapshot>>;
+    try {
+      snapshot = await readFrameStructureSnapshot(owner, signal);
+    } catch (cause) {
+      if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      if (error.kind === "aborted") throw cause;
+      return { status: "unknown", message: "请求已发送，但章节、素材或制作映射无法重新读取；结果尚未确认。草稿已冻结，请只核对服务器状态。" };
+    }
+
+    if (structureReadbackMatches(owner, snapshot, expectedContent)) {
+      refreshFrameStructureBase(owner, snapshot.directory, snapshot.chapter, snapshot.assets, true);
+      setChapterMutationNotice(owner.mode.kind === "insert"
+        ? "分镜已保存并重新核对。"
+        : "分镜已删除并核对；聊天记录清理与后续索引由服务器处理。");
+      return { status: "saved", message: owner.mode.kind === "insert" ? "分镜已保存并重新核对。" : "分镜已删除并重新核对。" };
+    }
+
+    if (structureBaselineMatches(owner, snapshot)) {
+      if (writeError !== null && writeError.kind === "http" && writeError.status !== null && writeError.status < 500) {
+        refreshFrameStructureBase(owner, snapshot.directory, snapshot.chapter, snapshot.assets, true);
+        return { status: "conflict", message: writeError.detail ?? "服务器明确拒绝了本次修改，且最新章节仍为原内容。草稿保留。" };
+      }
+      refreshFrameStructureBase(owner, snapshot.directory, snapshot.chapter, snapshot.assets, false);
+      return {
+        status: "unknown",
+        message: "最新章节仍是修改前内容，但无法证明请求不会迟到落库。当前操作继续冻结，请只核对服务器状态，或结束本次核对后重新读取再创建草稿。",
+      };
+    }
+
+    return { status: "unknown", message: "最新章节或制作映射与预期不一致，无法判断请求是否完成。草稿已冻结，请只核对服务器状态。" };
+  }
+
+  async function verifyFrameStructureWrite(
+    expectedOwner: FrameStructureEditorContext,
+    signal: AbortSignal,
+  ): Promise<FrameStructureVerifyResult> {
+    let owner = frameStructureEditorRef.current;
+    if (owner === null || owner.chapter.id !== expectedOwner.chapter.id
+      || !sameChapterBrowserScope(owner.scope, expectedOwner.scope)
+      || !isFrameStructureEditorCurrent(owner, signal)) {
+      throw new ApiError("aborted", "编辑内容已切换。", null);
+    }
+    try {
+      const snapshot = await readFrameStructureSnapshot(owner, signal);
+      if (owner.pendingExpectedContent !== null
+        && structureReadbackMatches(owner, snapshot, owner.pendingExpectedContent)) {
+        refreshFrameStructureBase(owner, snapshot.directory, snapshot.chapter, snapshot.assets, true);
+        setChapterMutationNotice("服务器状态已核对，分镜修改已完成。");
+        return { status: "saved", message: "服务器状态已核对，分镜修改已完成。" };
+      }
+      if (structureBaselineMatches(owner, snapshot)) {
+        refreshFrameStructureBase(owner, snapshot.directory, snapshot.chapter, snapshot.assets, false);
+        return {
+          status: "unknown",
+          message: "服务器仍是修改前内容，但无法证明原请求不会迟到落库。当前操作继续冻结；请只核对状态，或结束本次核对后重新读取再创建草稿。",
+        };
+      }
+      return { status: "unknown", message: "服务器当前内容与修改前和草稿结果都不一致，草稿继续冻结。" };
+    } catch (cause) {
+      if (!isFrameStructureEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (normalizeApiError(cause).status === 401) unauthorizedHandlerRef.current();
+      throw cause;
     }
   }
 
@@ -1988,7 +2731,9 @@ export function ChapterBrowser({
       if (owner.scope.services.getChapterEditLock === undefined) {
         throw new ApiError("invalid-response", "团队章节锁能力不可用，已停止保存。", null);
       }
-      const lock = await owner.scope.services.getChapterEditLock(owner.chapter.id, signal, owner.lockLease ?? undefined);
+      const lock = owner.lockLease === null
+        ? await owner.scope.services.getChapterEditLock(owner.chapter.id, signal)
+        : await owner.scope.services.getChapterEditLock(owner.chapter.id, signal, owner.lockLease);
       if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
       if (!validOwnedChapterLock(lock, owner.scope.userId)
         || !sameChapterEditLockIdentity(owner.lockIdentity, lock)) {
@@ -2066,9 +2811,12 @@ export function ChapterBrowser({
   const selectedIndex = chapters?.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
   const chapterManagementBlocked = chapterPanelsOpen
-    || chapterOrderEditor !== null || frameTextEditor !== null || frameEditOpening
+    || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null || frameEditOpening
     || storyboardGenerationDialog !== null;
   const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
+  const canEditFrameStructure = series.can_enter
+    && services.updateChapter !== undefined
+    && services.deleteFrame !== undefined;
   const canReorderChapters = series.can_enter && services.reorderChapters !== undefined;
   const canManageChapters = series.can_enter
     && services.createChapter !== undefined
@@ -2488,6 +3236,15 @@ export function ChapterBrowser({
                 </div>
                 <div className="selected-chapter-actions">
                   <span className="readonly-pill">{canEditStoryboard ? "可编辑分镜文字" : "只读"}</span>
+                  {canEditFrameStructure && (
+                    <button
+                      className="text-button frame-structure-insert-opening"
+                      disabled={chaptersLoading || chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                      onClick={() => void openFrameStructureEditor({ kind: "insert", afterPosition: 0 })}
+                      title={chapterManagementBlocked ? "请先关闭当前制作记录或编辑窗口" : undefined}
+                      type="button"
+                    >在开头插入分镜</button>
+                  )}
                   {canManageChapters && (
                     <>
                       <button
@@ -2721,6 +3478,30 @@ export function ChapterBrowser({
                                   type="button"
                                 >{frameEditOpening ? "正在核对…" : "编辑文字"}</button>
                               )}
+                              <button
+                                className="text-button frame-copy-text-button"
+                                disabled={selectedChapter === null || chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                                onClick={() => void copyFrameText(frame.position)}
+                                type="button"
+                              >复制文字</button>
+                              {canEditFrameStructure && sourceFrame !== undefined && (
+                                <>
+                                  <button
+                                    className="text-button frame-structure-insert-after"
+                                    disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                                    onClick={() => void openFrameStructureEditor({ kind: "insert", afterPosition: frame.position })}
+                                    title={chapterManagementBlocked ? "请先关闭当前制作记录或编辑窗口" : undefined}
+                                    type="button"
+                                  >在此镜头后插入</button>
+                                  <button
+                                    className="text-button chapter-delete-action frame-structure-delete"
+                                    disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening || frames.length <= 1}
+                                    onClick={() => void openFrameStructureEditor({ kind: "delete", position: frame.position })}
+                                    title={frames.length <= 1 ? "章节至少保留一个镜头" : undefined}
+                                    type="button"
+                                  >删除镜头</button>
+                                </>
+                              )}
                             </div>
                           </div>
                           <div className="storyboard-frame-body">
@@ -2855,6 +3636,31 @@ export function ChapterBrowser({
           onClose={() => closeFrameTextEditor(frameTextEditor)}
           onSave={saveFrameText}
           position={frameTextEditor.position}
+        />
+      )}
+      {frameStructureEditor !== null && sameChapterBrowserScope(frameStructureEditor.scope, currentScope) && (
+        <FrameStructureEditor
+          key={`${frameStructureEditor.scope.userId}:${frameStructureEditor.scope.seriesId}:${frameStructureEditor.chapter.id}:${frameStructureEditor.requestGeneration}:${frameStructureEditor.mode.kind}:${frameStructureEditor.mode.kind === "insert" ? frameStructureEditor.mode.afterPosition : frameStructureEditor.mode.position}`}
+          chapter={frameStructureEditor.chapter}
+          characters={frameStructureEditor.characters}
+          lifecycleSignal={frameStructureEditor.lifecycleController.signal}
+          lockNotice={frameStructureEditor.lockNotice}
+          mode={frameStructureEditor.mode}
+          onClose={() => closeFrameStructureEditor()}
+          onDraftDirtyChange={(dirty) => {
+            if (frameStructureEditorRef.current === frameStructureEditor) {
+              frameStructureDraftDirtyRef.current = dirty;
+            }
+          }}
+          onRegisterDiscardRequest={(request) => {
+            if (frameStructureEditorRef.current === frameStructureEditor) {
+              frameStructureDiscardRequestRef.current = request;
+            }
+          }}
+          onSubmit={(draft, signal) => submitFrameStructure(frameStructureEditor, draft, signal)}
+          onVerify={(signal) => verifyFrameStructureWrite(frameStructureEditor, signal)}
+          props={frameStructureEditor.props}
+          scenes={frameStructureEditor.scenes}
         />
       )}
       {chapterManagement !== null && sameChapterBrowserScope(chapterManagement.scope, currentScope) && (

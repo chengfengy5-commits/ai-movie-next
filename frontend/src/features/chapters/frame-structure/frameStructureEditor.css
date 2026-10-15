@@ -1,0 +1,134 @@
+.frame-structure-editor {
+  display: grid;
+  gap: 12px;
+}
+
+.frame-reference-choices {
+  min-width: 0;
+  margin: 0;
+  padding: 10px;
+  border: 1px solid #e2ebe7;
+  border-radius: 8px;
+}
+
+.frame-reference-choices legend {
+  padding: 0 5px;
+  color: #405557;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.frame-reference-choice-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  max-height: 136px;
+  overflow: auto;
+}
+
+.frame-reference-choice {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 7px;
+  padding: 6px;
+  border-radius: 6px;
+  color: #405557;
+  font-size: 12px;
+}
+
+.frame-reference-choice:has(input:checked) {
+  background: #eff7f3;
+}
+
+.frame-reference-choice input {
+  flex: 0 0 auto;
+  accent-color: #39786a;
+}
+
+.frame-reference-choice span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.frame-reference-empty,
+.frame-structure-delete-warning,
+.frame-structure-status {
+  margin: 0;
+  color: #627572;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.frame-structure-delete-warning {
+  padding: 12px;
+  border-radius: 8px;
+  color: #735d37;
+  background: #fbf8f0;
+}
+
+.frame-structure-status {
+  padding: 10px 12px;
+  border-radius: 7px;
+  color: #4e6661;
+  background: #f4f8f6;
+}
+
+.frame-structure-editor-actions {
+  flex-wrap: wrap;
+}
+
+.frame-structure-discard-confirmation {
+  display: grid;
+  gap: 8px;
+  padding: 14px;
+  border: 1px solid #d7b47a;
+  border-radius: 9px;
+  background: #fffaf0;
+}
+
+.frame-structure-discard-confirmation h3,
+.frame-structure-discard-confirmation p {
+  margin: 0;
+}
+
+.frame-structure-discard-confirmation h3 {
+  color: #574322;
+  font-size: 14px;
+}
+
+.frame-structure-discard-confirmation p {
+  color: #735d37;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.frame-structure-discard-confirmation .series-dialog-actions {
+  flex-wrap: wrap;
+}
+
+.storyboard-frame-heading-actions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.frame-structure-delete {
+  color: #9b5146;
+}
+
+@media (max-width: 600px) {
+  .frame-reference-choice-list {
+    grid-template-columns: minmax(0, 1fr);
+    max-height: 120px;
+  }
+
+  .frame-structure-editor-actions button {
+    flex: 1 1 45%;
+  }
+
+  .storyboard-frame-heading-actions {
+    gap: 4px 8px;
+  }
+}

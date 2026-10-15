@@ -254,59 +254,66 @@ describe("chapter and storyboard API services over real HTTP", () => {
     }
   });
 
-  it("binds chapter-lock release to the verified acquisition and refuses a changed API session", async () => {
+  it("keeps legacy lock acquisition server-managed and rejects an unleased read after the API session changes", async () => {
     const fixture = await startFixture();
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
     const requests: Array<{ method: string; pathname: string; authorization: string | null }> = [];
+    let holdNextLockRead = false;
+    let signalLockReadStarted!: () => void;
+    let releaseLockRead!: () => void;
+    const lockReadStarted = new Promise<void>((resolve) => { signalLockReadStarted = resolve; });
+    const lockReadGate = new Promise<void>((resolve) => { releaseLockRead = resolve; });
     const fetcher: typeof fetch = async (input, init) => {
       const url = input instanceof URL
         ? input
         : input instanceof Request
           ? new URL(input.url)
           : new URL(input);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
       requests.push({
-        method: init?.method ?? (input instanceof Request ? input.method : "GET"),
+        method,
         pathname: url.pathname,
         authorization: new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
           .get("Authorization"),
       });
+      if (holdNextLockRead && method === "GET" && url.pathname.endsWith("/lock")) {
+        holdNextLockRead = false;
+        signalLockReadStarted();
+        await lockReadGate;
+      }
       return globalThis.fetch(input, init);
     };
     const services = createApiServices(fixture.baseUrl, { storage, fetcher });
     const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
     const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
-    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
     const signal = new AbortController().signal;
-    const verifiedChapter = "fixture-series-03-chapter-02";
-    const changedSessionChapter = "fixture-series-03-chapter-01";
+    const chapterId = "fixture-series-03-chapter-02";
 
     try {
-      const verifiedAcquisition = await acquireLock(verifiedChapter, signal);
-      if (verifiedAcquisition.lease === null) throw new Error("Expected a new chapter lock acquisition.");
-      const verified = await getLock(verifiedChapter, signal, verifiedAcquisition.lease);
+      const acquisition = await acquireLock(chapterId, signal);
+      expect(acquisition.state.locked).toBe(true);
+      expect(acquisition.lease).toBeNull();
+      const verified = await getLock(chapterId, signal);
       expect(verified).toMatchObject({ locked: true, user_id: "demo-user", is_mine: true });
-      await releaseLock(verifiedChapter, signal, verifiedAcquisition.lease);
 
-      const changedAcquisition = await acquireLock(changedSessionChapter, signal);
-      if (changedAcquisition.lease === null) throw new Error("Expected a new chapter lock acquisition.");
-      await getLock(changedSessionChapter, signal, changedAcquisition.lease);
+      holdNextLockRead = true;
+      const pendingRead = getLock(chapterId, signal);
+      await lockReadStarted;
       storage.setItem(API_TOKEN_KEY, "fixture-demo-token-02");
-      await expect(releaseLock(changedSessionChapter, signal, changedAcquisition.lease))
-        .rejects.toMatchObject({ kind: "aborted" });
+      releaseLockRead();
+      await expect(pendingRead).rejects.toMatchObject({ kind: "aborted" });
 
       expect(requests.map(({ method, pathname }) => [method, pathname])).toEqual([
-        ["POST", `/api/chapters/${verifiedChapter}/lock`],
-        ["GET", `/api/chapters/${verifiedChapter}/lock`],
-        ["GET", `/api/chapters/${verifiedChapter}/lock`],
-        ["DELETE", `/api/chapters/${verifiedChapter}/lock`],
-        ["POST", `/api/chapters/${changedSessionChapter}/lock`],
-        ["GET", `/api/chapters/${changedSessionChapter}/lock`],
+        ["POST", `/api/chapters/${chapterId}/lock`],
+        ["GET", `/api/chapters/${chapterId}/lock`],
+        ["GET", `/api/chapters/${chapterId}/lock`],
       ]);
       expect(requests.every((request) => request.authorization !== null)).toBe(true);
-      expect(requests.slice(0, 4).every((request) => request.authorization === "Bearer fixture-demo-token")).toBe(true);
-      expect(requests.slice(4).every((request) => request.authorization === "Bearer fixture-demo-token")).toBe(true);
+      expect(requests.every((request) => request.authorization === "Bearer fixture-demo-token")).toBe(true);
+      expect(requests.some((request) => request.method === "DELETE")).toBe(false);
     } finally {
+      releaseLockRead();
       await fixture.stop();
     }
   });
@@ -331,13 +338,25 @@ describe("chapter and storyboard API services over real HTTP", () => {
     }
   });
 
-  it("allows a chapter PUT to extend the same acquisition and releases it by its stable acquired_at", async () => {
+  it("allows a chapter PUT to extend the same server-managed lock without claiming release authority", async () => {
     const fixture = await startFixture();
-    const { services } = createServices(fixture.baseUrl);
+    const requests: Array<{ method: string; pathname: string }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = input instanceof URL
+        ? input
+        : input instanceof Request
+          ? new URL(input.url)
+          : new URL(input);
+      requests.push({
+        method: init?.method ?? (input instanceof Request ? input.method : "GET"),
+        pathname: url.pathname,
+      });
+      return globalThis.fetch(input, init);
+    };
+    const { services } = createServices(fixture.baseUrl, { fetcher });
     const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
     const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
     const updateChapter = requireServiceMethod(services.updateChapter, "updateChapter");
-    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
     const seriesId = "fixture-series-03";
     const signal = new AbortController().signal;
 
@@ -346,17 +365,20 @@ describe("chapter and storyboard API services over real HTTP", () => {
       const chapter = chapters[0];
       if (!chapter || chapter.content === null) throw new Error("Expected a fixture chapter with storyboard content.");
       const acquisition = await acquireLock(chapter.id, signal);
-      if (acquisition.lease === null) throw new Error("Expected a chapter lock acquisition.");
-      const before = await getLock(chapter.id, signal, acquisition.lease);
+      expect(acquisition.state.locked).toBe(true);
+      expect(acquisition.lease).toBeNull();
+      const before = await getLock(chapter.id, signal);
       const updated = await updateChapter(seriesId, chapter.id, { content: chapter.content }, signal);
-      const after = await getLock(chapter.id, signal, acquisition.lease);
-      await releaseLock(chapter.id, signal, acquisition.lease);
+      const after = await getLock(chapter.id, signal);
 
       expect(updated.content).toEqual(chapter.content);
       expect(after.acquired_at).toBe(before.acquired_at);
       expect(Date.parse(after.expires_at ?? "")).toBeGreaterThan(Date.parse(before.expires_at ?? ""));
       expect(fixture.output()).toContain(`"method":"PUT","pathname":"/api/chapters/${chapter.id}","status":200`);
-      expect(fixture.output()).toContain(`"method":"DELETE","pathname":"/api/chapters/${chapter.id}/lock","status":200`);
+      expect(requests.filter((request) => request.pathname === `/api/chapters/${chapter.id}/lock`)
+        .map((request) => request.method)).toEqual(["POST", "GET", "GET"]);
+      expect(requests.some((request) => request.method === "DELETE"
+        && request.pathname === `/api/chapters/${chapter.id}/lock`)).toBe(false);
     } finally {
       await fixture.stop();
     }

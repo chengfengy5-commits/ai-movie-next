@@ -70,6 +70,23 @@ import { inspectRoughCutSource } from "../../features/chapters/personal-producti
 import { demoTaskRecords, getDemoMyTaskPage } from "../../features/tasks/demoTasks";
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
 import { parseTaskReceipt, parseTaskRequestRecord, type TaskReceipt, type TaskRequestRecord } from "./taskDetails";
+import {
+  InvalidCreatorSettingsResponseError,
+  parseCreatorModel,
+  parseCreatorModelList,
+  parseCreatorPrompt,
+  parseCreatorPromptList,
+  parseCreatorSettingsMessage,
+  type CreatorModel,
+  type CreatorModelCreateInput,
+  type CreatorModelReorderInput,
+  type CreatorModelUpdateInput,
+  type CreatorPrompt,
+  type CreatorPromptCreateInput,
+  type CreatorPromptReorderInput,
+  type CreatorPromptUpdateInput,
+  type CreatorSettingsServicePort,
+} from "./creatorSettings";
 import { parseMyTeamList, type MyTeam } from "./teams";
 import {
   parseStoryboardModels,
@@ -137,6 +154,12 @@ export interface WorkspaceServices {
     update: UpdateChapterInput,
     signal: AbortSignal,
   ): Promise<Chapter>;
+  deleteFrame?(
+    seriesId: string,
+    chapterId: string,
+    frameIndex: number,
+    signal: AbortSignal,
+  ): Promise<Chapter>;
   deleteChapter?(seriesId: string, chapterId: string, signal: AbortSignal): Promise<void>;
   listStoryboardAssets(
     seriesId: string,
@@ -176,6 +199,7 @@ export interface WorkspaceServices {
   getTaskReceipt?(taskId: string, signal: AbortSignal): Promise<TaskReceipt>;
   getTaskRequest?(taskId: string, signal: AbortSignal): Promise<TaskRequestRecord>;
   readonly storyboardGeneration?: StoryboardGenerationServicePort;
+  readonly creatorSettings?: CreatorSettingsServicePort;
   exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
   importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
   logout(): void;
@@ -335,6 +359,17 @@ function definedValues<T extends object>(value: T): Partial<T> {
   return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as Partial<T>;
 }
 
+function parseCreatorSettingsResponse<T>(parse: () => T): T {
+  try {
+    return parse();
+  } catch (error) {
+    if (error instanceof InvalidCreatorSettingsResponseError) {
+      throw new ApiError("invalid-response", error.message, null);
+    }
+    throw error;
+  }
+}
+
 function findDemoAssetRow(
   dataBySeries: Map<string, DemoAssetLibraryData>,
   category: "characters",
@@ -414,6 +449,34 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
   }>();
   let nextDemoStoryboardAssetId = 1;
   let nextDemoManagedAssetId = 1;
+  let nextCreatorModelId = 1;
+  let nextCreatorPromptId = 1;
+  const creatorModelRows: CreatorModel[] = [
+    {
+      id: "demo-creator-model-text",
+      category: "text",
+      name: "演示文本模型",
+      provider: "openai",
+      model: "example-text-model",
+      base_url: null,
+      params: null,
+      sort_order: 0,
+      is_system: false,
+      user_id: demoUser.id,
+    },
+  ];
+  const creatorPromptRows: CreatorPrompt[] = [
+    {
+      id: "demo-creator-prompt-storyboard",
+      category: "storyboard-design",
+      name: "演示分镜提示词",
+      system_prompt: "根据剧本内容设计清晰、可拍摄的分镜。",
+      user_prompt: "保留人物关系和场景连续性。",
+      sort_order: 0,
+      is_system: false,
+      user_id: demoUser.id,
+    },
+  ];
 
   function findDemoAssetData(seriesId: string): DemoAssetLibraryData | null {
     const existing = assetDataBySeries.get(seriesId);
@@ -438,9 +501,232 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
     return null;
   }
 
+  function reconcileDemoFrameStructureSnapshots(
+    snapshotKey: string,
+    chapter: Chapter,
+    assets: StoryboardAsset[],
+    removedAssetId: string | null = null,
+  ): void {
+    const activeIds = (chapter.content ?? []).map((frame) => {
+      const references = frame.storyboard;
+      return Array.isArray(references) && typeof references[0] === "string" && references[0].trim() !== ""
+        ? references[0]
+        : "";
+    });
+    const activeIdSet = new Set(activeIds.filter((id) => id !== ""));
+    const existingNotes = personalNoteSnapshots.get(snapshotKey)
+      ?? getDemoPersonalProductionNotes(chapter.id, chapter, assets);
+    const projectedNotes = getDemoPersonalProductionNotes(chapter.id, chapter, assets);
+    const existingNotesById = new Map(existingNotes.frames.flatMap((frame) => (
+      frame.storyboard_asset_id === null ? [] : [[frame.storyboard_asset_id, frame] as const]
+    )));
+    const nextNoteFrames = projectedNotes.frames.map((frame, index) => {
+      const id = activeIds[index] ?? "";
+      const previous = id === "" ? undefined : existingNotesById.get(id);
+      return previous === undefined
+        ? { ...frame, frame_index: index }
+        : { ...previous, frame_index: index, storyboard_asset_id: id };
+    });
+    const frameNotes = new Map([...existingNotes.frame_notes.entries()].map(([id, value]) => [
+      id,
+      cloneDemoNoteValue(value),
+    ]));
+    const removedNote = removedAssetId === null ? undefined : frameNotes.get(removedAssetId);
+    const notesChanged = removedNote !== null && typeof removedNote === "object" && !Array.isArray(removedNote)
+      && (removedNote as Record<string, unknown>).status === "approved";
+    if (notesChanged && removedAssetId !== null) {
+      const note = removedNote as Record<string, unknown>;
+      frameNotes.set(removedAssetId, {
+        ...note,
+        status: "unmarked",
+        approved_media_revision: null,
+        needs_reconfirmation: true,
+      });
+    }
+    personalNoteSnapshots.set(snapshotKey, {
+      ...existingNotes,
+      revision: existingNotes.revision + (notesChanged ? 1 : 0),
+      frames: nextNoteFrames,
+      frame_notes: frameNotes,
+      resume_frame_id: existingNotes.resume_frame_id,
+    });
+
+    const existingRoughCut = personalRoughCutSnapshots.get(snapshotKey);
+    const projectedRoughCut = getDemoPersonalRoughCut(chapter, assets);
+    if (existingRoughCut === undefined || !existingRoughCut.saved) {
+      personalRoughCutSnapshots.set(snapshotKey, clonePersonalRoughCutSnapshot(projectedRoughCut));
+      return;
+    }
+
+    const projectedById = new Map(projectedRoughCut.frames.flatMap((frame) => (
+      frame.asset_id === "" ? [] : [[frame.asset_id, frame] as const]
+    )));
+    const seenIds = new Set<string>();
+    const roughCutFrames: PersonalRoughCutSnapshot["frames"] = [];
+    const removedIds = new Set(existingRoughCut.removed_asset_ids);
+    for (const previous of existingRoughCut.frames) {
+      if (previous.asset_id === "") continue;
+      const current = projectedById.get(previous.asset_id);
+      if (current === undefined) {
+        removedIds.add(previous.asset_id);
+        continue;
+      }
+      if (seenIds.has(previous.asset_id)) continue;
+      seenIds.add(previous.asset_id);
+      roughCutFrames.push({ ...current, included: previous.included, pending: false });
+    }
+    if (removedAssetId !== null) removedIds.add(removedAssetId);
+    for (const current of projectedRoughCut.frames) {
+      if (current.asset_id === "") {
+        roughCutFrames.push({ ...current, included: false, pending: false });
+      } else if (!seenIds.has(current.asset_id)) {
+        seenIds.add(current.asset_id);
+        roughCutFrames.push({ ...current, included: false, pending: true });
+      }
+    }
+    for (const id of activeIdSet) removedIds.delete(id);
+    personalRoughCutSnapshots.set(snapshotKey, {
+      ...existingRoughCut,
+      frames: roughCutFrames,
+      removed_asset_ids: [...removedIds],
+    });
+  }
+
+  function assertDemoCreatorRequest(signal: AbortSignal): void {
+    if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+    ensureDemoSession(storage);
+  }
+
+  function orderCreatorRows<T extends { id: string; category: string; sort_order: number }>(
+    rows: T[],
+    category: string,
+    ids: string[],
+  ): void {
+    const categoryRows = rows.filter((row) => row.category === category);
+    if (new Set(ids).size !== ids.length || ids.length !== categoryRows.length
+      || ids.some((id) => !categoryRows.some((row) => row.id === id))) {
+      throw new ApiError("http", "当前分类的完整排序列表已变化，请重新读取后再排序。", 409);
+    }
+    ids.forEach((id, sortOrder) => {
+      const row = rows.find((item) => item.id === id);
+      if (row !== undefined) row.sort_order = sortOrder;
+    });
+  }
+
+  const creatorSettings: CreatorSettingsServicePort = {
+    async listModels(category, signal) {
+      assertDemoCreatorRequest(signal);
+      return creatorModelRows
+        .filter((model) => category === undefined || model.category === category)
+        .sort((left, right) => left.sort_order - right.sort_order)
+        .map((model) => ({ ...model }));
+    },
+    async getModel(id, signal) {
+      assertDemoCreatorRequest(signal);
+      const model = creatorModelRows.find((row) => row.id === id);
+      if (model === undefined) throw demoNotFound();
+      return { ...model };
+    },
+    async createModel(input: CreatorModelCreateInput, signal) {
+      assertDemoCreatorRequest(signal);
+      const model: CreatorModel = {
+        id: `demo-creator-model-${nextCreatorModelId++}`,
+        category: input.category,
+        name: input.name,
+        provider: input.provider,
+        ...(input.model === undefined ? {} : { model: input.model }),
+        ...(input.base_url === undefined ? {} : { base_url: input.base_url }),
+        params: input.params ?? null,
+        sort_order: Math.max(-1, ...creatorModelRows
+          .filter((row) => row.category === input.category)
+          .map((row) => row.sort_order)) + 1,
+        is_system: false,
+        user_id: demoUser.id,
+      };
+      creatorModelRows.push(model);
+      return { ...model };
+    },
+    async updateModel(id: string, update: CreatorModelUpdateInput, signal) {
+      assertDemoCreatorRequest(signal);
+      if (update.api_key !== undefined && update.api_key.trim() === "") {
+        throw new ApiError("http", "API 密钥不能为空；省略此字段可保留原密钥。", 422);
+      }
+      const model = creatorModelRows.find((row) => row.id === id);
+      if (model === undefined) throw demoNotFound();
+      if (update.name !== undefined) model.name = update.name;
+      if (update.provider !== undefined) model.provider = update.provider;
+      if (update.model !== undefined) model.model = update.model;
+      if (update.base_url !== undefined) model.base_url = update.base_url;
+      if (update.params !== undefined) model.params = update.params;
+      return { ...model };
+    },
+    async deleteModel(id: string, signal) {
+      assertDemoCreatorRequest(signal);
+      const index = creatorModelRows.findIndex((row) => row.id === id);
+      if (index < 0) throw demoNotFound();
+      creatorModelRows.splice(index, 1);
+      return { message: "模型已删除。" };
+    },
+    async reorderModels(input: CreatorModelReorderInput, signal) {
+      assertDemoCreatorRequest(signal);
+      orderCreatorRows(creatorModelRows, input.category, input.model_ids);
+      return { message: "模型排序已保存。" };
+    },
+    async listPrompts(category, signal) {
+      assertDemoCreatorRequest(signal);
+      return creatorPromptRows
+        .filter((prompt) => category === undefined || prompt.category === category)
+        .sort((left, right) => left.sort_order - right.sort_order)
+        .map((prompt) => ({ ...prompt }));
+    },
+    async getPrompt(id, signal) {
+      assertDemoCreatorRequest(signal);
+      const prompt = creatorPromptRows.find((row) => row.id === id);
+      if (prompt === undefined) throw demoNotFound();
+      return { ...prompt };
+    },
+    async createPrompt(input: CreatorPromptCreateInput, signal) {
+      assertDemoCreatorRequest(signal);
+      const prompt: CreatorPrompt = {
+        id: `demo-creator-prompt-${nextCreatorPromptId++}`,
+        category: input.category,
+        name: input.name,
+        system_prompt: input.system_prompt ?? null,
+        user_prompt: input.user_prompt ?? null,
+        sort_order: Math.max(-1, ...creatorPromptRows
+          .filter((row) => row.category === input.category)
+          .map((row) => row.sort_order)) + 1,
+        is_system: false,
+        user_id: demoUser.id,
+      };
+      creatorPromptRows.push(prompt);
+      return { ...prompt };
+    },
+    async updatePrompt(id: string, update: CreatorPromptUpdateInput, signal) {
+      assertDemoCreatorRequest(signal);
+      const prompt = creatorPromptRows.find((row) => row.id === id);
+      if (prompt === undefined) throw demoNotFound();
+      Object.assign(prompt, definedValues(update));
+      return { ...prompt };
+    },
+    async deletePrompt(id: string, signal) {
+      assertDemoCreatorRequest(signal);
+      const index = creatorPromptRows.findIndex((row) => row.id === id);
+      if (index < 0) throw demoNotFound();
+      creatorPromptRows.splice(index, 1);
+      return { message: "提示词已删除。" };
+    },
+    async reorderPrompts(input: CreatorPromptReorderInput, signal) {
+      assertDemoCreatorRequest(signal);
+      orderCreatorRows(creatorPromptRows, input.category, input.prompt_ids);
+      return { message: "提示词排序已保存。" };
+    },
+  };
+
   return {
     mode: "demo",
     apiBaseUrl: null,
+    creatorSettings,
     async restore(signal) {
       if (signal.aborted) {
         throw new ApiError("aborted", "Request was cancelled.");
@@ -803,6 +1089,97 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       }
       const updated = { ...match.chapter, ...normalizedUpdate, updated_at: new Date().toISOString() };
       match.data.chapters = match.data.chapters.map((chapter) => chapter.id === chapterId ? updated : chapter);
+      if (update.content !== undefined) {
+        reconcileDemoFrameStructureSnapshots(
+          snapshotKey,
+          updated,
+          match.data.assetsByChapter[chapterId] ?? [],
+        );
+      }
+      return cloneDemoChapter(updated);
+    },
+    async deleteFrame(seriesId, chapterId, frameIndex, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const match = findDemoChapter(chapterId);
+      if (match === null || match.seriesId !== seriesId) {
+        throw demoNotFound();
+      }
+      const content = match.chapter.content;
+      if (!Array.isArray(content) || content.length <= 1) {
+        throw new ApiError("http", "至少保留一个分镜。", 422);
+      }
+      if (!Number.isSafeInteger(frameIndex) || frameIndex < 0 || frameIndex >= content.length) {
+        throw new ApiError("http", "分镜索引无效。", 422);
+      }
+
+      const snapshotKey = demoUser.id + ":" + chapterId;
+      const assets = match.data.assetsByChapter[chapterId] ?? [];
+      if (!personalNoteSnapshots.has(snapshotKey)) {
+        personalNoteSnapshots.set(snapshotKey, cloneDemoPersonalProductionSnapshot(
+          getDemoPersonalProductionNotes(chapterId, match.chapter, assets),
+        ));
+      }
+      if (!personalRoughCutSnapshots.has(snapshotKey)) {
+        personalRoughCutSnapshots.set(snapshotKey, clonePersonalRoughCutSnapshot(
+          getDemoPersonalRoughCut(match.chapter, assets),
+        ));
+      }
+
+      const removedFrame = content[frameIndex];
+      const removedReferences = removedFrame?.storyboard;
+      const removedAssetId = Array.isArray(removedReferences) && typeof removedReferences[0] === "string"
+        ? removedReferences[0]
+        : null;
+      const nextContent = content
+        .filter((_, index) => index !== frameIndex)
+        .map((frame) => cloneDemoNoteValue(frame) as StoryboardFrame);
+      const timestamp = new Date().toISOString();
+      const assetCounts = new Map<string, number>();
+      for (const asset of assets) assetCounts.set(asset.id, (assetCounts.get(asset.id) ?? 0) + 1);
+      const referencedIds = new Set<string>();
+      const nextAssets: StoryboardAsset[] = [];
+      for (let index = 0; index < nextContent.length; index += 1) {
+        const frame = nextContent[index];
+        if (frame === undefined) continue;
+        const references = frame.storyboard;
+        const candidateId = Array.isArray(references) && typeof references[0] === "string"
+          ? references[0]
+          : null;
+        const matching = candidateId === null ? [] : assets.filter((asset) => asset.id === candidateId);
+        const canKeepIdentity = candidateId !== null && candidateId.trim() !== ""
+          && !referencedIds.has(candidateId) && assetCounts.get(candidateId) === 1
+          && matching.length === 1 && matching[0]?.series_id === seriesId
+          && matching[0]?.chapter_id === chapterId;
+        const assetId = canKeepIdentity && candidateId !== null
+          ? candidateId
+          : `demo-storyboard-${nextDemoStoryboardAssetId++}`;
+        const reconciledFrame = canKeepIdentity ? frame : { ...frame, storyboard: [assetId] };
+        nextContent[index] = reconciledFrame;
+        referencedIds.add(assetId);
+        const prior = canKeepIdentity ? matching[0] : undefined;
+        nextAssets.push({
+          ...(prior ?? {
+            id: assetId,
+            series_id: seriesId,
+            chapter_id: chapterId,
+            image_url: null,
+            created_at: timestamp,
+          }),
+          frame_index: index,
+          name: `分镜 ${index + 1}`,
+          description: typeof reconciledFrame.text === "string" && reconciledFrame.text !== ""
+            ? reconciledFrame.text
+            : typeof reconciledFrame.original_text === "string" ? reconciledFrame.original_text : prior?.description ?? "",
+          updated_at: timestamp,
+        });
+      }
+      match.data.assetsByChapter[chapterId] = nextAssets;
+      const updated = { ...match.chapter, content: nextContent, updated_at: timestamp };
+      match.data.chapters = match.data.chapters.map((chapter) => chapter.id === chapterId ? updated : chapter);
+      reconcileDemoFrameStructureSnapshots(snapshotKey, updated, nextAssets, removedAssetId);
       return cloneDemoChapter(updated);
     },
     async deleteChapter(seriesId, chapterId, signal) {
@@ -1460,6 +1837,7 @@ type ApiEndpoint =
   | "acquireChapterEditLock"
   | "releaseChapterEditLock"
   | "updateChapter"
+  | "deleteFrame"
   | "deleteChapter"
   | "storyboardAssets"
   | "characters"
@@ -1481,7 +1859,19 @@ type ApiEndpoint =
   | "savePersonalRoughCut"
   | "myTasks"
   | "taskRequest"
-  | "myTeams";
+  | "myTeams"
+  | "creatorModels"
+  | "creatorModel"
+  | "createCreatorModel"
+  | "updateCreatorModel"
+  | "deleteCreatorModel"
+  | "reorderCreatorModels"
+  | "creatorPrompts"
+  | "creatorPrompt"
+  | "createCreatorPrompt"
+  | "updateCreatorPrompt"
+  | "deleteCreatorPrompt"
+  | "reorderCreatorPrompts";
 
 interface ApiRequestDefinition {
   path: string;
@@ -1498,6 +1888,9 @@ function apiRequestDefinition(
     idempotencyKey?: string;
     taskId?: string;
     assetId?: string;
+    category?: string;
+    modelId?: string;
+    promptId?: string;
   },
 ): ApiRequestDefinition {
   if (endpoint === "login") {
@@ -1557,6 +1950,38 @@ function apiRequestDefinition(
   if (endpoint === "myTeams") {
     return { path: "/teams/my", method: "GET" };
   }
+  if (endpoint === "creatorModels" || endpoint === "createCreatorModel" || endpoint === "reorderCreatorModels") {
+    const query = endpoint === "creatorModels" && identifiers?.category !== undefined
+      ? "?" + new URLSearchParams({ category: identifiers.category }).toString()
+      : "";
+    return {
+      path: "/models" + (endpoint === "reorderCreatorModels" ? "/reorder" : query),
+      method: endpoint === "creatorModels" ? "GET" : "POST",
+    };
+  }
+  if (endpoint === "creatorModel" || endpoint === "updateCreatorModel" || endpoint === "deleteCreatorModel") {
+    const modelId = encodeApiPathId(identifiers?.modelId, "模型");
+    return {
+      path: "/models/" + modelId,
+      method: endpoint === "creatorModel" ? "GET" : endpoint === "updateCreatorModel" ? "PUT" : "DELETE",
+    };
+  }
+  if (endpoint === "creatorPrompts" || endpoint === "createCreatorPrompt" || endpoint === "reorderCreatorPrompts") {
+    const query = endpoint === "creatorPrompts" && identifiers?.category !== undefined
+      ? "?" + new URLSearchParams({ category: identifiers.category }).toString()
+      : "";
+    return {
+      path: "/prompts" + (endpoint === "reorderCreatorPrompts" ? "/reorder" : query),
+      method: endpoint === "creatorPrompts" ? "GET" : "POST",
+    };
+  }
+  if (endpoint === "creatorPrompt" || endpoint === "updateCreatorPrompt" || endpoint === "deleteCreatorPrompt") {
+    const promptId = encodeApiPathId(identifiers?.promptId, "提示词");
+    return {
+      path: "/prompts/" + promptId,
+      method: endpoint === "creatorPrompt" ? "GET" : endpoint === "updateCreatorPrompt" ? "PUT" : "DELETE",
+    };
+  }
   if (
     endpoint === "createCharacter" || endpoint === "updateCharacter" || endpoint === "deleteCharacter"
     || endpoint === "createScene" || endpoint === "updateScene" || endpoint === "deleteScene"
@@ -1603,6 +2028,10 @@ function apiRequestDefinition(
       method: endpoint === "updateChapter" ? "PUT" : "DELETE",
       ...(endpoint === "updateChapter" ? { expectedStatus: 200 } : { expectedStatus: 204 }),
     };
+  }
+  if (endpoint === "deleteFrame") {
+    const chapterId = encodeApiPathId(identifiers?.chapterId, "章节");
+    return { path: "/chapters/" + chapterId + "/delete-frame", method: "PUT", expectedStatus: 200 };
   }
   if (endpoint === "personalProductionNotes") {
     const chapterId = encodeApiPathId(identifiers?.chapterId, "章节");
@@ -1696,6 +2125,9 @@ export function createApiServices(
       idempotencyKey?: string;
       taskId?: string;
       assetId?: string;
+      category?: string;
+      modelId?: string;
+      promptId?: string;
     },
     requestBaseUrl = apiBaseUrl,
   ): Promise<unknown> {
@@ -1822,6 +2254,9 @@ export function createApiServices(
       idempotencyKey?: string;
       taskId?: string;
       assetId?: string;
+      category?: string;
+      modelId?: string;
+      promptId?: string;
     },
   ): Promise<unknown> {
     try {
@@ -1973,9 +2408,84 @@ export function createApiServices(
     },
   };
 
+  const creatorSettings: CreatorSettingsServicePort = {
+    async listModels(category, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "creatorModels", token, signal, undefined, category === undefined ? undefined : { category },
+      );
+      return parseCreatorSettingsResponse(() => parseCreatorModelList(payload));
+    },
+    async getModel(id, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("creatorModel", token, signal, undefined, { modelId: id });
+      return parseCreatorSettingsResponse(() => parseCreatorModel(payload));
+    },
+    async createModel(input: CreatorModelCreateInput, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("createCreatorModel", token, signal, input);
+      return parseCreatorSettingsResponse(() => parseCreatorModel(payload));
+    },
+    async updateModel(id, update: CreatorModelUpdateInput, signal) {
+      if (update.api_key !== undefined && update.api_key.trim() === "") {
+        throw new ApiError("invalid-response", "API 密钥不能为空；省略此字段可保留原密钥。", null);
+      }
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "updateCreatorModel", token, signal, update, { modelId: id },
+      );
+      return parseCreatorSettingsResponse(() => parseCreatorModel(payload));
+    },
+    async deleteModel(id, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("deleteCreatorModel", token, signal, undefined, { modelId: id });
+      return parseCreatorSettingsResponse(() => parseCreatorSettingsMessage(payload));
+    },
+    async reorderModels(input: CreatorModelReorderInput, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("reorderCreatorModels", token, signal, input);
+      return parseCreatorSettingsResponse(() => parseCreatorSettingsMessage(payload));
+    },
+    async listPrompts(category, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "creatorPrompts", token, signal, undefined, category === undefined ? undefined : { category },
+      );
+      return parseCreatorSettingsResponse(() => parseCreatorPromptList(payload));
+    },
+    async getPrompt(id, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("creatorPrompt", token, signal, undefined, { promptId: id });
+      return parseCreatorSettingsResponse(() => parseCreatorPrompt(payload));
+    },
+    async createPrompt(input: CreatorPromptCreateInput, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("createCreatorPrompt", token, signal, input);
+      return parseCreatorSettingsResponse(() => parseCreatorPrompt(payload));
+    },
+    async updatePrompt(id, update: CreatorPromptUpdateInput, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "updateCreatorPrompt", token, signal, update, { promptId: id },
+      );
+      return parseCreatorSettingsResponse(() => parseCreatorPrompt(payload));
+    },
+    async deletePrompt(id, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("deleteCreatorPrompt", token, signal, undefined, { promptId: id });
+      return parseCreatorSettingsResponse(() => parseCreatorSettingsMessage(payload));
+    },
+    async reorderPrompts(input: CreatorPromptReorderInput, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("reorderCreatorPrompts", token, signal, input);
+      return parseCreatorSettingsResponse(() => parseCreatorSettingsMessage(payload));
+    },
+  };
+
   return {
     mode: "api",
     apiBaseUrl,
+    creatorSettings,
     async restore(signal) {
       const token = storage.getItem(API_TOKEN_KEY);
       if (!token) {
@@ -2116,15 +2626,9 @@ export function createApiServices(
       if (state.expires_at === undefined) {
         throw new ApiError("invalid-response", "章节锁取得结果缺少有效期限。", null);
       }
-      const lease: ChapterEditLockLeaseHandle = {} as ChapterEditLockLeaseHandle;
-      chapterEditLockLeases.set(lease, {
-        chapterId,
-        token,
-        acquiredAt: state.acquired_at ?? null,
-        userId: state.user_id ?? null,
-        expiresAt: state.expires_at,
-      });
-      return { state, lease };
+      // The legacy POST response cannot distinguish a new lock from a same-user renewal.
+      // Keep the lock server-managed until expiry instead of claiming a releasable lease.
+      return { state, lease: null };
     },
     async releaseChapterEditLock(chapterId, signal, leaseHandle) {
       const token = requireApiToken(storage);
@@ -2166,6 +2670,20 @@ export function createApiServices(
       const parsed = parseChapterResponse(chapter, seriesId, chapterId);
       ensureCurrentApiSession(storage, token, signal);
       return parsed;
+    },
+    async deleteFrame(seriesId, chapterId, frameIndex, signal) {
+      if (!Number.isSafeInteger(frameIndex) || frameIndex < 0) {
+        throw new ApiError("invalid-response", "分镜索引无效。", null);
+      }
+      const token = requireApiToken(storage);
+      const chapter = await requestForCurrentApiSession(
+        "deleteFrame",
+        token,
+        signal,
+        { frame_index: frameIndex },
+        { seriesId, chapterId },
+      );
+      return parseChapterResponse(chapter, seriesId, chapterId);
     },
     async deleteChapter(seriesId, chapterId, signal) {
       const token = requireApiToken(storage);
