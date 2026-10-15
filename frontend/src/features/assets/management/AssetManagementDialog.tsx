@@ -577,7 +577,7 @@ export function AssetManagementDialog({
   }
 
   function renderField(field: FieldDefinition) {
-    const id = `asset-management-${field.key}`;
+    const id = `asset-management-field-${field.key}`;
     const control = field.multiline
       ? <textarea disabled={pending || frozenWrite} id={id} name={field.key} onChange={updateField} rows={field.key === "description" ? 4 : 3} value={form[field.key]} />
       : <input autoComplete="off" disabled={pending || frozenWrite} id={id} name={field.key} onChange={updateField} type="text" value={form[field.key]} />;

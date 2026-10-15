@@ -1,5 +1,5 @@
 import { StrictMode, useLayoutEffect, useState } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Prop, Scene } from "../../shared/api/contracts";
@@ -1750,6 +1750,24 @@ describe("asset library", () => {
     await waitFor(() => expect(listCharacters).toHaveBeenCalledTimes(3));
     expect(nameInput).toHaveValue("新角色草稿");
     expect(createCharacter).toHaveBeenCalledTimes(1);
+  });
+
+  it("associates the new scene title label with its input without duplicating the dialog title ID", async () => {
+    const user = userEvent.setup();
+    const services = makeServices({ listScenes: vi.fn(async () => []) });
+    renderLibrary(services);
+
+    await user.click(screen.getByRole("button", { name: "场景" }));
+    expect(await screen.findByRole("heading", { name: "还没有场景素材" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新增场景" }));
+
+    const dialog = screen.getByRole("dialog", { name: "新增场景" });
+    const titleInput = within(dialog).getByLabelText(/场景名称/);
+    expect(within(dialog).getByRole("textbox", { name: "场景名称" })).toBe(titleInput);
+    await user.type(titleInput, "档案馆地下室");
+    expect(titleInput).toHaveValue("档案馆地下室");
+    expect(dialog.querySelectorAll('[id="asset-management-title"]')).toHaveLength(1);
+    expect(titleInput).toHaveAttribute("id", "asset-management-field-title");
   });
 
   it("previews references across the series before issuing one asset deletion", async () => {
