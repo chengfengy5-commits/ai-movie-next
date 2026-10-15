@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../../shared/api/errors";
-import type { Chapter, Series, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
+import type { Chapter, ChapterEditLockLeaseHandle, ChapterEditLockState, Series, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import {
   FrameAssetReferencesPanel,
@@ -27,6 +27,17 @@ import { projectStoryboardFrames, type TextField } from "./storyboardProjection"
 import { findRoughCutFramePosition } from "./roughCutFrameNavigation";
 import { resolveProductionNoteFrameTarget } from "./productionNoteFrameNavigation";
 import { ChapterManagementDialog, type ChapterManagementAction } from "./ChapterManagementDialog";
+import { ChapterOrderDialog } from "./ChapterOrderDialog";
+import { FrameTextEditor, type FrameTextSaveResult } from "./FrameTextEditor";
+import {
+  buildChapterReorderInput,
+  inspectStoryboardReferences,
+  isSyncedFrameContentValid,
+  sameChapterContent,
+  sameChapterOrderSnapshot,
+  updateStoryboardFrameText,
+} from "./chapterEditing";
+import "./chapterEditing.css";
 
 interface ChapterBrowserProps {
   series: Series;
@@ -72,6 +83,30 @@ interface ChapterManagementRequest {
   action: ChapterManagementAction;
   scope: ChapterBrowserScope;
   chapter: Chapter | null;
+}
+
+interface ChapterOrderEditorContext {
+  scope: ChapterBrowserScope;
+  snapshot: Chapter[];
+  requestGeneration: number;
+}
+
+interface FrameTextEditorContext {
+  scope: ChapterBrowserScope;
+  chapter: Chapter;
+  position: number;
+  initialText: string;
+  requestGeneration: number;
+  lifecycleController: AbortController;
+  newlyAcquiredLock: boolean;
+  lockNotice: string | null;
+  lockLease: ChapterEditLockLeaseHandle | null;
+  lockIdentity: { acquiredAt: string; userId: string } | null;
+}
+
+interface FrameEditingInvalidationOptions {
+  deferLockRelease?: boolean;
+  updateState?: boolean;
 }
 
 type NavigationIssue = "missing" | "duplicate" | "foreign" | "frame";
@@ -247,6 +282,41 @@ interface RoughCutFrameNavigationFeedback {
 
 const EMPTY_STORYBOARD_ASSETS: StoryboardAsset[] = [];
 
+function utcTimestampMilliseconds(value: string): number {
+  const normalized = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(value) ? value : value + "Z";
+  return Date.parse(normalized);
+}
+
+function validOwnedChapterLock(lock: ChapterEditLockState, userId: string): boolean {
+  return lock.locked
+    && lock.is_mine === true
+    && lock.user_id === userId
+    && typeof lock.acquired_at === "string"
+    && typeof lock.expires_at === "string"
+    && utcTimestampMilliseconds(lock.expires_at) > Date.now();
+}
+
+function chapterEditLockIdentity(lock: ChapterEditLockState): FrameTextEditorContext["lockIdentity"] {
+  if (lock.acquired_at === undefined || lock.user_id === undefined) return null;
+  return { acquiredAt: lock.acquired_at, userId: lock.user_id };
+}
+
+function sameChapterEditLockIdentity(
+  left: FrameTextEditorContext["lockIdentity"],
+  lock: ChapterEditLockState,
+): boolean {
+  return left !== null
+    && lock.acquired_at === left.acquiredAt
+    && lock.user_id === left.userId;
+}
+
+function readEditableFrameText(chapter: Chapter, position: number): string | null {
+  const frame = chapter.content?.[position - 1];
+  if (frame === undefined) return null;
+  const value = frame.text;
+  return value === undefined || value === null || typeof value === "string" ? value ?? "" : null;
+}
+
 function errorPresentation(error: ApiError): ErrorPresentation {
   if (error.status === 403) {
     const detail = error.detail?.toLowerCase() ?? "";
@@ -366,6 +436,17 @@ export function ChapterBrowser({
   const [chaptersLoading, setChaptersLoading] = useState(true);
   const [chaptersError, setChaptersError] = useState<ApiError | null>(null);
   const [chapterManagement, setChapterManagement] = useState<ChapterManagementRequest | null>(null);
+  const [chapterOrderEditor, setChapterOrderEditor] = useState<ChapterOrderEditorContext | null>(null);
+  const chapterOrderEditorRef = useRef<ChapterOrderEditorContext | null>(null);
+  chapterOrderEditorRef.current = chapterOrderEditor;
+  const [frameTextEditor, setFrameTextEditor] = useState<FrameTextEditorContext | null>(null);
+  const frameTextEditorRef = useRef<FrameTextEditorContext | null>(null);
+  frameTextEditorRef.current = frameTextEditor;
+  const [frameEditOpening, setFrameEditOpening] = useState(false);
+  const frameEditOpeningController = useRef<AbortController | null>(null);
+  const frameEditOpeningChapterIdRef = useRef<string | null>(null);
+  const invalidateFrameEditingWorkflowRef = useRef<(options?: FrameEditingInvalidationOptions) => void>(() => undefined);
+  const pendingFrameLockReleaseRef = useRef<FrameTextEditorContext | null>(null);
   const [chapterMutationNotice, setChapterMutationNotice] = useState<string | null>(null);
   const [navigationIssue, setNavigationIssue] = useState<{ epoch: number; issue: NavigationIssue } | null>(null);
   const [pendingFrameNavigation, setPendingFrameNavigation] = useState<PendingFrameNavigation | null>(null);
@@ -412,6 +493,8 @@ export function ChapterBrowser({
   });
   const navigationIntentRef = useRef(navigationIntent);
   navigationIntentRef.current = navigationIntent;
+  const navigationIntentEpoch = navigationIntent?.navigationEpoch ?? null;
+  const navigationIntentEpochRef = useRef(navigationIntentEpoch);
   const finalizedNavigationEpochsRef = useRef(new Set<number>());
   const unauthorizedHandlerRef = useRef(onUnauthorized);
   unauthorizedHandlerRef.current = onUnauthorized;
@@ -441,6 +524,9 @@ export function ChapterBrowser({
     setChaptersLoading(true);
     setChaptersError(null);
     setChapterManagement(null);
+    chapterOrderEditorRef.current = null;
+    setChapterOrderEditor(null);
+    invalidateFrameEditingWorkflow({ deferLockRelease: true });
     setChapterMutationNotice(null);
     chapterMutationSelectionIntent.current = null;
     setNavigationIssue(null);
@@ -1255,6 +1341,7 @@ export function ChapterBrowser({
     : null;
 
   function retryChapters() {
+    invalidateFrameEditingWorkflow();
     chapterRequestGeneration.current += 1;
     assetRequestGeneration.current += 1;
     selectedChapterIdRef.current = null;
@@ -1276,6 +1363,22 @@ export function ChapterBrowser({
     chapterReloadSequence.current += 1;
     setChapterReloadKey(chapterReloadSequence.current);
   }
+
+  useLayoutEffect(() => {
+    const previousEpoch = navigationIntentEpochRef.current;
+    navigationIntentEpochRef.current = navigationIntentEpoch;
+    if (navigationIntentEpoch === null || navigationIntentEpoch === previousEpoch) return;
+
+    const intent = navigationIntentRef.current;
+    if (intent === null || finalizedNavigationEpochsRef.current.has(intent.navigationEpoch)
+      || !sameChapterBrowserScope({
+        userId: intent.userId,
+        services: intent.services,
+        seriesId: intent.seriesId,
+      }, activeScopeRef.current)) return;
+
+    retryChapters();
+  }, [navigationIntentEpoch]);
 
   function retryAssets() {
     const pending = pendingFrameNavigationRef.current;
@@ -1309,6 +1412,8 @@ export function ChapterBrowser({
     ) {
       return;
     }
+
+    invalidateFrameEditingWorkflow();
 
     const pendingIntent = navigationIntentRef.current;
     if (pendingIntent !== null && !finalizedNavigationEpochsRef.current.has(pendingIntent.navigationEpoch)) {
@@ -1413,6 +1518,7 @@ export function ChapterBrowser({
     }
     chapterRequestGeneration.current += 1;
     assetRequestGeneration.current += 1;
+    invalidateFrameEditingWorkflow();
     pendingFrameNavigationRef.current = null;
     setPendingFrameNavigation(null);
     setFrameNavigationFeedback(null);
@@ -1422,8 +1528,475 @@ export function ChapterBrowser({
     onBack();
   }
 
+  function applyFreshChapterDirectory(nextChapters: Chapter[], scope: ChapterBrowserScope): void {
+    if (!sameChapterBrowserScope(scope, activeScopeRef.current)) return;
+    const requestGeneration = chapterRequestGeneration.current;
+    chapterDirectoryRef.current = { scope, requestGeneration, chapters: nextChapters };
+    setChapters(nextChapters);
+    setChaptersError(null);
+    setChaptersLoading(false);
+  }
+
+  function refreshChapterOrderEditorSnapshot(context: ChapterOrderEditorContext, nextChapters: Chapter[]): void {
+    if (chapterOrderEditorRef.current !== context) return;
+    const refreshed = { ...context, snapshot: nextChapters };
+    chapterOrderEditorRef.current = refreshed;
+    setChapterOrderEditor(refreshed);
+  }
+
+  async function releaseNewlyAcquiredChapterLock(owner: FrameTextEditorContext): Promise<void> {
+    if (!owner.newlyAcquiredLock || owner.lockLease === null
+      || owner.scope.services.releaseChapterEditLock === undefined) return;
+    const controller = new AbortController();
+    try {
+      await owner.scope.services.releaseChapterEditLock(owner.chapter.id, controller.signal, owner.lockLease);
+    } catch (cause) {
+      const error = normalizeApiError(cause);
+      if (error.status === 401 && sameChapterBrowserScope(owner.scope, activeScopeRef.current)) {
+        unauthorizedHandlerRef.current();
+      }
+      // Release is best-effort; a failed release must not hide the editing result.
+    }
+  }
+
+  function invalidateFrameEditingWorkflow(options: FrameEditingInvalidationOptions = {}): void {
+    const openingController = frameEditOpeningController.current;
+    frameEditOpeningController.current = null;
+    frameEditOpeningChapterIdRef.current = null;
+    openingController?.abort();
+
+    const owner = frameTextEditorRef.current;
+    const pendingOwner = pendingFrameLockReleaseRef.current;
+    frameTextEditorRef.current = null;
+    pendingFrameLockReleaseRef.current = null;
+    owner?.lifecycleController.abort();
+    const cleanupOwner = owner ?? pendingOwner;
+    if (cleanupOwner?.newlyAcquiredLock) {
+      if (options.deferLockRelease) pendingFrameLockReleaseRef.current = cleanupOwner;
+      else void releaseNewlyAcquiredChapterLock(cleanupOwner);
+    }
+
+    if (options.updateState !== false) {
+      setFrameTextEditor(null);
+      setFrameEditOpening(false);
+    }
+  }
+
+  invalidateFrameEditingWorkflowRef.current = invalidateFrameEditingWorkflow;
+
+  useLayoutEffect(() => {
+    const owner = frameTextEditorRef.current;
+    const openingChapterId = frameEditOpeningChapterIdRef.current;
+    if ((owner !== null && owner.chapter.id !== selectedChapterId)
+      || (openingChapterId !== null && openingChapterId !== selectedChapterId)) {
+      invalidateFrameEditingWorkflowRef.current();
+    }
+  }, [selectedChapterId]);
+
+  useEffect(() => () => {
+    invalidateFrameEditingWorkflowRef.current({ updateState: false });
+  }, []);
+
+  useEffect(() => {
+    const owner = pendingFrameLockReleaseRef.current;
+    pendingFrameLockReleaseRef.current = null;
+    if (owner !== null) void releaseNewlyAcquiredChapterLock(owner);
+  }, [services, series.id, userId]);
+
+  function closeFrameTextEditor(expected?: FrameTextEditorContext): void {
+    const current = frameTextEditorRef.current;
+    if (current === null || (expected !== undefined && current !== expected)) return;
+    invalidateFrameEditingWorkflow();
+  }
+
+  function openChapterOrderEditor(): void {
+    const directory = chapterDirectoryRef.current;
+    if (!canReorderChapters || chapterManagement !== null || chapterManagementBlocked || frameEditOpening || chapters === null
+      || chaptersLoading || chaptersError !== null || chapterOrderEditorRef.current !== null
+      || frameTextEditorRef.current !== null
+      || !sameChapterBrowserScope(directory.scope, currentScope)
+      || directory.requestGeneration !== chapterRequestGeneration.current || directory.chapters !== chapters) return;
+    const context: ChapterOrderEditorContext = {
+      scope: currentScope,
+      snapshot: chapters,
+      requestGeneration: directory.requestGeneration,
+    };
+    chapterOrderEditorRef.current = context;
+    setChapterOrderEditor(context);
+    setChapterMutationNotice(null);
+  }
+
+  function isCurrentOrderEditor(context: ChapterOrderEditorContext, signal: AbortSignal): boolean {
+    const directory = chapterDirectoryRef.current;
+    return !signal.aborted
+      && chapterOrderEditorRef.current === context
+      && sameChapterBrowserScope(context.scope, activeScopeRef.current)
+      && context.requestGeneration === chapterRequestGeneration.current
+      && sameChapterBrowserScope(directory.scope, context.scope)
+      && directory.requestGeneration === context.requestGeneration;
+  }
+
+  async function saveChapterOrder(orderedIds: string[], signal: AbortSignal): Promise<void> {
+    const context = chapterOrderEditorRef.current;
+    if (context === null || !isCurrentOrderEditor(context, signal)) {
+      throw new ApiError("aborted", "章节目录已变化，请重新打开排序窗口。", null);
+    }
+    if (context.scope.services.reorderChapters === undefined) {
+      throw new ApiError("invalid-response", "当前服务不支持章节排序。", null);
+    }
+    const proposed = buildChapterReorderInput(context.snapshot, orderedIds, context.scope.seriesId);
+    if (proposed === null) throw new ApiError("http", "排序草稿包含重复或缺失的章节，未发送修改。", 409);
+
+    let currentDirectory: Chapter[];
+    try {
+      currentDirectory = await context.scope.services.listChapters(context.scope.seriesId, signal);
+    } catch (cause) {
+      if (!isCurrentOrderEditor(context, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (normalizeApiError(cause).status === 401) unauthorizedHandlerRef.current();
+      throw cause;
+    }
+    if (!isCurrentOrderEditor(context, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    if (!sameChapterOrderSnapshot(context.snapshot, currentDirectory, context.scope.seriesId)) {
+      applyFreshChapterDirectory(currentDirectory, context.scope);
+      refreshChapterOrderEditorSnapshot(context, currentDirectory);
+      throw new ApiError("http", "章节目录或顺序已变化；草稿仍保留，请核对最新目录后再调整。", 409);
+    }
+    const currentInput = buildChapterReorderInput(currentDirectory, orderedIds, context.scope.seriesId);
+    if (currentInput === null) throw new ApiError("http", "最新目录无法与排序草稿一一对应，未发送修改。", 409);
+    const orderIsUnchanged = currentDirectory.length === orderedIds.length
+      && currentDirectory.every((chapter, index) => chapter.id === orderedIds[index]);
+    if (orderIsUnchanged) {
+      applyFreshChapterDirectory(currentDirectory, context.scope);
+      return;
+    }
+
+    let writeError: ApiError | null = null;
+    try {
+      await context.scope.services.reorderChapters(context.scope.seriesId, currentInput, signal);
+    } catch (cause) {
+      if (!isCurrentOrderEditor(context, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      if (error.kind === "aborted") throw cause;
+      if (error.kind === "http" && error.status !== null && error.status < 500) throw cause;
+      writeError = error;
+    }
+    if (!isCurrentOrderEditor(context, signal)) throw new ApiError("aborted", "Request was cancelled.");
+
+    let verifiedDirectory: Chapter[];
+    try {
+      verifiedDirectory = await context.scope.services.listChapters(context.scope.seriesId, signal);
+    } catch (cause) {
+      if (!isCurrentOrderEditor(context, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (normalizeApiError(cause).status === 401) unauthorizedHandlerRef.current();
+      throw new ApiError("network", "排序请求已发送，但最新目录无法读取；结果尚未确认。草稿已保留，请重新读取后核对。", null);
+    }
+    if (!isCurrentOrderEditor(context, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    applyFreshChapterDirectory(verifiedDirectory, context.scope);
+    const verifiedInput = buildChapterReorderInput(verifiedDirectory, orderedIds, context.scope.seriesId);
+    const confirmed = verifiedInput !== null
+      && verifiedDirectory.length === orderedIds.length
+      && verifiedDirectory.every((chapter, index) => chapter.id === orderedIds[index])
+      && verifiedInput.chapters.every((entry) => verifiedDirectory.find((chapter) => chapter.id === entry.id)?.order === entry.order);
+    if (!confirmed) {
+      refreshChapterOrderEditorSnapshot(context, verifiedDirectory);
+      const reason = writeError === null ? "服务器返回后，目录顺序与草稿不一致。" : "请求结果不确定，最新目录没有显示草稿顺序。";
+      throw new ApiError("http", reason + "未自动重发，请核对最新目录。", 409);
+    }
+    setChapterMutationNotice("章节顺序已重新读取并核对。");
+  }
+
+  function isFrameEditorCurrent(owner: FrameTextEditorContext, signal: AbortSignal): boolean {
+    const directory = chapterDirectoryRef.current;
+    const matches = directory.chapters?.filter((chapter) => chapter.id === owner.chapter.id) ?? [];
+    return !signal.aborted
+      && !owner.lifecycleController.signal.aborted
+      && frameTextEditorRef.current === owner
+      && sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+      && owner.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === owner.chapter.id
+      && sameChapterBrowserScope(directory.scope, owner.scope)
+      && directory.requestGeneration === owner.requestGeneration
+      && matches.length === 1
+      && matches[0]?.series_id === owner.scope.seriesId;
+  }
+
+  function refreshFrameEditorBase(
+    owner: FrameTextEditorContext,
+    directory: Chapter[],
+    latestChapter: Chapter,
+  ): FrameTextEditorContext {
+    applyFreshChapterDirectory(directory, owner.scope);
+    const nextOwner = { ...owner, chapter: latestChapter };
+    if (frameTextEditorRef.current === owner) {
+      frameTextEditorRef.current = nextOwner;
+      setFrameTextEditor(nextOwner);
+    }
+    return nextOwner;
+  }
+
+  function refreshAssetsAfterFrameRead(chapterId: string, assets: StoryboardAsset[]): void {
+    assetCache.current.set(chapterId, assets);
+    assetRequestGeneration.current += 1;
+    setAssetResult({ chapterId, status: "ready", assets });
+  }
+
+  async function openFrameTextEditor(position: number): Promise<void> {
+    const directory = chapterDirectoryRef.current;
+    if (!canEditStoryboard || chapterManagement !== null || chapterManagementBlocked || chapterOrderEditorRef.current !== null
+      || frameTextEditorRef.current !== null || frameEditOpening || chaptersLoading
+      || chapters === null || chaptersError !== null || selectedChapter === null
+      || !sameChapterBrowserScope(directory.scope, currentScope)
+      || directory.requestGeneration !== chapterRequestGeneration.current || directory.chapters !== chapters
+      || !isChapterSelectableFromDirectory(directory.chapters, selectedChapter.id, series.id)) return;
+    const initialText = readEditableFrameText(selectedChapter, position);
+    if (initialText === null) {
+      setChapterMutationNotice("当前镜头的文字结构无法识别，未打开编辑器。");
+      return;
+    }
+    const controller = new AbortController();
+    const base = {
+      scope: currentScope,
+      chapter: selectedChapter,
+      position,
+      initialText,
+      requestGeneration: directory.requestGeneration,
+      lifecycleController: controller,
+      newlyAcquiredLock: false,
+      lockNotice: null as string | null,
+      lockLease: null as ChapterEditLockLeaseHandle | null,
+      lockIdentity: null as FrameTextEditorContext["lockIdentity"],
+    };
+    frameEditOpeningController.current = controller;
+    frameEditOpeningChapterIdRef.current = base.chapter.id;
+    setFrameEditOpening(true);
+    setChapterMutationNotice(null);
+    let newlyAcquiredLock = false;
+    let lockLease: ChapterEditLockLeaseHandle | null = null;
+    let lockIdentity: FrameTextEditorContext["lockIdentity"] = null;
+    const isCurrent = () => frameEditOpeningController.current === controller
+      && frameEditOpeningChapterIdRef.current === base.chapter.id
+      && !controller.signal.aborted
+      && sameChapterBrowserScope(currentScope, activeScopeRef.current)
+      && base.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === base.chapter.id
+      && chapterDirectoryRef.current.chapters?.filter((chapter) => chapter.id === base.chapter.id).length === 1;
+    try {
+      let lockNotice: string | null = null;
+      if (typeof series.team_id === "string" && series.team_id !== "") {
+        const { getChapterEditLock, acquireChapterEditLock } = services;
+        if (getChapterEditLock === undefined || acquireChapterEditLock === undefined
+          || services.releaseChapterEditLock === undefined) {
+          throw new ApiError("invalid-response", "团队章节锁能力未就绪，已停止编辑。", null);
+        }
+        const existing = await getChapterEditLock(base.chapter.id, controller.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        if (existing.locked) {
+          if (!validOwnedChapterLock(existing, userId)) {
+            throw new ApiError("http", existing.username
+              ? `当前章节由 ${existing.username} 编辑，暂不能修改。`
+              : "当前章节由其他创作者编辑，暂不能修改。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(existing);
+          lockNotice = "当前账号已持有有效编辑锁。";
+        } else {
+          newlyAcquiredLock = true;
+          const acquisition = await acquireChapterEditLock(base.chapter.id, controller.signal);
+          const acquired = acquisition.state;
+          lockLease = acquisition.lease;
+          if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+          if (!acquired.locked || lockLease === null || typeof acquired.expires_at !== "string"
+            || utcTimestampMilliseconds(acquired.expires_at) <= Date.now()) {
+            throw new ApiError("http", acquired.message ?? "未能取得有效章节编辑锁。", 409);
+          }
+          const verified = await getChapterEditLock(base.chapter.id, controller.signal, lockLease);
+          if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+          if (!validOwnedChapterLock(verified, userId)) {
+            throw new ApiError("http", "取得锁后无法核对当前账号、所有权和有效期限，已停止编辑。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(verified);
+          lockNotice = "已取得章节编辑锁，有效期至 " + verified.expires_at;
+        }
+      }
+      if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+      const context: FrameTextEditorContext = { ...base, newlyAcquiredLock, lockNotice, lockLease, lockIdentity };
+      frameTextEditorRef.current = context;
+      setFrameTextEditor(context);
+    } catch (cause) {
+      if (isCurrent()) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401) unauthorizedHandlerRef.current();
+        else if (error.kind !== "aborted") setChapterMutationNotice(error.detail ?? error.message);
+      }
+      if (newlyAcquiredLock) {
+        await releaseNewlyAcquiredChapterLock({
+          ...base, newlyAcquiredLock, lockNotice: null, lockLease, lockIdentity,
+        });
+      }
+    } finally {
+      if (frameEditOpeningController.current === controller) {
+        frameEditOpeningController.current = null;
+        frameEditOpeningChapterIdRef.current = null;
+        setFrameEditOpening(false);
+      }
+    }
+  }
+
+  async function saveFrameText(
+    text: string,
+    signal: AbortSignal,
+    explicitOverwrite: boolean,
+    expectedServerText: string | null | undefined,
+  ): Promise<FrameTextSaveResult> {
+    const currentOwner = frameTextEditorRef.current;
+    if (currentOwner === null || !isFrameEditorCurrent(currentOwner, signal)) {
+      throw new ApiError("aborted", "编辑内容已切换。", null);
+    }
+    let owner: FrameTextEditorContext = currentOwner;
+    try {
+      return await performFrameTextSave(owner, text, signal, explicitOverwrite, expectedServerText);
+    } catch (cause) {
+      const activeOwner = frameTextEditorRef.current;
+      if (activeOwner === null
+        || !sameChapterBrowserScope(activeOwner.scope, currentOwner.scope)
+        || activeOwner.chapter.id !== currentOwner.chapter.id
+        || !isFrameEditorCurrent(activeOwner, signal)) {
+        throw new ApiError("aborted", "编辑内容已切换。", null);
+      }
+      if (normalizeApiError(cause).status === 401) unauthorizedHandlerRef.current();
+      throw cause;
+    }
+  }
+
+  async function performFrameTextSave(
+    initialOwner: FrameTextEditorContext,
+    text: string,
+    signal: AbortSignal,
+    explicitOverwrite: boolean,
+    expectedServerText: string | null | undefined,
+  ): Promise<FrameTextSaveResult> {
+    let owner = initialOwner;
+    let changed = updateStoryboardFrameText(owner.chapter.content, owner.position, text);
+    if (!changed.ok) throw new ApiError("http", changed.message, 409);
+
+    const directory = await owner.scope.services.listChapters(owner.scope.seriesId, signal);
+    if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    const targetMatches = directory.filter((chapter) => chapter.id === owner.chapter.id);
+    const matchedChapter = targetMatches[0];
+    if (targetMatches.length !== 1 || matchedChapter === undefined || matchedChapter.series_id !== owner.scope.seriesId) {
+      throw new ApiError("http", "最新目录无法唯一确认当前章节，草稿已保留。", 409);
+    }
+    let latestChapter = matchedChapter;
+    if (latestChapter.order !== owner.chapter.order || !sameChapterContent(latestChapter.content, owner.chapter.content)) {
+      const currentText = readEditableFrameText(latestChapter, owner.position);
+      if (!explicitOverwrite || currentText === null || currentText !== expectedServerText) {
+        owner = refreshFrameEditorBase(owner, directory, latestChapter);
+        return {
+          status: "conflict",
+          serverText: currentText,
+          message: explicitOverwrite
+            ? "服务器文字再次变化。草稿仍保留；请核对当前值后重新决定是否覆盖。"
+            : "章节顺序或内容基线已变化。草稿仍保留；确认服务器当前值后，可选择以草稿覆盖此镜头文字。",
+        };
+      }
+      owner = refreshFrameEditorBase(owner, directory, latestChapter);
+      changed = updateStoryboardFrameText(latestChapter.content, owner.position, text);
+      if (!changed.ok) throw new ApiError("http", changed.message, 409);
+    }
+    if (!changed.changed) return { status: "unchanged" };
+    if (owner.scope.services.listStoryboardAssets === undefined) {
+      throw new ApiError("invalid-response", "当前服务无法读取素材目录，已停止保存。", null);
+    }
+    const priorAssets = await owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal);
+    if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    const references = inspectStoryboardReferences(owner.chapter.content, priorAssets, owner.scope.seriesId, owner.chapter.id);
+    if (!references.ok) throw new ApiError("http", references.message, 409);
+
+    if (typeof series.team_id === "string" && series.team_id !== "") {
+      if (owner.scope.services.getChapterEditLock === undefined) {
+        throw new ApiError("invalid-response", "团队章节锁能力不可用，已停止保存。", null);
+      }
+      const lock = await owner.scope.services.getChapterEditLock(owner.chapter.id, signal, owner.lockLease ?? undefined);
+      if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (!validOwnedChapterLock(lock, owner.scope.userId)
+        || !sameChapterEditLockIdentity(owner.lockIdentity, lock)) {
+        throw new ApiError("http", "保存前无法确认当前账号仍持有有效章节锁；草稿已保留。", 409);
+      }
+    }
+
+    let writeError: ApiError | null = null;
+    try {
+      if (owner.scope.services.updateChapter === undefined) throw new ApiError("invalid-response", "当前服务不支持分镜文字修改。", null);
+      await owner.scope.services.updateChapter(
+        owner.scope.seriesId,
+        owner.chapter.id,
+        { content: changed.content },
+        signal,
+      );
+    } catch (cause) {
+      const error = normalizeApiError(cause);
+      if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (error.kind === "aborted") throw cause;
+      if (error.kind === "http" && error.status !== null && error.status < 500) throw cause;
+      writeError = error;
+    }
+    if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+
+    let latestDirectory: Chapter[];
+    let latestAssets: StoryboardAsset[];
+    try {
+      latestDirectory = await owner.scope.services.listChapters(owner.scope.seriesId, signal);
+      if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      const latestMatches = latestDirectory.filter((chapter) => chapter.id === owner.chapter.id);
+      const latestMatch = latestMatches[0];
+      if (latestMatches.length !== 1 || latestMatch === undefined || latestMatch.series_id !== owner.scope.seriesId) {
+        throw new ApiError("invalid-response", "最新目录无法唯一确认当前章节。", null);
+      }
+      latestChapter = latestMatch;
+      latestAssets = await owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal);
+      if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+    } catch (cause) {
+      const error = normalizeApiError(cause);
+      if (!isFrameEditorCurrent(owner, signal)) throw new ApiError("aborted", "Request was cancelled.");
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      if (error.kind === "aborted") throw cause;
+      throw new ApiError("network", "文字修改请求已发送，但章节和素材目录无法重新读取；结果尚未确认，草稿仍保留。", null);
+    }
+
+    const confirmed = isSyncedFrameContentValid(
+      owner.chapter.content,
+      changed.content,
+      latestChapter.content,
+      references.missingPositions,
+      latestAssets,
+      owner.scope.seriesId,
+      owner.chapter.id,
+      owner.position,
+      text,
+    );
+    refreshAssetsAfterFrameRead(owner.chapter.id, latestAssets);
+    if (confirmed) {
+      applyFreshChapterDirectory(latestDirectory, owner.scope);
+      setChapterMutationNotice(`镜头 ${owner.position} 的文字已重新读取并核对${writeError === null ? "" : "；请求确认已丢失，但服务器内容已核对"}。`);
+      return { status: "saved" };
+    }
+    owner = refreshFrameEditorBase(owner, latestDirectory, latestChapter);
+    const currentText = readEditableFrameText(latestChapter, owner.position);
+    return {
+      status: "conflict",
+      serverText: currentText,
+      message: writeError === null
+        ? "服务器返回的章节结构或文字与预期不一致。草稿仍保留，请核对服务器当前值后再决定是否覆盖文字。"
+        : "请求结果未确认，最新章节结构没有通过核对。草稿仍保留；请查看服务器当前值。",
+    };
+  }
+
   const selectedIndex = chapters?.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
-  const chapterManagementBlocked = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
+  const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
+  const chapterManagementBlocked = chapterPanelsOpen
+    || chapterOrderEditor !== null || frameTextEditor !== null || frameEditOpening;
+  const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
+  const canReorderChapters = series.can_enter && services.reorderChapters !== undefined;
   const canManageChapters = series.can_enter
     && services.createChapter !== undefined
     && services.updateChapter !== undefined
@@ -1676,7 +2249,7 @@ export function ChapterBrowser({
     <section className="chapter-browser" aria-labelledby="chapter-browser-heading">
       <div className="chapter-browser-heading">
         <div>
-          <p className="eyebrow">只读浏览</p>
+          <p className="eyebrow">{canEditStoryboard ? "章节与分镜" : "只读浏览"}</p>
           <h1 id="chapter-browser-heading">{series.name}</h1>
           <p>查看已有章节、分镜与个人制作记录。</p>
         </div>
@@ -1696,6 +2269,15 @@ export function ChapterBrowser({
               {!chaptersLoading && chaptersError === null && chapters !== null && (
                 <span className="chapter-count">{chapters.length} 章</span>
               )}
+              {canReorderChapters && chapters !== null && chapters.length > 1 && (
+                <button
+                  className="text-button chapter-reorder-button"
+                  disabled={chaptersLoading || chaptersError !== null || chapterManagementBlocked || chapterManagement !== null}
+                  onClick={openChapterOrderEditor}
+                  title={chapterManagementBlocked ? "请先关闭当前制作记录或编辑窗口" : undefined}
+                  type="button"
+                >调整顺序</button>
+              )}
               {canManageChapters && (
                 <button
                   className="primary-button chapter-create-button"
@@ -1708,7 +2290,7 @@ export function ChapterBrowser({
             </div>
           </div>
 
-          {chapterManagementBlocked && (
+          {chapterPanelsOpen && (
             <p className="chapter-management-blocked" role="status">
               请先关闭当前制作记录或原图引用面板，再管理章节。
             </p>
@@ -1816,7 +2398,7 @@ export function ChapterBrowser({
                   <p>{frames.length} 个分镜 · 更新于 {formatDate(selectedChapter.updated_at)}</p>
                 </div>
                 <div className="selected-chapter-actions">
-                  <span className="readonly-pill">只读</span>
+                  <span className="readonly-pill">{canEditStoryboard ? "可编辑分镜文字" : "只读"}</span>
                   {canManageChapters && (
                     <>
                       <button
@@ -1866,13 +2448,17 @@ export function ChapterBrowser({
 
               <div className="chapter-readonly-note">
                 <span aria-hidden="true">◉</span>
-                <span>此页面提供只读展示，不包含编辑、锁定或提交操作。</span>
+                <span>{canEditStoryboard
+                  ? "可以编辑各镜头文字；原文、分镜素材关系和其他镜头字段会保留。"
+                  : "此页面提供只读展示。"}</span>
               </div>
 
               {lockMessage !== null && (
                 <div className="chapter-lock-note" role="note">
                   <span className="lock-glyph" aria-hidden="true">▣</span>
-                  <span>{lockMessage} · 这是读取时的状态快照，当前页面始终只读。</span>
+                  <span>{lockMessage} · {canEditStoryboard
+                    ? "编辑前会重新核对团队锁状态。"
+                    : "这是读取时的状态快照，当前页面始终只读。"}</span>
                 </div>
               )}
 
@@ -2033,9 +2619,20 @@ export function ChapterBrowser({
                         >
                           <div className="storyboard-frame-heading">
                             <span className="storyboard-position">镜头 {frame.position}</span>
-                            <span className="frame-preview-state">
-                              {frame.hasPreview ? "已有预览" : "暂无预览"}
-                            </span>
+                            <div className="storyboard-frame-heading-actions">
+                              <span className="frame-preview-state">
+                                {frame.hasPreview ? "已有预览" : "暂无预览"}
+                              </span>
+                              {canEditStoryboard && sourceFrame !== undefined && frame.text.kind !== "invalid" && (
+                                <button
+                                  className="text-button frame-text-edit-button"
+                                  disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                                  onClick={() => void openFrameTextEditor(frame.position)}
+                                  title={chapterPanelsOpen ? "请先关闭当前制作记录或原图引用面板" : undefined}
+                                  type="button"
+                                >{frameEditOpening ? "正在核对…" : "编辑文字"}</button>
+                              )}
+                            </div>
                           </div>
                           <div className="storyboard-frame-body">
                             <div className="storyboard-image-wrap">
@@ -2147,6 +2744,30 @@ export function ChapterBrowser({
           )}
         </div>
       </div>
+      {chapterOrderEditor !== null && sameChapterBrowserScope(chapterOrderEditor.scope, currentScope) && (
+        <ChapterOrderDialog
+          key={`${chapterOrderEditor.scope.userId}:${chapterOrderEditor.scope.seriesId}:${chapterOrderEditor.requestGeneration}`}
+          chapters={chapterOrderEditor.snapshot}
+          onClose={() => {
+            chapterOrderEditorRef.current = null;
+            setChapterOrderEditor(null);
+          }}
+          onSave={saveChapterOrder}
+          seriesId={chapterOrderEditor.scope.seriesId}
+        />
+      )}
+      {frameTextEditor !== null && sameChapterBrowserScope(frameTextEditor.scope, currentScope) && (
+        <FrameTextEditor
+          key={`${frameTextEditor.scope.userId}:${frameTextEditor.scope.seriesId}:${frameTextEditor.chapter.id}:${frameTextEditor.position}:${frameTextEditor.requestGeneration}`}
+          chapter={frameTextEditor.chapter}
+          initialText={frameTextEditor.initialText}
+          lifecycleSignal={frameTextEditor.lifecycleController.signal}
+          lockNotice={frameTextEditor.lockNotice}
+          onClose={() => closeFrameTextEditor(frameTextEditor)}
+          onSave={saveFrameText}
+          position={frameTextEditor.position}
+        />
+      )}
       {chapterManagement !== null && sameChapterBrowserScope(chapterManagement.scope, currentScope) && (
         <ChapterManagementDialog
           action={chapterManagement.action}

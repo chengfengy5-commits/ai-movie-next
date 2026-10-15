@@ -8,7 +8,9 @@ import { ApiConfigurationError, readEnvironmentConfiguration, resolveApiBaseUrl,
 import { ApiError, isAbortError } from "./errors";
 import {
   InvalidResponseError,
+  parseChapterEditLockState,
   parseChapterList,
+  parseChapterOrderResponse,
   parseChapterResponse,
   parseCharacterList,
   parseErrorDetail,
@@ -21,7 +23,11 @@ import {
   parseUser,
   type Character,
   type Chapter,
+  type ChapterEditLockAcquisition,
+  type ChapterEditLockLeaseHandle,
+  type ChapterEditLockState,
   type CreateChapterInput,
+  type ReorderChaptersInput,
   type Credentials,
   type Prop,
   type Scene,
@@ -83,6 +89,18 @@ export interface WorkspaceServices {
   listMyTeams(signal: AbortSignal): Promise<MyTeam[]>;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
+  reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
+  getChapterEditLock?(
+    chapterId: string,
+    signal: AbortSignal,
+    lease?: ChapterEditLockLeaseHandle,
+  ): Promise<ChapterEditLockState>;
+  acquireChapterEditLock?(chapterId: string, signal: AbortSignal): Promise<ChapterEditLockAcquisition>;
+  releaseChapterEditLock?(
+    chapterId: string,
+    signal: AbortSignal,
+    lease: ChapterEditLockLeaseHandle,
+  ): Promise<{ message: string }>;
   updateChapter?(
     seriesId: string,
     chapterId: string,
@@ -240,6 +258,15 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
   }
   const personalNoteSnapshots = new Map<string, PersonalProductionSnapshot>();
   const personalRoughCutSnapshots = new Map<string, PersonalRoughCutSnapshot>();
+  const demoChapterLocks = new Map<string, { userId: string; username: string; acquiredAt: string; lastActiveAt: string; expiresAt: string }>();
+  const demoChapterLockLeases = new Map<ChapterEditLockLeaseHandle, {
+    chapterId: string;
+    session: string | null;
+    acquiredAt: string | null;
+    expiresAt: string | null;
+    userId: string | null;
+  }>();
+  let nextDemoStoryboardAssetId = 1;
 
   function findDemoChapter(chapterId: string): { seriesId: string; data: DemoChapterData; chapter: Chapter } | null {
     for (const [seriesId, data] of chapterDataBySeries) {
@@ -429,6 +456,129 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       ));
       return cloneDemoChapter(chapter);
     },
+    async reorderChapters(seriesId, input, signal) {
+      if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+      ensureDemoSession(storage);
+      const data = chapterDataBySeries.get(seriesId);
+      if (data === undefined) throw demoNotFound();
+      const ids = input.chapters.map((entry) => entry.id);
+      const currentIds = data.chapters.map((chapter) => chapter.id);
+      const orders = input.chapters.map((entry) => entry.order);
+      if (ids.length !== currentIds.length || new Set(ids).size !== ids.length
+        || ids.some((id) => !currentIds.includes(id))
+        || new Set(orders).size !== currentIds.length
+        || orders.some((order) => !Number.isInteger(order) || order < 1 || order > currentIds.length)) {
+        throw new ApiError("http", "章节列表已变化，请重新读取后再排序。", 409);
+      }
+      const byId = new Map(data.chapters.map((chapter) => [chapter.id, chapter]));
+      const timestamp = new Date().toISOString();
+      data.chapters = input.chapters.map((entry) => {
+        const chapter = byId.get(entry.id);
+        if (chapter === undefined) throw new ApiError("http", "章节列表已变化，请重新读取后再排序。", 409);
+        return { ...chapter, order: entry.order, updated_at: timestamp };
+      });
+      return { message: "排序已更新" };
+    },
+    async getChapterEditLock(chapterId, signal, leaseHandle) {
+      if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+      ensureDemoSession(storage);
+      const lease = leaseHandle === undefined ? undefined : demoChapterLockLeases.get(leaseHandle);
+      if (leaseHandle !== undefined && (lease === undefined || lease.chapterId !== chapterId
+        || lease.session !== storage.getItem(MOCK_SESSION_KEY))) {
+        throw new ApiError("aborted", "章节锁句柄不属于当前编辑会话。", null);
+      }
+      const match = findDemoChapter(chapterId);
+      if (match === null) throw demoNotFound();
+      const series = seriesRows.find((row) => row.id === match.seriesId);
+      if (!series?.team_id) return { locked: false };
+      const lock = demoChapterLocks.get(chapterId);
+      if (lock === undefined || Date.parse(lock.expiresAt) <= Date.now()) {
+        demoChapterLocks.delete(chapterId);
+        return { locked: false };
+      }
+      const state: ChapterEditLockState = {
+        locked: true,
+        user_id: lock.userId,
+        username: lock.username,
+        is_mine: lock.userId === demoUser.id,
+        acquired_at: lock.acquiredAt,
+        last_active_at: lock.lastActiveAt,
+        expires_at: lock.expiresAt,
+      };
+      if (lease !== undefined && (lease.acquiredAt === null || lease.userId === null
+        || lease.acquiredAt !== lock.acquiredAt || lease.userId !== lock.userId
+        || lease.expiresAt !== lock.expiresAt)) {
+        throw new ApiError("aborted", "章节锁身份已变化，未继续使用旧编辑句柄。", null);
+      }
+      return state;
+    },
+    async acquireChapterEditLock(chapterId, signal) {
+      if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+      ensureDemoSession(storage);
+      const match = findDemoChapter(chapterId);
+      if (match === null) throw demoNotFound();
+      const series = seriesRows.find((row) => row.id === match.seriesId);
+      if (!series?.team_id) return { state: { locked: false, message: "个人剧集无需加锁" }, lease: null };
+      const existing = demoChapterLocks.get(chapterId);
+      if (existing !== undefined && Date.parse(existing.expiresAt) > Date.now()
+        && existing.userId !== demoUser.id) {
+        throw new ApiError("http", "章节当前由其他创作者编辑。", 409);
+      }
+      if (existing !== undefined && Date.parse(existing.expiresAt) > Date.now()) {
+        return {
+          state: {
+            locked: true,
+            user_id: existing.userId,
+            username: existing.username,
+            is_mine: existing.userId === demoUser.id,
+            acquired_at: existing.acquiredAt,
+            expires_at: existing.expiresAt,
+          },
+          lease: null,
+        };
+      }
+      const now = new Date().toISOString();
+      const expiresAt = new Date(Date.now() + 15 * 60_000).toISOString();
+      demoChapterLocks.set(chapterId, {
+        userId: demoUser.id, username: demoUser.username, acquiredAt: now, lastActiveAt: now, expiresAt,
+      });
+      const lease = {} as ChapterEditLockLeaseHandle;
+      demoChapterLockLeases.set(lease, {
+        chapterId,
+        session: storage.getItem(MOCK_SESSION_KEY),
+        acquiredAt: now,
+        expiresAt,
+        userId: demoUser.id,
+      });
+      return {
+        state: {
+          locked: true,
+          user_id: demoUser.id,
+          username: demoUser.username,
+          is_mine: true,
+          acquired_at: now,
+          expires_at: expiresAt,
+          idle_minutes: 15,
+        },
+        lease,
+      };
+    },
+    async releaseChapterEditLock(chapterId, signal, leaseHandle) {
+      if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+      ensureDemoSession(storage);
+      const lease = demoChapterLockLeases.get(leaseHandle);
+      const existing = demoChapterLocks.get(chapterId);
+      if (lease === undefined || lease.chapterId !== chapterId
+        || lease.session !== storage.getItem(MOCK_SESSION_KEY) || lease.acquiredAt === null
+        || existing === undefined || existing.userId !== lease.userId
+        || existing.acquiredAt !== lease.acquiredAt || existing.expiresAt !== lease.expiresAt
+        || existing.userId !== demoUser.id) {
+        throw new ApiError("aborted", "章节锁不属于当前编辑会话，未释放。");
+      }
+      demoChapterLocks.delete(chapterId);
+      demoChapterLockLeases.delete(leaseHandle);
+      return { message: "锁已释放" };
+    },
     async updateChapter(seriesId, chapterId, update, signal) {
       if (signal.aborted) {
         throw new ApiError("aborted", "Request was cancelled.");
@@ -453,7 +603,43 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
           getDemoPersonalRoughCut(match.chapter, match.data.assetsByChapter[chapterId] ?? []),
         ));
       }
-      const updated = { ...match.chapter, ...update, updated_at: new Date().toISOString() };
+      let normalizedUpdate = update;
+      if (update.content !== undefined) {
+        const timestamp = new Date().toISOString();
+        const content = update.content.map((frame, frameIndex) => {
+          const nextFrame = { ...(cloneDemoNoteValue(frame) as StoryboardFrame) } as Record<string, unknown>;
+          const refs = nextFrame.storyboard;
+          if (refs === undefined || refs === null || (Array.isArray(refs) && refs.length === 0)) {
+            const id = `demo-storyboard-${nextDemoStoryboardAssetId++}`;
+            const text = typeof nextFrame.text === "string" ? nextFrame.text : "";
+            nextFrame.storyboard = [id];
+            const chapterAssets = match.data.assetsByChapter[chapterId]
+              ?? (match.data.assetsByChapter[chapterId] = []);
+            chapterAssets.push({
+              id,
+              series_id: seriesId,
+              chapter_id: chapterId,
+              frame_index: frameIndex,
+              name: `分镜 ${frameIndex + 1}`,
+              description: text || (typeof nextFrame.original_text === "string" ? nextFrame.original_text : ""),
+              image_url: null,
+              created_at: timestamp,
+              updated_at: timestamp,
+            });
+          } else if (Array.isArray(refs) && typeof refs[0] === "string") {
+            const asset = (match.data.assetsByChapter[chapterId] ?? []).find((candidate) => candidate.id === refs[0]);
+            if (asset !== undefined) {
+              asset.frame_index = frameIndex;
+              asset.name = `分镜 ${frameIndex + 1}`;
+              asset.description = typeof nextFrame.text === "string" ? nextFrame.text : asset.description;
+              asset.updated_at = timestamp;
+            }
+          }
+          return nextFrame as StoryboardFrame;
+        });
+        normalizedUpdate = { ...update, content };
+      }
+      const updated = { ...match.chapter, ...normalizedUpdate, updated_at: new Date().toISOString() };
       match.data.chapters = match.data.chapters.map((chapter) => chapter.id === chapterId ? updated : chapter);
       return cloneDemoChapter(updated);
     },
@@ -855,6 +1041,10 @@ type ApiEndpoint =
   | "uploadSeriesCover"
   | "chapters"
   | "createChapter"
+  | "reorderChapters"
+  | "getChapterEditLock"
+  | "acquireChapterEditLock"
+  | "releaseChapterEditLock"
   | "updateChapter"
   | "deleteChapter"
   | "storyboardAssets"
@@ -913,6 +1103,22 @@ function apiRequestDefinition(
     const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
     return { path: "/series/" + seriesId + "/chapters", method: "POST", expectedStatus: 201 };
   }
+  if (endpoint === "reorderChapters") {
+    const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
+    return { path: "/series/" + seriesId + "/chapters/reorder", method: "PUT", expectedStatus: 200 };
+  }
+  if (
+    endpoint === "getChapterEditLock"
+    || endpoint === "acquireChapterEditLock"
+    || endpoint === "releaseChapterEditLock"
+  ) {
+    const chapterId = encodeApiPathId(identifiers?.chapterId, "章节");
+    return {
+      path: "/chapters/" + chapterId + "/lock",
+      method: endpoint === "getChapterEditLock" ? "GET" : endpoint === "acquireChapterEditLock" ? "POST" : "DELETE",
+      expectedStatus: 200,
+    };
+  }
   if (endpoint === "updateChapter" || endpoint === "deleteChapter") {
     const chapterId = encodeApiPathId(identifiers?.chapterId, "章节");
     return {
@@ -967,6 +1173,39 @@ export function createApiServices(
   const storage = options.storage ?? browserStorage();
   const fetcher = options.fetcher ?? window.fetch.bind(window);
   const timeoutMs = options.timeoutMs ?? 15_000;
+  const chapterEditLockLeases = new Map<ChapterEditLockLeaseHandle, {
+    chapterId: string;
+    token: string;
+    acquiredAt: string | null;
+    userId: string | null;
+    expiresAt: string | null;
+  }>();
+
+  function recordCurrentChapterLockLease(
+    lease: NonNullable<ReturnType<typeof chapterEditLockLeases.get>>,
+    state: ChapterEditLockState,
+  ): boolean {
+    if (!state.locked || state.is_mine !== true || state.acquired_at === undefined
+      || state.user_id === undefined || state.expires_at === undefined) return false;
+    const expiresAt = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(state.expires_at)
+      ? state.expires_at
+      : state.expires_at + "Z";
+    const expiry = Date.parse(expiresAt);
+    if (!Number.isFinite(expiry) || expiry <= Date.now()) return false;
+    if (lease.acquiredAt === null) {
+      if (state.expires_at !== lease.expiresAt || (lease.userId !== null && state.user_id !== lease.userId)) return false;
+      lease.acquiredAt = state.acquired_at;
+      lease.userId = state.user_id;
+      return true;
+    }
+    const previousExpiry = lease.expiresAt === null
+      ? Number.NaN
+      : Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(lease.expiresAt) ? lease.expiresAt : lease.expiresAt + "Z");
+    if (state.acquired_at !== lease.acquiredAt || state.user_id !== lease.userId
+      || !Number.isFinite(previousExpiry) || expiry < previousExpiry) return false;
+    lease.expiresAt = state.expires_at;
+    return true;
+  }
 
   async function request(
     endpoint: ApiEndpoint,
@@ -974,7 +1213,7 @@ export function createApiServices(
     signal: AbortSignal,
     body?: Credentials | PersonalProductionNoteUpdate | PersonalProductionResumeUpdate
       | PersonalRoughCutUpdate | CreateSeriesInput | UpdateSeriesInput
-      | CreateChapterInput | UpdateChapterInput | FormData,
+      | CreateChapterInput | UpdateChapterInput | ReorderChaptersInput | FormData,
     identifiers?: { seriesId?: string; chapterId?: string; page?: number },
     requestBaseUrl = apiBaseUrl,
   ): Promise<unknown> {
@@ -1093,10 +1332,12 @@ export function createApiServices(
     endpoint: ApiEndpoint,
     token: string,
     signal: AbortSignal,
-    body?: CreateSeriesInput | UpdateSeriesInput | CreateChapterInput | UpdateChapterInput | FormData,
+    body?: CreateSeriesInput | UpdateSeriesInput | CreateChapterInput | UpdateChapterInput
+      | ReorderChaptersInput | FormData,
     identifiers?: { seriesId?: string; chapterId?: string },
   ): Promise<unknown> {
     try {
+      ensureCurrentApiSession(storage, token, signal);
       const result = await request(endpoint, token, signal, body, identifiers);
       ensureCurrentApiSession(storage, token, signal);
       return result;
@@ -1218,6 +1459,74 @@ export function createApiServices(
         await requestForCurrentApiSession("createChapter", token, signal, input, { seriesId }),
         seriesId,
       );
+    },
+    async reorderChapters(seriesId, input, signal) {
+      const token = requireApiToken(storage);
+      const response = await requestForCurrentApiSession(
+        "reorderChapters", token, signal, input, { seriesId },
+      );
+      return parseChapterOrderResponse(response);
+    },
+    async getChapterEditLock(chapterId, signal, leaseHandle) {
+      const token = requireApiToken(storage);
+      const lease = leaseHandle === undefined ? undefined : chapterEditLockLeases.get(leaseHandle);
+      if (leaseHandle !== undefined && (lease === undefined || lease.chapterId !== chapterId || lease.token !== token)) {
+        throw new ApiError("aborted", "登录会话已变化，未继续使用原章节锁。", null);
+      }
+      const state = parseChapterEditLockState(await requestForCurrentApiSession(
+        "getChapterEditLock", token, signal, undefined, { chapterId },
+      ));
+      if (lease !== undefined && !recordCurrentChapterLockLease(lease, state)) {
+        throw new ApiError("aborted", "章节锁无法与本次取得记录对应，未继续使用旧编辑句柄。", null);
+      }
+      return state;
+    },
+    async acquireChapterEditLock(chapterId, signal) {
+      const token = requireApiToken(storage);
+      const state = parseChapterEditLockState(await requestForCurrentApiSession(
+        "acquireChapterEditLock", token, signal, undefined, { chapterId },
+      ));
+      if (!state.locked) return { state, lease: null };
+      if (state.expires_at === undefined) {
+        throw new ApiError("invalid-response", "章节锁取得结果缺少有效期限。", null);
+      }
+      const lease: ChapterEditLockLeaseHandle = {} as ChapterEditLockLeaseHandle;
+      chapterEditLockLeases.set(lease, {
+        chapterId,
+        token,
+        acquiredAt: state.acquired_at ?? null,
+        userId: state.user_id ?? null,
+        expiresAt: state.expires_at,
+      });
+      return { state, lease };
+    },
+    async releaseChapterEditLock(chapterId, signal, leaseHandle) {
+      const token = requireApiToken(storage);
+      const lease = chapterEditLockLeases.get(leaseHandle);
+      if (lease === undefined || lease.chapterId !== chapterId || lease.token !== token) {
+        throw new ApiError("aborted", "当前会话没有可安全释放的章节锁。");
+      }
+      if (lease.acquiredAt === null || lease.userId === null) {
+        chapterEditLockLeases.delete(leaseHandle);
+        throw new ApiError("aborted", "尚未记录本次锁的取得时间，未发送释放请求。", null);
+      }
+      const current = parseChapterEditLockState(await requestForCurrentApiSession(
+        "getChapterEditLock", token, signal, undefined, { chapterId },
+      ));
+      const normalizedExpiry = current.expires_at === undefined
+        ? Number.NaN
+        : Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/i.test(current.expires_at)
+          ? current.expires_at : current.expires_at + "Z");
+      if (!recordCurrentChapterLockLease(lease, current)
+        || !Number.isFinite(normalizedExpiry) || normalizedExpiry <= Date.now()) {
+        throw new ApiError("aborted", "章节锁已变化或过期，未释放当前锁。", null);
+      }
+      const response = await requestForCurrentApiSession(
+        "releaseChapterEditLock", token, signal, undefined, { chapterId },
+      );
+      const parsed = parseChapterOrderResponse(response);
+      chapterEditLockLeases.delete(leaseHandle);
+      return parsed;
     },
     async updateChapter(seriesId, chapterId, update, signal) {
       const token = requireApiToken(storage);

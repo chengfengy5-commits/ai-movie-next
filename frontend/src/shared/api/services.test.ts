@@ -54,6 +54,11 @@ function jsonResponse(payload: unknown, status = 200): Response {
   } as Response;
 }
 
+function requireServiceMethod<T>(method: T | undefined, name: string): NonNullable<T> {
+  if (method === undefined) throw new Error(`Expected ${name} to be available.`);
+  return method as NonNullable<T>;
+}
+
 function responseForUser() {
   return {
     id: "fixture-user",
@@ -116,6 +121,103 @@ async function startFixture(overrides: Record<string, string> = {}): Promise<Fix
 
 describe("API services", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("keeps delayed cleanup bound to its acquisition after a newer lock is created", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
+    const firstExpiry = "2099-01-01T00:15:00Z";
+    const secondExpiry = "2099-01-01T00:30:00Z";
+    let currentLock: Record<string, unknown> | null = null;
+    let acquisitionCount = 0;
+    const requests: string[] = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      requests.push(method + " " + url.pathname);
+      if (method === "POST") {
+        acquisitionCount += 1;
+        const acquiredAt = acquisitionCount === 1 ? "2098-12-31T23:00:00Z" : "2098-12-31T23:15:00Z";
+        const expiresAt = acquisitionCount === 1 ? firstExpiry : secondExpiry;
+        currentLock = {
+          locked: true,
+          user_id: "demo-user",
+          username: "演示创作者",
+          is_mine: true,
+          acquired_at: acquiredAt,
+          last_active_at: acquiredAt,
+          expires_at: expiresAt,
+        };
+        return jsonResponse({ locked: true, username: "演示创作者", expires_at: expiresAt, idle_minutes: 15 });
+      }
+      if (method === "GET") return jsonResponse(currentLock ?? { locked: false });
+      return jsonResponse({ message: "锁已释放" });
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
+    const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
+    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
+    const signal = new AbortController().signal;
+    const first = await acquireLock("chapter-lease", signal);
+    if (first.lease === null) throw new Error("Expected the first acquisition lease.");
+    await getLock("chapter-lease", signal, first.lease);
+    const second = await acquireLock("chapter-lease", signal);
+    if (second.lease === null) throw new Error("Expected the second acquisition lease.");
+    await getLock("chapter-lease", signal, second.lease);
+
+    await expect(releaseLock("chapter-lease", signal, first.lease))
+      .rejects.toMatchObject({ kind: "aborted" });
+    await releaseLock("chapter-lease", signal, second.lease);
+
+    expect(requests.filter((request) => request.startsWith("DELETE "))).toEqual([
+      "DELETE /api/chapters/chapter-lease/lock",
+    ]);
+  });
+
+  it("does not replace a recorded same-user acquired_at when a later GET sees a new lock", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
+    const requests: string[] = [];
+    const firstLock = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2098-12-31T23:00:00Z",
+      last_active_at: "2098-12-31T23:00:00Z",
+      expires_at: "2099-01-01T00:15:00Z",
+    };
+    let currentLock: Record<string, unknown> = firstLock;
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+      requests.push(method + " " + url.pathname);
+      if (method === "POST") {
+        return jsonResponse({ locked: true, username: "演示创作者", expires_at: firstLock.expires_at, idle_minutes: 15 });
+      }
+      if (method === "GET") return jsonResponse(currentLock);
+      return jsonResponse({ message: "锁已释放" });
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
+    const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
+    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
+    const signal = new AbortController().signal;
+    const acquisition = await acquireLock("chapter-lock-renewed", signal);
+    if (acquisition.lease === null) throw new Error("Expected an acquisition lease.");
+    await getLock("chapter-lock-renewed", signal, acquisition.lease);
+    currentLock = {
+      ...firstLock,
+      acquired_at: "2098-12-31T23:30:00Z",
+      last_active_at: "2098-12-31T23:30:00Z",
+      expires_at: "2099-01-01T00:45:00Z",
+    };
+
+    await expect(getLock("chapter-lock-renewed", signal, acquisition.lease))
+      .rejects.toMatchObject({ kind: "aborted" });
+    await expect(releaseLock("chapter-lock-renewed", signal, acquisition.lease))
+      .rejects.toMatchObject({ kind: "aborted" });
+    expect(requests.some((request) => request.startsWith("DELETE "))).toBe(false);
+  });
 
   it("uses only the compatible login, session and series contracts over real HTTP", async () => {
     const fixture = await startFixture();
@@ -805,6 +907,65 @@ describe("API services", () => {
     await expect(first.getPersonalProductionNotes(created.id, signal)).rejects.toMatchObject({ status: 404 });
     await expect(first.getPersonalRoughCut(created.id, signal)).rejects.toMatchObject({ status: 404 });
     expect((await first.listChapters(firstSeries.id, signal)).some((chapter) => chapter.id === created.id)).toBe(false);
+  });
+
+  it("keeps demo chapter reorder aligned with its descending directory view", async () => {
+    const first = createDemoServices(new MemoryStorage());
+    const second = createDemoServices(new MemoryStorage());
+    const signal = new AbortController().signal;
+    await first.login({ username: "demo", password: "demo123" }, signal);
+    await second.login({ username: "demo", password: "demo123" }, signal);
+    const seriesId = demoSeries[0]!.id;
+    const originalOrder = (await second.listChapters(seriesId, signal)).map((chapter) => chapter.id);
+    const visualOrder = [...originalOrder].reverse();
+    const reorder = first.reorderChapters;
+    if (reorder === undefined) throw new Error("Demo chapter reorder is unavailable.");
+
+    await reorder(seriesId, {
+      chapters: visualOrder.map((id, index) => ({ id, order: visualOrder.length - index })),
+    }, signal);
+
+    expect((await first.listChapters(seriesId, signal)).map((chapter) => chapter.id)).toEqual(visualOrder);
+    expect((await second.listChapters(seriesId, signal)).map((chapter) => chapter.id)).toEqual(originalOrder);
+  });
+
+  it("persists demo frame edits and generated storyboard assets within one service instance", async () => {
+    const first = createDemoServices(new MemoryStorage());
+    const second = createDemoServices(new MemoryStorage());
+    const signal = new AbortController().signal;
+    await first.login({ username: "demo", password: "demo123" }, signal);
+    await second.login({ username: "demo", password: "demo123" }, signal);
+    const seriesId = demoSeries[0]!.id;
+    const create = first.createChapter;
+    const update = first.updateChapter;
+    if (!create || !update) throw new Error("Demo chapter editing is unavailable.");
+    const created = await create(seriesId, {
+      title: "仅本实例的章节",
+      content: [{ text: "初始文字", future_data: { retained: [1, 2] } }],
+      order: 0,
+    }, signal);
+
+    await update(seriesId, created.id, {
+      content: [{ text: "更新文字", future_data: { retained: [1, 2] } }],
+    }, signal);
+
+    const saved = (await first.listChapters(seriesId, signal)).find((chapter) => chapter.id === created.id);
+    const assets = await first.listStoryboardAssets(seriesId, created.id, signal);
+    const savedFrame = saved?.content?.[0];
+    const generatedId = Array.isArray(savedFrame?.storyboard) ? savedFrame.storyboard[0] : null;
+    expect(saved?.content?.[0]).toMatchObject({
+      text: "更新文字",
+      future_data: { retained: [1, 2] },
+      storyboard: [expect.any(String)],
+    });
+    expect(assets).toHaveLength(1);
+    expect(assets[0]).toMatchObject({
+      id: generatedId,
+      series_id: seriesId,
+      chapter_id: created.id,
+      frame_index: 0,
+    });
+    expect((await second.listChapters(seriesId, signal)).some((chapter) => chapter.id === created.id)).toBe(false);
   });
 
   it("keeps demo series mutations local to one service instance and gives new series empty production data", async () => {

@@ -1,0 +1,172 @@
+.chapter-editing-backdrop {
+  z-index: 80;
+}
+
+.chapter-editing-dialog {
+  width: min(620px, 100%);
+  max-height: min(82vh, 820px);
+  overflow: auto;
+}
+
+.chapter-editing-help {
+  margin: 0 0 14px;
+  color: #738582;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.chapter-order-list {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chapter-order-item {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 48px;
+  padding: 6px 9px;
+  border: 1px solid #e4ece9;
+  border-radius: 8px;
+  color: #34484a;
+  outline: none;
+}
+
+.chapter-order-item:focus-visible,
+.chapter-order-item.active {
+  border-color: #83b8a9;
+  box-shadow: 0 0 0 2px rgba(62, 139, 119, 0.12);
+}
+
+.chapter-order-position {
+  color: #718985;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+
+.chapter-order-item strong {
+  overflow-wrap: anywhere;
+  font-size: 13px;
+}
+
+.chapter-order-controls {
+  display: flex;
+  gap: 5px;
+}
+
+.chapter-order-controls button {
+  min-height: 32px;
+  padding: 0 9px;
+  border: 1px solid #dce8e3;
+  border-radius: 6px;
+  color: #376d62;
+  background: #fff;
+  font-size: 11px;
+}
+
+.chapter-order-controls button:disabled {
+  color: #a1aeab;
+  cursor: not-allowed;
+}
+
+.frame-text-editor-label {
+  display: grid;
+  gap: 8px;
+  color: #405557;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.frame-text-editor-label textarea {
+  width: 100%;
+  min-height: 160px;
+  padding: 11px 12px;
+  border: 1px solid #dce7e3;
+  border-radius: 8px;
+  color: #35484a;
+  background: #fbfdfc;
+  font: inherit;
+  font-size: 13px;
+  font-weight: 400;
+  line-height: 1.7;
+  resize: vertical;
+}
+
+.frame-text-editor-label textarea:focus-visible {
+  border-color: #69a28f;
+  outline: 3px solid rgba(62, 139, 119, 0.13);
+}
+
+.chapter-editing-lock,
+.frame-text-server-value {
+  margin: 0 0 14px;
+  padding: 10px 12px;
+  border-radius: 7px;
+  color: #735d37;
+  background: #fbf8f0;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.frame-text-server-value {
+  color: #4e6661;
+  background: #f4f8f6;
+}
+
+.frame-text-server-value strong {
+  display: block;
+  margin-bottom: 5px;
+}
+
+.frame-text-server-value p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.frame-text-editor-actions {
+  flex-wrap: wrap;
+}
+
+@media (max-width: 600px) {
+  .chapter-order-item {
+    grid-template-columns: 28px minmax(0, 1fr);
+  }
+
+  .chapter-order-controls {
+    grid-column: 2;
+  }
+
+  .chapter-editing-dialog .series-dialog-actions {
+    align-items: stretch;
+  }
+
+  .frame-text-editor-actions button {
+    flex: 1 1 45%;
+  }
+}
+
+.chapter-list-heading-actions .chapter-reorder-button {
+  min-height: 31px;
+  padding: 0 5px;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.storyboard-frame-heading-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.frame-text-edit-button {
+  min-height: 30px;
+  padding: 0 5px;
+  color: #39786a;
+  font-size: 10px;
+  white-space: nowrap;
+}

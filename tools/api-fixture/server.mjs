@@ -188,6 +188,7 @@ function createAsset(seriesId, chapterId, id, frameIndex, name) {
 
 const chaptersBySeries = new Map();
 const assetsBySeriesAndChapter = new Map();
+const chapterEditLocks = new Map();
 for (const item of series) {
   const firstChapterId = `${item.id}-chapter-02`;
   const secondChapterId = `${item.id}-chapter-01`;
@@ -1039,6 +1040,30 @@ function decodePersonalNotesChapterId(pathname) {
   }
 }
 
+function decodeChapterId(pathname) {
+  const match = pathname.match(/^\/api\/chapters\/([^/]+)$/);
+  if (!match?.[1]) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
+function decodeChapterLockId(pathname) {
+  const match = pathname.match(/^\/api\/chapters\/([^/]+)\/lock$/);
+  if (!match?.[1]) {
+    return null;
+  }
+  try {
+    return decodeURIComponent(match[1]);
+  } catch {
+    return null;
+  }
+}
+
 function decodePersonalRoughCutChapterId(pathname) {
   const match = pathname.match(/^\/api\/chapters\/([^/]+)\/rough-cut$/);
   if (!match?.[1]) {
@@ -1434,6 +1459,180 @@ async function handleChapters(request, response, pathname) {
     200,
     process.env.FIXTURE_CHAPTERS_EMPTY === "true" ? [] : chaptersBySeries.get(seriesId),
   );
+}
+
+async function handleChapterReorder(request, response, pathname) {
+  if (!hasValidBearer(request)) {
+    sendJson(request, response, 401, { detail: "登录状态已失效。" });
+    return;
+  }
+  const seriesId = decodeSeriesId(pathname, "chapters/reorder");
+  const selectedSeries = series.find((item) => item.id === seriesId);
+  const current = seriesId === null ? null : chaptersBySeries.get(seriesId);
+  if (!selectedSeries || !current) {
+    sendJson(request, response, 404, { detail: "剧集不存在。" });
+    return;
+  }
+  if (!selectedSeries.can_enter) {
+    sendJson(request, response, 403, { detail: "该剧集当前由其他创作者负责。" });
+    return;
+  }
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch {
+    sendJson(request, response, 422, { detail: "章节排序请求格式无效。" });
+    return;
+  }
+  const entries = body && typeof body === "object" && Array.isArray(body.chapters) ? body.chapters : null;
+  const ids = entries?.map((entry) => entry?.id) ?? [];
+  const orders = entries?.map((entry) => entry?.order) ?? [];
+  if (entries === null || Object.keys(body).length !== 1 || ids.length !== current.length
+    || new Set(ids).size !== ids.length || ids.some((id) => !current.some((chapter) => chapter.id === id))
+    || new Set(orders).size !== current.length
+    || orders.some((order) => !Number.isInteger(order) || order < 1 || order > current.length)) {
+    sendJson(request, response, 409, { detail: "章节列表已变化，请重新读取后再排序。" });
+    return;
+  }
+  const orderById = new Map(entries.map((entry) => [entry.id, entry.order]));
+  for (const chapter of current) {
+    chapter.order = orderById.get(chapter.id);
+    chapter.updated_at = new Date().toISOString();
+  }
+  sendJson(request, response, 200, { message: "排序已更新" });
+}
+
+async function handleChapterUpdate(request, response, chapterId) {
+  if (!hasValidBearer(request)) {
+    sendJson(request, response, 401, { detail: "登录状态已失效。" });
+    return;
+  }
+  const selectedSeries = seriesForChapter(chapterId);
+  const chapter = selectedSeries === undefined
+    ? null
+    : chaptersBySeries.get(selectedSeries.id)?.find((item) => item.id === chapterId) ?? null;
+  if (!selectedSeries || !chapter) {
+    sendJson(request, response, 404, { detail: "章节不存在。" });
+    return;
+  }
+  if (!selectedSeries.can_enter) {
+    sendJson(request, response, 403, { detail: "该剧集当前由其他创作者负责。" });
+    return;
+  }
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch {
+    sendJson(request, response, 422, { detail: "章节修改请求格式无效。" });
+    return;
+  }
+  if (!body || typeof body !== "object" || Object.keys(body).length !== 1 || !Array.isArray(body.content)) {
+    sendJson(request, response, 422, { detail: "章节修改仅支持 content 数组。" });
+    return;
+  }
+
+  const key = `${selectedSeries.id}:${chapter.id}`;
+  const assets = assetsBySeriesAndChapter.get(key) ?? [];
+  chapter.content = body.content.map((frame, frameIndex) => {
+    const nextFrame = frame && typeof frame === "object" && !Array.isArray(frame) ? { ...frame } : frame;
+    if (!nextFrame || typeof nextFrame !== "object" || Array.isArray(nextFrame)) {
+      return nextFrame;
+    }
+    const refs = nextFrame.storyboard;
+    if (refs === undefined || refs === null || (Array.isArray(refs) && refs.length === 0)) {
+      const id = `fixture-generated-${chapter.id}-${frameIndex}`;
+      nextFrame.storyboard = [id];
+      assets.push(createAsset(selectedSeries.id, chapter.id, id, frameIndex, `分镜 ${frameIndex + 1}`));
+    } else if (Array.isArray(refs) && typeof refs[0] === "string") {
+      const asset = assets.find((candidate) => candidate.id === refs[0]);
+      if (asset) {
+        asset.frame_index = frameIndex;
+        asset.name = `分镜 ${frameIndex + 1}`;
+        asset.description = typeof nextFrame.text === "string" ? nextFrame.text : asset.description;
+        asset.updated_at = new Date().toISOString();
+      }
+    }
+    return nextFrame;
+  });
+  assetsBySeriesAndChapter.set(key, assets);
+  chapter.updated_at = new Date().toISOString();
+  const activeLock = chapterEditLocks.get(chapter.id);
+  const editor = authenticatedUser(request);
+  if (activeLock && activeLock.user_id === editor?.id && Date.parse(activeLock.expires_at) > Date.now()) {
+    activeLock.last_active_at = new Date().toISOString();
+    activeLock.expires_at = new Date(Date.now() + 15 * 60_000).toISOString();
+  }
+  if (process.env.FIXTURE_CHAPTER_UPDATE_MODE === "commit-then-500") {
+    sendJson(request, response, 500, { detail: "章节内容已提交，但确认响应不可用。" });
+    return;
+  }
+  sendJson(request, response, 200, chapter);
+}
+
+async function handleChapterEditLock(request, response, chapterId) {
+  if (!hasValidBearer(request)) {
+    sendJson(request, response, 401, { detail: "登录状态已失效。" });
+    return;
+  }
+  const selectedSeries = seriesForChapter(chapterId);
+  const chapter = selectedSeries === undefined
+    ? null
+    : chaptersBySeries.get(selectedSeries.id)?.find((item) => item.id === chapterId) ?? null;
+  if (!selectedSeries || !chapter) {
+    sendJson(request, response, 404, { detail: "章节不存在。" });
+    return;
+  }
+  if (!selectedSeries.team_id) {
+    if (request.method === "DELETE") {
+      sendJson(request, response, 200, { message: "个人剧集无需释放锁" });
+      return;
+    }
+    sendJson(request, response, 200, { locked: false, message: "个人剧集无需加锁" });
+    return;
+  }
+  const current = chapterEditLocks.get(chapterId);
+  if (request.method === "GET") {
+    if (!current || Date.parse(current.expires_at) <= Date.now()) {
+      chapterEditLocks.delete(chapterId);
+      sendJson(request, response, 200, { locked: false });
+      return;
+    }
+    const account = authenticatedUser(request);
+    sendJson(request, response, 200, {
+      locked: true,
+      user_id: current.user_id,
+      username: current.username,
+      acquired_at: current.acquired_at,
+      last_active_at: current.last_active_at,
+      expires_at: current.expires_at,
+      is_mine: account?.id === current.user_id,
+    });
+    return;
+  }
+  if (request.method === "POST") {
+    if (current && Date.parse(current.expires_at) > Date.now()) {
+      sendJson(request, response, 409, { detail: "章节当前由其他创作者编辑。" });
+      return;
+    }
+    const account = authenticatedUser(request);
+    const expires_at = new Date(Date.now() + 15 * 60_000).toISOString();
+    chapterEditLocks.set(chapterId, {
+      user_id: account.id,
+      username: account.username,
+      acquired_at: new Date().toISOString(),
+      last_active_at: new Date().toISOString(),
+      expires_at,
+    });
+    sendJson(request, response, 200, { locked: true, username: account.username, expires_at, idle_minutes: 15 });
+    return;
+  }
+  if (!current || current.user_id !== authenticatedUser(request)?.id
+    || Date.parse(current.expires_at) <= Date.now()) {
+    sendJson(request, response, 409, { detail: "章节锁已变化或过期。" });
+    return;
+  }
+  chapterEditLocks.delete(chapterId);
+  sendJson(request, response, 200, { message: "锁已释放" });
 }
 
 async function handleStoryboardAssets(request, response, pathname, searchParams) {
@@ -2255,6 +2454,20 @@ const server = createServer(async (request, response) => {
   }
   if (request.method === "GET" && url.pathname === "/api/series") {
     await handleSeries(request, response);
+    return;
+  }
+  if (request.method === "PUT" && decodeSeriesId(url.pathname, "chapters/reorder") !== null) {
+    await handleChapterReorder(request, response, url.pathname);
+    return;
+  }
+  const chapterId = decodeChapterId(url.pathname);
+  if (chapterId !== null && request.method === "PUT") {
+    await handleChapterUpdate(request, response, chapterId);
+    return;
+  }
+  const chapterLockId = decodeChapterLockId(url.pathname);
+  if (chapterLockId !== null && ["GET", "POST", "DELETE"].includes(request.method ?? "")) {
+    await handleChapterEditLock(request, response, chapterLockId);
     return;
   }
   if (request.method === "GET" && decodeSeriesId(url.pathname, "chapters") !== null) {

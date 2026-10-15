@@ -99,6 +99,11 @@ function createServices(baseUrl: string, options: { timeoutMs?: number; fetcher?
   return { services, storage };
 }
 
+function requireServiceMethod<T>(method: T | undefined, name: string): NonNullable<T> {
+  if (method === undefined) throw new Error(`Expected ${name} to be available.`);
+  return method as NonNullable<T>;
+}
+
 function recordedFetcher(records: Array<{
   method: string;
   pathname: string;
@@ -149,6 +154,213 @@ const malformedCases = [
 
 describe("chapter and storyboard API services over real HTTP", () => {
   afterEach(() => vi.restoreAllMocks());
+
+  it("sends one full content PUT, then confirms a committed 500 result through fresh chapter and asset reads", async () => {
+    const fixture = await startFixture({ FIXTURE_CHAPTER_UPDATE_MODE: "commit-then-500" });
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
+    const requests: Array<{ method: string; pathname: string; authorization: string | null; body: string | null }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = input instanceof URL
+        ? input
+        : input instanceof Request
+          ? new URL(input.url)
+          : new URL(input);
+      requests.push({
+        method: init?.method ?? (input instanceof Request ? input.method : "GET"),
+        pathname: url.pathname,
+        authorization: new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+          .get("Authorization"),
+        body: typeof init?.body === "string" ? init.body : null,
+      });
+      return globalThis.fetch(input, init);
+    };
+    const services = createApiServices(fixture.baseUrl, { storage, fetcher });
+    const updateChapter = requireServiceMethod(services.updateChapter, "updateChapter");
+    const seriesId = "fixture-series-01";
+    const chapterId = `${seriesId}-chapter-03`;
+    const content = [{ text: "", original_text: null, nested_future: { preserved: true } }];
+
+    try {
+      await expect(updateChapter(
+        seriesId,
+        chapterId,
+        { content },
+        new AbortController().signal,
+      )).rejects.toMatchObject({ kind: "http", status: 500 });
+
+      const chapters = await services.listChapters(seriesId, new AbortController().signal);
+      const saved = chapters.find((chapter) => chapter.id === chapterId);
+      const assets = await services.listStoryboardAssets(seriesId, chapterId, new AbortController().signal);
+      expect(saved?.content).toEqual([{ ...content[0], storyboard: [`fixture-generated-${chapterId}-0`] }]);
+      expect(assets).toContainEqual(expect.objectContaining({
+        id: `fixture-generated-${chapterId}-0`,
+        series_id: seriesId,
+        chapter_id: chapterId,
+        frame_index: 0,
+      }));
+      expect(requests.filter((request) => request.method === "PUT")).toEqual([{
+        method: "PUT",
+        pathname: `/api/chapters/${chapterId}`,
+        authorization: "Bearer fixture-demo-token",
+        body: JSON.stringify({ content }),
+      }]);
+      expect(requests.slice(1).every((request) => request.authorization === "Bearer fixture-demo-token")).toBe(true);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("sends one complete reorder request and reads back the assigned chapter orders", async () => {
+    const fixture = await startFixture();
+    const requests: Array<{ method: string; pathname: string; authorization: string | null; body: string | null }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = input instanceof URL
+        ? input
+        : input instanceof Request
+          ? new URL(input.url)
+          : new URL(input);
+      requests.push({
+        method: init?.method ?? (input instanceof Request ? input.method : "GET"),
+        pathname: url.pathname,
+        authorization: new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+          .get("Authorization"),
+        body: typeof init?.body === "string" ? init.body : null,
+      });
+      return globalThis.fetch(input, init);
+    };
+    const { services } = createServices(fixture.baseUrl, { fetcher });
+    const reorderChapters = requireServiceMethod(services.reorderChapters, "reorderChapters");
+    const seriesId = "fixture-series-01";
+    const ids = ["fixture-series-01-chapter-01", "fixture-series-01-chapter-02", "fixture-series-01-chapter-03", "fixture-series-01-chapter-04"];
+    const input = { chapters: [...ids].reverse().map((id, index) => ({ id, order: ids.length - index })) };
+
+    try {
+      await reorderChapters(seriesId, input, new AbortController().signal);
+      const chapters = await services.listChapters(seriesId, new AbortController().signal);
+      const reordered = chapters.filter((chapter) => ids.includes(chapter.id));
+      expect(reordered).toHaveLength(ids.length);
+      expect(reordered.map((chapter) => chapter.id).sort()).toEqual([...ids].sort());
+      expect(Object.fromEntries(reordered.map((chapter) => [chapter.id, chapter.order])))
+        .toEqual(Object.fromEntries(input.chapters.map(({ id, order }) => [id, order])));
+      expect(requests.filter((request) => request.method === "PUT")).toEqual([{
+        method: "PUT",
+        pathname: `/api/series/${seriesId}/chapters/reorder`,
+        authorization: "Bearer fixture-demo-token",
+        body: JSON.stringify(input),
+      }]);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("binds chapter-lock release to the verified acquisition and refuses a changed API session", async () => {
+    const fixture = await startFixture();
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
+    const requests: Array<{ method: string; pathname: string; authorization: string | null }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = input instanceof URL
+        ? input
+        : input instanceof Request
+          ? new URL(input.url)
+          : new URL(input);
+      requests.push({
+        method: init?.method ?? (input instanceof Request ? input.method : "GET"),
+        pathname: url.pathname,
+        authorization: new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+          .get("Authorization"),
+      });
+      return globalThis.fetch(input, init);
+    };
+    const services = createApiServices(fixture.baseUrl, { storage, fetcher });
+    const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
+    const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
+    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
+    const signal = new AbortController().signal;
+    const verifiedChapter = "fixture-series-03-chapter-02";
+    const changedSessionChapter = "fixture-series-03-chapter-01";
+
+    try {
+      const verifiedAcquisition = await acquireLock(verifiedChapter, signal);
+      if (verifiedAcquisition.lease === null) throw new Error("Expected a new chapter lock acquisition.");
+      const verified = await getLock(verifiedChapter, signal, verifiedAcquisition.lease);
+      expect(verified).toMatchObject({ locked: true, user_id: "demo-user", is_mine: true });
+      await releaseLock(verifiedChapter, signal, verifiedAcquisition.lease);
+
+      const changedAcquisition = await acquireLock(changedSessionChapter, signal);
+      if (changedAcquisition.lease === null) throw new Error("Expected a new chapter lock acquisition.");
+      await getLock(changedSessionChapter, signal, changedAcquisition.lease);
+      storage.setItem(API_TOKEN_KEY, "fixture-demo-token-02");
+      await expect(releaseLock(changedSessionChapter, signal, changedAcquisition.lease))
+        .rejects.toMatchObject({ kind: "aborted" });
+
+      expect(requests.map(({ method, pathname }) => [method, pathname])).toEqual([
+        ["POST", `/api/chapters/${verifiedChapter}/lock`],
+        ["GET", `/api/chapters/${verifiedChapter}/lock`],
+        ["GET", `/api/chapters/${verifiedChapter}/lock`],
+        ["DELETE", `/api/chapters/${verifiedChapter}/lock`],
+        ["POST", `/api/chapters/${changedSessionChapter}/lock`],
+        ["GET", `/api/chapters/${changedSessionChapter}/lock`],
+      ]);
+      expect(requests.every((request) => request.authorization !== null)).toBe(true);
+      expect(requests.slice(0, 4).every((request) => request.authorization === "Bearer fixture-demo-token")).toBe(true);
+      expect(requests.slice(4).every((request) => request.authorization === "Bearer fixture-demo-token")).toBe(true);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("does not create a chapter lock for a personal series", async () => {
+    const fixture = await startFixture();
+    const { services } = createServices(fixture.baseUrl);
+    const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
+
+    try {
+      const acquisition = await acquireLock("fixture-series-01-chapter-01", new AbortController().signal);
+
+      expect(acquisition).toEqual({
+        state: { locked: false, message: "个人剧集无需加锁" },
+        lease: null,
+      });
+      expect(fixture.output()).toContain(
+        '"method":"POST","pathname":"/api/chapters/fixture-series-01-chapter-01/lock","status":200',
+      );
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("allows a chapter PUT to extend the same acquisition and releases it by its stable acquired_at", async () => {
+    const fixture = await startFixture();
+    const { services } = createServices(fixture.baseUrl);
+    const acquireLock = requireServiceMethod(services.acquireChapterEditLock, "acquireChapterEditLock");
+    const getLock = requireServiceMethod(services.getChapterEditLock, "getChapterEditLock");
+    const updateChapter = requireServiceMethod(services.updateChapter, "updateChapter");
+    const releaseLock = requireServiceMethod(services.releaseChapterEditLock, "releaseChapterEditLock");
+    const seriesId = "fixture-series-03";
+    const signal = new AbortController().signal;
+
+    try {
+      const chapters = await services.listChapters(seriesId, signal);
+      const chapter = chapters[0];
+      if (!chapter || chapter.content === null) throw new Error("Expected a fixture chapter with storyboard content.");
+      const acquisition = await acquireLock(chapter.id, signal);
+      if (acquisition.lease === null) throw new Error("Expected a chapter lock acquisition.");
+      const before = await getLock(chapter.id, signal, acquisition.lease);
+      const updated = await updateChapter(seriesId, chapter.id, { content: chapter.content }, signal);
+      const after = await getLock(chapter.id, signal, acquisition.lease);
+      await releaseLock(chapter.id, signal, acquisition.lease);
+
+      expect(updated.content).toEqual(chapter.content);
+      expect(after.acquired_at).toBe(before.acquired_at);
+      expect(Date.parse(after.expires_at ?? "")).toBeGreaterThan(Date.parse(before.expires_at ?? ""));
+      expect(fixture.output()).toContain(`"method":"PUT","pathname":"/api/chapters/${chapter.id}","status":200`);
+      expect(fixture.output()).toContain(`"method":"DELETE","pathname":"/api/chapters/${chapter.id}/lock","status":200`);
+    } finally {
+      await fixture.stop();
+    }
+  });
 
   it("uses the expected five-route request sequence with Bearer auth and no secret logging", async () => {
     const fixture = await startFixture();

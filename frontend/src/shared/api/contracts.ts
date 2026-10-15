@@ -61,6 +61,34 @@ export interface CreateChapterInput {
 
 export interface UpdateChapterInput {
   title?: string;
+  content?: StoryboardFrame[];
+}
+
+export interface ReorderChaptersInput {
+  chapters: Array<{ id: string; order: number }>;
+}
+
+export interface ChapterEditLockState {
+  locked: boolean;
+  user_id?: string;
+  username?: string;
+  is_mine?: boolean;
+  acquired_at?: string;
+  last_active_at?: string;
+  expires_at?: string;
+  idle_minutes?: number;
+  message?: string;
+}
+
+declare const chapterEditLockLeaseHandleBrand: unique symbol;
+
+export interface ChapterEditLockLeaseHandle {
+  readonly [chapterEditLockLeaseHandleBrand]: true;
+}
+
+export interface ChapterEditLockAcquisition {
+  state: ChapterEditLockState;
+  lease: ChapterEditLockLeaseHandle | null;
 }
 
 export interface StoryboardAsset {
@@ -368,6 +396,49 @@ export function parseChapterList(value: unknown, expectedSeriesId: string): Chap
     ids.add(chapter.id);
   }
   return chapters;
+}
+
+export function parseChapterEditLockState(value: unknown): ChapterEditLockState {
+  if (!isRecord(value) || typeof value.locked !== "boolean") {
+    throw new InvalidResponseError("服务器返回的章节锁状态格式无效。");
+  }
+  const result: ChapterEditLockState = { locked: value.locked };
+  for (const key of ["user_id", "username", "acquired_at", "last_active_at", "expires_at", "message"] as const) {
+    const field = value[key];
+    if (field !== undefined) {
+      if (typeof field !== "string") {
+        throw new InvalidResponseError("服务器返回的章节锁状态格式无效。");
+      }
+      if ((key === "acquired_at" || key === "last_active_at" || key === "expires_at")
+        && !isValidIsoTimestamp(field)) {
+        throw new InvalidResponseError("服务器返回的章节锁时间格式无效。");
+      }
+      result[key] = field;
+    }
+  }
+  if (value.is_mine !== undefined) {
+    if (typeof value.is_mine !== "boolean") {
+      throw new InvalidResponseError("服务器返回的章节锁状态格式无效。");
+    }
+    result.is_mine = value.is_mine;
+  }
+  if (value.idle_minutes !== undefined) {
+    if (!Number.isSafeInteger(value.idle_minutes) || (value.idle_minutes as number) < 1) {
+      throw new InvalidResponseError("服务器返回的章节锁时长格式无效。");
+    }
+    result.idle_minutes = value.idle_minutes as number;
+  }
+  if (value.locked && (typeof result.expires_at !== "string" || result.expires_at.length === 0)) {
+    throw new InvalidResponseError("服务器返回的章节锁缺少有效期限。");
+  }
+  return result;
+}
+
+export function parseChapterOrderResponse(value: unknown): { message: string } {
+  if (!isRecord(value) || typeof value.message !== "string" || value.message.length === 0) {
+    throw new InvalidResponseError("服务器返回的章节排序结果格式无效。");
+  }
+  return { message: value.message };
 }
 
 export function parseChapterResponse(
