@@ -150,7 +150,7 @@
   }
 }
 
-.chapter-list-heading-actions .chapter-reorder-button {
+.chapter-list-panel .chapter-list-heading-actions .chapter-reorder-button {
   min-height: 31px;
   padding: 0 5px;
   font-size: 10px;
@@ -167,6 +167,43 @@
   min-height: 30px;
   padding: 0 5px;
   color: #39786a;
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+
+.chapter-list-panel .chapter-list-heading {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  align-items: start;
+  gap: 10px;
+}
+
+.chapter-list-panel .chapter-list-heading > div:first-child {
+  min-width: 0;
+}
+
+.chapter-list-panel .chapter-list-heading-actions {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+}
+
+.chapter-list-panel .chapter-list-heading-actions > * {
+  flex: 0 0 auto;
+}
+
+.chapter-list-panel .chapter-list-heading-actions > button {
+  white-space: nowrap;
+}
+
+.chapter-list-panel .chapter-list-heading-actions .chapter-ai-generation-button {
+  min-height: 31px;
+  padding: 0 7px;
   font-size: 10px;
   white-space: nowrap;
 }
