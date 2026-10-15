@@ -1,5 +1,6 @@
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vitest/config";
+import { fileURLToPath } from "node:url";
 import { createApiProxyOptions } from "./devProxy.mjs";
 
 const devPort = Number(process.env.VITE_DEV_PORT ?? "5173");
@@ -24,7 +25,10 @@ export default defineConfig({
   },
   build: {
     rollupOptions: {
-      input: ["index.html", "reset-password.html"],
+      input: [
+        fileURLToPath(new URL("./index.html", import.meta.url)),
+        fileURLToPath(new URL("./reset-password.html", import.meta.url)),
+      ],
     },
   },
   test: {
