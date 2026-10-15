@@ -576,7 +576,7 @@ export function StoryboardGenerationDialog({
                 <input checked={skipFrameGeneration} disabled={quoteInputsLocked} onChange={(event) => setSkipFrameGeneration(event.target.checked)} type="checkbox" />
                 仅生成剧情分段
               </label>
-              <p className="storyboard-generation-hint">模型目录只显示名称和类别，不读取或展示凭据、提示词正文等安全字段。</p>
+              <p className="storyboard-generation-hint">先获取报价并确认积分，再开始生成。结果可编辑，确认保存后才会创建章节。</p>
               {phase === "quoting" && <p aria-live="polite">正在获取服务器报价…</p>}
               {phase === "streaming" && <p aria-live="polite">{message}</p>}
               {receivedStreamText && phase === "streaming" && <p className="storyboard-generation-progress">已收到生成文本，完整结果确认前不会用于预览。</p>}
@@ -623,7 +623,7 @@ export function StoryboardGenerationDialog({
                     <textarea onChange={(event) => updateFrameText(index, event.target.value)} rows={3} value={selectedText(frame)} />
                   </label>
                 ))}
-                <p className="storyboard-generation-hint">只保存镜头文字、角色、场景和道具；生成结果中的其他字段不会通过创建章节接口持久化。</p>
+                <p className="storyboard-generation-hint">保存内容包括镜头文字、角色、场景和道具，时长等其他生成信息不会保存。</p>
                 <button className="primary" onClick={() => void saveChapter()} type="button">确认并创建新章节</button>
               </>}
               {(phase === "saving" || phase === "save-unknown") && <button disabled={phase === "saving"} onClick={() => void retryReadback()} type="button">只读回查，不重复创建</button>}
