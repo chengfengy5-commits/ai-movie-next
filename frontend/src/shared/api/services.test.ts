@@ -198,6 +198,106 @@ describe("API services", () => {
     }
   });
 
+  it("uses the backend account-entry contracts through the shared request client", async () => {
+    const storage = new MemoryStorage();
+    const requests: Array<{ url: URL; init: RequestInit }> = [];
+    const fetcher: typeof fetch = async (input, init) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      requests.push({ url, init: init ?? {} });
+      if (url.pathname === "/api/auth/register") return jsonResponse(responseForUser(), 201);
+      if (url.pathname === "/api/auth/send-code") return jsonResponse({ message: "验证码已发送", expire_in: 300 });
+      if (url.pathname === "/api/auth/verify-code") return jsonResponse({ message: "验证成功" });
+      if (url.pathname === "/api/auth/forgot-password") return jsonResponse({ message: "如果信息正确，重置链接已发送" });
+      if (url.pathname === "/api/auth/reset-password") return jsonResponse({ message: "密码重置成功" });
+      return jsonResponse({ detail: "Unexpected account request" }, 404);
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const accountAccess = services.accountAccess;
+    if (accountAccess === undefined) throw new Error("API account access is unavailable.");
+    const signal = new AbortController().signal;
+
+    const user = await accountAccess.register({
+      username: "new-user",
+      email: "new@example.invalid",
+      password: "secret123",
+      email_code: "123456",
+    }, signal);
+    const sent = await accountAccess.sendEmailCode({ email: "new@example.invalid", username: "new-user" }, signal);
+    const verified = await accountAccess.verifyEmailCode({ email: "new@example.invalid", code: "123456" }, signal);
+    const resetRequest = await accountAccess.requestPasswordReset({
+      username: "new-user",
+      email: "new@example.invalid",
+    }, signal);
+    const reset = await accountAccess.resetPassword({ token: "one-time-token", new_password: "newSecret123" }, signal);
+
+    expect(user.username).toBe("演示创作者");
+    expect(sent.expireInSeconds).toBe(300);
+    expect(verified.message).toBe("验证成功");
+    expect(resetRequest.message).toBe("如果信息正确，重置链接已发送");
+    expect(reset.message).toBe("密码重置成功");
+    expect(storage.getItem(API_TOKEN_KEY)).toBeNull();
+    expect(storage.getItem(API_USER_KEY)).toBeNull();
+    expect(requests.map(({ url }) => `${url.pathname} ${url.search}`)).toEqual([
+      "/api/auth/register ",
+      "/api/auth/send-code ",
+      "/api/auth/verify-code ",
+      "/api/auth/forgot-password ",
+      "/api/auth/reset-password ",
+    ]);
+    expect(requests.map(({ init }) => init.method)).toEqual(["POST", "POST", "POST", "POST", "POST"]);
+    for (const { init } of requests) {
+      expect(init.credentials).toBe("omit");
+      expect(init.redirect).toBe("error");
+      expect(init.referrerPolicy).toBe("no-referrer");
+      expect(new Headers(init.headers).has("Authorization")).toBe(false);
+    }
+    expect(JSON.parse(String(requests[0]?.init.body))).toEqual({
+      username: "new-user",
+      email: "new@example.invalid",
+      password: "secret123",
+      email_code: "123456",
+    });
+    expect(JSON.parse(String(requests[4]?.init.body))).toEqual({
+      token: "one-time-token",
+      new_password: "newSecret123",
+    });
+    expect(createDemoServices(new MemoryStorage()).accountAccess).toBeUndefined();
+  });
+
+  it("preserves the backend rate-limit message and never retries account creation", async () => {
+    const storage = new MemoryStorage();
+    let calls = 0;
+    const fetcher: typeof fetch = async () => {
+      calls += 1;
+      return jsonResponse({ error: "发送太频繁，请 42 秒后再试" }, 429);
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const accountAccess = services.accountAccess;
+    if (accountAccess === undefined) throw new Error("API account access is unavailable.");
+
+    await expect(accountAccess.sendEmailCode({ email: "new@example.invalid" }, new AbortController().signal))
+      .rejects.toMatchObject({ status: 429, detail: "发送太频繁，请 42 秒后再试" });
+    expect(calls).toBe(1);
+
+    let registrationCalls = 0;
+    const registrationServices = createApiServices("http://127.0.0.1:4175/api", {
+      storage: new MemoryStorage(),
+      fetcher: async () => {
+        registrationCalls += 1;
+        return jsonResponse({ detail: "temporary failure" }, 503);
+      },
+    });
+    const registration = registrationServices.accountAccess;
+    if (registration === undefined) throw new Error("API account access is unavailable.");
+    await expect(registration.register({
+      username: "new-user",
+      email: "new@example.invalid",
+      password: "secret123",
+      email_code: "123456",
+    }, new AbortController().signal)).rejects.toMatchObject({ status: 503 });
+    expect(registrationCalls).toBe(1);
+  });
+
   it("classifies an actual HTTP response timeout as a timeout", async () => {
     const fixture = await startFixture({ FIXTURE_SERIES_STATUS: "timeout" });
     const storage = new MemoryStorage();

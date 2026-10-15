@@ -633,10 +633,10 @@ export function parseLoginResponse(value: unknown): { token: string; user: User 
 }
 
 export function parseErrorDetail(value: unknown): string | null {
-  if (!isRecord(value) || !("detail" in value)) {
+  if (!isRecord(value)) {
     return null;
   }
-  const detail = value.detail;
+  const detail = "detail" in value ? value.detail : value.error;
   if (typeof detail === "string") {
     return detail.slice(0, 400);
   }

@@ -22,6 +22,11 @@ export default defineConfig({
     strictPort: true,
     ...(apiProxy ? { proxy: apiProxy } : {}),
   },
+  build: {
+    rollupOptions: {
+      input: ["index.html", "reset-password.html"],
+    },
+  },
   test: {
     clearMocks: true,
     environment: "jsdom",

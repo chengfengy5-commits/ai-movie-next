@@ -7,6 +7,12 @@ import { clonePersonalRoughCutSnapshot, getDemoPersonalRoughCut } from "../../fe
 import { ApiConfigurationError, readEnvironmentConfiguration, resolveApiBaseUrl, type AppMode } from "./config";
 import { ApiError, isAbortError } from "./errors";
 import {
+  parseAccountActionReceipt,
+  parseEmailCodeReceipt,
+  parseRegisteredUser,
+  type AccountAccessService,
+} from "./accountAccess";
+import {
   parseCreatedCharacter,
   parseCreatedProp,
   parseCreatedScene,
@@ -124,6 +130,7 @@ import {
 export interface WorkspaceServices {
   readonly mode: AppMode;
   readonly apiBaseUrl: string | null;
+  readonly accountAccess?: AccountAccessService;
   restore(signal: AbortSignal): Promise<User | null>;
   login(credentials: Credentials, signal: AbortSignal): Promise<User>;
   listSeries(signal: AbortSignal): Promise<Series[]>;
@@ -1814,6 +1821,11 @@ function encodeApiPathId(value: string | undefined, label: string): string {
 
 type ApiEndpoint =
   | "login"
+  | "register"
+  | "sendCode"
+  | "verifyCode"
+  | "forgotPassword"
+  | "resetPassword"
   | "me"
   | "series"
   | "seriesDetail"
@@ -1895,6 +1907,21 @@ function apiRequestDefinition(
 ): ApiRequestDefinition {
   if (endpoint === "login") {
     return { path: "/auth/login", method: "POST" };
+  }
+  if (endpoint === "register") {
+    return { path: "/auth/register", method: "POST", expectedStatus: 201 };
+  }
+  if (endpoint === "sendCode") {
+    return { path: "/auth/send-code", method: "POST" };
+  }
+  if (endpoint === "verifyCode") {
+    return { path: "/auth/verify-code", method: "POST" };
+  }
+  if (endpoint === "forgotPassword") {
+    return { path: "/auth/forgot-password", method: "POST" };
+  }
+  if (endpoint === "resetPassword") {
+    return { path: "/auth/reset-password", method: "POST" };
   }
   if (endpoint === "me") {
     return { path: "/auth/me", method: "GET" };
@@ -2486,6 +2513,23 @@ export function createApiServices(
     mode: "api",
     apiBaseUrl,
     creatorSettings,
+    accountAccess: {
+      async register(input, signal) {
+        return parseRegisteredUser(await request("register", null, signal, input));
+      },
+      async sendEmailCode(input, signal) {
+        return parseEmailCodeReceipt(await request("sendCode", null, signal, input));
+      },
+      async verifyEmailCode(input, signal) {
+        return parseAccountActionReceipt(await request("verifyCode", null, signal, input));
+      },
+      async requestPasswordReset(input, signal) {
+        return parseAccountActionReceipt(await request("forgotPassword", null, signal, input));
+      },
+      async resetPassword(input, signal) {
+        return parseAccountActionReceipt(await request("resetPassword", null, signal, input));
+      },
+    },
     async restore(signal) {
       const token = storage.getItem(API_TOKEN_KEY);
       if (!token) {

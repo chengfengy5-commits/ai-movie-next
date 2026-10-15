@@ -512,6 +512,7 @@ export function Workspace() {
   if (state.status === "anonymous") {
     return (
       <LoginPage
+        accountAccess={services.accountAccess}
         error={state.error}
         mode={services.mode}
         onSubmit={login}

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { AdminFeature } from "../features/admin/AdminFeature";
 import { ApiConfigurationError, resolveApiBaseUrl } from "../shared/api/config";
 import { AuthProvider } from "../features/auth/AuthProvider";
+import { ResetPasswordPage } from "../features/auth/ResetPasswordPage";
 import { Workspace } from "./Workspace";
 import {
   createServicesFromEnvironment,
@@ -10,6 +11,7 @@ import {
 
 interface AppProps {
   services?: WorkspaceServices;
+  resetPasswordTokenHolder?: { current: string | null };
 }
 
 type ServiceInitialization =
@@ -56,9 +58,28 @@ function AdminApiRequired() {
   );
 }
 
-export function App({ services: providedServices }: AppProps) {
+export function App({ services: providedServices, resetPasswordTokenHolder }: AppProps) {
   const [initialized] = useState(initializeServices);
   const services = providedServices ?? initialized.services;
+
+  if (window.location.pathname === "/reset-password.html") {
+    return (
+      <ResetPasswordPage
+        accountAccess={services?.accountAccess}
+        serviceUnavailableMessage={services === null
+          ? initialized.error ?? "本地 API 服务配置不可用，请检查运行环境后重试。"
+          : services.mode === "demo"
+            ? "当前演示模式不连接密码重置服务。请在配置了本地 API 的环境中重新打开重置链接。"
+            : "当前 API 服务未提供密码重置能力，请检查本地服务版本。"}
+        onTokenConsumed={() => {
+          if (resetPasswordTokenHolder !== undefined) {
+            resetPasswordTokenHolder.current = null;
+          }
+        }}
+        token={resetPasswordTokenHolder?.current ?? null}
+      />
+    );
+  }
 
   if (isAdminPath(window.location.pathname)) {
     const apiBaseUrl = resolveAdminApiBaseUrl(services);

@@ -114,6 +114,12 @@ a:focus-visible {
   line-height: 1.2;
 }
 
+.login-intro h1:focus {
+  outline: 2px solid rgba(34, 155, 137, 0.45);
+  outline-offset: 6px;
+  border-radius: 3px;
+}
+
 .login-intro > p:last-child {
   margin: 11px 0 0;
   color: var(--muted);
@@ -237,6 +243,85 @@ a:focus-visible {
   color: var(--danger);
   font-size: 12px;
   line-height: 1.55;
+}
+
+.form-success,
+.account-access-note {
+  margin: 4px 0 0;
+  padding: 10px 12px;
+  border: 1px solid #d7e8e2;
+  border-radius: 8px;
+  color: #37665f;
+  background: #f5faf8;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.form-success {
+  margin-top: 11px;
+}
+
+.account-access-note {
+  margin-top: 18px;
+  color: #5c6870;
+  border-color: #e5e9eb;
+  background: #f8fafb;
+}
+
+.account-entry-links {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  margin-top: 17px;
+}
+
+.account-entry-links button,
+.account-back-link {
+  border: 0;
+  padding: 5px 0;
+  color: var(--teal-deep);
+  background: transparent;
+  font-size: 12px;
+  font-weight: 650;
+  text-decoration: none;
+}
+
+.account-entry-links button:disabled {
+  cursor: wait;
+  opacity: 0.6;
+}
+
+.account-back-link {
+  display: inline-flex;
+  margin-top: 19px;
+}
+
+.account-access-panel .login-form {
+  margin-top: 15px;
+}
+
+.account-code-button {
+  width: 100%;
+  margin-top: 3px;
+}
+
+.account-code-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 76px;
+  align-items: center;
+  gap: 8px;
+}
+
+.account-code-row .secondary-button {
+  min-width: 76px;
+}
+
+.login-form .account-field-hint {
+  margin: -5px 0 1px;
+  color: #7e8a8d;
+  font-size: 11px;
+  line-height: 1.45;
 }
 
 .login-footnote {
