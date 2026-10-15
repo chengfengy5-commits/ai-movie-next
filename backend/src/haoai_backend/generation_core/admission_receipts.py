@@ -40,6 +40,10 @@ from haoai_backend.generation_core.base_schema import (
 AdmissionWireReceipt: TypeAlias = SingleAdmissionReceipt | BatchImageReceipt
 _PRODUCER_MODULE = "haoai_backend.generation_credentials.snapshot_producer"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
+_LEGACY_STEP_SNAPSHOT_KEYS = frozenset(
+    {"server_attempt_id", "prepared_payload_id", "protected_ref", "snapshot_digest"}
+)
+_CURRENT_STEP_SNAPSHOT_KEYS = _LEGACY_STEP_SNAPSHOT_KEYS | {"ordered_manifest_digest"}
 _SUPPORTED_GRAPH_VERSIONS = {
     "image.single": "image-single-v1",
     "video.single": "video-single-v1",
@@ -289,6 +293,11 @@ def _lookup(
         or not _DIGEST.fullmatch(request_digest)
     ):
         return _refusal("receipt_unverified", "准入回执查找范围无效")
+    expected_manifest_digest = (
+        _expected_manifest_digest(expected) if expected is not None else None
+    )
+    if expected is not None and expected_manifest_digest is None:
+        return _refusal("receipt_unverified", "准入 producer 的 manifest 摘要无法核实")
 
     submission_table = TaskSubmissionRow.__table__
     task_table = AITaskRow.__table__
@@ -373,6 +382,8 @@ def _lookup(
             task_types: set[str] = set()
             seen_child_attempt_ids: set[str] = set()
             seen_prepared_payload_ids: set[str] = set()
+            step_snapshot_formats: set[str] = set()
+            persisted_manifest_digests: set[str] = set()
             graph_version = expected.graph_version if expected is not None else None
             for position, task_id in enumerate(task_ids):
                 task = task_by_id[task_id]
@@ -604,14 +615,37 @@ def _lookup(
                     or step["input_digest"] != request_data["request_digest"]
                     or step["input_digest"] != request_digest
                     or not isinstance(snapshot, dict)
-                    or set(snapshot)
-                    != {"server_attempt_id", "prepared_payload_id", "protected_ref", "snapshot_digest"}
+                    or (
+                        set(snapshot) != _CURRENT_STEP_SNAPSHOT_KEYS
+                        if expected is not None
+                        else set(snapshot)
+                        not in {_LEGACY_STEP_SNAPSHOT_KEYS, _CURRENT_STEP_SNAPSHOT_KEYS}
+                    )
                     or snapshot.get("server_attempt_id") != request_data["server_attempt_id"]
                     or snapshot.get("prepared_payload_id") != request_data["prepared_payload_id"]
                     or snapshot.get("protected_ref") != request_data["protected_ref"]
                     or snapshot.get("snapshot_digest") != request_data["snapshot_digest"]
+                    or (
+                        expected is not None
+                        and snapshot.get("ordered_manifest_digest") != expected_manifest_digest
+                    )
+                    or (
+                        "ordered_manifest_digest" in snapshot
+                        and (
+                            not isinstance(snapshot.get("ordered_manifest_digest"), str)
+                            or not _DIGEST.fullmatch(snapshot["ordered_manifest_digest"])
+                        )
+                    )
                 ):
                     return _refusal("receipt_unverified", "受保护输入与执行步骤关联无效")
+                snapshot_format = (
+                    "current"
+                    if "ordered_manifest_digest" in snapshot
+                    else "legacy"
+                )
+                step_snapshot_formats.add(snapshot_format)
+                if snapshot_format == "current":
+                    persisted_manifest_digests.add(snapshot["ordered_manifest_digest"])
 
                 task_message_id = task["message_id"] or None
                 if operation == "image.batch":
@@ -631,6 +665,8 @@ def _lookup(
                 ordered_unit_ids.append(unit["id"])
                 decoded_data[task_id] = request_data
 
+            if len(step_snapshot_formats) != 1 or len(persisted_manifest_digests) > 1:
+                return _refusal("receipt_unverified", "原始任务 manifest 摘要集合不一致")
             if graph_version != _SUPPORTED_GRAPH_VERSIONS[operation]:
                 return _refusal("receipt_unverified", "原始任务图版本不属于已支持的冻结版本")
             if len(task_types) != 1:
@@ -811,6 +847,19 @@ def _credit_log_columns(log_table: object) -> tuple[object, ...]:
     )
 
 
+def _expected_manifest_digest(expected: AdmissionStaged) -> str | None:
+    try:
+        module = expected.producer_binding._module
+        staged = expected.producer_staged_result
+        staged_type = getattr(module, "SnapshotPayloadsStaged")
+        if type(staged) is not staged_type:
+            return None
+        digest = staged.manifest_digest
+        return digest if isinstance(digest, str) and _DIGEST.fullmatch(digest) else None
+    except Exception:
+        return None
+
+
 def _verify_staged_payloads(session: Session, expected: AdmissionStaged) -> bool:
     """Verify the exact producer result after the durable SQL graph checks."""
 
@@ -837,6 +886,8 @@ def _verify_staged_payloads(session: Session, expected: AdmissionStaged) -> bool
             or staged_result.actor_id != expected.owner_id
             or staged_result.operation != expected.operation
             or staged_result.graph_version != expected.graph_version
+            or not isinstance(staged_result.manifest_digest, str)
+            or not _DIGEST.fullmatch(staged_result.manifest_digest)
             or fingerprint.operation != expected.operation
             or fingerprint.actor_id != expected.owner_id
             or fingerprint.ordered_nonsecret_payload_digest != expected.request_digest

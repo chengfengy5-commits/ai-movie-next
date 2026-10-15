@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import importlib
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, fields, is_dataclass
 from datetime import datetime, timezone
@@ -64,6 +65,7 @@ from haoai_backend.generation_runtime.registry import operation_policy
 
 
 _PRODUCER_MODULE = "haoai_backend.generation_credentials.snapshot_producer"
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _SUPPORTED_OPERATIONS = frozenset({"image.single", "video.single", "image.batch"})
 _SUPPORTED_GRAPH_VERSIONS = {
     "image.single": "image-single-v1",
@@ -298,6 +300,9 @@ def _build_graph_and_rows(
     raw_key: str,
     now: datetime,
 ) -> AdmissionStageResult:
+    manifest_digest = getattr(staged_result, "manifest_digest", None)
+    if not isinstance(manifest_digest, str) or not _DIGEST.fullmatch(manifest_digest):
+        return _stage_refusal("receipt_unverified", "准入 producer 的 manifest 摘要无效", abort=True)
     actor_id = staged_result.actor_id
     parent_attempt_id = staged_result.parent_attempt_id
     preparation = staged_result.preparation
@@ -573,6 +578,7 @@ def _build_graph_and_rows(
                     "prepared_payload_id": item.prepared_payload_id,
                     "protected_ref": item.protected_ref,
                     "snapshot_digest": "",
+                    "ordered_manifest_digest": manifest_digest,
                 },
                 "required": True,
                 "step_order": 0,

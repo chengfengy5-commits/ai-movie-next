@@ -365,6 +365,46 @@ def _staging_database() -> tuple[Session, object]:
     return Session(engine), engine
 
 
+def test_invalid_staged_manifest_digest_aborts_before_graph_or_fee_writes() -> None:
+    session, engine = _staging_database()
+    try:
+        with session.begin():
+            session.execute(insert(UserRow.__table__), [{"id": "owner-1"}])
+            session.execute(
+                insert(chapters), [{"id": "chapter-1", "series_id": "series-1"}]
+            )
+            session.execute(
+                insert(UserCreditRow.__table__),
+                [{"id": "wallet-1", "user_id": "owner-1", "credits": 20}],
+            )
+            binding, producer, staged_result = _successful_staging_binding(
+                session, "image.single", (3,), ModelSource.SYSTEM
+            )
+            producer.result = replace(staged_result, manifest_digest="bad-digest")
+
+            result = prepare_and_stage(
+                binding,
+                session,
+                authorization="server-auth-context",
+                operation="image.single",
+                raw_key="bad-manifest-key",
+                request={"prompt": "server-owned request"},
+            )
+
+            assert isinstance(result, AdmissionStageRefusal)
+            assert result.code == "receipt_unverified"
+            assert result.caller_must_abort is True
+            assert session.execute(select(TaskSubmissionRow.__table__.c.id)).all() == []
+            assert session.execute(select(AITaskRow.__table__.c.id)).all() == []
+            assert session.execute(select(BillingUnitRow.__table__.c.id)).all() == []
+            assert session.execute(select(ExecutionStepRow.__table__.c.id)).all() == []
+            assert session.execute(select(CreditLogRow.__table__.c.id)).all() == []
+        assert session.execute(select(UserCreditRow.__table__.c.credits)).scalar_one() == 20
+    finally:
+        session.close()
+        engine.dispose()
+
+
 def test_missing_real_producer_fails_closed_without_a_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     def missing_module(_: str) -> object:
         raise ModuleNotFoundError("producer module is not installed")
@@ -1619,6 +1659,10 @@ def _assert_joint_graph_and_fees(
         assert unit["quoted_amount"] == quote
         assert unit["billing_status"] == ("charged" if quote else "no_charge")
         assert step["input_digest"] == request_data["request_digest"]
+        assert step["input_snapshot"]["ordered_manifest_digest"] == (
+            staged.producer_staged_result.manifest_digest
+        )
+        assert "ordered_manifest_digest" not in request_data
         if staged.operation == AdmissionOperation.IMAGE_BATCH.value:
             assert request_data["chapter_id"] == "joint-chapter-1"
             assert request_data["asset_id"] == (

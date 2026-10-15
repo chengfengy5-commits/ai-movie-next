@@ -431,6 +431,7 @@ def _seed_batch(
                     "prepared_payload_id": payload_id,
                     "protected_ref": payload_ref,
                     "snapshot_digest": snapshot_digest,
+                    "ordered_manifest_digest": "e" * 64,
                 },
                 "required": True,
                 "step_order": 0,
@@ -609,6 +610,7 @@ def _seed_two_item_batch(session: Session) -> AdmissionStaged:
         "prepared_payload_id": "payload-B",
         "protected_ref": "prepared-payload-v1/9:payload-B",
         "snapshot_digest": "c" * 64,
+        "ordered_manifest_digest": "e" * 64,
     }
     messages = session.execute(
         select(message_table).where(
@@ -762,6 +764,136 @@ def test_independent_lookup_replays_original_order_and_asset_name() -> None:
         assert result.receipt.tasks[0].asset_name == "original asset name"
         assert result.receipt.tasks[0].asset_id == "asset-1"
         assert result.receipt.tasks[0].message_id == "message-assistant-1"
+    finally:
+        reader.close()
+        writer.close()
+        engine.dispose()
+
+
+def test_new_admission_requires_exact_manifest_digest_but_original_replay_accepts_legacy() -> None:
+    writer, engine = _database()
+    reader = Session(engine)
+    try:
+        staged = _seed_batch(writer, quote=3)
+        step_table = ExecutionStepRow.__table__
+        legacy_snapshot = dict(
+            writer.execute(
+                select(step_table.c.input_snapshot).where(step_table.c.id == "step-1")
+            ).scalar_one()
+        )
+        legacy_snapshot.pop("ordered_manifest_digest")
+        writer.execute(
+            update(step_table)
+            .where(step_table.c.id == "step-1")
+            .values(input_snapshot=legacy_snapshot)
+        )
+        writer.commit()
+
+        confirmed = verify_original_replay(
+            reader,
+            owner_id=staged.owner_id,
+            operation=staged.operation,
+            raw_key=staged.raw_key,
+            request_digest=staged.request_digest,
+        )
+        assert isinstance(confirmed, AdmissionConfirmed)
+
+        # The same legacy row can still replay its original receipt, but cannot
+        # confirm a newly staged write as an executable snapshot.
+        writer.rollback()
+        writer.execute(
+            update(step_table)
+            .where(step_table.c.id == "step-1")
+            .values(input_snapshot={
+                **legacy_snapshot,
+                "ordered_manifest_digest": "f" * 64,
+            })
+        )
+        writer.commit()
+        rejected = lookup_staged_admission(reader, staged)
+        assert not isinstance(rejected, AdmissionConfirmed)
+        assert rejected.code == "receipt_unverified"
+    finally:
+        reader.close()
+        writer.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ("missing", "invalid_type", "invalid_length", "unknown_key"),
+)
+def test_new_admission_requires_well_formed_exact_manifest_digest(mutation: str) -> None:
+    writer, engine = _database()
+    reader = Session(engine)
+    try:
+        staged = _seed_batch(writer, quote=3)
+        step_table = ExecutionStepRow.__table__
+        snapshot = dict(
+            writer.execute(
+                select(step_table.c.input_snapshot).where(step_table.c.id == "step-1")
+            ).scalar_one()
+        )
+        if mutation == "missing":
+            snapshot.pop("ordered_manifest_digest")
+        elif mutation == "invalid_type":
+            snapshot["ordered_manifest_digest"] = 17
+        elif mutation == "invalid_length":
+            snapshot["ordered_manifest_digest"] = "e" * 63
+        else:
+            snapshot["unrecognized"] = "extra"
+        writer.execute(
+            update(step_table)
+            .where(step_table.c.id == "step-1")
+            .values(input_snapshot=snapshot)
+        )
+        writer.commit()
+
+        result = lookup_staged_admission(reader, staged)
+
+        assert not isinstance(result, AdmissionConfirmed)
+        assert result.code == "receipt_unverified"
+    finally:
+        reader.close()
+        writer.close()
+        engine.dispose()
+
+
+@pytest.mark.parametrize("mutation", ("mixed_legacy", "different_valid_digest"))
+def test_original_batch_replay_rejects_mixed_or_conflicting_manifest_digests(
+    mutation: str,
+) -> None:
+    writer, engine = _database()
+    reader = Session(engine)
+    try:
+        staged = _seed_two_item_batch(writer)
+        step_table = ExecutionStepRow.__table__
+        snapshot = dict(
+            writer.execute(
+                select(step_table.c.input_snapshot).where(step_table.c.id == "step-2")
+            ).scalar_one()
+        )
+        if mutation == "mixed_legacy":
+            snapshot.pop("ordered_manifest_digest")
+        else:
+            snapshot["ordered_manifest_digest"] = "f" * 64
+        writer.execute(
+            update(step_table)
+            .where(step_table.c.id == "step-2")
+            .values(input_snapshot=snapshot)
+        )
+        writer.commit()
+
+        result = verify_original_replay(
+            reader,
+            owner_id=staged.owner_id,
+            operation=staged.operation,
+            raw_key=staged.raw_key,
+            request_digest=staged.request_digest,
+        )
+
+        assert not isinstance(result, AdmissionConfirmed)
+        assert result.code == "receipt_unverified"
     finally:
         reader.close()
         writer.close()
