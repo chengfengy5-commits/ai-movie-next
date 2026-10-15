@@ -107,6 +107,7 @@ interface FrameTextEditorContext {
 interface FrameEditingInvalidationOptions {
   deferLockRelease?: boolean;
   updateState?: boolean;
+  refreshLockSnapshot?: boolean;
 }
 
 type NavigationIssue = "missing" | "duplicate" | "foreign" | "frame";
@@ -301,6 +302,15 @@ function chapterEditLockIdentity(lock: ChapterEditLockState): FrameTextEditorCon
   return { acquiredAt: lock.acquired_at, userId: lock.user_id };
 }
 
+function chapterLockSnapshot(lock: ChapterEditLockState): Record<string, unknown> | null {
+  if (!lock.locked) return null;
+  const snapshot: Record<string, unknown> = { locked: true };
+  if (lock.username !== undefined) snapshot.locked_by_username = lock.username;
+  if (lock.is_mine !== undefined) snapshot.is_mine = lock.is_mine;
+  if (lock.expires_at !== undefined) snapshot.expires_at = lock.expires_at;
+  return snapshot;
+}
+
 function sameChapterEditLockIdentity(
   left: FrameTextEditorContext["lockIdentity"],
   lock: ChapterEditLockState,
@@ -475,6 +485,7 @@ export function ChapterBrowser({
   const roughCutContextRef = useRef<PersonalRoughCutContext | null>(personalRoughCutContext);
   roughCutContextRef.current = personalRoughCutContext;
   const roughCutOpenEpoch = useRef(0);
+  const frameEditWorkflowEpoch = useRef(0);
   const chapterRequestGeneration = useRef(0);
   const chapterMutationSelectionIntent = useRef<ChapterMutationSelectionIntent | null>(null);
   const assetRequestGeneration = useRef(0);
@@ -1544,10 +1555,36 @@ export function ChapterBrowser({
     setChapterOrderEditor(refreshed);
   }
 
-  async function releaseNewlyAcquiredChapterLock(owner: FrameTextEditorContext): Promise<void> {
+  async function releaseNewlyAcquiredChapterLock(
+    owner: FrameTextEditorContext,
+    options: { refreshLockSnapshot?: boolean } = {},
+  ): Promise<void> {
     if (!owner.newlyAcquiredLock || owner.lockLease === null
       || owner.scope.services.releaseChapterEditLock === undefined) return;
     const controller = new AbortController();
+    const directoryAtRelease = options.refreshLockSnapshot ? chapterDirectoryRef.current : null;
+    const workflowEpoch = frameEditWorkflowEpoch.current;
+    const canRefreshLockSnapshot = (): boolean => {
+      const directory = chapterDirectoryRef.current;
+      const matchingChapters = directory.chapters?.filter((chapter) => chapter.id === owner.chapter.id) ?? [];
+      return directoryAtRelease !== null
+        && sameChapterBrowserScope(directoryAtRelease.scope, owner.scope)
+        && directoryAtRelease.requestGeneration === owner.requestGeneration
+        && directory.chapters === directoryAtRelease.chapters
+        && directory.requestGeneration === directoryAtRelease.requestGeneration
+        && directory.requestGeneration === owner.requestGeneration
+        && chapterRequestGeneration.current === owner.requestGeneration
+        && sameChapterBrowserScope(directory.scope, owner.scope)
+        && sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+        && selectedChapterIdRef.current === owner.chapter.id
+        && matchingChapters.length === 1
+        && matchingChapters[0]?.series_id === owner.scope.seriesId
+        && frameEditWorkflowEpoch.current === workflowEpoch
+        && frameTextEditorRef.current === null
+        && frameEditOpeningController.current === null
+        && frameEditOpeningChapterIdRef.current === null
+        && chapterOrderEditorRef.current === null;
+    };
     try {
       await owner.scope.services.releaseChapterEditLock(owner.chapter.id, controller.signal, owner.lockLease);
     } catch (cause) {
@@ -1556,10 +1593,35 @@ export function ChapterBrowser({
         unauthorizedHandlerRef.current();
       }
       // Release is best-effort; a failed release must not hide the editing result.
+      return;
     }
+
+    const getChapterEditLock = owner.scope.services.getChapterEditLock;
+    if (getChapterEditLock === undefined || !canRefreshLockSnapshot()) return;
+    let currentLock: ChapterEditLockState;
+    try {
+      // The successful DELETE consumes the opaque lease, so this read is deliberately unleased.
+      currentLock = await getChapterEditLock(owner.chapter.id, controller.signal);
+    } catch (cause) {
+      if (normalizeApiError(cause).status === 401 && canRefreshLockSnapshot()) {
+        unauthorizedHandlerRef.current();
+      }
+      return;
+    }
+    if (!canRefreshLockSnapshot()) return;
+
+    const currentDirectory = chapterDirectoryRef.current;
+    const currentChapters = currentDirectory.chapters;
+    if (currentChapters === null) return;
+    const nextLock = chapterLockSnapshot(currentLock);
+    const nextChapters = currentChapters.map((chapter) => chapter.id === owner.chapter.id
+      ? { ...chapter, lock: nextLock }
+      : chapter);
+    applyFreshChapterDirectory(nextChapters, owner.scope);
   }
 
   function invalidateFrameEditingWorkflow(options: FrameEditingInvalidationOptions = {}): void {
+    frameEditWorkflowEpoch.current += 1;
     const openingController = frameEditOpeningController.current;
     frameEditOpeningController.current = null;
     frameEditOpeningChapterIdRef.current = null;
@@ -1573,7 +1635,9 @@ export function ChapterBrowser({
     const cleanupOwner = owner ?? pendingOwner;
     if (cleanupOwner?.newlyAcquiredLock) {
       if (options.deferLockRelease) pendingFrameLockReleaseRef.current = cleanupOwner;
-      else void releaseNewlyAcquiredChapterLock(cleanupOwner);
+      else void releaseNewlyAcquiredChapterLock(cleanupOwner, {
+        refreshLockSnapshot: options.refreshLockSnapshot === true && owner === cleanupOwner,
+      });
     }
 
     if (options.updateState !== false) {
@@ -1606,7 +1670,7 @@ export function ChapterBrowser({
   function closeFrameTextEditor(expected?: FrameTextEditorContext): void {
     const current = frameTextEditorRef.current;
     if (current === null || (expected !== undefined && current !== expected)) return;
-    invalidateFrameEditingWorkflow();
+    invalidateFrameEditingWorkflow({ refreshLockSnapshot: true });
   }
 
   function openChapterOrderEditor(): void {
@@ -1754,6 +1818,7 @@ export function ChapterBrowser({
       setChapterMutationNotice("当前镜头的文字结构无法识别，未打开编辑器。");
       return;
     }
+    frameEditWorkflowEpoch.current += 1;
     const controller = new AbortController();
     const base = {
       scope: currentScope,

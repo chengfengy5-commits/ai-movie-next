@@ -3529,4 +3529,210 @@ describe("read-only chapter browser", () => {
     expect(releaseChapterEditLock).toHaveBeenCalledWith(current.id, expect.any(AbortSignal), expect.any(Object));
   });
 
+  it("refreshes the chapter lock snapshot after saving text and releasing its new team lock", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-lock-refresh-success", "保存后刷新锁", [
+      { text: "保存前文字", storyboard: ["lock-refresh-asset"] },
+    ], {
+      lock: { locked: true, locked_by_username: "演示创作者", is_mine: true },
+    });
+    const { services, getChapterEditLock, releaseChapterEditLock, updateChapter } = makeServices(
+      [current], { [current.id]: [asset("lock-refresh-asset", current.id)] }, false, true,
+    );
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    getChapterEditLock
+      .mockResolvedValueOnce({ locked: false })
+      .mockResolvedValueOnce(ownedLock)
+      .mockResolvedValueOnce(ownedLock)
+      .mockResolvedValueOnce({ locked: false });
+    const teamSeries = { ...series, team_id: "team-lock-refresh" };
+    renderBrowser(services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByText(/你在其他位置持有编辑锁/);
+    const article = await screen.findByRole("article", { name: "保存后刷新锁 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = editor.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "已保存的新文字");
+    await user.click(editor.getByRole("button", { name: "保存文字" }));
+
+    await waitFor(() => expect(updateChapter).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(releaseChapterEditLock).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(/你在其他位置持有编辑锁/)).not.toBeInTheDocument());
+    expect(screen.getByText("已保存的新文字")).toBeInTheDocument();
+    const calls = getChapterEditLock.mock.calls;
+    expect(calls).toHaveLength(4);
+    expect(calls[3]).toHaveLength(2);
+    expect(calls[3]?.[0]).toBe(current.id);
+  });
+
+  it("shows a newer lock returned after release instead of clearing it", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-lock-refresh-new-owner", "释放后出现新锁", [
+      { text: "正文", storyboard: ["lock-refresh-new-owner-asset"] },
+    ], {
+      lock: { locked: true, locked_by_username: "演示创作者", is_mine: true },
+    });
+    const { services, getChapterEditLock } = makeServices(
+      [current], { [current.id]: [asset("lock-refresh-new-owner-asset", current.id)] }, false, true,
+    );
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    const newerLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "other-user",
+      username: "周编剧",
+      is_mine: false,
+      acquired_at: "2026-10-15T10:05:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    getChapterEditLock
+      .mockResolvedValueOnce({ locked: false })
+      .mockResolvedValueOnce(ownedLock)
+      .mockResolvedValueOnce(newerLock);
+    const teamSeries = { ...series, team_id: "team-lock-refresh-new-owner" };
+    renderBrowser(services, vi.fn(), vi.fn(), teamSeries);
+
+    const article = await screen.findByRole("article", { name: "释放后出现新锁 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    await user.click(screen.getByRole("button", { name: "关闭文字编辑" }));
+
+    expect(await screen.findByText(/当前由 周编剧 编辑/)).toBeInTheDocument();
+    expect(screen.queryByText(/你在其他位置持有编辑锁/)).not.toBeInTheDocument();
+  });
+
+  it.each(["release", "confirmation read"] as const)(
+    "keeps the chapter lock snapshot when %s fails after closing the editor",
+    async (failurePoint) => {
+      const user = userEvent.setup();
+      const current = chapter(`chapter-lock-refresh-failure-${failurePoint}`, "释放失败保留锁提示", [
+        { text: "原始文字", storyboard: ["lock-refresh-failure-asset"] },
+      ], {
+        lock: { locked: true, locked_by_username: "演示创作者", is_mine: true },
+      });
+      const { services, getChapterEditLock, releaseChapterEditLock } = makeServices(
+        [current], { [current.id]: [asset("lock-refresh-failure-asset", current.id)] }, false, true,
+      );
+      const ownedLock: ChapterEditLockState = {
+        locked: true,
+        user_id: "demo-user",
+        username: "演示创作者",
+        is_mine: true,
+        acquired_at: "2026-10-15T10:00:00Z",
+        expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+      };
+      getChapterEditLock
+        .mockResolvedValueOnce({ locked: false })
+        .mockResolvedValueOnce(ownedLock);
+      if (failurePoint === "release") {
+        releaseChapterEditLock.mockRejectedValueOnce(new ApiError("network", "release was not confirmed"));
+      } else {
+        getChapterEditLock.mockRejectedValueOnce(new ApiError("network", "lock state was not confirmed"));
+      }
+      const teamSeries = { ...series, team_id: `team-lock-refresh-${failurePoint}` };
+      renderBrowser(services, vi.fn(), vi.fn(), teamSeries);
+
+      await screen.findByText(/你在其他位置持有编辑锁/);
+      const article = await screen.findByRole("article", { name: "释放失败保留锁提示 · 镜头 1" });
+      await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+      await screen.findByRole("dialog", { name: "编辑分镜文字" });
+      await user.click(screen.getByRole("button", { name: "关闭文字编辑" }));
+
+      await waitFor(() => expect(releaseChapterEditLock).toHaveBeenCalledTimes(1));
+      if (failurePoint === "release") {
+        expect(getChapterEditLock).toHaveBeenCalledTimes(2);
+      } else {
+        await waitFor(() => expect(getChapterEditLock).toHaveBeenCalledTimes(3));
+      }
+      expect(screen.getByText(/你在其他位置持有编辑锁/)).toBeInTheDocument();
+    },
+  );
+
+  it("ignores a late released-lock snapshot while a new chapter editor is opening", async () => {
+    const user = userEvent.setup();
+    const first = chapter("chapter-lock-refresh-late-first", "迟到锁章节", [
+      { text: "迟到锁正文", storyboard: ["lock-refresh-late-first-asset"] },
+    ], {
+      lock: { locked: true, locked_by_username: "演示创作者", is_mine: true },
+    });
+    const second = chapter("chapter-lock-refresh-late-second", "新编辑章节", [
+      { text: "新编辑正文", storyboard: ["lock-refresh-late-second-asset"] },
+    ], { order: 2 });
+    const pendingReleaseRead = deferred<ChapterEditLockState>();
+    const pendingOpeningRead = deferred<ChapterEditLockState>();
+    const { services, getChapterEditLock } = makeServices([first, second], {
+      [first.id]: [asset("lock-refresh-late-first-asset", first.id)],
+      [second.id]: [asset("lock-refresh-late-second-asset", second.id)],
+    }, false, true);
+    const firstLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    const secondLock: ChapterEditLockState = {
+      ...firstLock,
+      acquired_at: "2026-10-15T10:05:00Z",
+    };
+    let firstUnlockedReads = 0;
+    getChapterEditLock.mockImplementation(async (chapterId, _signal, lease) => {
+      if (chapterId === first.id) {
+        if (lease !== undefined) return firstLock;
+        firstUnlockedReads += 1;
+        return firstUnlockedReads === 1 ? { locked: false } : pendingReleaseRead.promise;
+      }
+      if (chapterId === second.id) {
+        if (lease !== undefined) return secondLock;
+        return pendingOpeningRead.promise;
+      }
+      return { locked: false };
+    });
+    const teamSeries = { ...series, team_id: "team-lock-refresh-late" };
+    renderBrowser(services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByText(/你在其他位置持有编辑锁/);
+    await user.click(within(await screen.findByRole("article", { name: "迟到锁章节 · 镜头 1" }))
+      .getByRole("button", { name: "编辑文字" }));
+    await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    await user.click(screen.getByRole("button", { name: "关闭文字编辑" }));
+    await waitFor(() => expect(getChapterEditLock).toHaveBeenCalledTimes(3));
+
+    await user.click(screen.getByRole("button", { name: /新编辑章节/ }));
+    await screen.findByText("新编辑正文");
+    await user.click(within(await screen.findByRole("article", { name: "新编辑章节 · 镜头 1" }))
+      .getByRole("button", { name: "编辑文字" }));
+    await waitFor(() => expect(getChapterEditLock).toHaveBeenLastCalledWith(second.id, expect.any(AbortSignal)));
+
+    await act(async () => {
+      pendingReleaseRead.resolve({ locked: false });
+      await pendingReleaseRead.promise;
+    });
+    await user.click(screen.getByRole("button", { name: /迟到锁章节/ }));
+    await screen.findByText("迟到锁正文");
+    await act(async () => {
+      pendingOpeningRead.resolve({ locked: false });
+      await pendingOpeningRead.promise;
+    });
+
+    expect(screen.getByText(/你在其他位置持有编辑锁/)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument();
+  });
+
 });
