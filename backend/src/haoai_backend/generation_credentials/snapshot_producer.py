@@ -1465,22 +1465,34 @@ def _open_stored_payload(
     return crypto.open_secret(material, associated_data)
 
 
-def _stored_payload_associated_data(
+def canonical_payload_json(value: object) -> bytes:
+    """Return the exact canonical encoding used by protected payload proofs."""
+
+    return _canonical_json(value)
+
+
+def stored_payload_associated_data(
     row: Mapping[str, object],
-    item: SnapshotPayloadItem,
-    expected: SnapshotPayloadsStaged,
+    *,
+    parent_attempt_id: str,
+    protected_ref: str,
+    item_index: int,
+    ordered_count: int,
+    ordered_manifest_digest: str,
 ) -> bytes:
+    """Build the producer's frozen AEAD AAD for a durable payload row."""
+
     return _canonical_json(
         {
             "purpose": _PROTECTED_INPUT_PURPOSE,
             "actor_id": row["actor_id"],
             "operation": row["operation"],
-            "parent_attempt_id": expected.parent_attempt_id,
-            "protected_ref": item.protected_ref,
+            "parent_attempt_id": parent_attempt_id,
+            "protected_ref": protected_ref,
             "child_attempt_id": row["server_attempt_id"],
-            "item_index": item.index,
-            "ordered_count": len(expected.items),
-            "ordered_manifest_digest": expected.manifest_digest,
+            "item_index": item_index,
+            "ordered_count": ordered_count,
+            "ordered_manifest_digest": ordered_manifest_digest,
             "command_proof": row["command_proof"],
             "fingerprint": row["context_fingerprint"],
             "scope": {
@@ -1499,6 +1511,21 @@ def _stored_payload_associated_data(
             "model_ref": row["model_ref"],
             "grant_ref": row["grant_ref"],
         }
+    )
+
+
+def _stored_payload_associated_data(
+    row: Mapping[str, object],
+    item: SnapshotPayloadItem,
+    expected: SnapshotPayloadsStaged,
+) -> bytes:
+    return stored_payload_associated_data(
+        row,
+        parent_attempt_id=expected.parent_attempt_id,
+        protected_ref=item.protected_ref,
+        item_index=item.index,
+        ordered_count=len(expected.items),
+        ordered_manifest_digest=expected.manifest_digest,
     )
 
 
