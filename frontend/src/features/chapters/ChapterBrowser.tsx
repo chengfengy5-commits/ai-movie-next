@@ -29,6 +29,7 @@ import { resolveProductionNoteFrameTarget } from "./productionNoteFrameNavigatio
 import { ChapterManagementDialog, type ChapterManagementAction } from "./ChapterManagementDialog";
 import { ChapterOrderDialog } from "./ChapterOrderDialog";
 import { FrameTextEditor, type FrameTextSaveResult } from "./FrameTextEditor";
+import { StoryboardGenerationDialog } from "../storyboard-generation/StoryboardGenerationDialog";
 import {
   buildChapterReorderInput,
   inspectStoryboardReferences,
@@ -64,6 +65,10 @@ interface ChapterBrowserScope {
   userId: string;
   services: WorkspaceServices;
   seriesId: string;
+}
+
+interface StoryboardGenerationDialogOwner {
+  scope: ChapterBrowserScope;
 }
 
 interface ChapterDirectorySnapshot {
@@ -446,6 +451,7 @@ export function ChapterBrowser({
   const [chaptersLoading, setChaptersLoading] = useState(true);
   const [chaptersError, setChaptersError] = useState<ApiError | null>(null);
   const [chapterManagement, setChapterManagement] = useState<ChapterManagementRequest | null>(null);
+  const [storyboardGenerationDialog, setStoryboardGenerationDialog] = useState<StoryboardGenerationDialogOwner | null>(null);
   const [chapterOrderEditor, setChapterOrderEditor] = useState<ChapterOrderEditorContext | null>(null);
   const chapterOrderEditorRef = useRef<ChapterOrderEditorContext | null>(null);
   chapterOrderEditorRef.current = chapterOrderEditor;
@@ -535,6 +541,7 @@ export function ChapterBrowser({
     setChaptersLoading(true);
     setChaptersError(null);
     setChapterManagement(null);
+    setStoryboardGenerationDialog(null);
     chapterOrderEditorRef.current = null;
     setChapterOrderEditor(null);
     invalidateFrameEditingWorkflow({ deferLockRelease: true });
@@ -2059,13 +2066,21 @@ export function ChapterBrowser({
   const selectedIndex = chapters?.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
   const chapterManagementBlocked = chapterPanelsOpen
-    || chapterOrderEditor !== null || frameTextEditor !== null || frameEditOpening;
+    || chapterOrderEditor !== null || frameTextEditor !== null || frameEditOpening
+    || storyboardGenerationDialog !== null;
   const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
   const canReorderChapters = series.can_enter && services.reorderChapters !== undefined;
   const canManageChapters = series.can_enter
     && services.createChapter !== undefined
     && services.updateChapter !== undefined
     && services.deleteChapter !== undefined;
+
+  function openStoryboardGeneration(): void {
+    if (!canManageChapters || services.storyboardGeneration === undefined
+      || chapterManagementBlocked || chapterManagement !== null
+      || chaptersLoading || chaptersError !== null || chapters === null) return;
+    setStoryboardGenerationDialog({ scope: currentScope });
+  }
 
   function openChapterManagement(action: ChapterManagementAction, chapter: Chapter | null = null): void {
     if (!canManageChapters || chapterManagementBlocked || chaptersLoading || chapters === null || chaptersError !== null) {
@@ -2351,6 +2366,15 @@ export function ChapterBrowser({
                   title={chapterManagementBlocked ? "请先关闭当前制作记录或原图引用面板" : undefined}
                   type="button"
                 >新建章节</button>
+              )}
+              {canManageChapters && services.storyboardGeneration !== undefined && (
+                <button
+                  className="secondary-button chapter-ai-generation-button"
+                  disabled={chaptersLoading || chaptersError !== null || chapterManagementBlocked || chapterManagement !== null}
+                  onClick={openStoryboardGeneration}
+                  title={chapterManagementBlocked ? "请先关闭当前制作记录、镜头编辑或章节管理窗口" : undefined}
+                  type="button"
+                >AI 生成分镜</button>
               )}
             </div>
           </div>
@@ -2841,6 +2865,34 @@ export function ChapterBrowser({
           onConfirm={(title, signal) => confirmChapterManagement(chapterManagement, title, signal)}
           onVerify={(signal) => verifyChapterManagement(chapterManagement, signal)}
           {...(chapterManagement.chapter === null ? {} : { chapter: chapterManagement.chapter })}
+        />
+      )}
+      {storyboardGenerationDialog !== null
+        && sameChapterBrowserScope(storyboardGenerationDialog.scope, currentScope) && (
+        <StoryboardGenerationDialog
+          key={`${storyboardGenerationDialog.scope.userId}:${storyboardGenerationDialog.scope.seriesId}`}
+          onClose={() => setStoryboardGenerationDialog((current) => (
+            current !== null && sameChapterBrowserScope(current.scope, storyboardGenerationDialog.scope)
+              ? null
+              : current
+          ))}
+          onCreated={(chapter) => {
+            if (!sameChapterBrowserScope(storyboardGenerationDialog.scope, activeScopeRef.current)
+              || chapter.series_id !== storyboardGenerationDialog.scope.seriesId) return;
+            setStoryboardGenerationDialog(null);
+            assetCache.current.delete(chapter.id);
+            requestChapterDirectoryReload({
+              scope: storyboardGenerationDialog.scope,
+              chapterId: chapter.id,
+              fallbackIndex: Math.max(selectedIndex, 0),
+              message: `《${chapter.title}》已创建`,
+            });
+          }}
+          onUnauthorized={onUnauthorized}
+          seriesId={storyboardGenerationDialog.scope.seriesId}
+          seriesName={series.name}
+          services={storyboardGenerationDialog.scope.services}
+          userId={storyboardGenerationDialog.scope.userId}
         />
       )}
     </section>

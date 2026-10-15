@@ -1079,4 +1079,28 @@ describe("SeriesPage list behavior", () => {
     expect(props.onUnauthorized).not.toHaveBeenCalled();
   });
 
+  it("shows JSON import and per-series export when the exchange service port is available", async () => {
+    const user = userEvent.setup();
+    const row = { ...demoSeries[0]!, id: "exchange-series", name: "可交换剧集", can_enter: true };
+    const exportSeries = vi.fn(async () => ({ version: 1, chapters: [] }));
+    const importSeries = vi.fn(async () => ({ id: "imported", name: "导入剧集", message: "ok" }));
+    const service = Object.assign(servicesWithSeriesManagement([row]), { exportSeries, importSeries });
+    render(
+      <SeriesPage
+        active={true}
+        services={service}
+        userId={currentUserId}
+        onUnauthorized={vi.fn()}
+        onViewChapters={() => undefined}
+        onViewAssets={() => undefined}
+      />,
+    );
+
+    const card = await screen.findByRole("article");
+    expect(screen.getByRole("button", { name: "导入剧集 / 章节" })).toBeInTheDocument();
+    expect(within(card).getByRole("button", { name: "导出剧集 JSON：可交换剧集" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "导入剧集 / 章节" }));
+    expect(screen.getByRole("dialog", { name: "导入剧集或章节" })).toBeInTheDocument();
+  });
+
 });

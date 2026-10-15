@@ -2,11 +2,13 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { ApiError } from "../../shared/api/errors";
 import type { Series, SeriesFilter } from "../../shared/api/contracts";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import type { SeriesExchangePort } from "../../shared/api/seriesExchange";
 import type { MyTeam } from "../../shared/api/teams";
 import { filterSeries, SERIES_PAGE_SIZE, seriesFilters } from "./seriesFilters";
 import { SeriesCard } from "./SeriesCard";
 import { SeriesDeleteDialog } from "./SeriesDeleteDialog";
 import { SeriesEditorDialog } from "./SeriesEditorDialog";
+import { SeriesExchangeDialog } from "../series-exchange/SeriesExchangeDialog";
 import "./SeriesManagement.css";
 
 interface SeriesPageProps {
@@ -17,6 +19,7 @@ interface SeriesPageProps {
   onViewChapters(series: Series): void;
   onViewAssets(series: Series): void;
   isSuperuser?: boolean;
+  onImported?(result: { seriesId: string; name: string; chapterIds: string[]; kind: "json" | "markdown" }): void;
 }
 
 type TeamDirectoryStatus = "idle" | "loading" | "ready" | "error";
@@ -119,6 +122,7 @@ export function SeriesPage({
   onViewChapters,
   onViewAssets,
   isSuperuser = false,
+  onImported,
 }: SeriesPageProps) {
   const [series, setSeries] = useState<Awaited<ReturnType<WorkspaceServices["listSeries"]>>>([]);
   const [seriesScope, setSeriesScope] = useState({ userId, services });
@@ -139,6 +143,19 @@ export function SeriesPage({
   const [editor, setEditor] = useState<{ mode: "create" | "edit"; series?: Series } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Series | null>(null);
   const [mutationNotice, setMutationNotice] = useState<string | null>(null);
+  const [exchangeDialogOpen, setExchangeDialogOpen] = useState(false);
+
+  const exchangeServiceMethods = services as WorkspaceServices & Partial<SeriesExchangePort>;
+  const exchangePort = useMemo<SeriesExchangePort | undefined>(() => {
+    if (typeof exchangeServiceMethods.exportSeries !== "function"
+      || typeof exchangeServiceMethods.importSeries !== "function") {
+      return undefined;
+    }
+    return {
+      exportSeries: (seriesId, signal) => exchangeServiceMethods.exportSeries!(seriesId, signal),
+      importSeries: (input, signal) => exchangeServiceMethods.importSeries!(input, signal),
+    };
+  }, [exchangeServiceMethods]);
 
   const identityRef = useRef({ userId, services });
   const requestGeneration = useRef(0);
@@ -258,6 +275,9 @@ export function SeriesPage({
     if (!active || identityChanged) {
       setEditor(null);
       setDeleteTarget(null);
+      if (identityChanged) {
+        setExchangeDialogOpen(false);
+      }
     }
     if (identityChanged) {
       setMutationNotice(null);
@@ -401,19 +421,31 @@ export function SeriesPage({
           <h1 id="series-heading">我的剧集</h1>
           <p>管理个人剧集信息，查看团队共享与认领内容。</p>
         </div>
-        {services.createSeries !== undefined
-          && (visibleLoading || visibleError !== null || visibleSeries.length > 0) && (
+        {((services.createSeries !== undefined
+          && (visibleLoading || visibleError !== null || visibleSeries.length > 0)) || exchangePort !== undefined) && (
           <div className="series-heading-actions">
-            <button
-              className="primary-button series-create-button"
-              onClick={() => {
-                setMutationNotice(null);
-                setEditor({ mode: "create" });
-              }}
-              type="button"
-            >
-              创建剧集
-            </button>
+            {exchangePort !== undefined && (
+              <button
+                className="secondary-button"
+                onClick={() => setExchangeDialogOpen(true)}
+                type="button"
+              >
+                导入剧集 / 章节
+              </button>
+            )}
+            {services.createSeries !== undefined
+              && (visibleLoading || visibleError !== null || visibleSeries.length > 0) && (
+              <button
+                className="primary-button series-create-button"
+                onClick={() => {
+                  setMutationNotice(null);
+                  setEditor({ mode: "create" });
+                }}
+                type="button"
+              >
+                创建剧集
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -576,6 +608,7 @@ export function SeriesPage({
                   key={item.id}
                   onViewAssets={onViewAssets}
                   onViewChapters={onViewChapters}
+                  {...(exchangePort === undefined ? {} : { exchangePort })}
                   {...(onEdit === undefined ? {} : { onEdit })}
                   {...(onDelete === undefined ? {} : { onDelete })}
                   series={item}
@@ -633,6 +666,25 @@ export function SeriesPage({
           }}
           onUnauthorized={onUnauthorized}
           series={deleteTarget}
+          services={services}
+          userId={userId}
+        />
+      )}
+      {exchangePort !== undefined && (
+        <SeriesExchangeDialog
+          active={active}
+          onClose={() => setExchangeDialogOpen(false)}
+          onImported={(result) => {
+            if (result.kind === "json" || result.chapterIds.length === 0) {
+              setMutationNotice(`已导入《${result.name}》，正在刷新剧集列表。`);
+              setReloadKey((key) => key + 1);
+            }
+            onImported?.(result);
+          }}
+          onUnauthorized={onUnauthorized}
+          open={exchangeDialogOpen}
+          port={exchangePort}
+          series={seriesMatchesScope ? visibleSeries : []}
           services={services}
           userId={userId}
         />

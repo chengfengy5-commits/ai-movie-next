@@ -1,6 +1,8 @@
 import { useState } from "react";
 import { isSafeCoverUrl } from "../../shared/api/config";
 import type { Series } from "../../shared/api/contracts";
+import type { SeriesExchangePort } from "../../shared/api/seriesExchange";
+import { SeriesExportButton } from "../series-exchange/SeriesExportButton";
 
 interface SeriesCardProps {
   series: Series;
@@ -10,6 +12,7 @@ interface SeriesCardProps {
   onViewAssets(series: Series): void;
   onEdit?(series: Series): void;
   onDelete?(series: Series): void;
+  exchangePort?: SeriesExchangePort;
 }
 
 function formatDateTime(value: string): string {
@@ -30,6 +33,7 @@ export function SeriesCard({
   onViewAssets,
   onEdit,
   onDelete,
+  exchangePort,
 }: SeriesCardProps) {
   const [imageFailed, setImageFailed] = useState(false);
   const coverUrl = apiBaseUrl === null ? null : isSafeCoverUrl(series.image_url, apiBaseUrl);
@@ -113,6 +117,13 @@ export function SeriesCard({
                 >
                   只读查看素材库 <span aria-hidden="true">→</span>
                 </button>
+                {exchangePort !== undefined && (
+                  <SeriesExportButton
+                    port={exchangePort}
+                    seriesId={series.id}
+                    seriesName={series.name}
+                  />
+                )}
               </>
             )}
             {series.can_enter && onEdit !== undefined && (

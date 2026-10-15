@@ -11,6 +11,7 @@ import {
   type PersonalProductionSnapshot,
 } from "../../shared/api/personalProductionNotes";
 import type { WorkspaceServices } from "../../shared/api/services";
+import type { StoryboardGenerationServicePort } from "../storyboard-generation/contracts";
 import { digestPersonalProductionMediaIdentity } from "./personal-production/mediaIdentity";
 import { demoSeries } from "../series/demoSeries";
 import { ChapterBrowser, type ChapterNavigationIntent } from "./ChapterBrowser";
@@ -2802,6 +2803,27 @@ describe("read-only chapter browser", () => {
     expect(screen.queryByRole("button", { name: "新建章节" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "修改名称" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "删除章节" })).not.toBeInTheDocument();
+  });
+
+  it("opens the storyboard generation dialog through the chapter browser capability", async () => {
+    const user = userEvent.setup();
+    const base = makeServices([], {}, true);
+    const generation: StoryboardGenerationServicePort = {
+      listModels: vi.fn(async () => []),
+      listPrompts: vi.fn(async () => []),
+      quote: vi.fn(async () => { throw new Error("Not used by this integration test."); }),
+      stream: vi.fn(async function* () {}),
+      getSubmission: vi.fn(async () => { throw new Error("Not used by this integration test."); }),
+      getTask: vi.fn(async () => { throw new Error("Not used by this integration test."); }),
+    };
+    const services: WorkspaceServices = { ...base.services, storyboardGeneration: generation };
+    renderBrowser(services);
+
+    await user.click(await screen.findByRole("button", { name: "AI 生成分镜" }));
+
+    expect(await screen.findByRole("dialog", { name: "AI 生成分镜" })).toBeInTheDocument();
+    expect(generation.listModels).toHaveBeenCalledWith(expect.any(AbortSignal));
+    expect(generation.listPrompts).toHaveBeenCalledWith(expect.any(AbortSignal));
   });
 
   it("creates a blank chapter with the legacy payload and selects it after a fresh list read", async () => {

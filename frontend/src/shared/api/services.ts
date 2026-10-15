@@ -57,6 +57,21 @@ import { getDemoMyTaskPage } from "../../features/tasks/demoTasks";
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
 import { parseMyTeamList, type MyTeam } from "./teams";
 import {
+  parseStoryboardModels,
+  parseStoryboardPrompts,
+  parseTwoPassQuote,
+  parseTwoPassSubmission,
+  parseTwoPassTask,
+  type StoryboardGenerationServicePort,
+  type TwoPassQuoteInput,
+} from "../../features/storyboard-generation/contracts";
+import { parseTwoPassSse } from "../../features/storyboard-generation/sse";
+import {
+  parseImportSeriesResponse,
+  type ImportSeriesInput,
+  type ImportSeriesResponse,
+} from "./seriesExchange";
+import {
   parseStylePromptChoices,
   parseUploadedSeriesCover,
   type CreateSeriesInput,
@@ -134,6 +149,9 @@ export interface WorkspaceServices {
     signal: AbortSignal,
   ): Promise<PersonalRoughCutSnapshot>;
   listMyTasks(page: number, signal: AbortSignal): Promise<MyTaskPage>;
+  readonly storyboardGeneration?: StoryboardGenerationServicePort;
+  exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
+  importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
   logout(): void;
 }
 
@@ -1002,6 +1020,45 @@ function timeoutSignal(parent: AbortSignal, timeoutMs: number): {
   };
 }
 
+const STORYBOARD_STREAM_TOTAL_TIMEOUT_MS = 5 * 60_000;
+const STORYBOARD_STREAM_IDLE_TIMEOUT_MS = 45_000;
+
+function storyboardStreamTimeout(parent: AbortSignal): {
+  signal: AbortSignal;
+  didTimeout(): boolean;
+  resetIdle(): void;
+  dispose(): void;
+} {
+  const controller = new AbortController();
+  let timedOut = false;
+  const totalTimer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, STORYBOARD_STREAM_TOTAL_TIMEOUT_MS);
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const resetIdle = () => {
+    if (idleTimer !== null) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, STORYBOARD_STREAM_IDLE_TIMEOUT_MS);
+  };
+  const abortFromParent = () => controller.abort();
+  if (parent.aborted) controller.abort();
+  else parent.addEventListener("abort", abortFromParent, { once: true });
+  resetIdle();
+  return {
+    signal: controller.signal,
+    didTimeout: () => timedOut,
+    resetIdle,
+    dispose() {
+      clearTimeout(totalTimer);
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      parent.removeEventListener("abort", abortFromParent);
+    },
+  };
+}
+
 function errorMessageForStatus(status: number, detail: string | null): string {
   if (detail !== null) {
     return detail;
@@ -1038,6 +1095,14 @@ type ApiEndpoint =
   | "updateSeries"
   | "deleteSeries"
   | "stylePrompts"
+  | "storyboardModels"
+  | "storyboardPrompts"
+  | "quoteTwoPassStoryboard"
+  | "streamTwoPassStoryboard"
+  | "twoPassSubmission"
+  | "twoPassTask"
+  | "exportSeries"
+  | "importSeries"
   | "uploadSeriesCover"
   | "chapters"
   | "createChapter"
@@ -1067,7 +1132,13 @@ interface ApiRequestDefinition {
 
 function apiRequestDefinition(
   endpoint: ApiEndpoint,
-  identifiers?: { seriesId?: string; chapterId?: string; page?: number },
+  identifiers?: {
+    seriesId?: string;
+    chapterId?: string;
+    page?: number;
+    idempotencyKey?: string;
+    taskId?: string;
+  },
 ): ApiRequestDefinition {
   if (endpoint === "login") {
     return { path: "/auth/login", method: "POST" };
@@ -1081,8 +1152,31 @@ function apiRequestDefinition(
   if (endpoint === "createSeries") {
     return { path: "/series", method: "POST", expectedStatus: 201 };
   }
+  if (endpoint === "exportSeries") {
+    const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
+    return { path: "/series/" + seriesId + "/export", method: "GET" };
+  }
+  if (endpoint === "importSeries") {
+    return { path: "/series/import", method: "POST", expectedStatus: 200 };
+  }
   if (endpoint === "stylePrompts") {
     return { path: "/prompts?category=style", method: "GET" };
+  }
+  if (endpoint === "storyboardModels") return { path: "/models", method: "GET" };
+  if (endpoint === "storyboardPrompts") return { path: "/prompts", method: "GET" };
+  if (endpoint === "quoteTwoPassStoryboard") {
+    return { path: "/storyboard/two-pass/quote", method: "POST" };
+  }
+  if (endpoint === "streamTwoPassStoryboard") {
+    return { path: "/storyboard/two-pass/stream", method: "POST" };
+  }
+  if (endpoint === "twoPassSubmission") {
+    const query = new URLSearchParams({ idempotency_key: identifiers?.idempotencyKey ?? "" });
+    return { path: "/chat/submissions/storyboard.two_pass?" + query.toString(), method: "GET" };
+  }
+  if (endpoint === "twoPassTask") {
+    const query = new URLSearchParams({ task_id: identifiers?.taskId ?? "" });
+    return { path: "/chat/tasks?" + query.toString(), method: "GET" };
   }
   if (endpoint === "uploadSeriesCover") {
     return { path: "/upload/image", method: "POST" };
@@ -1211,10 +1305,14 @@ export function createApiServices(
     endpoint: ApiEndpoint,
     token: string | null,
     signal: AbortSignal,
-    body?: Credentials | PersonalProductionNoteUpdate | PersonalProductionResumeUpdate
-      | PersonalRoughCutUpdate | CreateSeriesInput | UpdateSeriesInput
-      | CreateChapterInput | UpdateChapterInput | ReorderChaptersInput | FormData,
-    identifiers?: { seriesId?: string; chapterId?: string; page?: number },
+    body?: object | FormData,
+    identifiers?: {
+      seriesId?: string;
+      chapterId?: string;
+      page?: number;
+      idempotencyKey?: string;
+      taskId?: string;
+    },
     requestBaseUrl = apiBaseUrl,
   ): Promise<unknown> {
     const requestDefinition = apiRequestDefinition(endpoint, identifiers);
@@ -1332,9 +1430,14 @@ export function createApiServices(
     endpoint: ApiEndpoint,
     token: string,
     signal: AbortSignal,
-    body?: CreateSeriesInput | UpdateSeriesInput | CreateChapterInput | UpdateChapterInput
-      | ReorderChaptersInput | FormData,
-    identifiers?: { seriesId?: string; chapterId?: string },
+    body?: object | FormData,
+    identifiers?: {
+      seriesId?: string;
+      chapterId?: string;
+      page?: number;
+      idempotencyKey?: string;
+      taskId?: string;
+    },
   ): Promise<unknown> {
     try {
       ensureCurrentApiSession(storage, token, signal);
@@ -1346,6 +1449,144 @@ export function createApiServices(
       throw error;
     }
   }
+
+  async function storyboardJsonRequest(
+    endpoint: ApiEndpoint,
+    signal: AbortSignal,
+    body?: object,
+    identifiers?: { idempotencyKey?: string; taskId?: string },
+  ): Promise<unknown> {
+    const token = requireApiToken(storage);
+    try {
+      return await requestForCurrentApiSession(endpoint, token, signal, body, identifiers);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 401) {
+        ensureCurrentApiSession(storage, token, signal);
+        if (storage.getItem(API_TOKEN_KEY) === token) clearApiSession(storage);
+      }
+      throw error;
+    }
+  }
+
+  const storyboardGeneration: StoryboardGenerationServicePort = {
+    async listModels(signal) {
+      return parseStoryboardModels(await storyboardJsonRequest("storyboardModels", signal));
+    },
+    async listPrompts(signal) {
+      return parseStoryboardPrompts(await storyboardJsonRequest("storyboardPrompts", signal));
+    },
+    async quote(input: TwoPassQuoteInput, signal) {
+      return parseTwoPassQuote(await storyboardJsonRequest("quoteTwoPassStoryboard", signal, input));
+    },
+    async *stream(quoteId, idempotencyKey, signal) {
+      if (quoteId.trim() === "" || idempotencyKey.trim() === "" || idempotencyKey.length > 255) {
+        throw new ApiError("invalid-response", "报价或生成请求标识无效。");
+      }
+      const token = requireApiToken(storage);
+      ensureCurrentApiSession(storage, token, signal);
+      const endpoint = apiRequestDefinition("streamTwoPassStoryboard");
+      const url = new URL(`${apiBaseUrl}${endpoint.path}`);
+      const timed = storyboardStreamTimeout(signal);
+      const headers = new Headers({
+        Accept: "text/event-stream",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "Idempotency-Key": idempotencyKey,
+      });
+      let response: Response;
+      try {
+        response = await fetcher(url, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ quote_id: quoteId }),
+          signal: timed.signal,
+          credentials: "omit",
+          cache: "no-store",
+          redirect: "error",
+          referrerPolicy: "no-referrer",
+        });
+        ensureCurrentApiSession(storage, token, signal);
+      } catch (error) {
+        timed.dispose();
+        if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+        if (timed.didTimeout()) throw new ApiError("timeout", "分镜生成连接超时，可查询任务状态后恢复。");
+        if (error instanceof ApiError) throw error;
+        if (isAbortError(error)) throw new ApiError("aborted", "Request was cancelled.");
+        throw new ApiError("network", "无法连接分镜生成服务，可查询任务状态后恢复。");
+      }
+
+      if (response.status !== 200) {
+        let detail: string | null = null;
+        try {
+          detail = parseErrorDetail(await response.json());
+        } catch {
+          detail = null;
+        }
+        try {
+          if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+          if (timed.didTimeout()) {
+            throw new ApiError("timeout", "分镜生成连接超时，可查询任务状态后恢复。");
+          }
+          ensureCurrentApiSession(storage, token, signal);
+          if (response.status === 401 && storage.getItem(API_TOKEN_KEY) === token) clearApiSession(storage);
+          throw new ApiError("http", errorMessageForStatus(response.status, detail), response.status, detail);
+        } finally {
+          timed.dispose();
+        }
+      }
+      const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
+      if (!contentType.includes("text/event-stream") || response.body === null) {
+        await response.body?.cancel().catch(() => undefined);
+        timed.dispose();
+        throw new ApiError("invalid-response", "分镜生成服务没有返回有效的事件流，可查询任务状态后恢复。");
+      }
+
+      const reader = response.body.getReader();
+      let finished = false;
+      const guardedReader: Pick<ReadableStreamDefaultReader<Uint8Array>, "read"> = {
+        async read() {
+          const result = await reader.read();
+          ensureCurrentApiSession(storage, token, signal);
+          if (!result.done) timed.resetIdle();
+          else finished = true;
+          return result;
+        },
+      };
+      try {
+        for await (const event of parseTwoPassSse(guardedReader, timed.signal)) {
+          ensureCurrentApiSession(storage, token, signal);
+          yield event;
+        }
+      } catch (error) {
+        if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+        if (timed.didTimeout()) throw new ApiError("timeout", "分镜生成等待超时，可查询任务状态后恢复。");
+        throw error;
+      } finally {
+        if (!finished) {
+          try {
+            await reader.cancel();
+          } catch {
+            // The stream may already be closed or aborted.
+          }
+        }
+        reader.releaseLock();
+        timed.dispose();
+      }
+    },
+    async getSubmission(idempotencyKey, signal) {
+      if (idempotencyKey.trim() === "" || idempotencyKey.length > 255) {
+        throw new ApiError("invalid-response", "生成请求标识无效。");
+      }
+      return parseTwoPassSubmission(await storyboardJsonRequest(
+        "twoPassSubmission", signal, undefined, { idempotencyKey },
+      ));
+    },
+    async getTask(taskId, signal) {
+      const task = parseTwoPassTask(await storyboardJsonRequest("twoPassTask", signal, undefined, { taskId }));
+      if (task.id !== taskId) throw new InvalidResponseError("服务器返回了其他分镜任务。");
+      return task;
+    },
+  };
 
   return {
     mode: "api",
@@ -1555,11 +1796,8 @@ export function createApiServices(
       }
     },
     async listStoryboardAssets(seriesId, chapterId, signal) {
-      const token = storage.getItem(API_TOKEN_KEY);
-      if (!token) {
-        throw new ApiError("http", "登录状态已失效，请重新登录。", 401);
-      }
-      return parseStoryboardAssetList(await request(
+      const token = requireApiToken(storage);
+      return parseStoryboardAssetList(await requestForCurrentApiSession(
         "storyboardAssets",
         token,
         signal,
@@ -1757,6 +1995,16 @@ export function createApiServices(
         await request("myTasks", token, signal, undefined, { page }),
         page,
       );
+    },
+    storyboardGeneration,
+    async exportSeries(seriesId, signal) {
+      const token = requireApiToken(storage);
+      return requestForCurrentApiSession("exportSeries", token, signal, undefined, { seriesId });
+    },
+    async importSeries(input, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("importSeries", token, signal, input);
+      return parseImportSeriesResponse(payload);
     },
     logout() {
       clearApiSession(storage);
