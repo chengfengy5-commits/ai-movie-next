@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import { MY_TASK_PAGE_SIZE, projectMyTask, type MyTaskPage as MyTaskPageData } from "../../shared/api/myTasks";
+import { TaskDetailDialog } from "./TaskDetailDialog";
 
 interface MyTasksPageProps {
   services: WorkspaceServices;
@@ -54,7 +55,10 @@ function presentError(error: ApiError): ErrorPresentation {
   return { title: "暂时无法读取任务", message: error.detail ?? error.message, kind: "request" };
 }
 
-function TaskCard({ task }: { task: MyTaskPageData["tasks"][number] }) {
+function TaskCard({ task, onOpen }: {
+  task: MyTaskPageData["tasks"][number];
+  onOpen(task: MyTaskPageData["tasks"][number]): void;
+}) {
   const presentation = projectMyTask(task);
 
   return (
@@ -126,8 +130,27 @@ function TaskCard({ task }: { task: MyTaskPageData["tasks"][number] }) {
         <span>结果记录</span>
         <p>{presentation.result}</p>
       </div>
+
+      <div className="my-task-card-actions">
+        <button
+          aria-label={"查看详情：" + presentation.type}
+          className="secondary-button"
+          onClick={() => onOpen(task)}
+          type="button"
+        >
+          查看详情
+        </button>
+      </div>
     </article>
   );
+}
+
+interface SelectedTaskDetail {
+  task: MyTaskPageData["tasks"][number];
+  services: WorkspaceServices;
+  userId: string;
+  page: number;
+  openGeneration: number;
 }
 
 export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTasksPageProps) {
@@ -136,6 +159,8 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
   const [pageData, setPageData] = useState<MyTaskPageData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
+  const [selectedTaskDetail, setSelectedTaskDetail] = useState<SelectedTaskDetail | null>(null);
+  const detailOpenGenerationRef = useRef(0);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -169,7 +194,23 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
     };
   }, [onUnauthorized, reloadKey, requestedPage, services, userId]);
 
+  useEffect(() => {
+    setSelectedTaskDetail(null);
+  }, [requestedPage, services, userId]);
+
+  function openTaskDetail(task: MyTaskPageData["tasks"][number]): void {
+    detailOpenGenerationRef.current += 1;
+    setSelectedTaskDetail({
+      task,
+      services,
+      userId,
+      page: requestedPage,
+      openGeneration: detailOpenGenerationRef.current,
+    });
+  }
+
   function reread() {
+    setSelectedTaskDetail(null);
     setPageData(null);
     setError(null);
     setLoading(true);
@@ -188,6 +229,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
     ) {
       return;
     }
+    setSelectedTaskDetail(null);
     setError(null);
     setLoading(true);
     setRequestedPage(page);
@@ -221,7 +263,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
 
       <div className="my-tasks-readonly-note">
         <span className="readonly-pill"><span aria-hidden="true">◉</span> 只读记录</span>
-        <p>积分仅为任务记录；列表不提供完整请求、结果媒体或任务操作。</p>
+        <p>这里仅显示任务状态快照；打开详情后按需读取完整文本记录。</p>
       </div>
 
       {loading && (
@@ -267,7 +309,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
                 </div>
               ) : (
                 <div className="my-tasks-list" aria-label="任务记录列表">
-                  {visiblePageData.tasks.map((task) => <TaskCard key={task.id} task={task} />)}
+                  {visiblePageData.tasks.map((task) => <TaskCard key={task.id} onOpen={openTaskDetail} task={task} />)}
                 </div>
               )}
             </>
@@ -298,6 +340,24 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
           )}
         </>
       )}
+
+      {selectedTaskDetail !== null
+        && selectedTaskDetail.userId === userId
+        && selectedTaskDetail.services === services
+        && selectedTaskDetail.page === requestedPage
+        && pageData?.page === requestedPage
+        && pageData.tasks.some((task) => task.id === selectedTaskDetail.task.id)
+        && (
+          <TaskDetailDialog
+            key={selectedTaskDetail.openGeneration}
+            onClose={() => setSelectedTaskDetail(null)}
+            onUnauthorized={onUnauthorized}
+            openGeneration={selectedTaskDetail.openGeneration}
+            services={selectedTaskDetail.services}
+            task={selectedTaskDetail.task}
+            userId={selectedTaskDetail.userId}
+          />
+        )}
     </section>
   );
 }

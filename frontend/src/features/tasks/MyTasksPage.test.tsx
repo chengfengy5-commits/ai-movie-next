@@ -5,6 +5,7 @@ import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, User } f
 import { ApiError } from "../../shared/api/errors";
 import type { WorkspaceServices } from "../../shared/api/services";
 import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../../shared/api/myTasks";
+import type { TaskReceipt, TaskRequestRecord } from "../../shared/api/taskDetails";
 import { MyTasksPage } from "./MyTasksPage";
 
 const user: User = {
@@ -256,5 +257,254 @@ describe("read-only task page", () => {
     expect(await screen.findByRole("article", { name: "图片，已完成" })).toBeInTheDocument();
     expect(listMyTasks).toHaveBeenCalledTimes(2);
     expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+});
+
+function detailReceipt(id: string, result: unknown = "完整结果全文"): TaskReceipt {
+  return {
+    id,
+    type: "storyboard",
+    messageId: "message-" + id,
+    status: "completed",
+    result,
+    billingStatus: "unbilled",
+    quotedAmount: 0,
+    progress: 100,
+    progressMessage: "全部完成",
+    externalTaskId: null,
+    externalProvider: null,
+    createdAt: "2026-10-15T08:00:00Z",
+    updatedAt: "2026-10-15T08:01:00Z",
+  };
+}
+
+function detailRequest(id: string, request: unknown = { prompt: "saved request" }): TaskRequestRecord {
+  return {
+    id,
+    type: "storyboard",
+    status: "completed",
+    modelName: "model-record",
+    creditCost: 0,
+    externalTaskId: null,
+    externalProvider: null,
+    createdAt: "2026-10-15T08:00:00Z",
+    request,
+  };
+}
+
+function servicesWithDetails(
+  listMyTasks: WorkspaceServices["listMyTasks"],
+  overrides: {
+    getTaskReceipt?: WorkspaceServices["getTaskReceipt"];
+    getTaskRequest?: WorkspaceServices["getTaskRequest"];
+  } = {},
+): WorkspaceServices {
+  return {
+    ...servicesFor(listMyTasks),
+    getTaskReceipt: overrides.getTaskReceipt ?? (async (taskId) => detailReceipt(taskId)),
+    getTaskRequest: overrides.getTaskRequest ?? (async (taskId) => detailRequest(taskId)),
+  };
+}
+
+describe("my task details", () => {
+  afterEach(() => {
+    cleanup();
+    vi.restoreAllMocks();
+  });
+
+  it("fetches full records only after opening, sanitizes text, and returns keyboard focus", async () => {
+    const userEvents = userEvent.setup();
+    const clipboard = vi.fn(async (_value: string) => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      configurable: true,
+      value: { writeText: clipboard },
+    });
+    const listMyTasks = vi.fn(async () => page(1, [task("task-one", { type: "storyboard" })]));
+    const getTaskReceipt = vi.fn(async (taskId: string) => detailReceipt(taskId, JSON.stringify({
+      frames: [{ position: 1, text: "完整分镜文字，列表预览已截断" }],
+      remote: "https://cdn.example.test/result.mp4?X-Amz-Signature=private-signature",
+      literal: "<img src=x onerror=alert(1)>",
+    })));
+    const getTaskRequest = vi.fn(async (taskId: string) => detailRequest(taskId, {
+      api_key: "private-api-key",
+      prompt: "安全请求文字",
+    }));
+    const currentServices = servicesWithDetails(listMyTasks, { getTaskReceipt, getTaskRequest });
+    const { container } = renderPage(currentServices);
+
+    const opener = await screen.findByRole("button", { name: "查看详情：智能分镜" });
+    expect(getTaskReceipt).not.toHaveBeenCalled();
+    expect(getTaskRequest).not.toHaveBeenCalled();
+
+    await userEvents.click(opener);
+    const result = await screen.findByLabelText("安全结果文本");
+    const request = await screen.findByLabelText("安全请求文本");
+    expect(result.textContent).toContain("完整分镜文字，列表预览已截断");
+    expect(request.textContent).toContain("安全请求文字");
+    expect(result.textContent).toContain("<img src=x onerror=alert(1)>");
+    expect(result.textContent).not.toContain("private-signature");
+    expect(request.textContent).not.toContain("private-api-key");
+    expect(container.querySelector("img, video, audio, a, script")).toBeNull();
+    expect(getTaskReceipt).toHaveBeenCalledExactlyOnceWith("task-one", expect.any(AbortSignal));
+    expect(getTaskRequest).toHaveBeenCalledExactlyOnceWith("task-one", expect.any(AbortSignal));
+    expect(within(screen.getByRole("region", { name: "结果与费用记录" })).getByText("0 积分")).toBeInTheDocument();
+    expect(screen.getByText(/不能据此认定实际扣费/)).toBeInTheDocument();
+
+    await userEvents.click(screen.getByRole("button", { name: "复制安全结果文本" }));
+    await waitFor(() => expect(clipboard).toHaveBeenCalledTimes(1));
+    expect(clipboard.mock.calls[0]?.[0]).toBe(result.textContent);
+    expect(clipboard.mock.calls[0]?.[0]).not.toContain("private-signature");
+
+    await userEvents.keyboard("{Escape}");
+    await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("keeps the receipt visible when membership blocks only the request record", async () => {
+    const userEvents = userEvent.setup();
+    const onUnauthorized = vi.fn();
+    const listMyTasks = vi.fn(async () => page(1, [task("task-one")]));
+    const currentServices = servicesWithDetails(listMyTasks, {
+      getTaskReceipt: async (taskId) => detailReceipt(taskId, "结果仍可读取"),
+      getTaskRequest: async () => {
+        throw new ApiError("http", "需要会员", 403, "会员资格暂不可用");
+      },
+    });
+    renderPage(currentServices, vi.fn(), onUnauthorized);
+
+    await userEvents.click(await screen.findByRole("button", { name: "查看详情：图片" }));
+    expect(await screen.findByText("结果仍可读取")).toBeInTheDocument();
+    expect(await screen.findByText(/暂不可查看任务请求记录/)).toBeInTheDocument();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("retains and marks the prior receipt after a refresh fails", async () => {
+    const userEvents = userEvent.setup();
+    const listMyTasks = vi.fn(async () => page(1, [task("task-one")]));
+    const getTaskReceipt = vi.fn()
+      .mockResolvedValueOnce(detailReceipt("task-one", "已读取的结果快照"))
+      .mockRejectedValueOnce(new ApiError("network", "暂时断网"));
+    const currentServices = servicesWithDetails(listMyTasks, { getTaskReceipt });
+    renderPage(currentServices);
+
+    await userEvents.click(await screen.findByRole("button", { name: "查看详情：图片" }));
+    expect(await screen.findByText("已读取的结果快照")).toBeInTheDocument();
+    await userEvents.click(screen.getByRole("button", { name: "刷新结果记录" }));
+    expect(await screen.findByText("下方仍保留上次读取的旧快照。")).toBeInTheDocument();
+    expect(screen.getByText("已读取的结果快照")).toBeInTheDocument();
+    expect(getTaskReceipt).toHaveBeenCalledTimes(2);
+  });
+
+  it("aborts reads on close and ignores a late 401 from the closed task", async () => {
+    const userEvents = userEvent.setup();
+    const lateRequest = deferred<TaskRequestRecord>();
+    const onUnauthorized = vi.fn();
+    const first = task("task-one", { type: "storyboard" });
+    const second = task("task-two", { type: "storyboard" });
+    const listMyTasks = vi.fn(async () => page(1, [first, second]));
+    const getTaskReceipt = vi.fn(async (taskId: string) => detailReceipt(taskId, "result-" + taskId));
+    const getTaskRequest = vi.fn((taskId: string, _signal: AbortSignal) => (
+      taskId === "task-one" ? lateRequest.promise : Promise.resolve(detailRequest(taskId))
+    ));
+    const currentServices = servicesWithDetails(listMyTasks, { getTaskReceipt, getTaskRequest });
+    renderPage(currentServices, vi.fn(), onUnauthorized);
+
+    const detailButtons = await screen.findAllByRole("button", { name: "查看详情：智能分镜" });
+    await userEvents.click(detailButtons[0]!);
+    const firstRequestSignal = getTaskRequest.mock.calls[0]?.[1];
+    expect(firstRequestSignal).toBeInstanceOf(AbortSignal);
+
+    await userEvents.keyboard("{Escape}");
+    await waitFor(() => expect(firstRequestSignal?.aborted).toBe(true));
+    await act(async () => {
+      lateRequest.reject(new ApiError("http", "登录失效", 401));
+      await Promise.resolve();
+    });
+
+    await userEvents.click(screen.getAllByRole("button", { name: "查看详情：智能分镜" })[1]!);
+    expect(await screen.findByText("result-task-two")).toBeInTheDocument();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("aborts a receipt refresh on close and ignores its late 401", async () => {
+    const userEvents = userEvent.setup();
+    const lateReceipt = deferred<TaskReceipt>();
+    const onUnauthorized = vi.fn();
+    const listMyTasks = vi.fn(async () => page(1, [task("task-one")]));
+    const getTaskReceipt = vi.fn(
+      (_taskId: string, _signal: AbortSignal): Promise<TaskReceipt> => (
+        Promise.resolve(detailReceipt("task-one", "已读取的结果快照"))
+      ),
+    ).mockImplementationOnce(() => Promise.resolve(detailReceipt("task-one", "已读取的结果快照")))
+      .mockImplementationOnce((_taskId, _signal) => lateReceipt.promise);
+    const currentServices = servicesWithDetails(listMyTasks, { getTaskReceipt });
+    renderPage(currentServices, vi.fn(), onUnauthorized);
+
+    await userEvents.click(await screen.findByRole("button", { name: "查看详情：图片" }));
+    expect(await screen.findByText("已读取的结果快照")).toBeInTheDocument();
+    await userEvents.click(screen.getByRole("button", { name: "刷新结果记录" }));
+    await waitFor(() => expect(getTaskReceipt).toHaveBeenCalledTimes(2));
+    const refreshSignal = getTaskReceipt.mock.calls[1]?.[1];
+    expect(refreshSignal).toBeInstanceOf(AbortSignal);
+
+    await userEvents.keyboard("{Escape}");
+    await waitFor(() => expect(refreshSignal?.aborted).toBe(true));
+    await act(async () => {
+      lateReceipt.reject(new ApiError("http", "登录失效", 401));
+      await Promise.resolve();
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("aborts a request refresh and ignores its late 401 after owner changes", async () => {
+    const userEvents = userEvent.setup();
+    const lateRequest = deferred<TaskRequestRecord>();
+    const onUnauthorized = vi.fn();
+    const firstList = vi.fn(async () => page(1, [task("task-one")]));
+    const getTaskRequest = vi.fn(
+      (_taskId: string, _signal: AbortSignal): Promise<TaskRequestRecord> => (
+        Promise.resolve(detailRequest("task-one"))
+      ),
+    ).mockImplementationOnce(() => Promise.resolve(detailRequest("task-one")))
+      .mockImplementationOnce((_taskId, _signal) => lateRequest.promise);
+    const firstServices = servicesWithDetails(firstList, { getTaskRequest });
+    const secondList = vi.fn(async () => page(1, [task("task-one", { asset_name: "新账号任务" })]));
+    const secondServices = servicesWithDetails(secondList);
+    const onBack = vi.fn();
+    const view = render(
+      <MyTasksPage onBack={onBack} onUnauthorized={onUnauthorized} services={firstServices} userId={user.id} />,
+    );
+
+    await userEvents.click(await screen.findByRole("button", { name: "查看详情：图片" }));
+    expect((await screen.findByLabelText("安全请求文本")).textContent).toContain("saved request");
+    await userEvents.click(screen.getByRole("button", { name: "刷新请求记录" }));
+    await waitFor(() => expect(getTaskRequest).toHaveBeenCalledTimes(2));
+    const refreshSignal = getTaskRequest.mock.calls[1]?.[1];
+    expect(refreshSignal).toBeInstanceOf(AbortSignal);
+
+    view.rerender(
+      <MyTasksPage onBack={onBack} onUnauthorized={onUnauthorized} services={secondServices} userId="next-user" />,
+    );
+    await waitFor(() => expect(refreshSignal?.aborted).toBe(true));
+    expect(await screen.findByText("新账号任务")).toBeInTheDocument();
+    await act(async () => {
+      lateRequest.reject(new ApiError("http", "登录失效", 401));
+      await Promise.resolve();
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("exits the current session for an active task-detail 401", async () => {
+    const onUnauthorized = vi.fn();
+    const listMyTasks = vi.fn(async () => page(1, [task("task-one")]));
+    const currentServices = servicesWithDetails(listMyTasks, {
+      getTaskReceipt: async () => {
+        throw new ApiError("http", "登录状态已失效", 401);
+      },
+    });
+    const userEvents = userEvent.setup();
+    renderPage(currentServices, vi.fn(), onUnauthorized);
+
+    await userEvents.click(await screen.findByRole("button", { name: "查看详情：图片" }));
+    await waitFor(() => expect(onUnauthorized).toHaveBeenCalledTimes(1));
   });
 });
