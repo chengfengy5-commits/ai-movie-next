@@ -1780,6 +1780,134 @@ describe("asset library", () => {
     expect(services.listCharacters).toHaveBeenCalledTimes(2);
   });
 
+  it("invalidates the old directory after a confirmed delete when its refresh fails", async () => {
+    const user = userEvent.setup();
+    const listCharacters = vi.fn()
+      .mockResolvedValueOnce([character()])
+      .mockRejectedValueOnce(new ApiError("network", "post-delete refresh failed"))
+      .mockRejectedValueOnce(new ApiError("network", "parent refresh failed"))
+      .mockResolvedValueOnce([]);
+    const listScenes = vi.fn(async () => [scene()]);
+    const deleteCharacter = vi.fn(async () => undefined);
+    const services = makeServices({
+      listCharacters,
+      listScenes,
+      listChapters: vi.fn(async () => []),
+      deleteCharacter,
+    });
+    renderLibrary(services);
+
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "删除" }));
+    expect(await screen.findByText("已读取 0 章；未找到可确认的引用。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "确认删除整个剧集中的素材" }));
+    expect(await screen.findByText(/已删除，目录刷新待完成/)).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "删除角色" })).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "顾行舟素材卡片" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "关闭" }));
+    expect(await screen.findByRole("heading", { name: "还没有角色素材" })).toBeInTheDocument();
+    expect(listCharacters).toHaveBeenCalledTimes(4);
+
+    await user.click(screen.getByRole("button", { name: "场景" }));
+    expect(await screen.findByRole("heading", { name: "档案馆地下室" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(await screen.findByRole("heading", { name: "还没有角色素材" })).toBeInTheDocument();
+    expect(listCharacters).toHaveBeenCalledTimes(4);
+    expect(deleteCharacter).toHaveBeenCalledExactlyOnceWith("shared-asset-id", expect.any(AbortSignal));
+  });
+
+  it.each(["create", "edit"] as const)(
+    "invalidates the old directory after a confirmed %s when its refresh fails",
+    async (mode) => {
+      const user = userEvent.setup();
+      const initial = character();
+      const created = character({ id: "created-character", name: "新增角色" });
+      const updated = character({ name: "编辑后角色" });
+      const listCharacters = vi.fn();
+      if (mode === "create") {
+        listCharacters
+          .mockResolvedValueOnce([initial])
+          .mockRejectedValueOnce(new ApiError("network", "post-create refresh failed"))
+          .mockRejectedValueOnce(new ApiError("network", "parent refresh failed"))
+          .mockResolvedValueOnce([initial, created]);
+      } else {
+        listCharacters
+          .mockResolvedValueOnce([initial])
+          .mockResolvedValueOnce([initial])
+          .mockRejectedValueOnce(new ApiError("network", "post-edit refresh failed"))
+          .mockRejectedValueOnce(new ApiError("network", "parent refresh failed"))
+          .mockResolvedValueOnce([updated]);
+      }
+      const services = makeServices({
+        listCharacters,
+        listScenes: vi.fn(async () => [scene()]),
+        createCharacter: vi.fn(async () => created),
+        updateCharacter: vi.fn(async () => updated),
+      });
+      renderLibrary(services);
+
+      expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+      if (mode === "create") {
+        await user.click(screen.getByRole("button", { name: "新增角色" }));
+        await user.type(screen.getByLabelText(/角色名称/), "新增角色");
+        await user.click(screen.getByRole("button", { name: "创建素材" }));
+      } else {
+        await user.click(screen.getByRole("button", { name: "编辑" }));
+        const nameInput = screen.getByLabelText(/角色名称/);
+        await user.clear(nameInput);
+        await user.type(nameInput, "编辑后角色");
+        await user.click(screen.getByRole("button", { name: "保存更改" }));
+      }
+
+      expect(await screen.findByText(/已保存，目录刷新待完成/)).toBeInTheDocument();
+      expect(screen.getByRole("dialog")).toBeInTheDocument();
+      expect(screen.queryByRole("article", { name: "顾行舟素材卡片" })).not.toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "关闭" }));
+
+      const expectedName = mode === "create" ? "新增角色" : "编辑后角色";
+      expect(await screen.findByRole("heading", { name: expectedName })).toBeInTheDocument();
+      expect(listCharacters).toHaveBeenCalledTimes(mode === "create" ? 4 : 5);
+      await user.click(screen.getByRole("button", { name: "场景" }));
+      expect(await screen.findByRole("heading", { name: "档案馆地下室" })).toBeInTheDocument();
+      await user.click(screen.getByRole("button", { name: "角色" }));
+      expect(await screen.findByRole("heading", { name: expectedName })).toBeInTheDocument();
+      expect(listCharacters).toHaveBeenCalledTimes(mode === "create" ? 4 : 5);
+    },
+  );
+
+  it("invalidates the old directory after an uncertain create whose reconciliation GET fails", async () => {
+    const user = userEvent.setup();
+    const listCharacters = vi.fn()
+      .mockResolvedValueOnce([character()])
+      .mockRejectedValueOnce(new ApiError("network", "reconciliation GET failed"))
+      .mockRejectedValueOnce(new ApiError("network", "parent refresh failed"))
+      .mockResolvedValueOnce([character()]);
+    const createCharacter = vi.fn(async () => {
+      throw new ApiError("network", "create response lost");
+    });
+    const services = makeServices({ listCharacters, createCharacter });
+    renderLibrary(services);
+
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新增角色" }));
+    const nameInput = screen.getByLabelText(/角色名称/);
+    await user.type(nameInput, "未知结果草稿");
+    await user.click(screen.getByRole("button", { name: "创建素材" }));
+    expect(await screen.findByText(/写入结果仍未知，目录核对失败/)).toBeInTheDocument();
+    expect(nameInput).toHaveValue("未知结果草稿");
+    expect(screen.queryByRole("article", { name: "顾行舟素材卡片" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "关闭" }));
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    expect(listCharacters).toHaveBeenCalledTimes(4);
+    expect(createCharacter).toHaveBeenCalledExactlyOnceWith(
+      series.id,
+      expect.objectContaining({ name: "未知结果草稿" }),
+      expect.any(AbortSignal),
+    );
+  });
+
   it("does not request remote or non-loopback images", async () => {
     const services = makeServices({
       listCharacters: vi.fn(async () => [character({ image_url: "https://assets.example.invalid/private.jpg" })]),

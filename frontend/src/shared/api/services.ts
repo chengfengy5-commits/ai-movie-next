@@ -67,7 +67,7 @@ import {
   type PersonalRoughCutUpdate,
 } from "./personalRoughCut";
 import { inspectRoughCutSource } from "../../features/chapters/personal-production/roughCutEdit";
-import { getDemoMyTaskPage } from "../../features/tasks/demoTasks";
+import { demoTaskRecords, getDemoMyTaskPage } from "../../features/tasks/demoTasks";
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
 import { parseTaskReceipt, parseTaskRequestRecord, type TaskReceipt, type TaskRequestRecord } from "./taskDetails";
 import { parseMyTeamList, type MyTeam } from "./teams";
@@ -273,6 +273,45 @@ function cloneDemoChapterData(data: DemoChapterData): DemoChapterData {
       assets.map((asset) => ({ ...asset })),
     ])),
   };
+}
+
+function removeDemoChapterAssetReferences(
+  data: DemoChapterData | undefined,
+  category: "characters" | "scenes" | "props",
+  assetId: string,
+): void {
+  if (data === undefined) {
+    return;
+  }
+  const referenceField = category === "characters" ? "character" : category === "scenes" ? "scene" : "prop";
+  for (const chapter of data.chapters) {
+    if (chapter.content === null) {
+      continue;
+    }
+    let changed = false;
+    chapter.content = chapter.content.map((frame) => {
+      const references = frame[referenceField];
+      if (!Array.isArray(references) || !references.includes(assetId)) {
+        return frame;
+      }
+      changed = true;
+      return { ...frame, [referenceField]: references.filter((reference) => reference !== assetId) };
+    });
+    if (changed) {
+      chapter.updated_at = new Date().toISOString();
+    }
+  }
+}
+
+function parseDemoTaskRequestData(value: string | null): unknown {
+  if (value === null) {
+    return null;
+  }
+  try {
+    return JSON.parse(value) as unknown;
+  } catch {
+    return { _raw: value };
+  }
 }
 
 function cloneDemoAssetData(data: DemoAssetLibraryData): DemoAssetLibraryData {
@@ -894,6 +933,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       if (found === null) {
         throw demoNotFound();
       }
+      removeDemoChapterAssetReferences(chapterDataBySeries.get(found.asset.series_id), "characters", assetId);
       found.rows.splice(found.index, 1);
     },
     async createScene(seriesId, input, signal) {
@@ -947,6 +987,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       if (found === null) {
         throw demoNotFound();
       }
+      removeDemoChapterAssetReferences(chapterDataBySeries.get(found.asset.series_id), "scenes", assetId);
       found.rows.splice(found.index, 1);
     },
     async createProp(seriesId, input, signal) {
@@ -1000,6 +1041,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       if (found === null) {
         throw demoNotFound();
       }
+      removeDemoChapterAssetReferences(chapterDataBySeries.get(found.asset.series_id), "props", assetId);
       found.rows.splice(found.index, 1);
     },
     async getPersonalProductionNotes(chapterId, signal) {
@@ -1245,6 +1287,52 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("invalid-response", "任务页码无效。");
       }
       return parseMyTaskPage(getDemoMyTaskPage(page), page);
+    },
+    async getTaskReceipt(taskId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const record = demoTaskRecords.find((candidate) => candidate.id === taskId);
+      if (record === undefined) {
+        throw demoNotFound();
+      }
+      return parseTaskReceipt({
+        id: record.id,
+        type: record.type,
+        message_id: record.message_id,
+        status: record.status,
+        result: record.result,
+        billing_status: null,
+        quoted_amount: null,
+        progress: Number.isSafeInteger(record.progress) && record.progress >= 0 ? record.progress : null,
+        progress_message: record.progress_message,
+        external_task_id: null,
+        external_provider: null,
+        created_at: record.created_at,
+        updated_at: record.updated_at,
+      }, taskId);
+    },
+    async getTaskRequest(taskId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const record = demoTaskRecords.find((candidate) => candidate.id === taskId);
+      if (record === undefined) {
+        throw demoNotFound();
+      }
+      return parseTaskRequestRecord({
+        id: record.id,
+        type: record.type,
+        status: record.status,
+        model_name: null,
+        credit_cost: null,
+        external_task_id: null,
+        external_provider: null,
+        created_at: record.created_at,
+        request: parseDemoTaskRequestData(record.request_data),
+      }, taskId);
     },
     logout() {
       clearMockSession(storage);

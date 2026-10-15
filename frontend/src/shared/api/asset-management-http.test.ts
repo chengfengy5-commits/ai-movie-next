@@ -1,7 +1,7 @@
 // @vitest-environment node
 import { describe, expect, it } from "vitest";
 import { demoSeries } from "../../features/series/demoSeries";
-import { InvalidResponseError, type Character, type Prop, type Scene } from "./contracts";
+import { InvalidResponseError, type Character, type Prop, type Scene, type StoryboardFrame } from "./contracts";
 import { createApiServices, createDemoServices } from "./services";
 import { API_TOKEN_KEY, type StorageLike } from "./storage";
 
@@ -133,6 +133,84 @@ describe("asset management API services", () => {
     expect(reread.find(({ id }) => id === created.id)).toMatchObject({
       name: "手工新增角色",
       description: "保留在本次服务会话中",
+    });
+  });
+
+  it.each([
+    ["characters", "character", "-character-linlan", "deleteCharacter"],
+    ["scenes", "scene", "-scene-old-street", "deleteScene"],
+    ["props", "prop", "-prop-key", "deleteProp"],
+  ] as const)("removes deleted demo %s references across chapter frames while preserving other data", async (category, field, suffix, method) => {
+    const storage = new MemoryStorage();
+    const services = createDemoServices(storage);
+    const controller = new AbortController();
+    await services.login({ username: "demo", password: "demo123" }, controller.signal);
+    const seriesId = demoSeries[0]!.id;
+    const before = await services.listChapters(seriesId, controller.signal);
+    const assetId = seriesId + suffix;
+    const deleteAsset = services[method];
+    if (deleteAsset === undefined) throw new Error(`Demo ${category} deletion is unavailable.`);
+
+    await deleteAsset(assetId, controller.signal);
+
+    const after = await services.listChapters(seriesId, controller.signal);
+    const withoutDeletedReference = (frame: StoryboardFrame) => {
+      const references = frame[field];
+      return Array.isArray(references) && references.includes(assetId)
+        ? { ...frame, [field]: references.filter((reference) => reference !== assetId) }
+        : frame;
+    };
+    expect(after.map(({ id, content }) => ({ id, content }))).toEqual(
+      before.map(({ id, content }) => ({ id, content: content?.map(withoutDeletedReference) ?? null })),
+    );
+    expect(after.flatMap((chapter) => chapter.content ?? []).every((frame) => {
+      const references = frame[field];
+      return !Array.isArray(references) || !references.includes(assetId);
+    })).toBe(true);
+    if (category === "characters") {
+      const secondChapter = after.find(({ id }) => id === seriesId + "-chapter-letter");
+      expect(secondChapter?.content?.[0]?.character).toEqual([seriesId + "-shared-material-id"]);
+    }
+  });
+
+  it("serves local task receipt and request details in demo mode without inventing billing data", async () => {
+    const storage = new MemoryStorage();
+    const services = createDemoServices(storage);
+    const controller = new AbortController();
+    await services.login({ username: "demo", password: "demo123" }, controller.signal);
+
+    const receipt = await services.getTaskReceipt?.("task-demo-01", controller.signal);
+    const request = await services.getTaskRequest?.("task-demo-01", controller.signal);
+
+    expect(receipt).toMatchObject({
+      id: "task-demo-01",
+      type: "image",
+      status: "completed",
+      billingStatus: null,
+      quotedAmount: null,
+    });
+    expect(request).toMatchObject({
+      id: "task-demo-01",
+      type: "image",
+      creditCost: null,
+      request: { prompt: "本地演示记录" },
+    });
+    await expect(services.getTaskReceipt?.("missing-demo-task", controller.signal)).rejects.toMatchObject({ status: 404 });
+    await expect(services.getTaskRequest?.("missing-demo-task", controller.signal)).rejects.toMatchObject({ status: 404 });
+
+    const aborted = new AbortController();
+    aborted.abort();
+    await expect(services.getTaskReceipt?.("task-demo-01", aborted.signal)).rejects.toMatchObject({ kind: "aborted" });
+  });
+
+  it("keeps malformed demo task request data visible as raw text", async () => {
+    const storage = new MemoryStorage();
+    const services = createDemoServices(storage);
+    const controller = new AbortController();
+    await services.login({ username: "demo", password: "demo123" }, controller.signal);
+
+    await expect(services.getTaskRequest?.("task-demo-11", controller.signal)).resolves.toMatchObject({
+      request: { _raw: "截断的旧请求文本，不会在任务卡片显示。" },
     });
   });
 

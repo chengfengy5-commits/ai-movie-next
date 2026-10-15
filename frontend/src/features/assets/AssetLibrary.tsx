@@ -383,6 +383,7 @@ export function AssetLibrary({
   const managementRequestRef = useRef(managementRequest);
   managementRequestRef.current = managementRequest;
   const managementRequestIdRef = useRef(0);
+  const invalidatedManagementRequestRef = useRef<AssetManagementRequest | null>(null);
   const [navigationIssue, setNavigationIssue] = useState<{ epoch: number; message: string } | null>(null);
   const [navigationFeedback, setNavigationFeedback] = useState<AssetNavigationFeedback | null>(null);
   const cache = useRef(new Map<AssetLibraryType, AssetReadyResult>());
@@ -414,6 +415,7 @@ export function AssetLibrary({
     searchGenerationRef.current += 1;
     searchSelectionRef.current = null;
     cache.current = new Map();
+    invalidatedManagementRequestRef.current = null;
     usageOwnerRef.current = null;
     openEpochRef.current += 1;
   }
@@ -454,6 +456,7 @@ export function AssetLibrary({
     setSearchSelection(null);
     usageOwnerRef.current = null;
     openEpochRef.current += 1;
+    invalidatedManagementRequestRef.current = null;
     setUsageOwner(null);
     managementRequestRef.current = null;
     setManagementRequest(null);
@@ -506,6 +509,15 @@ export function AssetLibrary({
         return;
       }
       cache.current.set(selectedType, readyResult);
+      const invalidatedRequest = invalidatedManagementRequestRef.current;
+      if (
+        invalidatedRequest !== null
+        && invalidatedRequest === managementRequestRef.current
+        && invalidatedRequest.scope === libraryScope
+        && invalidatedRequest.category === selectedType
+      ) {
+        invalidatedManagementRequestRef.current = null;
+      }
       setResult({ scope: libraryScope, requestGeneration, navigationEpoch: requestNavigationEpoch, result: readyResult });
     }).catch((cause: unknown) => {
       if (!isCurrent()) {
@@ -600,6 +612,7 @@ export function AssetLibrary({
     setSearchSelection(nextSelection);
     invalidateUsage();
     managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
     setManagementRequest(null);
     setNavigationFeedback(null);
   }
@@ -636,6 +649,9 @@ export function AssetLibrary({
       return;
     }
     directoryRequestGenerationRef.current += 1;
+    managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
+    setManagementRequest(null);
     resetAssetSearch();
     if (navigationIntentRef.current?.category !== type) {
       abandonNavigationIntent();
@@ -737,13 +753,31 @@ export function AssetLibrary({
     if (!isCurrentManagement(request)) {
       return;
     }
+    const needsFreshRead = invalidatedManagementRequestRef.current === request;
+    invalidatedManagementRequestRef.current = null;
     managementRequestRef.current = null;
     setManagementRequest(null);
+    if (needsFreshRead) {
+      reloadCurrentType();
+    }
+  }
+
+  function invalidateManagedDirectory(request: AssetManagementRequest) {
+    if (!isCurrentManagement(request)) {
+      return;
+    }
+    invalidatedManagementRequestRef.current = request;
+    cache.current.delete(request.category);
+    resultRef.current = null;
+    reloadCurrentType();
   }
 
   function acceptManagedDirectory(request: AssetManagementRequest, directory: AssetDirectory) {
     if (!isCurrentManagement(request) || directory.category !== request.category) {
       return;
+    }
+    if (invalidatedManagementRequestRef.current === request) {
+      invalidatedManagementRequestRef.current = null;
     }
     const requestGeneration = ++directoryRequestGenerationRef.current;
     let ready: AssetReadyResult;
@@ -779,12 +813,14 @@ export function AssetLibrary({
     setNavigationFeedback(null);
     setNavigationIssue(null);
     cache.current.delete(selectedType);
-    setResult({
+    const loadingResult: ScopedAssetResult = {
       scope: libraryScope,
       requestGeneration: directoryRequestGenerationRef.current,
       navigationEpoch: navigationIntentRef.current?.navigationEpoch ?? null,
       result: { type: selectedType, status: "loading" },
-    });
+    };
+    resultRef.current = loadingResult;
+    setResult(loadingResult);
     setFailedImages((previous) => {
       const next = new Set(previous);
       for (const key of next) {
@@ -800,6 +836,7 @@ export function AssetLibrary({
   function goBack() {
     abandonNavigationIntent();
     invalidateUsage();
+    invalidatedManagementRequestRef.current = null;
     managementRequestRef.current = null;
     setManagementRequest(null);
     onBack();
@@ -1209,6 +1246,7 @@ export function AssetLibrary({
             mode={managementRequest.mode}
             onClose={() => closeManagement(managementRequest)}
             onDirectoryUpdated={(directory) => acceptManagedDirectory(managementRequest, directory)}
+            onDirectoryNeedsRefresh={() => invalidateManagedDirectory(managementRequest)}
             onUnauthorized={() => {
               if (isCurrentManagement(managementRequest)) {
                 unauthorizedHandlerRef.current();

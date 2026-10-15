@@ -38,6 +38,7 @@ interface AssetManagementDialogProps {
   onClose(): void;
   onUnauthorized(): void;
   onDirectoryUpdated(directory: AssetDirectory): void;
+  onDirectoryNeedsRefresh(): void;
 }
 
 interface FieldDefinition {
@@ -304,6 +305,7 @@ export function AssetManagementDialog({
   onClose,
   onUnauthorized,
   onDirectoryUpdated,
+  onDirectoryNeedsRefresh,
 }: AssetManagementDialogProps) {
   const isCurrentRef = useRef(isCurrent);
   const unauthorizedRef = useRef(onUnauthorized);
@@ -494,6 +496,7 @@ export function AssetManagementDialog({
       if (controller.signal.aborted || !isCurrent()) {
         return;
       }
+      onDirectoryNeedsRefresh();
       setWriteState({ kind: "checking" });
       await refreshDirectory(controller, "saved");
     } catch (cause: unknown) {
@@ -510,6 +513,7 @@ export function AssetManagementDialog({
         return;
       }
       if (writeDispatched && isUncertainWrite(error)) {
+        onDirectoryNeedsRefresh();
         setWriteState({ kind: "checking" });
         await refreshDirectory(controller, "unknown");
         return;
@@ -542,6 +546,7 @@ export function AssetManagementDialog({
       if (controller.signal.aborted || !isCurrent()) {
         return;
       }
+      onDirectoryNeedsRefresh();
       setWriteState({ kind: "checking" });
       await refreshDirectory(controller, "saved");
     } catch (cause: unknown) {
@@ -558,6 +563,7 @@ export function AssetManagementDialog({
         return;
       }
       if (writeDispatched && isUncertainWrite(error)) {
+        onDirectoryNeedsRefresh();
         setWriteState({ kind: "checking" });
         await refreshDirectory(controller, "unknown");
         return;
