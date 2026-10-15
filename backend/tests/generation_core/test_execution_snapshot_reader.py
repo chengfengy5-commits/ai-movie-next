@@ -312,6 +312,10 @@ def test_reader_reopens_only_the_original_durable_image_snapshot_and_binding(
             assert type(result) is VerifiedImageExecutionInput
             assert result.snapshot.effective_prompt == "A quiet room"
             assert result.snapshot.model_ref.model_id == "model-1"
+            assert result.task_model_name == binding.task_model_name
+            assert result.task_model_name == "Public joint-fixture model"
+            assert result.snapshot.model_name == "wire-joint-fixture-model"
+            assert result.task_model_name != result.snapshot.model_name
             assert result.references == ()
             assert result.provider_credential.secret == "joint-fixture-provider-secret"
             assert "joint-fixture-provider-secret" not in repr(result)
@@ -334,6 +338,18 @@ def test_reader_reopens_only_the_original_durable_image_snapshot_and_binding(
             assert not _snapshot_matches_binding(
                 result.snapshot,
                 {**item, "model": {**item["model"], "provider": "wrong-provider"}},
+                binding,
+                payload_row,
+            )
+            assert not _snapshot_matches_binding(
+                result.snapshot,
+                {
+                    **item,
+                    "model": {
+                        **item["model"],
+                        "display_name": "interchanged-display-name",
+                    },
+                },
                 binding,
                 payload_row,
             )
@@ -378,6 +394,17 @@ def test_reader_reopens_only_the_original_durable_image_snapshot_and_binding(
             assert read_original_image_single_execution_input(
                 reader,
                 wrong_digest,
+                registry=registry,
+                crypto=crypto,
+                proof_authority=proof_authority,
+            ) is None
+
+            wrong_display_name = replace(
+                binding, task_model_name="interchanged-display-name"
+            )
+            assert read_original_image_single_execution_input(
+                reader,
+                wrong_display_name,
                 registry=registry,
                 crypto=crypto,
                 proof_authority=proof_authority,

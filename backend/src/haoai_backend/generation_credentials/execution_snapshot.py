@@ -222,13 +222,14 @@ class PersistedImageExecutionBinding:
 
 @dataclass(frozen=True, slots=True)
 class VerifiedImageExecutionInput:
-    """Authenticated server-side inputs; secret and prompt are hidden in repr."""
+    """Authenticated inputs; display name is distinct from the frozen wire model."""
 
     task_id: str
     unit_id: str
     step_id: str
     prepared_payload_id: str
     server_attempt_id: str
+    task_model_name: str
     snapshot: FrozenExecutionSnapshot = field(repr=False)
     credential_binding: CredentialBinding = field(repr=False)
     provider_credential: BoundCredential = field(repr=False)
@@ -356,6 +357,7 @@ def read_original_image_single_execution_input(
             step_id=binding.step_id,
             prepared_payload_id=binding.prepared_payload_id,
             server_attempt_id=binding.server_attempt_id,
+            task_model_name=binding.task_model_name,
             snapshot=snapshot,
             credential_binding=credential_binding,
             provider_credential=provider_credential,
