@@ -32,6 +32,15 @@ class StoryboardGenerationTaskConflict(StoryboardGenerationError):
         super().__init__(409, detail)
 
 
+class StoryboardGenerationInsufficientCredits(StoryboardGenerationTaskConflict):
+    def __init__(self, quoted_amount: int, balance: int | None) -> None:
+        detail = f"积分不足，需要 {quoted_amount} 积分"
+        if balance is not None:
+            detail += f"，当前余额 {balance} 积分"
+        super().__init__(detail)
+        self.status_code = 402
+
+
 class StoryboardProviderFailure(Exception):
     """Provider failure with a user-displayable detail."""
 

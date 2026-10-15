@@ -311,7 +311,7 @@ def test_create_app_composes_package_routes_with_public_auth_and_supplied_sessio
         tmp_path / "packages-composed.sqlite", integrated=True
     )
     try:
-        assert len(app.routes) == 248
+        assert len(app.routes) == 250
         package_routes = {
             (method, route.path)
             for route in app.routes

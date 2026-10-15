@@ -345,6 +345,8 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("POST", "/api/storyboard/generate-stream", "generate_storyboard_stream"),
             ("POST", "/api/storyboard/create-chapter-with-storyboard", "create_chapter_with_storyboard"),
             ("POST", "/api/storyboard/two-pass", "two_pass_storyboard"),
+            ("POST", "/api/storyboard/two-pass/quote", "quote_two_pass_storyboard"),
+            ("POST", "/api/storyboard/two-pass/stream", "two_pass_storyboard_stream"),
         }
         storyboard_asset_generation_routes = {
             ("POST", "/api/storyboard/extract-characters-stream", "extract_characters_stream"),
@@ -389,8 +391,8 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             chat_media_routes,
             chat_text_routes,
         )
-        assert len(methods) == 248
-        assert len(triples) == 248
+        assert len(methods) == 250
+        assert len(triples) == 250
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
         assert len(series_exchange_routes) == 5
@@ -399,7 +401,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
         assert len(chat_media_routes) == 3
         assert len(chat_text_routes) == 3
         assert len(fused_generation_routes) == 1
-        assert len(storyboard_generation_routes) == 4
+        assert len(storyboard_generation_routes) == 6
         assert len(storyboard_asset_generation_routes) == 6
         assert sum(map(len, route_groups)) == len(set().union(*route_groups))
         assert len(

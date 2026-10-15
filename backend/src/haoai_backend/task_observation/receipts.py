@@ -56,7 +56,7 @@ def build_task_receipt(
 
 
 def _validate_submission_key(operation: str, raw_key: str | None) -> str:
-    if operation not in {"image.single", "video.single"}:
+    if operation not in {"image.single", "video.single", "storyboard.two_pass"}:
         raise TaskObservationBadRequest("不支持的任务操作")
     if raw_key is None or not raw_key.strip() or len(raw_key) > 255:
         raise TaskObservationBadRequest("Idempotency-Key 必须为 1 到 255 个非空白字符")

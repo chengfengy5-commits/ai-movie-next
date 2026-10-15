@@ -7,7 +7,14 @@ from haoai_backend.generic_tasks.errors import GenericTaskError
 from haoai_backend.generic_tasks.ports import GenericTaskUnitOfWork
 
 CONTROLLED_TASK_TYPES = frozenset(
-    {"batch-optimize", "batch-image", "image-single", "video-single", "ai-review"}
+    {
+        "batch-optimize",
+        "batch-image",
+        "image-single",
+        "video-single",
+        "ai-review",
+        "storyboard-two-pass",
+    }
 )
 _CONTROLLED_TASK_DETAIL = "该任务由受控执行流程管理，请刷新任务状态"
 

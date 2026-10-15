@@ -11,6 +11,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import StreamingResponse
 from pydantic import ValidationError
+from sqlalchemy.orm import Session
 
 from haoai_backend.shared.errors import BusinessError
 from haoai_backend.shared.identity import TrustedActor
@@ -35,6 +36,13 @@ from .execution import (
     run_owned_in_threadpool,
 )
 from .ports import StoryboardGenerationRuntime, StoryboardGenerationUnitOfWorkFactory
+from .two_pass_billing import (
+    TwoPassAdmission,
+    TwoPassBillingService,
+    TwoPassQuoteRequest,
+    TwoPassStreamRequest,
+)
+from .two_pass_execution import TwoPassStoryboardExecution, replay_events
 from .schemas import (
     CreateChapterWithStoryboardRequest,
     GenerateStoryboardRequest,
@@ -49,10 +57,21 @@ def build_storyboard_generation_router(
     uow_factory: StoryboardGenerationUnitOfWorkFactory | None,
     resolve_actor: ActorResolver | None,
     runtime: StoryboardGenerationRuntime | None,
+    session_factory: Callable[[], Session] | None = None,
+    decrypt_api_key: Callable[[str], str] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/storyboard", tags=["storyboard-generation"])
     execution = (
         StoryboardGenerationExecution(runtime, uow_factory)
+        if runtime is not None
+        else None
+    )
+    billing = TwoPassBillingService(
+        session_factory,
+        decrypt_api_key=decrypt_api_key,
+    )
+    two_pass_execution = (
+        TwoPassStoryboardExecution(runtime, billing)
         if runtime is not None
         else None
     )
@@ -238,6 +257,75 @@ def build_storyboard_generation_router(
             },
         )
 
+    @router.post("/two-pass/quote")
+    async def quote_two_pass_storyboard(
+        request: Request,
+        actor: TrustedActor = Depends(trusted_actor),
+    ) -> dict[str, Any]:
+        require_runtime()
+        payload = await _validated_request(request, TwoPassQuoteRequest)
+        try:
+            return await run_owned_in_threadpool(billing.create_quote, actor, payload)
+        except BusinessError as error:
+            raise HTTPException(error.status_code, error.detail) from error
+
+    @router.post("/two-pass/stream")
+    async def two_pass_storyboard_stream(
+        request: Request,
+        actor: TrustedActor = Depends(trusted_actor),
+    ) -> StreamingResponse:
+        require_runtime()
+        payload = await _validated_request(request, TwoPassStreamRequest)
+        try:
+            admission = await run_owned_in_threadpool(
+                billing.admit,
+                actor,
+                payload.quote_id,
+                request.headers.get("idempotency-key"),
+            )
+        except BusinessError as error:
+            raise HTTPException(error.status_code, error.detail) from error
+        first = {"type": "receipt", **dict(admission.receipt)}
+        if admission.kind == "new":
+            assert two_pass_execution is not None and admission.execution is not None
+            try:
+                queue = two_pass_execution.start(admission.execution)
+            except Exception:
+                detail = "分镜生成任务无法启动"
+                try:
+                    settled = await run_owned_in_threadpool(
+                        billing.mark_failed,
+                        admission.execution,
+                        detail,
+                    )
+                except Exception:
+                    settled = False
+                if settled:
+                    first["status"] = "failed"
+                    first["billing_status"] = (
+                        "refunded" if admission.execution.quoted_amount > 0 else "no_charge"
+                    )
+                    queue = replay_events(
+                        TwoPassAdmission(
+                            "failed",
+                            admission.receipt,
+                            result={"error": detail},
+                        )
+                    )
+                else:
+                    queue = replay_events(TwoPassAdmission("pending", admission.receipt))
+        else:
+            queue = replay_events(admission)
+        return StreamingResponse(
+            _sse_events(queue, first),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
     return router
 
 
@@ -267,7 +355,7 @@ async def _sse_events(
     while True:
         event = await queue.get()
         yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
-        if event.get("type") in {"error", "complete", "done"}:
+        if event.get("type") in {"error", "complete", "done", "pending"}:
             return
 
 

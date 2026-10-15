@@ -84,4 +84,5 @@ def test_exact_controlled_task_type_set_is_kept() -> None:
         "image-single",
         "video-single",
         "ai-review",
+        "storyboard-two-pass",
     }

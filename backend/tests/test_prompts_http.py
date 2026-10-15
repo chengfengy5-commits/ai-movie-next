@@ -355,7 +355,7 @@ def test_create_app_wires_prompts_and_profiles_to_public_authentication(
         authentication_runtime=runtime,
     )
     try:
-        assert len(app.routes) == 248
+        assert len(app.routes) == 250
         assert events == []
         assert auth_sessions == [] and business_sessions == []
 

@@ -295,6 +295,8 @@ def test_app_factory_registers_existing_routes_and_chapter_asset_replacement(dat
         ("/api/storyboard/generate-stream", frozenset({"POST"})),
         ("/api/storyboard/create-chapter-with-storyboard", frozenset({"POST"})),
         ("/api/storyboard/two-pass", frozenset({"POST"})),
+        ("/api/storyboard/two-pass/quote", frozenset({"POST"})),
+        ("/api/storyboard/two-pass/stream", frozenset({"POST"})),
         ("/api/storyboard/extract-characters-stream", frozenset({"POST"})),
         ("/api/storyboard/judge-character-appearance-stream", frozenset({"POST"})),
         ("/api/storyboard/extract-scenes-stream", frozenset({"POST"})),

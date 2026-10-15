@@ -59,6 +59,8 @@ STORYBOARD_ROUTES = {
     ("POST", "/api/storyboard/generate-stream", "generate_storyboard_stream"),
     ("POST", "/api/storyboard/create-chapter-with-storyboard", "create_chapter_with_storyboard"),
     ("POST", "/api/storyboard/two-pass", "two_pass_storyboard"),
+    ("POST", "/api/storyboard/two-pass/quote", "quote_two_pass_storyboard"),
+    ("POST", "/api/storyboard/two-pass/stream", "two_pass_storyboard_stream"),
 }
 MARKED = "_::~OUTPUT_START::~_保留完整镜头文本。_::~OUTPUT_END::~_"
 

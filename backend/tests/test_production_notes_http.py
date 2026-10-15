@@ -305,6 +305,8 @@ def test_factory_adds_chat_and_asset_methods_without_changing_notes_and_rough_cu
         ("/api/storyboard/generate-stream", frozenset({"POST"})),
         ("/api/storyboard/create-chapter-with-storyboard", frozenset({"POST"})),
         ("/api/storyboard/two-pass", frozenset({"POST"})),
+        ("/api/storyboard/two-pass/quote", frozenset({"POST"})),
+        ("/api/storyboard/two-pass/stream", frozenset({"POST"})),
         ("/api/storyboard/extract-characters-stream", frozenset({"POST"})),
         ("/api/storyboard/judge-character-appearance-stream", frozenset({"POST"})),
         ("/api/storyboard/extract-scenes-stream", frozenset({"POST"})),

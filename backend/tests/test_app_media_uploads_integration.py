@@ -372,7 +372,7 @@ def test_create_app_mounts_authenticated_upload_retry_and_disabled_proxy(
         for method in route.methods
         if method not in {"HEAD", "OPTIONS"}
     }
-    assert len(registered) == 248
+    assert len(registered) == 250
     assert MEDIA_ROUTES <= registered
     assert CHAT_MEDIA_ROUTES <= registered
 

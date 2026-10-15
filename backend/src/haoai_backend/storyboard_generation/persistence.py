@@ -8,11 +8,12 @@ from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import select, update
+from sqlalchemy import inspect, select, update
 from sqlalchemy.orm import Session
 
 from haoai_backend.generation_catalog.tables import model_configs, prompt_configs, system_models, system_prompts
-from haoai_backend.generation_core.base_schema import AITaskRow
+from haoai_backend.generation_core.base_schema import AITaskRow, BillingUnitRow, TaskSubmissionRow
+from haoai_backend.generic_tasks.guard import CONTROLLED_TASK_TYPES
 from haoai_backend.series_access.application import require_series_access as apply_series_access
 from haoai_backend.series_access.domain import ActorIdentity
 from haoai_backend.series_access.errors import SeriesAccessDenied, SeriesNotFound
@@ -144,12 +145,22 @@ class SqlAlchemyStoryboardGenerationUnitOfWork:
         if not task_id:
             return
         row = self._session.execute(
-            select(AITaskRow.id, AITaskRow.status, AITaskRow.user_cancelled_at).where(
+            select(
+                AITaskRow.id,
+                AITaskRow.status,
+                AITaskRow.user_cancelled_at,
+                AITaskRow.type,
+            ).where(
                 AITaskRow.id == task_id,
                 AITaskRow.user_id == actor.user_id,
             )
         ).mappings().first()
-        if row is None or row["status"] in _TERMINAL_TASK_STATUSES or row["user_cancelled_at"] is not None:
+        if (
+            row is None
+            or row["status"] in _TERMINAL_TASK_STATUSES
+            or row["user_cancelled_at"] is not None
+            or self._is_foundation_controlled_task(actor.user_id, task_id, row["type"])
+        ):
             raise StoryboardGenerationTaskConflict()
 
     def write_task_result(
@@ -162,11 +173,22 @@ class SqlAlchemyStoryboardGenerationUnitOfWork:
     ) -> bool:
         if status not in {"completed", "failed"}:
             raise ValueError("task status must be terminal")
+        task_type = self._session.execute(
+            select(AITaskRow.type).where(
+                AITaskRow.id == task_id,
+                AITaskRow.user_id == actor.user_id,
+            )
+        ).scalar_one_or_none()
+        if task_type is None:
+            return False
+        if self._is_foundation_controlled_task(actor.user_id, task_id, task_type):
+            raise StoryboardGenerationTaskConflict()
         changed = self._session.execute(
             update(AITaskRow)
             .where(
                 AITaskRow.id == task_id,
                 AITaskRow.user_id == actor.user_id,
+                AITaskRow.type.not_in(CONTROLLED_TASK_TYPES),
                 AITaskRow.status.not_in(_TERMINAL_TASK_STATUSES),
                 AITaskRow.user_cancelled_at.is_(None),
             )
@@ -179,6 +201,36 @@ class SqlAlchemyStoryboardGenerationUnitOfWork:
             )
         )
         return changed.rowcount == 1
+
+    def _is_foundation_controlled_task(
+        self,
+        actor_id: str,
+        task_id: str,
+        task_type: str,
+    ) -> bool:
+        if task_type in CONTROLLED_TASK_TYPES:
+            return True
+
+        inspector = inspect(self._session.connection())
+        if inspector.has_table(BillingUnitRow.__tablename__):
+            if self._session.execute(
+                select(BillingUnitRow.id)
+                .where(BillingUnitRow.task_id == task_id)
+                .limit(1)
+            ).first() is not None:
+                return True
+
+        if inspector.has_table(TaskSubmissionRow.__tablename__):
+            task_ids_by_submission = self._session.execute(
+                select(TaskSubmissionRow.task_ids).where(
+                    TaskSubmissionRow.user_id == actor_id
+                )
+            ).scalars()
+            return any(
+                isinstance(task_ids, list) and task_id in task_ids
+                for task_ids in task_ids_by_submission
+            )
+        return False
 
     def create_chapter(
         self,

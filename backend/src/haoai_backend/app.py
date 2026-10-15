@@ -924,6 +924,8 @@ def create_app(
             uow_factory=storyboard_uow_factory,
             resolve_actor=effective_resolver,
             runtime=storyboard_generation_runtime,
+            session_factory=effective_session_factory,
+            decrypt_api_key=LegacyFernet(secret_key).decrypt,
         )
     )
     storyboard_asset_uow_factory_value = (
