@@ -1,11 +1,25 @@
 import { demoSeries } from "../../features/series/demoSeries";
 import { demoTeams } from "../../features/series/demoTeams";
 import { getDemoChapterData, type DemoChapterData } from "../../features/chapters/demoChapters";
-import { getDemoAssetLibraryData } from "../../features/assets/demoAssets";
+import { getDemoAssetLibraryData, type DemoAssetLibraryData } from "../../features/assets/demoAssets";
 import { getDemoPersonalProductionNotes } from "../../features/chapters/demoPersonalProductionNotes";
 import { clonePersonalRoughCutSnapshot, getDemoPersonalRoughCut } from "../../features/chapters/demoPersonalRoughCut";
 import { ApiConfigurationError, readEnvironmentConfiguration, resolveApiBaseUrl, type AppMode } from "./config";
 import { ApiError, isAbortError } from "./errors";
+import {
+  parseCreatedCharacter,
+  parseCreatedProp,
+  parseCreatedScene,
+  parseUpdatedCharacter,
+  parseUpdatedProp,
+  parseUpdatedScene,
+  type CharacterCreateInput,
+  type CharacterUpdateInput,
+  type PropCreateInput,
+  type PropUpdateInput,
+  type SceneCreateInput,
+  type SceneUpdateInput,
+} from "./assetManagement";
 import {
   InvalidResponseError,
   parseChapterEditLockState,
@@ -55,6 +69,7 @@ import {
 import { inspectRoughCutSource } from "../../features/chapters/personal-production/roughCutEdit";
 import { getDemoMyTaskPage } from "../../features/tasks/demoTasks";
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
+import { parseTaskReceipt, parseTaskRequestRecord, type TaskReceipt, type TaskRequestRecord } from "./taskDetails";
 import { parseMyTeamList, type MyTeam } from "./teams";
 import {
   parseStoryboardModels,
@@ -131,6 +146,15 @@ export interface WorkspaceServices {
   listCharacters(seriesId: string, signal: AbortSignal): Promise<Character[]>;
   listScenes(seriesId: string, signal: AbortSignal): Promise<Scene[]>;
   listProps(seriesId: string, signal: AbortSignal): Promise<Prop[]>;
+  createCharacter?(seriesId: string, input: CharacterCreateInput, signal: AbortSignal): Promise<Character>;
+  updateCharacter?(seriesId: string, assetId: string, update: CharacterUpdateInput, signal: AbortSignal): Promise<Character>;
+  deleteCharacter?(assetId: string, signal: AbortSignal): Promise<void>;
+  createScene?(seriesId: string, input: SceneCreateInput, signal: AbortSignal): Promise<Scene>;
+  updateScene?(seriesId: string, assetId: string, update: SceneUpdateInput, signal: AbortSignal): Promise<Scene>;
+  deleteScene?(assetId: string, signal: AbortSignal): Promise<void>;
+  createProp?(seriesId: string, input: PropCreateInput, signal: AbortSignal): Promise<Prop>;
+  updateProp?(seriesId: string, assetId: string, update: PropUpdateInput, signal: AbortSignal): Promise<Prop>;
+  deleteProp?(assetId: string, signal: AbortSignal): Promise<void>;
   getPersonalProductionNotes(chapterId: string, signal: AbortSignal): Promise<PersonalProductionSnapshot>;
   savePersonalProductionNote?(
     chapterId: string,
@@ -149,6 +173,8 @@ export interface WorkspaceServices {
     signal: AbortSignal,
   ): Promise<PersonalRoughCutSnapshot>;
   listMyTasks(page: number, signal: AbortSignal): Promise<MyTaskPage>;
+  getTaskReceipt?(taskId: string, signal: AbortSignal): Promise<TaskReceipt>;
+  getTaskRequest?(taskId: string, signal: AbortSignal): Promise<TaskRequestRecord>;
   readonly storyboardGeneration?: StoryboardGenerationServicePort;
   exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
   importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
@@ -249,6 +275,62 @@ function cloneDemoChapterData(data: DemoChapterData): DemoChapterData {
   };
 }
 
+function cloneDemoAssetData(data: DemoAssetLibraryData): DemoAssetLibraryData {
+  return {
+    characters: data.characters.map((asset) => ({
+      ...asset,
+      aliases: asset.aliases === null ? null : [...asset.aliases],
+    })),
+    scenes: data.scenes.map((asset) => ({
+      ...asset,
+      aliases: asset.aliases === null ? null : [...asset.aliases],
+    })),
+    props: data.props.map((asset) => ({
+      ...asset,
+      aliases: asset.aliases === null ? null : [...asset.aliases],
+    })),
+  };
+}
+
+function definedValues<T extends object>(value: T): Partial<T> {
+  return Object.fromEntries(Object.entries(value).filter(([, entry]) => entry !== undefined)) as Partial<T>;
+}
+
+function findDemoAssetRow(
+  dataBySeries: Map<string, DemoAssetLibraryData>,
+  category: "characters",
+  assetId: string,
+): { rows: Character[]; index: number; asset: Character } | null;
+function findDemoAssetRow(
+  dataBySeries: Map<string, DemoAssetLibraryData>,
+  category: "scenes",
+  assetId: string,
+): { rows: Scene[]; index: number; asset: Scene } | null;
+function findDemoAssetRow(
+  dataBySeries: Map<string, DemoAssetLibraryData>,
+  category: "props",
+  assetId: string,
+): { rows: Prop[]; index: number; asset: Prop } | null;
+function findDemoAssetRow(
+  dataBySeries: Map<string, DemoAssetLibraryData>,
+  category: "characters" | "scenes" | "props",
+  assetId: string,
+): { rows: Character[] | Scene[] | Prop[]; index: number; asset: Character | Scene | Prop } | null {
+  for (const data of dataBySeries.values()) {
+    const rows = data[category];
+    const index = rows.findIndex((asset) => asset.id === assetId);
+    const asset = rows[index];
+    if (asset !== undefined) {
+      return { rows, index, asset } as {
+        rows: Character[] | Scene[] | Prop[];
+        index: number;
+        asset: Character | Scene | Prop;
+      };
+    }
+  }
+  return null;
+}
+
 function cloneDemoPersonalProductionSnapshot(
   snapshot: PersonalProductionSnapshot,
 ): PersonalProductionSnapshot {
@@ -265,6 +347,13 @@ function cloneDemoPersonalProductionSnapshot(
 export function createDemoServices(storage: StorageLike = browserStorage()): WorkspaceServices {
   const seriesRows = demoSeries.map((series) => ({ ...series }));
   const customSeriesIds = new Set<string>();
+  const assetDataBySeries = new Map<string, DemoAssetLibraryData>();
+  for (const series of seriesRows) {
+    const data = getDemoAssetLibraryData(series.id);
+    if (data !== null) {
+      assetDataBySeries.set(series.id, cloneDemoAssetData(data));
+    }
+  }
   let nextSeriesId = 1;
   let nextChapterId = 1;
   const chapterDataBySeries = new Map<string, DemoChapterData>();
@@ -285,6 +374,20 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
     userId: string | null;
   }>();
   let nextDemoStoryboardAssetId = 1;
+  let nextDemoManagedAssetId = 1;
+
+  function findDemoAssetData(seriesId: string): DemoAssetLibraryData | null {
+    const existing = assetDataBySeries.get(seriesId);
+    if (existing !== undefined) {
+      return existing;
+    }
+    if (!customSeriesIds.has(seriesId)) {
+      return null;
+    }
+    const empty: DemoAssetLibraryData = { characters: [], scenes: [], props: [] };
+    assetDataBySeries.set(seriesId, empty);
+    return empty;
+  }
 
   function findDemoChapter(chapterId: string): { seriesId: string; data: DemoChapterData; chapter: Chapter } | null {
     for (const [seriesId, data] of chapterDataBySeries) {
@@ -371,6 +474,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       };
       customSeriesIds.add(id);
       chapterDataBySeries.set(id, { chapters: [], assetsByChapter: {} });
+      assetDataBySeries.set(id, { characters: [], scenes: [], props: [] });
       seriesRows.unshift(created);
       return { ...created };
     },
@@ -417,6 +521,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
       seriesRows.splice(index, 1);
       customSeriesIds.delete(seriesId);
       chapterDataBySeries.delete(seriesId);
+      assetDataBySeries.delete(seriesId);
     },
     async listSeriesStylePrompts(signal) {
       if (signal.aborted) {
@@ -695,10 +800,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      const data = getDemoAssetLibraryData(seriesId);
-      if (data === null && customSeriesIds.has(seriesId)) {
-        return [];
-      }
+      const data = findDemoAssetData(seriesId);
       if (data === null) {
         throw demoNotFound();
       }
@@ -712,10 +814,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      const data = getDemoAssetLibraryData(seriesId);
-      if (data === null && customSeriesIds.has(seriesId)) {
-        return [];
-      }
+      const data = findDemoAssetData(seriesId);
       if (data === null) {
         throw demoNotFound();
       }
@@ -729,10 +828,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         throw new ApiError("aborted", "Request was cancelled.");
       }
       ensureDemoSession(storage);
-      const data = getDemoAssetLibraryData(seriesId);
-      if (data === null && customSeriesIds.has(seriesId)) {
-        return [];
-      }
+      const data = findDemoAssetData(seriesId);
       if (data === null) {
         throw demoNotFound();
       }
@@ -740,6 +836,171 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         ...prop,
         aliases: prop.aliases === null ? null : [...prop.aliases],
       }));
+    },
+    async createCharacter(seriesId, input, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const data = findDemoAssetData(seriesId);
+      if (data === null) {
+        throw demoNotFound();
+      }
+      const timestamp = new Date().toISOString();
+      const created: Character = {
+        id: `demo-character-${nextDemoManagedAssetId++}`,
+        series_id: seriesId,
+        name: input.name,
+        gender: input.gender ?? null,
+        age: input.age ?? null,
+        role: input.role ?? null,
+        appearance: input.appearance ?? null,
+        description: input.description ?? null,
+        image_url: input.image_url ?? null,
+        audio_url: input.audio_url ?? null,
+        voice_ref: input.voice_ref ?? null,
+        aliases: null,
+        canonical_key: input.name.trim() || null,
+        created_at: timestamp,
+        updated_at: timestamp,
+      };
+      data.characters.push(created);
+      return { ...created };
+    },
+    async updateCharacter(seriesId, assetId, update, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const found = findDemoAssetRow(assetDataBySeries, "characters", assetId);
+      if (found === null || found.asset.series_id !== seriesId) {
+        throw demoNotFound();
+      }
+      const updated: Character = {
+        ...found.asset,
+        ...definedValues(update),
+        canonical_key: update.name === undefined ? found.asset.canonical_key : update.name.trim() || null,
+        updated_at: new Date().toISOString(),
+      };
+      found.rows[found.index] = updated;
+      return { ...updated, aliases: updated.aliases === null ? null : [...updated.aliases] };
+    },
+    async deleteCharacter(assetId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const found = findDemoAssetRow(assetDataBySeries, "characters", assetId);
+      if (found === null) {
+        throw demoNotFound();
+      }
+      found.rows.splice(found.index, 1);
+    },
+    async createScene(seriesId, input, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const data = findDemoAssetData(seriesId);
+      if (data === null) {
+        throw demoNotFound();
+      }
+      const timestamp = new Date().toISOString();
+      const created: Scene = {
+        id: `demo-scene-${nextDemoManagedAssetId++}`,
+        series_id: seriesId,
+        title: input.title,
+        description: input.description ?? null,
+        image_url: input.image_url ?? null,
+        aliases: null,
+        canonical_key: input.title.trim() || null,
+        created_at: timestamp,
+        updated_at: timestamp,
+      };
+      data.scenes.push(created);
+      return { ...created };
+    },
+    async updateScene(seriesId, assetId, update, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const found = findDemoAssetRow(assetDataBySeries, "scenes", assetId);
+      if (found === null || found.asset.series_id !== seriesId) {
+        throw demoNotFound();
+      }
+      const updated: Scene = {
+        ...found.asset,
+        ...definedValues(update),
+        canonical_key: update.title === undefined ? found.asset.canonical_key : update.title.trim() || null,
+        updated_at: new Date().toISOString(),
+      };
+      found.rows[found.index] = updated;
+      return { ...updated, aliases: updated.aliases === null ? null : [...updated.aliases] };
+    },
+    async deleteScene(assetId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const found = findDemoAssetRow(assetDataBySeries, "scenes", assetId);
+      if (found === null) {
+        throw demoNotFound();
+      }
+      found.rows.splice(found.index, 1);
+    },
+    async createProp(seriesId, input, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const data = findDemoAssetData(seriesId);
+      if (data === null) {
+        throw demoNotFound();
+      }
+      const timestamp = new Date().toISOString();
+      const created: Prop = {
+        id: `demo-prop-${nextDemoManagedAssetId++}`,
+        series_id: seriesId,
+        name: input.name,
+        description: input.description ?? null,
+        image_url: input.image_url ?? null,
+        aliases: null,
+        canonical_key: input.name.trim() || null,
+        created_at: timestamp,
+        updated_at: timestamp,
+      };
+      data.props.push(created);
+      return { ...created };
+    },
+    async updateProp(seriesId, assetId, update, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const found = findDemoAssetRow(assetDataBySeries, "props", assetId);
+      if (found === null || found.asset.series_id !== seriesId) {
+        throw demoNotFound();
+      }
+      const updated: Prop = {
+        ...found.asset,
+        ...definedValues(update),
+        canonical_key: update.name === undefined ? found.asset.canonical_key : update.name.trim() || null,
+        updated_at: new Date().toISOString(),
+      };
+      found.rows[found.index] = updated;
+      return { ...updated, aliases: updated.aliases === null ? null : [...updated.aliases] };
+    },
+    async deleteProp(assetId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      const found = findDemoAssetRow(assetDataBySeries, "props", assetId);
+      if (found === null) {
+        throw demoNotFound();
+      }
+      found.rows.splice(found.index, 1);
     },
     async getPersonalProductionNotes(chapterId, signal) {
       if (signal.aborted) {
@@ -1116,12 +1377,22 @@ type ApiEndpoint =
   | "characters"
   | "scenes"
   | "props"
+  | "createCharacter"
+  | "updateCharacter"
+  | "deleteCharacter"
+  | "createScene"
+  | "updateScene"
+  | "deleteScene"
+  | "createProp"
+  | "updateProp"
+  | "deleteProp"
   | "personalProductionNotes"
   | "savePersonalProductionNote"
   | "savePersonalProductionResume"
   | "personalRoughCut"
   | "savePersonalRoughCut"
   | "myTasks"
+  | "taskRequest"
   | "myTeams";
 
 interface ApiRequestDefinition {
@@ -1138,6 +1409,7 @@ function apiRequestDefinition(
     page?: number;
     idempotencyKey?: string;
     taskId?: string;
+    assetId?: string;
   },
 ): ApiRequestDefinition {
   if (endpoint === "login") {
@@ -1178,6 +1450,10 @@ function apiRequestDefinition(
     const query = new URLSearchParams({ task_id: identifiers?.taskId ?? "" });
     return { path: "/chat/tasks?" + query.toString(), method: "GET" };
   }
+  if (endpoint === "taskRequest") {
+    const taskId = encodeApiPathId(identifiers?.taskId, "任务");
+    return { path: "/chat/tasks/" + taskId + "/request", method: "GET" };
+  }
   if (endpoint === "uploadSeriesCover") {
     return { path: "/upload/image", method: "POST" };
   }
@@ -1192,6 +1468,25 @@ function apiRequestDefinition(
   }
   if (endpoint === "myTeams") {
     return { path: "/teams/my", method: "GET" };
+  }
+  if (
+    endpoint === "createCharacter" || endpoint === "updateCharacter" || endpoint === "deleteCharacter"
+    || endpoint === "createScene" || endpoint === "updateScene" || endpoint === "deleteScene"
+    || endpoint === "createProp" || endpoint === "updateProp" || endpoint === "deleteProp"
+  ) {
+    const assetType = endpoint.endsWith("Character")
+      ? "characters"
+      : endpoint.endsWith("Scene") ? "scenes" : "props";
+    if (endpoint.startsWith("create")) {
+      const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
+      return { path: "/series/" + seriesId + "/" + assetType, method: "POST", expectedStatus: 201 };
+    }
+    const assetId = encodeApiPathId(identifiers?.assetId, "素材");
+    return {
+      path: "/" + assetType + "/" + assetId,
+      method: endpoint.startsWith("update") ? "PUT" : "DELETE",
+      ...(endpoint.startsWith("update") ? { expectedStatus: 200 } : { expectedStatus: 204 }),
+    };
   }
   if (endpoint === "createChapter") {
     const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
@@ -1312,6 +1607,7 @@ export function createApiServices(
       page?: number;
       idempotencyKey?: string;
       taskId?: string;
+      assetId?: string;
     },
     requestBaseUrl = apiBaseUrl,
   ): Promise<unknown> {
@@ -1437,6 +1733,7 @@ export function createApiServices(
       page?: number;
       idempotencyKey?: string;
       taskId?: string;
+      assetId?: string;
     },
   ): Promise<unknown> {
     try {
@@ -1835,6 +2132,69 @@ export function createApiServices(
         seriesId,
       );
     },
+    async createCharacter(seriesId, input, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("createCharacter", token, signal, input, { seriesId });
+      const character = parseCreatedCharacter(value, seriesId);
+      ensureCurrentApiSession(storage, token, signal);
+      return character;
+    },
+    async updateCharacter(seriesId, assetId, update, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("updateCharacter", token, signal, update, { assetId });
+      const character = parseUpdatedCharacter(value, seriesId, assetId);
+      ensureCurrentApiSession(storage, token, signal);
+      return character;
+    },
+    async deleteCharacter(assetId, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("deleteCharacter", token, signal, undefined, { assetId });
+      if (value !== undefined) {
+        throw new InvalidResponseError("服务器删除角色时返回了非预期内容。");
+      }
+    },
+    async createScene(seriesId, input, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("createScene", token, signal, input, { seriesId });
+      const scene = parseCreatedScene(value, seriesId);
+      ensureCurrentApiSession(storage, token, signal);
+      return scene;
+    },
+    async updateScene(seriesId, assetId, update, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("updateScene", token, signal, update, { assetId });
+      const scene = parseUpdatedScene(value, seriesId, assetId);
+      ensureCurrentApiSession(storage, token, signal);
+      return scene;
+    },
+    async deleteScene(assetId, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("deleteScene", token, signal, undefined, { assetId });
+      if (value !== undefined) {
+        throw new InvalidResponseError("服务器删除场景时返回了非预期内容。");
+      }
+    },
+    async createProp(seriesId, input, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("createProp", token, signal, input, { seriesId });
+      const prop = parseCreatedProp(value, seriesId);
+      ensureCurrentApiSession(storage, token, signal);
+      return prop;
+    },
+    async updateProp(seriesId, assetId, update, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("updateProp", token, signal, update, { assetId });
+      const prop = parseUpdatedProp(value, seriesId, assetId);
+      ensureCurrentApiSession(storage, token, signal);
+      return prop;
+    },
+    async deleteProp(assetId, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("deleteProp", token, signal, undefined, { assetId });
+      if (value !== undefined) {
+        throw new InvalidResponseError("服务器删除道具时返回了非预期内容。");
+      }
+    },
     async getPersonalProductionNotes(chapterId, signal) {
       const token = storage.getItem(API_TOKEN_KEY);
       if (!token) {
@@ -1995,6 +2355,20 @@ export function createApiServices(
         await request("myTasks", token, signal, undefined, { page }),
         page,
       );
+    },
+    async getTaskReceipt(taskId, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("twoPassTask", token, signal, undefined, { taskId });
+      const receipt = parseTaskReceipt(value, taskId);
+      ensureCurrentApiSession(storage, token, signal);
+      return receipt;
+    },
+    async getTaskRequest(taskId, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession("taskRequest", token, signal, undefined, { taskId });
+      const requestRecord = parseTaskRequestRecord(value, taskId);
+      ensureCurrentApiSession(storage, token, signal);
+      return requestRecord;
     },
     storyboardGeneration,
     async exportSeries(seriesId, signal) {
