@@ -265,6 +265,53 @@ class OpenAIImageProvider:
             )
 
 
+def build_original_openai_image_provider(
+    *,
+    snapshot: FrozenExecutionSnapshot,
+    execution_snapshot_ref: str,
+    credential_binding: CredentialBinding,
+    intent: CommittedIntent,
+    wire_model: str,
+    http_client_factory: HttpClientFactory,
+    credential_resolver: CredentialResolver,
+) -> OpenAIImageProvider:
+    """Build the adapter from authenticated values without opening resources.
+
+    Callers must independently confirm the durable intent before passing it.
+    The returned provider does not treat this value shape as proof of commit.
+    """
+
+    if (
+        type(snapshot) is not FrozenExecutionSnapshot
+        or type(credential_binding) is not CredentialBinding
+        or type(intent) is not CommittedIntent
+        or not isinstance(wire_model, str)
+        or not wire_model
+        or snapshot.model_name != wire_model
+        or snapshot.endpoint_policy.provider_origin != credential_binding.endpoint_origin
+        or credential_binding.source not in {"system", "user"}
+        or credential_binding.owner_or_system != snapshot.model_ref.owner_id
+        or credential_binding.row_id != snapshot.model_ref.model_id
+        or credential_binding.provider != snapshot.model_ref.provider
+        or not callable(http_client_factory)
+        or not callable(credential_resolver)
+    ):
+        raise ValueError("original image execution binding is incomplete")
+    execution = _OriginalImageExecutionBinding(
+        snapshot=snapshot,
+        execution_snapshot_ref=execution_snapshot_ref,
+        credential_binding=credential_binding,
+        credential_binding_ref=snapshot.credential_binding_ref,
+        intent=intent,
+        wire_model=wire_model,
+    )
+    return OpenAIImageProvider(
+        execution=execution,
+        http_client_factory=http_client_factory,
+        credential_resolver=credential_resolver,
+    )
+
+
 def _running_loop_exists() -> bool:
     try:
         asyncio.get_running_loop()

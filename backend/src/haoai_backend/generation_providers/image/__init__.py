@@ -7,13 +7,14 @@ from .openai_codec import (
     build_openai_text_to_image_request,
     parse_openai_image_response,
 )
-from .openai_provider import OpenAIImageProvider
+from .openai_provider import OpenAIImageProvider, build_original_openai_image_provider
 
 __all__ = [
     "OpenAIImageCodecError",
     "OpenAIImageGenerationRequest",
     "OpenAIImageOutput",
     "OpenAIImageProvider",
+    "build_original_openai_image_provider",
     "build_openai_text_to_image_request",
     "parse_openai_image_response",
 ]
