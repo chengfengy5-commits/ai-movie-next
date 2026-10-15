@@ -9,6 +9,11 @@ import type {
 } from "../../shared/api/contracts";
 import type { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import {
+  AssetManagementDialog,
+  type AssetDirectory,
+  type AssetManagementMode,
+} from "./management/AssetManagementDialog";
 import { searchAssetLibraryItems, type AssetLibraryItemsByCategory } from "./assetLibrarySearch";
 import {
   AssetFrameUsagePanel,
@@ -76,6 +81,14 @@ interface AssetSearchTicket {
   result: ScopedAssetResult;
   requestGeneration: number;
   generation: number;
+}
+
+interface AssetManagementRequest {
+  id: number;
+  scope: LibraryScope;
+  category: AssetLibraryType;
+  mode: AssetManagementMode;
+  item: AssetRecord | null;
 }
 
 const assetTypes: Array<{ id: AssetLibraryType; label: string }> = [
@@ -238,6 +251,8 @@ function AssetCard({
   failed,
   onImageError,
   onShowUsage,
+  onEdit,
+  onDelete,
   usageUnavailable,
   cardRef,
   highlighted,
@@ -250,6 +265,8 @@ function AssetCard({
   failed: boolean;
   onImageError(): void;
   onShowUsage?: (() => void) | undefined;
+  onEdit?: (() => void) | undefined;
+  onDelete?: (() => void) | undefined;
   usageUnavailable: boolean;
   cardRef?(element: HTMLElement | null): void;
   highlighted: boolean;
@@ -313,6 +330,12 @@ function AssetCard({
             素材身份暂无法核对，不能查看关联镜头。
           </p>
         )}
+        {(onEdit !== undefined || onDelete !== undefined) && (
+          <div className="asset-card-management-actions" aria-label={name + "素材操作"}>
+            {onEdit !== undefined && <button onClick={onEdit} type="button">编辑</button>}
+            {onDelete !== undefined && <button className="asset-card-delete" onClick={onDelete} type="button">删除</button>}
+          </div>
+        )}
       </div>
     </article>
   );
@@ -356,6 +379,10 @@ export function AssetLibrary({
   searchSelectionRef.current = searchSelection;
   const searchGenerationRef = useRef(0);
   const [usageOwner, setUsageOwner] = useState<AssetFrameUsageOwner | null>(null);
+  const [managementRequest, setManagementRequest] = useState<AssetManagementRequest | null>(null);
+  const managementRequestRef = useRef(managementRequest);
+  managementRequestRef.current = managementRequest;
+  const managementRequestIdRef = useRef(0);
   const [navigationIssue, setNavigationIssue] = useState<{ epoch: number; message: string } | null>(null);
   const [navigationFeedback, setNavigationFeedback] = useState<AssetNavigationFeedback | null>(null);
   const cache = useRef(new Map<AssetLibraryType, AssetReadyResult>());
@@ -428,6 +455,8 @@ export function AssetLibrary({
     usageOwnerRef.current = null;
     openEpochRef.current += 1;
     setUsageOwner(null);
+    managementRequestRef.current = null;
+    setManagementRequest(null);
     setNavigationIssue(null);
     setNavigationFeedback(null);
     setSelectedType(effectiveNavigationIntent.category);
@@ -570,6 +599,8 @@ export function AssetLibrary({
     searchSelectionRef.current = nextSelection;
     setSearchSelection(nextSelection);
     invalidateUsage();
+    managementRequestRef.current = null;
+    setManagementRequest(null);
     setNavigationFeedback(null);
   }
 
@@ -662,6 +693,85 @@ export function AssetLibrary({
     invalidateUsage();
   }
 
+  function openManagement(
+    mode: AssetManagementMode,
+    category: AssetLibraryType,
+    item: AssetRecord | null,
+    directoryItems: AssetRecord[],
+  ) {
+    const activeResult = resultRef.current;
+    if (
+      category !== selectedTypeRef.current
+      || activeResult === null
+      || activeResult.scope !== libraryScope
+      || activeResult.result.status !== "ready"
+      || activeResult.result.type !== category
+      || libraryScopeRef.current !== libraryScope
+    ) {
+      return;
+    }
+    if (item !== null && !hasUniqueUsageIdentity(directoryItems, item, series.id)) {
+      return;
+    }
+    const request: AssetManagementRequest = {
+      id: ++managementRequestIdRef.current,
+      scope: libraryScope,
+      category,
+      mode,
+      item,
+    };
+    managementRequestRef.current = request;
+    setManagementRequest(request);
+  }
+
+  function isCurrentManagement(request: AssetManagementRequest): boolean {
+    return managementRequestRef.current === request
+      && libraryScopeRef.current === request.scope
+      && request.scope.userId === userId
+      && request.scope.services === services
+      && request.scope.seriesId === series.id
+      && selectedTypeRef.current === request.category;
+  }
+
+  function closeManagement(request: AssetManagementRequest) {
+    if (!isCurrentManagement(request)) {
+      return;
+    }
+    managementRequestRef.current = null;
+    setManagementRequest(null);
+  }
+
+  function acceptManagedDirectory(request: AssetManagementRequest, directory: AssetDirectory) {
+    if (!isCurrentManagement(request) || directory.category !== request.category) {
+      return;
+    }
+    const requestGeneration = ++directoryRequestGenerationRef.current;
+    let ready: AssetReadyResult;
+    switch (directory.category) {
+      case "characters":
+        ready = { type: "characters", status: "ready", items: directory.items };
+        break;
+      case "scenes":
+        ready = { type: "scenes", status: "ready", items: directory.items };
+        break;
+      case "props":
+        ready = { type: "props", status: "ready", items: directory.items };
+        break;
+    }
+    cache.current.set(directory.category, ready);
+    resetAssetSearch();
+    invalidateUsage();
+    setNavigationFeedback(null);
+    const nextResult: ScopedAssetResult = {
+      scope: request.scope,
+      requestGeneration,
+      navigationEpoch: null,
+      result: ready,
+    };
+    resultRef.current = nextResult;
+    setResult(nextResult);
+  }
+
   function reloadCurrentType() {
     directoryRequestGenerationRef.current += 1;
     resetAssetSearch();
@@ -690,6 +800,8 @@ export function AssetLibrary({
   function goBack() {
     abandonNavigationIntent();
     invalidateUsage();
+    managementRequestRef.current = null;
+    setManagementRequest(null);
     onBack();
   }
 
@@ -730,6 +842,8 @@ export function AssetLibrary({
         key={category + ":" + item.id + ":" + itemPosition}
         onImageError={() => setFailedImages((previous) => new Set(previous).add(imageKey))}
         onShowUsage={identityIsUnique ? () => openUsage(category, item, items) : undefined}
+        onEdit={identityIsUnique ? () => openManagement("edit", category, item, items) : undefined}
+        onDelete={identityIsUnique ? () => openManagement("delete", category, item, items) : undefined}
         usageUnavailable={!identityIsUnique}
         type={category}
       />
@@ -804,6 +918,13 @@ export function AssetLibrary({
       setUsageOwner(null);
     }
   }, [usageOwner, libraryScope]);
+
+  useEffect(() => {
+    if (managementRequest !== null && managementRequest.scope !== libraryScope) {
+      managementRequestRef.current = null;
+      setManagementRequest(null);
+    }
+  }, [libraryScope, managementRequest]);
 
   useLayoutEffect(() => {
     const intent = effectiveNavigationIntent;
@@ -924,11 +1045,23 @@ export function AssetLibrary({
     <section className="asset-library" aria-labelledby="asset-library-heading" ref={libraryElementRef}>
       <div className="asset-library-heading">
         <div>
-          <p className="eyebrow">只读浏览 · 素材</p>
+          <p className="eyebrow">素材目录 · 手工维护</p>
           <h1 id="asset-library-heading">{series.name} · 素材库</h1>
-          <p>查看剧集已有的角色、场景与道具素材。</p>
+          <p>查看并维护剧集已有的角色、场景与道具文字资料。</p>
         </div>
         <div className="asset-library-actions">
+          <button
+            className="primary-button"
+            disabled={currentResult?.status !== "ready"}
+            onClick={() => {
+              if (currentResult?.status === "ready") {
+                openManagement("create", selectedType, null, currentResult.items);
+              }
+            }}
+            type="button"
+          >
+            新增{assetTypes.find((type) => type.id === selectedType)?.label}
+          </button>
           <button className="secondary-button asset-refresh-button" onClick={reloadCurrentType} type="button">
             重新读取
           </button>
@@ -1013,7 +1146,7 @@ export function AssetLibrary({
         <div className="state-panel empty-panel" role="status">
           <div className="empty-icon" aria-hidden="true">◌</div>
           <h2>还没有{assetTypes.find((type) => type.id === selectedType)?.label}素材</h2>
-          <p>新增与编辑功能暂未开放。</p>
+          <p>可以用右上角的新增按钮创建第一项素材。</p>
         </div>
       ) : (
         <>
@@ -1065,6 +1198,27 @@ export function AssetLibrary({
           owner={visibleUsageOwner}
         />
       )}
+      {managementRequest !== null
+        && managementRequest.scope === libraryScope
+        && managementRequest.category === selectedType && (
+          <AssetManagementDialog
+            category={managementRequest.category}
+            isCurrent={() => isCurrentManagement(managementRequest)}
+            item={managementRequest.item}
+            key={managementRequest.id}
+            mode={managementRequest.mode}
+            onClose={() => closeManagement(managementRequest)}
+            onDirectoryUpdated={(directory) => acceptManagedDirectory(managementRequest, directory)}
+            onUnauthorized={() => {
+              if (isCurrentManagement(managementRequest)) {
+                unauthorizedHandlerRef.current();
+              }
+            }}
+            seriesId={series.id}
+            seriesName={series.name}
+            services={services}
+          />
+        )}
     </section>
   );
 }

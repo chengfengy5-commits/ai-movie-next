@@ -206,7 +206,7 @@ function LayoutCommitObserver({ onCommit }: { onCommit(): void }) {
   return null;
 }
 
-describe("read-only asset library", () => {
+describe("asset library", () => {
   afterEach(() => {
     cleanup();
     assetSearchRuntime.inputs = [];
@@ -1686,6 +1686,99 @@ describe("read-only asset library", () => {
       }
     },
   );
+
+  it("moves focus into the dialog, keeps Escape from closing while saving, and restores focus after completion", async () => {
+    const user = userEvent.setup();
+    const initialAsset = character();
+    const updatedAsset = character({ name: "新名字" });
+    const preflight = deferred<Character[]>();
+    const listCharacters = vi.fn()
+      .mockResolvedValueOnce([initialAsset])
+      .mockReturnValueOnce(preflight.promise)
+      .mockResolvedValueOnce([updatedAsset]);
+    const updateCharacter = vi.fn(async () => updatedAsset);
+    renderLibrary(makeServices({ listCharacters, updateCharacter }));
+
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    const editButton = screen.getByRole("button", { name: "编辑" });
+    await user.click(editButton);
+    const dialog = screen.getByRole("dialog", { name: "编辑角色" });
+    const closeButton = screen.getByRole("button", { name: "关闭素材窗口" });
+    const nameInput = screen.getByLabelText(/角色名称/);
+    expect(closeButton).toHaveFocus();
+
+    await user.clear(nameInput);
+    await user.type(nameInput, "新名字");
+    await user.click(screen.getByRole("button", { name: "保存更改" }));
+    expect(await screen.findByText("正在提交…")).toBeInTheDocument();
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(screen.getByRole("dialog", { name: "编辑角色" })).toBe(dialog);
+
+    await act(async () => {
+      preflight.resolve([initialAsset]);
+      await preflight.promise;
+    });
+    await waitFor(() => expect(updateCharacter).toHaveBeenCalledExactlyOnceWith(
+      series.id,
+      initialAsset.id,
+      { name: "新名字" },
+      expect.any(AbortSignal),
+    ));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "编辑角色" })).not.toBeInTheDocument());
+    expect(editButton).toHaveFocus();
+  });
+
+  it("preserves an uncertain create draft and only rereads the directory after a network error", async () => {
+    const user = userEvent.setup();
+    const createCharacter = vi.fn(async () => {
+      throw new ApiError("network", "connection lost");
+    });
+    const listCharacters = vi.fn(async () => [character()]);
+    renderLibrary(makeServices({ createCharacter, listCharacters }));
+
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新增角色" }));
+    const nameInput = screen.getByLabelText(/角色名称/);
+    await user.type(nameInput, "新角色草稿");
+    await user.click(screen.getByRole("button", { name: "创建素材" }));
+
+    expect(await screen.findByText(/创建请求结果未知/)).toBeInTheDocument();
+    expect(nameInput).toHaveValue("新角色草稿");
+    expect(createCharacter).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "仅重新读取目录" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "仅重新读取目录" }));
+    await waitFor(() => expect(listCharacters).toHaveBeenCalledTimes(3));
+    expect(nameInput).toHaveValue("新角色草稿");
+    expect(createCharacter).toHaveBeenCalledTimes(1);
+  });
+
+  it("previews references across the series before issuing one asset deletion", async () => {
+    const user = userEvent.setup();
+    const listChapters = vi.fn(async () => [
+      chapter("第一章", "第一处关联"),
+      chapter("第二章", "第二处关联"),
+    ]);
+    const deleteCharacter = vi.fn(async () => undefined);
+    const services = makeServices({ listChapters, deleteCharacter });
+    renderLibrary(services);
+
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "删除" }));
+    expect(await screen.findByText(/以下为当前影响预览/)).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByRole("status")).toHaveTextContent(
+      "已读取 2 章；发现 2 章、2 个镜头、2 次可确认引用。",
+    ));
+    expect(listChapters).toHaveBeenCalledExactlyOnceWith(series.id, expect.any(AbortSignal));
+
+    await user.click(screen.getByRole("button", { name: "确认删除整个剧集中的素材" }));
+    await waitFor(() => expect(deleteCharacter).toHaveBeenCalledExactlyOnceWith(
+      "shared-asset-id",
+      expect.any(AbortSignal),
+    ));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "删除角色" })).not.toBeInTheDocument());
+    expect(listChapters).toHaveBeenCalledTimes(1);
+    expect(services.listCharacters).toHaveBeenCalledTimes(2);
+  });
 
   it("does not request remote or non-loopback images", async () => {
     const services = makeServices({
