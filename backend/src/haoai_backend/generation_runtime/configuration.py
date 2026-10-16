@@ -24,6 +24,7 @@ class RegisteredExecutorFactory:
     task_type: str
     execution_port_factory: Callable[[], GenerationExecutionPort]
     executor_factory: ExecutorFactory
+    recovery_factory: Callable[[], object] | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -38,6 +39,8 @@ class RegisteredExecutorFactory:
             raise ValueError("registered task type must be a canonical lowercase identifier")
         if not callable(self.execution_port_factory) or not callable(self.executor_factory):
             raise TypeError("registered executor dependencies must be lazy callables")
+        if self.recovery_factory is not None and not callable(self.recovery_factory):
+            raise TypeError("recovery_factory must be a lazy callable when provided")
 
     def __call__(self) -> GenerationExecutor:
         """Preserve the public zero-argument executor-factory shape."""

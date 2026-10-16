@@ -18,6 +18,7 @@ from haoai_backend.authentication.tables import users as authentication_users
 from haoai_backend.generation_contracts.ports import GenerationRuntimeConfig
 from haoai_backend.generation_contracts.types import (
     BoundCredential,
+    OwnerTaskScope,
     PreparedReference,
     StoredMedia,
 )
@@ -774,6 +775,1025 @@ def test_unknown_create_is_persisted_and_a_reclaimed_task_never_posts_again(
         assert unit["billing_status"] in {"charged", "no_charge"}
         assert unit["refunded_amount"] == 0
     environment.engine.dispose()
+
+
+def test_due_settlement_ignores_late_unknown_observation_and_replays_exact_refund(
+    tmp_path: Path, monkeypatch
+) -> None:
+    environment, task_id = _admitted_image_task(
+        tmp_path, monkeypatch, "image-worker-due-late-unknown"
+    )
+    stores: list[StoredMedia] = []
+    runtime_config, provider_calls = _runtime_configuration(
+        environment, _provider_body(status=500), stores, response_status=500
+    )
+    clock_state = {
+        "now": datetime(2026, 10, 16, 2, 0, 30, tzinfo=timezone.utc)
+    }
+    runtime_config = replace(runtime_config, db_clock=lambda: clock_state["now"])
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+
+    assert runtime.run_claimed_once("image-single") == "pending"
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+        ).mappings().one()
+        unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == task_id
+            )
+        ).mappings().one()
+        step = reader.execute(
+            select(ExecutionStepRow.__table__).where(
+                ExecutionStepRow.__table__.c.billing_unit_id == unit["id"]
+            )
+        ).mappings().one()
+        submission = reader.execute(
+            select(ExternalSubmissionRow.__table__).where(
+                ExternalSubmissionRow.__table__.c.step_id == step["id"]
+            )
+        ).mappings().one()
+        first_intent = unit["first_intent_at"].replace(tzinfo=timezone.utc)
+        deadline = unit["deadline_at"].replace(tzinfo=timezone.utc)
+        wallet_after_debit = reader.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+        ).scalar_one()
+
+    late_observation_at = deadline + timedelta(seconds=1)
+    with Session(environment.engine) as mutator:
+        mutator.execute(
+            insert(ResultEvidenceRow.__table__).values(
+                id="late-unknown-observation",
+                step_id=step["id"],
+                submission_id=submission["id"],
+                evidence_key=f"image-single-observation-v1:{submission['id']}",
+                source="provider",
+                evidence_kind="provider_image_locator",
+                payload_digest="a" * 64,
+                result_location="https://provider.example.test/late.png",
+                result_digest="a" * 64,
+                received_at=late_observation_at.replace(tzinfo=None),
+                validity="unknown",
+                application_status="pending",
+                applied_at=None,
+            )
+        )
+        mutator.commit()
+
+    clock_state["now"] = late_observation_at
+    assert runtime.run_claimed_once("image-single") == "pending"
+    assert len(provider_calls) == 1
+    assert stores == []
+
+    with Session(environment.engine) as reader:
+        task_after_due = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+        ).mappings().one()
+        unit_after_due = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == task_id
+            )
+        ).mappings().one()
+        debit = reader.execute(
+            select(CreditLogRow.__table__).where(
+                CreditLogRow.__table__.c.business_key == f"debit:{unit['id']}"
+            )
+        ).mappings().one()
+        refund = reader.execute(
+            select(CreditLogRow.__table__).where(
+                CreditLogRow.__table__.c.business_key == f"refund:{unit['id']}"
+            )
+        ).mappings().one()
+        assert task_after_due["status"] == "failed"
+        assert task_after_due["billing_status"] == "refunded"
+        assert json.loads(task_after_due["result"])["code"] == "result_unconfirmed"
+        assert unit_after_due["result_status"] == "failed"
+        assert unit_after_due["refunded_amount"] == unit_after_due["debited_amount"] == 3
+        assert unit_after_due["first_intent_at"].replace(tzinfo=timezone.utc) == first_intent
+        assert unit_after_due["deadline_at"].replace(tzinfo=timezone.utc) == deadline
+        assert reader.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+        ).scalar_one() == wallet_after_debit + unit_after_due["debited_amount"]
+        assert refund["related_debit_id"] == debit["id"]
+        assert debit["amount"] == -unit_after_due["debited_amount"]
+        assert refund["amount"] == unit_after_due["debited_amount"] == 3
+        assert debit["amount"] + refund["amount"] == 0
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 1
+
+    results = SqlAlchemyImageSingleResults(
+        lambda: Session(environment.engine),
+        lambda: clock_state["now"],
+        lambda: "unused-due-replay-id",
+    )
+    assert results.settle_due(
+        OwnerTaskScope(task["user_id"], task_id, "image.single")
+    ) == "settled"
+    assert runtime.run_claimed_once("image-single") == "pending"
+    with Session(environment.engine) as reader:
+        assert reader.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+        ).scalar_one() == wallet_after_debit + unit_after_due["debited_amount"]
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"debit:{unit['id']}"
+            )
+        ).scalar_one() == 1
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 1
+    environment.engine.dispose()
+
+
+def test_timely_linked_image_success_is_retained_without_due_refund(
+    tmp_path: Path, monkeypatch
+) -> None:
+    environment, task_id = _admitted_image_task(
+        tmp_path, monkeypatch, "image-worker-due-timely-success"
+    )
+    stores: list[StoredMedia] = []
+    runtime_config, provider_calls = _runtime_configuration(
+        environment, _provider_body(), stores
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+
+    outcome = runtime.run_claimed_once("image-single")
+
+    assert outcome is not None and outcome != "pending" and outcome != "ownership_lost"
+    assert len(provider_calls) == 1
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+        ).mappings().one()
+        unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == task_id
+            )
+        ).mappings().one()
+    deadline = unit["deadline_at"].replace(tzinfo=timezone.utc)
+    results = SqlAlchemyImageSingleResults(
+        lambda: Session(environment.engine),
+        lambda: deadline + timedelta(microseconds=1),
+        lambda: "unused-success-check-id",
+    )
+
+    assert results.settle_due(
+        OwnerTaskScope(task["user_id"], task_id, "image.single")
+    ) == "retained"
+    with Session(environment.engine) as reader:
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 0
+
+
+def _unresolved_due_case(
+    tmp_path,
+    monkeypatch,
+    name,
+    *,
+    model_source=None,
+    wallet_credits: int | None = 20,
+):
+    environment, task_id = _admitted_image_task(
+        tmp_path, monkeypatch, name,
+        model_source=model_source, wallet_credits=wallet_credits,
+    )
+    stores: list[StoredMedia] = []
+    runtime_config, provider_calls = _runtime_configuration(
+        environment, _provider_body(status=500), stores, response_status=500
+    )
+    clock_state = {"now": datetime(2026, 10, 16, 2, 0, 30, tzinfo=timezone.utc)}
+    runtime_config = replace(runtime_config, db_clock=lambda: clock_state["now"])
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+    assert runtime.run_claimed_once("image-single") == "pending"
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+        ).mappings().one()
+        unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == task_id
+            )
+        ).mappings().one()
+    assert json.loads(task["result"]) == {
+        "message": "图片生成结果需要恢复确认",
+        "status": "reconciling",
+    }
+    deadline = unit["deadline_at"].replace(tzinfo=timezone.utc)
+    clock_state["now"] = deadline + timedelta(microseconds=1)
+    results = SqlAlchemyImageSingleResults(
+        lambda: Session(environment.engine),
+        lambda: clock_state["now"],
+        lambda: "unused-due-test-id",
+    )
+    return environment, task_id, task, unit, clock_state, results, provider_calls, stores, deadline
+
+
+def test_zero_cost_byok_deadline_settlement_needs_no_wallet_or_ledger(
+    tmp_path: Path, monkeypatch
+) -> None:
+    environment, task_id, task, unit, _, results, _, _, _ = _unresolved_due_case(
+        tmp_path, monkeypatch, "image-worker-due-byok-no-charge",
+        model_source=admission_staging_module.ModelSource.USER,
+        wallet_credits=None,
+    )
+    assert unit["debited_amount"] == 0
+    assert unit["billing_status"] == "no_charge"
+    with Session(environment.engine) as reader:
+        assert reader.execute(select(func.count()).select_from(UserCreditRow)).scalar_one() == 0
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.task_id == task_id
+            )
+        ).scalar_one() == 0
+    scope = OwnerTaskScope(task["user_id"], task_id, "image.single")
+    assert results.settle_due(scope) == "settled"
+    assert results.settle_due(scope) == "settled"
+    with Session(environment.engine) as reader:
+        task_after = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+        ).mappings().one()
+        unit_after = reader.execute(
+            select(BillingUnitRow.__table__).where(BillingUnitRow.__table__.c.id == unit["id"])
+        ).mappings().one()
+        assert task_after["billing_status"] == unit_after["billing_status"] == "no_charge"
+        assert unit_after["refunded_amount"] == 0
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.task_id == task_id
+            )
+        ).scalar_one() == 0
+        assert reader.execute(select(func.count()).select_from(UserCreditRow)).scalar_one() == 0
+    environment.engine.dispose()
+
+def test_wrong_graph_isolated_from_due_first_write_replay_and_retained_success(
+    tmp_path: Path, monkeypatch
+) -> None:
+    due_path = tmp_path / "due-graph"
+    due_path.mkdir()
+    environment, task_id, task, unit, clock_state, results, _, _, _ = _unresolved_due_case(
+        due_path, monkeypatch, "image-worker-due-wrong-graph"
+    )
+    original_request = task["request_data"]
+    wrong_request = dict(json.loads(original_request))
+    wrong_request["target_ref"] = wrong_request["protected_ref"] + "-other#target"
+    with Session(environment.engine) as mutator:
+        mutator.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.__table__.c.id == task_id)
+            .values(request_data=json.dumps(wrong_request, sort_keys=True))
+        )
+        mutator.commit()
+    scope = OwnerTaskScope(task["user_id"], task_id, "image.single")
+    assert results.settle_due(scope) == "pending"
+    with Session(environment.engine) as reader:
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 0
+
+    with Session(environment.engine) as mutator:
+        mutator.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.__table__.c.id == task_id)
+            .values(request_data=original_request)
+        )
+        mutator.commit()
+    original_confirm = results._confirm_due
+
+    def break_reference_before_ack(ack_scope, expected, original_graph, *, stop_signal=None):
+        with Session(environment.engine) as mutator:
+            mutator.execute(
+                update(AITaskRow.__table__)
+                .where(AITaskRow.__table__.c.id == task_id)
+                .values(request_data=json.dumps(wrong_request, sort_keys=True))
+            )
+            mutator.commit()
+        return original_confirm(ack_scope, expected, original_graph, stop_signal=stop_signal)
+
+    with monkeypatch.context() as patch_context:
+        patch_context.setattr(results, "_confirm_due", break_reference_before_ack)
+        assert results.settle_due(scope) == "pending"
+    with Session(environment.engine) as reader:
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 1
+    with Session(environment.engine) as mutator:
+        mutator.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.__table__.c.id == task_id)
+            .values(request_data=original_request)
+        )
+        mutator.commit()
+    assert results.settle_due(scope) == "settled"
+    with Session(environment.engine) as mutator:
+        mutator.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.__table__.c.id == task_id)
+            .values(request_data=json.dumps(wrong_request, sort_keys=True))
+        )
+        mutator.commit()
+    assert results.settle_due(scope) == "pending"
+    with Session(environment.engine) as reader:
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 1
+    environment.engine.dispose()
+
+    retained_path = tmp_path / "retained-graph"
+    retained_path.mkdir()
+    successful_environment, success_task_id = _admitted_image_task(
+        retained_path, monkeypatch, "image-worker-due-wrong-graph-retained"
+    )
+    stores: list[StoredMedia] = []
+    runtime_config, _ = _runtime_configuration(
+        successful_environment, _provider_body(), stores
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(
+            runtime_config, successful_environment.capabilities
+        )
+    )
+    assert runtime.run_claimed_once("image-single") not in {"pending", "ownership_lost"}
+    with Session(successful_environment.engine) as reader:
+        success_task = reader.execute(
+            select(AITaskRow.__table__).where(
+                AITaskRow.__table__.c.id == success_task_id
+            )
+        ).mappings().one()
+        success_unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == success_task_id
+            )
+        ).mappings().one()
+    success_deadline = success_unit["deadline_at"].replace(tzinfo=timezone.utc)
+    success_results = SqlAlchemyImageSingleResults(
+        lambda: Session(successful_environment.engine),
+        lambda: success_deadline + timedelta(microseconds=1),
+        lambda: "unused-retained-test-id",
+    )
+    success_scope = OwnerTaskScope(success_task["user_id"], success_task_id, "image.single")
+    assert success_results.settle_due(success_scope) == "retained"
+    bad_success_request = dict(json.loads(success_task["request_data"]))
+    bad_success_request["target_ref"] = (
+        bad_success_request["protected_ref"] + "-other#target"
+    )
+    with Session(successful_environment.engine) as mutator:
+        mutator.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.__table__.c.id == success_task_id)
+            .values(request_data=json.dumps(bad_success_request, sort_keys=True))
+        )
+        mutator.commit()
+    assert success_results.settle_due(success_scope) == "pending"
+    with Session(successful_environment.engine) as reader:
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{success_unit['id']}"
+            )
+        ).scalar_one() == 0
+    successful_environment.engine.dispose()
+
+
+def _stage_follow_up_image_task(environment, raw_key: str) -> str:
+    caller = _joint_caller(environment.engine)
+    staged = _joint_prepare_and_stage(
+        environment.binding,
+        caller,
+        operation="image.single",
+        raw_key=raw_key,
+        request={
+            "model_id": "model-1",
+            "prompt": "Follow-up legal wallet transaction",
+            "target": {"kind": "standalone"},
+            "size": None,
+            "reference_images": [],
+        },
+    )
+    assert isinstance(staged, AdmissionStaged)
+    task_id = staged.ordered_tasks[0].task_id
+    caller.commit()
+    caller.close()
+    return task_id
+
+
+def test_due_refund_rolls_back_after_wallet_update_then_retries_once(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import haoai_backend.generation_core.image_single_results as results_module
+
+    environment, task_id, task, unit, _, results, _, _, _ = _unresolved_due_case(
+        tmp_path, monkeypatch, "image-worker-due-wallet-rollback"
+    )
+    scope = OwnerTaskScope(task["user_id"], task_id, "image.single")
+    original_apply_refund = results_module._apply_refund
+
+    def fail_after_financial_writes(session, settlement, now):
+        original_apply_refund(session, settlement, now)
+        raise RuntimeError("injected failure after wallet and refund writes")
+
+    monkeypatch.setattr(results_module, "_apply_refund", fail_after_financial_writes)
+    assert results.settle_due(scope) == "pending"
+    with Session(environment.engine) as reader:
+        task_after = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+        ).mappings().one()
+        unit_after = reader.execute(
+            select(BillingUnitRow.__table__).where(BillingUnitRow.__table__.c.id == unit["id"])
+        ).mappings().one()
+        assert task_after["status"] == "reconciling"
+        assert unit_after["result_status"] == "unknown"
+        assert reader.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+        ).scalar_one() == 17
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 0
+
+    monkeypatch.undo()
+    assert results.settle_due(scope) == "settled"
+    assert results.settle_due(scope) == "settled"
+    with Session(environment.engine) as reader:
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 1
+    environment.engine.dispose()
+
+
+def test_due_commit_ack_and_later_wallet_debits_keep_exact_replay_settled(
+    tmp_path: Path, monkeypatch
+) -> None:
+    environment, task_id, task, unit, _, results, _, _, _ = _unresolved_due_case(
+        tmp_path, monkeypatch, "image-worker-due-commit-ack-and-wallet"
+    )
+    scope = OwnerTaskScope(task["user_id"], task_id, "image.single")
+    original_confirm = results._confirm_due
+    follow_up_task_ids: list[str] = []
+
+    def create_follow_up_before_ack(ack_scope, expected, original_graph, *, stop_signal=None):
+        follow_up_task_ids.append(
+            _stage_follow_up_image_task(environment, "image-worker-due-wallet-before-ack")
+        )
+        return original_confirm(
+            ack_scope, expected, original_graph, stop_signal=stop_signal
+        )
+
+    monkeypatch.setattr(results, "_confirm_due", create_follow_up_before_ack)
+    commit_ack_lost = False
+
+    def raise_after_first_commit(session) -> None:
+        nonlocal commit_ack_lost
+        if not commit_ack_lost:
+            commit_ack_lost = True
+            raise RuntimeError("injected connection loss after durable commit")
+
+    event.listen(Session, "after_commit", raise_after_first_commit)
+    try:
+        assert results.settle_due(scope) == "settled"
+    finally:
+        event.remove(Session, "after_commit", raise_after_first_commit)
+    assert commit_ack_lost
+
+    assert len(follow_up_task_ids) == 1
+    with Session(environment.engine) as reader:
+        refund = reader.execute(
+            select(CreditLogRow.__table__).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).mappings().one()
+        follow_up_debit = reader.execute(
+            select(CreditLogRow.__table__).where(
+                CreditLogRow.task_id == follow_up_task_ids[0],
+                CreditLogRow.type == "usage",
+            )
+        ).mappings().one()
+        assert follow_up_debit["amount"] == -3
+        assert follow_up_debit["user_id"] == task["user_id"]
+        assert refund["balance_after"] == 20
+        assert reader.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+        ).scalar_one() == 17
+
+    monkeypatch.setattr(results, "_confirm_due", original_confirm)
+    later_task_id = _stage_follow_up_image_task(
+        environment, "image-worker-due-wallet-after-settlement"
+    )
+    with Session(environment.engine) as reader:
+        later_debit = reader.execute(
+            select(CreditLogRow.__table__).where(
+                CreditLogRow.task_id == later_task_id,
+                CreditLogRow.type == "usage",
+            )
+        ).mappings().one()
+        assert later_debit["amount"] == -3
+        balance_before_replay = reader.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+        ).scalar_one()
+        assert balance_before_replay == 14
+    assert results.settle_due(scope) == "settled"
+    with Session(environment.engine) as reader:
+        assert reader.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+        ).scalar_one() == balance_before_replay
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 1
+    environment.engine.dispose()
+
+
+def test_due_shutdown_latches_before_graph_and_after_financial_locks(
+    tmp_path: Path, monkeypatch
+) -> None:
+    import haoai_backend.generation_core.image_single_results as image_single_results_module
+
+    environment, task_id, task, unit, _, results, _, _, _ = _unresolved_due_case(
+        tmp_path, monkeypatch, "image-worker-due-shutdown-locks"
+    )
+    scope = OwnerTaskScope(task["user_id"], task_id, "image.single")
+    stop_signal = Event()
+    stop_signal.set()
+    assert results.settle_due(scope, stop_signal=stop_signal) == "pending"
+
+    original_lock = image_single_results_module._lock_image_graph
+    stop_signal.clear()
+
+    def lock_then_stop(session, authority):
+        graph = original_lock(session, authority)
+        stop_signal.set()
+        return graph
+
+    monkeypatch.setattr(image_single_results_module, "_lock_image_graph", lock_then_stop)
+    assert results.settle_due(scope, stop_signal=stop_signal) == "pending"
+    monkeypatch.setattr(image_single_results_module, "_lock_image_graph", original_lock)
+
+    original_financial_state = results._with_financial_state
+    stop_signal.clear()
+
+    def financial_lock_then_stop(session, locked_scope, graph, expected):
+        decision = original_financial_state(session, locked_scope, graph, expected)
+        stop_signal.set()
+        return decision
+
+    monkeypatch.setattr(results, "_with_financial_state", financial_lock_then_stop)
+    assert results.settle_due(scope, stop_signal=stop_signal) == "pending"
+    with Session(environment.engine) as reader:
+        current_unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.id == unit["id"]
+            )
+        ).mappings().one()
+        assert current_unit["result_status"] == "unknown"
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.business_key == f"refund:{unit['id']}"
+            )
+        ).scalar_one() == 0
+    environment.engine.dispose()
+
+
+def test_due_discovery_rotates_over_more_than_one_page_and_honors_stop(
+    monkeypatch
+) -> None:
+    from types import SimpleNamespace
+
+    from haoai_backend.generation_core.image_single_recovery import (
+        SqlAlchemyImageSingleRecovery,
+    )
+
+    now = datetime(2026, 10, 16, 2, 0, 30, tzinfo=timezone.utc)
+    candidates = [
+        SimpleNamespace(
+            user_id="owner-1",
+            task_id=f"task-{index:02d}",
+            created_at=now,
+        )
+        for index in range(35)
+    ]
+
+    class RecordingResults:
+        def __init__(self) -> None:
+            self.task_ids: list[str] = []
+
+        def settle_due(self, scope, *, stop_signal=None):
+            self.task_ids.append(scope.task_id)
+            if stop_signal is not None:
+                stop_signal.set()
+            return "pending"
+
+    def read_page(self, observed_now, cursor, limit):
+        eligible = [
+            candidate
+            for candidate in candidates
+            if cursor is None
+            or (candidate.created_at, candidate.task_id) > cursor
+        ]
+        return eligible[:limit]
+
+    monkeypatch.setattr(SqlAlchemyImageSingleRecovery, "_read_candidates", read_page)
+    recorder = RecordingResults()
+    recovery = SqlAlchemyImageSingleRecovery(lambda: None, lambda: now, recorder)
+    recovery.scan_due()
+    assert len(recorder.task_ids) == 32
+    recovery.scan_due()
+    assert len(set(recorder.task_ids)) == 35
+
+    stopped_recorder = RecordingResults()
+    stopped_recovery = SqlAlchemyImageSingleRecovery(
+        lambda: None, lambda: now, stopped_recorder, page_size=3
+    )
+    stop_signal = Event()
+    stopped_recovery.scan_due(stop_signal=stop_signal)
+    assert len(stopped_recorder.task_ids) == 1
+
+
+def test_due_sql_discovery_pages_past_invalid_graph_to_later_due_task(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from haoai_backend.generation_core.image_single_recovery import (
+        SqlAlchemyImageSingleRecovery,
+    )
+
+    work_path = tmp_path / "sql-discovery"
+    work_path.mkdir()
+    environment, first_task_id = _admitted_image_task(
+        work_path, monkeypatch, "image-worker-due-sql-first"
+    )
+    second_task_id = _stage_follow_up_image_task(
+        environment, "image-worker-due-sql-second"
+    )
+    stores: list[StoredMedia] = []
+    runtime_config, provider_calls = _runtime_configuration(
+        environment, _provider_body(status=500), stores, response_status=500
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+    assert runtime.run_claimed_once("image-single") == "pending"
+    assert runtime.run_claimed_once("image-single") == "pending"
+    assert len(provider_calls) == 2
+
+    pending_task_id = _stage_follow_up_image_task(
+        environment, "image-worker-due-sql-no-intent"
+    )
+
+    with Session(environment.engine) as reader:
+        due_rows = reader.execute(
+            select(AITaskRow.__table__)
+            .where(
+                AITaskRow.__table__.c.id.in_((first_task_id, second_task_id)),
+                AITaskRow.__table__.c.status == "reconciling",
+            )
+            .order_by(AITaskRow.__table__.c.created_at, AITaskRow.__table__.c.id)
+        ).mappings().all()
+        assert len(due_rows) == 2
+        invalid_first = due_rows[0]
+        invalid_request = dict(json.loads(invalid_first["request_data"]))
+        invalid_request["target_ref"] = (
+            invalid_request["protected_ref"] + "-other#target"
+        )
+        invalid_task_id = invalid_first["id"]
+        later_due_task_id = due_rows[1]["id"]
+    with Session(environment.engine) as mutator:
+        mutator.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.__table__.c.id == invalid_task_id)
+            .values(request_data=json.dumps(invalid_request, sort_keys=True))
+        )
+        mutator.commit()
+
+    due_now = datetime(2026, 10, 16, 4, 0, 31, tzinfo=timezone.utc)
+    results = SqlAlchemyImageSingleResults(
+        lambda: Session(environment.engine),
+        lambda: due_now,
+        lambda: "unused-sql-discovery-id",
+    )
+    recovery = SqlAlchemyImageSingleRecovery(
+        lambda: Session(environment.engine),
+        lambda: due_now,
+        results,
+        page_size=1,
+    )
+    assert recovery.scan_due() == ("pending",)
+    assert recovery.scan_due() == ("settled",)
+    with Session(environment.engine) as reader:
+        invalid_task = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == invalid_task_id)
+        ).mappings().one()
+        later_task = reader.execute(
+            select(AITaskRow.__table__).where(
+                AITaskRow.__table__.c.id == later_due_task_id
+            )
+        ).mappings().one()
+        later_unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == later_due_task_id
+            )
+        ).mappings().one()
+        pending_task = reader.execute(
+            select(AITaskRow.__table__).where(
+                AITaskRow.__table__.c.id == pending_task_id
+            )
+        ).mappings().one()
+        assert invalid_task["status"] == "reconciling"
+        assert later_task["status"] == "failed"
+        assert later_unit["refunded_amount"] == later_unit["debited_amount"] == 3
+        assert pending_task["status"] == "queued"
+    environment.engine.dispose()
+
+
+def test_runtime_shutdown_signals_active_recovery_and_reports_resource_receipt(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from haoai_backend.generation_core.image_single_recovery import (
+        SqlAlchemyImageSingleRecovery,
+    )
+
+    environment, task_id = _admitted_image_task(
+        tmp_path, monkeypatch, "image-worker-due-runtime-shutdown"
+    )
+    stores: list[StoredMedia] = []
+    runtime_config, provider_calls = _runtime_configuration(
+        environment, _provider_body(status=500), stores, response_status=500
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+    scan_started = Event()
+    stop_observed = Event()
+    release_scan = Event()
+    stop_signals: list[Event] = []
+
+    def blocked_scan(self, *, stop_signal=None):
+        assert stop_signal is not None
+        stop_signals.append(stop_signal)
+        scan_started.set()
+        assert stop_signal.wait()
+        stop_observed.set()
+        assert release_scan.wait()
+        return ()
+
+    monkeypatch.setattr(SqlAlchemyImageSingleRecovery, "scan_due", blocked_scan)
+    outcomes: list[object] = []
+    worker = Thread(target=lambda: outcomes.append(runtime.run_claimed_once("image-single")))
+    worker.start()
+    assert scan_started.wait(timeout=2.0)
+
+    def release_after_stop() -> None:
+        assert stop_signals[0].wait()
+        release_scan.set()
+
+    releaser = Thread(target=release_after_stop)
+    releaser.start()
+    try:
+        receipt = runtime.shutdown("test shutdown")
+        worker.join(timeout=2.0)
+        releaser.join(timeout=2.0)
+        assert not worker.is_alive()
+        assert not releaser.is_alive()
+        assert stop_observed.is_set()
+        assert outcomes == ["pending"]
+        assert receipt.released_resources == ("recovery:image-single",)
+        assert receipt.timed_out is False
+        assert receipt.unreleased_resources == ()
+        assert receipt.recovery_plan_refs == ("recovery:image-single",)
+        assert receipt.revoked_claim_refs == ()
+        assert provider_calls == []
+        assert stores == []
+        with Session(environment.engine) as reader:
+            task = reader.execute(
+                select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+            ).mappings().one()
+            assert task["user_cancelled_at"] is None
+            assert task["status"] == "queued"
+            assert reader.execute(
+                select(func.count()).select_from(CreditLogRow).where(
+                    CreditLogRow.business_key.like("refund:%"),
+                    CreditLogRow.task_id == task_id,
+                )
+            ).scalar_one() == 0
+    finally:
+        for signal in stop_signals:
+            signal.set()
+        release_scan.set()
+        worker.join(timeout=2.0)
+        releaser.join(timeout=2.0)
+        environment.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    (
+        (timedelta(microseconds=-1), "retained"),
+        (timedelta(0), "settled"),
+        (timedelta(microseconds=1), "settled"),
+    ),
+)
+def test_due_classifies_actual_receipt_and_evidence_at_deadline_boundary(
+    tmp_path: Path, monkeypatch, offset: timedelta, expected: str
+) -> None:
+    from haoai_backend.generation_core.image_single_recovery import (
+        SqlAlchemyImageSingleRecovery,
+    )
+
+    environment, task_id = _admitted_image_task(
+        tmp_path, monkeypatch, f"image-worker-due-receipt-boundary-{offset}"
+    )
+    intent_time = datetime(2026, 10, 16, 2, 0, 30, tzinfo=timezone.utc)
+    deadline = intent_time + timedelta(hours=2)
+    clock_state = {"now": intent_time}
+    stores: list[StoredMedia] = []
+
+    def advance_after_storage(_stored: StoredMedia) -> None:
+        with Session(environment.engine) as lease_writer:
+            lease_writer.execute(
+                update(AITaskRow.__table__)
+                .where(AITaskRow.__table__.c.id == task_id)
+                .values(
+                    lease_until=(deadline + timedelta(minutes=1)).replace(tzinfo=None)
+                )
+            )
+            lease_writer.commit()
+        clock_state["now"] = deadline + offset
+
+    runtime_config, provider_calls = _runtime_configuration(
+        environment,
+        _provider_body(),
+        stores,
+        media_store_factory=lambda: _Storage(stores, on_store=advance_after_storage),
+    )
+    runtime_config = replace(runtime_config, db_clock=lambda: clock_state["now"])
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+    outcome = runtime.run_claimed_once("image-single")
+    assert len(provider_calls) == 1
+    assert len(stores) == 1
+
+    with Session(environment.engine) as reader:
+        task_before_due = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+        ).mappings().one()
+        unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == task_id
+            )
+        ).mappings().one()
+        step_id = reader.execute(
+            select(ExecutionStepRow.__table__.c.id).where(
+                ExecutionStepRow.__table__.c.billing_unit_id == unit["id"]
+            )
+        ).scalar_one()
+        submission_id = reader.execute(
+            select(ExternalSubmissionRow.__table__.c.id).where(
+                ExternalSubmissionRow.__table__.c.step_id == step_id
+            )
+        ).scalar_one()
+        receipts = reader.execute(
+            select(GenerationResultReceiptRow.__table__).where(
+                GenerationResultReceiptRow.__table__.c.task_id == task_id
+            )
+        ).mappings().all()
+        evidence = reader.execute(
+            select(ResultEvidenceRow.__table__).where(
+                ResultEvidenceRow.__table__.c.submission_id == submission_id
+            )
+        ).mappings().all()
+        wallet_after_debit = reader.execute(
+            select(UserCreditRow.credits).where(
+                UserCreditRow.user_id == task_before_due["user_id"]
+            )
+        ).scalar_one()
+        assert wallet_after_debit == 17
+        assert unit["first_intent_at"].replace(tzinfo=timezone.utc) == intent_time
+        assert unit["deadline_at"].replace(tzinfo=timezone.utc) == deadline
+        if offset < timedelta(0):
+            assert task_before_due["status"] == "completed"
+            assert len(receipts) == 1
+            receipt = receipts[0]
+            assert receipt["validated_at"].replace(tzinfo=timezone.utc) == deadline + offset
+            assert receipt["generation_fulfilled_at"].replace(tzinfo=timezone.utc) == deadline + offset
+            assert len(evidence) == 1
+            assert evidence[0]["validity"] == "valid"
+            assert evidence[0]["result_digest"] == receipt["content_digest"]
+            assert evidence[0]["result_location"] == receipt["recoverable_locator"]
+        else:
+            assert outcome == "ownership_lost"
+            assert task_before_due["status"] == "queued"
+            assert task_before_due["claimed_by"] is None
+            assert task_before_due["claim_token"] is None
+            assert task_before_due["lease_until"] is None
+            assert receipts == []
+            assert all(row["validity"] != "valid" for row in evidence)
+
+    clock_state["now"] = deadline + timedelta(microseconds=1)
+    results = SqlAlchemyImageSingleResults(
+        lambda: Session(environment.engine),
+        lambda: clock_state["now"],
+        lambda: "unused-receipt-boundary-id",
+    )
+    scope = OwnerTaskScope(task_before_due["user_id"], task_id, "image.single")
+    recovery = SqlAlchemyImageSingleRecovery(
+        lambda: Session(environment.engine),
+        lambda: clock_state["now"],
+        results,
+        page_size=1,
+    )
+    if offset < timedelta(0):
+        assert results.settle_due(scope) == expected
+        assert recovery.scan_due() == ()
+    else:
+        assert recovery.scan_due() == (expected,)
+        assert results.settle_due(scope) == expected
+
+    with Session(environment.engine) as reader:
+        terminal = reader.execute(
+            select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+        ).mappings().one()
+        terminal_unit = reader.execute(
+            select(BillingUnitRow.__table__).where(
+                BillingUnitRow.__table__.c.task_id == task_id
+            )
+        ).mappings().one()
+        debit_rows = reader.execute(
+            select(CreditLogRow.__table__).where(
+                CreditLogRow.__table__.c.business_key == f"debit:{unit['id']}"
+            )
+        ).mappings().all()
+        refund_rows = reader.execute(
+            select(CreditLogRow.__table__).where(
+                CreditLogRow.__table__.c.business_key == f"refund:{unit['id']}"
+            )
+        ).mappings().all()
+        wallet_after_recovery = reader.execute(
+            select(UserCreditRow.credits).where(
+                UserCreditRow.user_id == task_before_due["user_id"]
+            )
+        ).scalar_one()
+        assert terminal["status"] == ("completed" if expected == "retained" else "failed")
+        assert terminal["claimed_by"] is None
+        assert terminal["claim_token"] is None
+        assert terminal["lease_until"] is None
+        assert terminal_unit["first_intent_at"].replace(tzinfo=timezone.utc) == intent_time
+        assert terminal_unit["deadline_at"].replace(tzinfo=timezone.utc) == deadline
+        assert len(debit_rows) == 1
+        debit = debit_rows[0]
+        assert debit["amount"] == -unit["debited_amount"] == -3
+        if expected == "retained":
+            assert refund_rows == []
+            assert terminal_unit["refunded_amount"] == 0
+            assert wallet_after_recovery == wallet_after_debit == 17
+        else:
+            assert len(refund_rows) == 1
+            refund = refund_rows[0]
+            assert refund["related_debit_id"] == debit["id"]
+            assert refund["amount"] == unit["debited_amount"] == 3
+            assert debit["amount"] + refund["amount"] == 0
+            assert terminal_unit["refunded_amount"] == unit["debited_amount"] == 3
+            assert wallet_after_recovery == wallet_after_debit + unit["debited_amount"] == 20
+    environment.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("offset", "expected"),
+    (
+        (timedelta(microseconds=-1), True),
+        (timedelta(0), False),
+        (timedelta(microseconds=1), False),
+    ),
+)
+def test_timely_success_deadline_is_strictly_before(
+    offset: timedelta, expected: bool
+) -> None:
+    from haoai_backend.generation_core.image_single_results import (
+        _is_strictly_before_deadline,
+    )
+
+    deadline = datetime(2026, 10, 16, 4, 0, tzinfo=timezone.utc)
+    assert _is_strictly_before_deadline(deadline + offset, deadline) is expected
 
 
 def test_http_200_malformed_response_is_unknown_and_never_refunded(

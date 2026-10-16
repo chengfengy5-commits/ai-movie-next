@@ -5,11 +5,12 @@ import base64
 import hashlib
 import json
 from contextlib import AbstractAsyncContextManager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import monotonic
 
 import httpx
+import pytest
 
 from haoai_backend.app import create_app
 from haoai_backend.generation_contracts.ports import GenerationRuntimeConfig
@@ -26,11 +27,11 @@ _PNG_BASE64 = base64.b64encode(_PNG).decode("ascii")
 
 
 class _Response:
-    status_code = 200
     headers = {"content-length": "0"}
 
-    def __init__(self, body: bytes) -> None:
+    def __init__(self, body: bytes, status_code: int = 200) -> None:
         self._body = body
+        self.status_code = status_code
 
     async def iter_bytes(self, *, chunk_size: int):
         assert chunk_size > 0
@@ -38,9 +39,12 @@ class _Response:
 
 
 class _HttpClient:
-    def __init__(self, body: bytes, calls: list[dict[str, object]]) -> None:
+    def __init__(
+        self, body: bytes, calls: list[dict[str, object]], status_code: int = 200
+    ) -> None:
         self._body = body
         self._calls = calls
+        self._status_code = status_code
 
     async def request(self, method, url, *, headers=None, content=None, **kwargs):
         self._calls.append(
@@ -52,7 +56,7 @@ class _HttpClient:
                 "follow_redirects": kwargs.get("follow_redirects"),
             }
         )
-        return _Response(self._body)
+        return _Response(self._body, self._status_code)
 
 
 class _HttpClientContext(AbstractAsyncContextManager):
@@ -101,9 +105,11 @@ def test_default_app_lifespan_does_not_start_generation_resources() -> None:
     assert app.state.generation_worker_service is None
 
 
+@pytest.mark.parametrize("provider_status", (200, 500))
 def test_http_admission_is_processed_by_server_worker_and_readable_by_task_get(
     tmp_path: Path,
     monkeypatch,
+    provider_status: int,
 ) -> None:
     monkeypatch.setattr(app_admission_staging_module, "_G2_JOINT_PROVIDER", "openai")
     monkeypatch.setattr(
@@ -115,6 +121,15 @@ def test_http_admission_is_processed_by_server_worker_and_readable_by_task_get(
     provider_calls: list[dict[str, object]] = []
     stored_media: list[StoredMedia] = []
     worker_session_calls = 0
+    clock_origin = datetime(2026, 10, 16, 2, 0, 30, tzinfo=timezone.utc)
+    clock_state = {"now": clock_origin}
+    provider_body = (
+        b'{"data":[{"b64_json":"'
+        + _PNG_BASE64.encode("ascii")
+        + b'"}]}'
+        if provider_status == 200
+        else b"{}"
+    )
     runtime_id = 0
     original_create_app = admission_app_module.create_app
 
@@ -138,17 +153,10 @@ def test_http_admission_is_processed_by_server_worker_and_readable_by_task_get(
         )
         runtime = GenerationRuntimeConfig(
             session_factory=worker_session_factory,
-            db_clock=lambda: datetime(2026, 10, 16, 2, 0, 30, tzinfo=timezone.utc),
+            db_clock=lambda: clock_state["now"],
             id_factory=new_runtime_id,
             http_client_factory=lambda: _HttpClientContext(
-                _HttpClient(
-                    (
-                        b'{"data":[{"b64_json":"'
-                        + _PNG_BASE64.encode("ascii")
-                        + b'"}]}'
-                    ),
-                    provider_calls,
-                )
+                _HttpClient(provider_body, provider_calls, provider_status)
             ),
             credential_resolver=registry.resolve_original_credential,
             provider_factories=(),
@@ -203,6 +211,7 @@ def test_http_admission_is_processed_by_server_worker_and_readable_by_task_get(
                 )
                 assert admitted.status_code == 200, admitted.text
                 task_id = admitted.json()["task_id"]
+                expected_status = "completed" if provider_status == 200 else "failed"
                 deadline = monotonic() + 5.0
                 observed: dict[str, object] = {}
                 while monotonic() < deadline:
@@ -213,25 +222,28 @@ def test_http_admission_is_processed_by_server_worker_and_readable_by_task_get(
                     )
                     assert response.status_code == 200, response.text
                     observed = response.json()
-                    if observed.get("status") == "completed":
+                    if provider_status == 500 and observed.get("status") == "reconciling":
+                        clock_state["now"] = clock_origin + timedelta(seconds=7201)
+                    if observed.get("status") == expected_status:
                         break
                     await asyncio.sleep(0.025)
-                assert observed.get("status") == "completed", observed
-                result = observed.get("result")
-                assert isinstance(result, str)
-                result = json.loads(result)
-                assert result.get("url") == stored_media[0].locator
-                assert result.get("content_digest") == stored_media[0].content_digest
+                assert observed.get("status") == expected_status, observed
+                if provider_status == 200:
+                    result = observed.get("result")
+                    assert isinstance(result, str)
+                    result = json.loads(result)
+                    assert result.get("url") == stored_media[0].locator
+                    assert result.get("content_digest") == stored_media[0].content_digest
                 return observed
 
     observed = asyncio.run(exercise_http_and_lifespan())
 
-    assert observed["status"] == "completed"
+    assert observed["status"] == ("completed" if provider_status == 200 else "failed")
     assert len(provider_calls) == 1
     assert provider_calls[0]["method"] == "POST"
     assert provider_calls[0]["url"].endswith("/images/generations")
     assert provider_calls[0]["follow_redirects"] is False
-    assert len(stored_media) == 1
+    assert len(stored_media) == (1 if provider_status == 200 else 0)
     assert worker_session_calls > 0
     shutdown = system.app.state.generation_worker_shutdown
     assert shutdown.reason == "application lifespan shutdown"

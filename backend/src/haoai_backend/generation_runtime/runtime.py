@@ -91,16 +91,27 @@ class _InertRuntime:
 
 
 @dataclass(slots=True)
+class _ActiveRecovery:
+    task_type: str
+    stop_signal: Event
+    complete: Event
+
+
+@dataclass(slots=True)
 class _ConfiguredRuntime:
     _config: GenerationRuntimeConfig
     _executor_factories: tuple[ExecutorFactory, ...]
     _instance: str | None = None
     _closed: bool = False
     _active: dict[str, _ActiveClaim] | None = None
+    _recoveries: dict[str, object] | None = None
+    _active_recoveries: dict[str, _ActiveRecovery] | None = None
     _lock: RLock | None = None
 
     def __post_init__(self) -> None:
         self._active = {}
+        self._recoveries = {}
+        self._active_recoveries = {}
         self._lock = RLock()
 
     def run_claimed_once(self, task_type: str) -> WorkerExecutionOutcome:
@@ -118,6 +129,8 @@ class _ConfiguredRuntime:
             None,
         )
         if factory is None:
+            return "pending"
+        if not self._run_recovery(factory):
             return "pending"
         instance = self._worker_instance()
         if instance is None:
@@ -166,6 +179,43 @@ class _ConfiguredRuntime:
                 self._active.pop(claim.token, None)
         return outcome
 
+    def _run_recovery(self, factory: RegisteredExecutorFactory) -> bool:
+        recovery = self._recovery_for(factory)
+        scan_due = getattr(recovery, "scan_due", None)
+        if not callable(scan_due):
+            return True
+        active = _ActiveRecovery(factory.task_type, Event(), Event())
+        assert self._active_recoveries is not None and self._lock is not None
+        with self._lock:
+            if self._closed or factory.task_type in self._active_recoveries:
+                return False
+            self._active_recoveries[factory.task_type] = active
+        try:
+            scan_due(stop_signal=active.stop_signal)
+        except Exception:
+            pass
+        finally:
+            active.complete.set()
+            with self._lock:
+                self._active_recoveries.pop(factory.task_type, None)
+                closed = self._closed
+        return not active.stop_signal.is_set() and not closed
+
+    def _recovery_for(self, factory: RegisteredExecutorFactory) -> object | None:
+        if factory.recovery_factory is None:
+            return None
+        assert self._recoveries is not None and self._lock is not None
+        with self._lock:
+            existing = self._recoveries.get(factory.task_type)
+            if existing is not None:
+                return existing
+            try:
+                recovery = factory.recovery_factory()
+            except Exception:
+                return None
+            self._recoveries[factory.task_type] = recovery
+            return recovery
+
     async def run_web_stream(
         self,
         command: WebStreamCommand,
@@ -186,15 +236,20 @@ class _ConfiguredRuntime:
     def shutdown(self, reason: str) -> ShutdownReceipt:
         if not reason:
             raise ValueError("shutdown reason must be non-empty")
-        assert self._active is not None and self._lock is not None
+        assert self._active is not None and self._active_recoveries is not None and self._lock is not None
         with self._lock:
             self._closed = True
             active = tuple(self._active.values())
+            recoveries = tuple(self._active_recoveries.values())
+        for recovery in recoveries:
+            recovery.stop_signal.set()
         timeout = self._config.shutdown_timeout_seconds
         deadline = monotonic() + timeout
         released: list[str] = []
         unreleased: list[str] = []
         heartbeat_unreleased: list[str] = []
+        recovery_released: list[str] = []
+        recovery_unreleased: list[str] = []
         revoked: list[str] = []
         for item in active:
             item.heartbeat_stop.set()
@@ -229,15 +284,23 @@ class _ConfiguredRuntime:
             else:
                 unreleased.append(label)
         unreleased.extend(heartbeat_unreleased)
+        for recovery in recoveries:
+            label = f"recovery:{recovery.task_type}"
+            if recovery.complete.wait(timeout=max(0.0, deadline - monotonic())):
+                recovery_released.append(label)
+            else:
+                recovery_unreleased.append(label)
+        unreleased.extend(recovery_unreleased)
         return ShutdownReceipt(
             reason=reason,
-            released_resources=tuple(released),
+            released_resources=tuple((*released, *recovery_released)),
             unreleased_resources=tuple(unreleased),
             revoked_claim_refs=tuple(revoked),
-            recovery_plan_refs=tuple(
-                f"task:{item.claim.scope.task_id}" for item in active
+            recovery_plan_refs=(
+                *(f"task:{item.claim.scope.task_id}" for item in active),
+                *(f"recovery:{item.task_type}" for item in recoveries),
             ),
-            timed_out=bool(heartbeat_unreleased) or any(
+            timed_out=bool(heartbeat_unreleased or recovery_unreleased) or any(
                 item.release_complete is None or not item.release_complete.is_set()
                 for item in active
             ),

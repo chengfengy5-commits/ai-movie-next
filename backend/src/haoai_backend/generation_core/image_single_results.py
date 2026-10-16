@@ -7,7 +7,8 @@ import json
 import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from threading import Event
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -21,6 +22,7 @@ from haoai_backend.generation_contracts.types import (
     ClaimAuthority,
     CommittedIntent,
     FrozenExecutionSnapshot,
+    OwnerTaskScope,
     StoredMedia,
 )
 from haoai_backend.generation_credentials.execution_snapshot import (
@@ -76,6 +78,10 @@ _INTENT_SNAPSHOT_KEYS = frozenset(
 _DIGEST = re.compile(r"[0-9a-f]{64}\Z")
 _TERMINAL_MESSAGE = "图片生成结果需要恢复确认"
 
+
+def _is_stopping(stop_signal: Event | None) -> bool:
+    return stop_signal is not None and stop_signal.is_set()
+
 SessionFactory = Callable[[], Session]
 DbClock = Callable[[], datetime]
 IdFactory = Callable[[], str]
@@ -113,6 +119,7 @@ class _RefundSettlement:
     amount: int
     balance_before: int
     balance_after: int
+    description: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,6 +144,7 @@ class _ExpectedTerminal:
     refunded_amount: int | None = None
     refund: _RefundSettlement | None = None
     original_graph: _LockedImageGraph | None = None
+    refund_description: str | None = None
 
 
 class SqlAlchemyImageSingleResults:
@@ -153,6 +161,203 @@ class SqlAlchemyImageSingleResults:
         self._session_factory = session_factory
         self._db_clock = db_clock
         self._id_factory = id_factory
+
+    def settle_due(
+        self, scope: OwnerTaskScope, *, stop_signal: Event | None = None
+    ) -> Literal["settled", "retained", "pending"]:
+        """Settle an unresolved original image.single intent at its fixed deadline."""
+
+        if _is_stopping(stop_signal):
+            return "pending"
+        if (
+            type(scope) is not OwnerTaskScope
+            or scope.operation != _OPERATION
+            or not isinstance(scope.user_id, str)
+            or not scope.user_id
+            or not isinstance(scope.task_id, str)
+            or not scope.task_id
+        ):
+            return "pending"
+
+        expected = _due_terminal(scope)
+        original_graph: _LockedImageGraph | None = None
+        try:
+            with self._session_factory() as session:
+                with session.begin():
+                    graph = _lock_image_graph(session, scope)
+                    now = self._read_clock()
+                    if (
+                        graph is None or now is None or _is_stopping(stop_signal)
+                        or not _valid_image_single_identity(graph, scope)
+                    ):
+                        return "pending"
+                    if _is_due_terminal(graph, scope, expected.result_value):
+                        return (
+                            "settled"
+                            if _confirm_due_finances(
+                                session, graph, scope, stop_signal=stop_signal
+                            )
+                            else "pending"
+                        )
+                    if _has_timely_linked_success(session, graph, scope):
+                        return "retained"
+                    if not _valid_due_graph(graph, scope, now):
+                        return "pending"
+
+                    expected = replace(expected, now=now, original_graph=graph)
+                    expected = self._with_financial_state(
+                        session, scope, graph, expected
+                    )
+                    if _is_stopping(stop_signal):
+                        return "pending"
+                    fresh_now = self._read_clock()
+                    deadline_value = graph.unit.get("deadline_at")
+                    if (
+                        fresh_now is None
+                        or not isinstance(deadline_value, datetime)
+                        or _aware_utc(fresh_now) < _aware_utc(deadline_value)
+                    ):
+                        return "pending"
+                    now = fresh_now
+                    expected = replace(expected, now=now)
+                    original_graph = graph
+                    task_table = AITaskRow.__table__
+                    task_change = session.execute(
+                        update(task_table)
+                        .where(
+                            task_table.c.id == scope.task_id,
+                            task_table.c.user_id == scope.user_id,
+                            task_table.c.type == _TASK_TYPE,
+                            task_table.c.status == graph.task["status"],
+                            task_table.c.status.in_(("processing", "reconciling", "queued")),
+                            task_table.c.user_cancelled_at.is_(None),
+                            task_table.c.request_data == graph.task["request_data"],
+                            task_table.c.result == graph.task.get("result"),
+                        )
+                        .values(
+                            status="failed",
+                            result=expected.result_value,
+                            progress=100,
+                            progress_message="图片生成结果未能在期限内确认",
+                            billing_status=expected.task_billing_status,
+                            updated_at=_database_datetime(now),
+                        )
+                    )
+                    if task_change.rowcount != 1:
+                        raise _OwnershipLost
+
+                    unit_table = BillingUnitRow.__table__
+                    unit_change = session.execute(
+                        update(unit_table)
+                        .where(
+                            unit_table.c.id == graph.unit["id"],
+                            unit_table.c.task_id == scope.task_id,
+                            unit_table.c.operation == _OPERATION,
+                            unit_table.c.step_graph_version == _GRAPH_VERSION,
+                            unit_table.c.result_status.in_(("pending", "unknown")),
+                            unit_table.c.billing_status.in_(("charged", "no_charge")),
+                            unit_table.c.user_cancelled_at.is_(None),
+                            unit_table.c.success_confirmed_at.is_(None),
+                            unit_table.c.first_intent_at
+                            == _database_datetime(_aware_utc(graph.unit["first_intent_at"])),
+                            unit_table.c.deadline_at
+                            == _database_datetime(_aware_utc(graph.unit["deadline_at"])),
+                            unit_table.c.debited_amount == graph.unit["debited_amount"],
+                            unit_table.c.refunded_amount == 0,
+                        )
+                        .values(
+                            result_status="failed",
+                            billing_status=expected.unit_billing_status,
+                            refunded_amount=expected.refunded_amount,
+                            updated_at=_database_datetime(now),
+                        )
+                    )
+                    if unit_change.rowcount != 1:
+                        raise _OwnershipLost
+
+                    step_change = session.execute(
+                        update(ExecutionStepRow.__table__)
+                        .where(
+                            ExecutionStepRow.id == graph.step["id"],
+                            ExecutionStepRow.billing_unit_id == graph.unit["id"],
+                            ExecutionStepRow.step_key == "generate",
+                            ExecutionStepRow.input_digest == graph.step["input_digest"],
+                            ExecutionStepRow.execution_status.in_(("submitting", "reconciling")),
+                        )
+                        .values(
+                            execution_status="failed",
+                            updated_at=_database_datetime(now),
+                        )
+                    )
+                    if step_change.rowcount != 1:
+                        raise _OwnershipLost
+
+                    submission_change = session.execute(
+                        update(ExternalSubmissionRow.__table__)
+                        .where(
+                            ExternalSubmissionRow.id == graph.submission["id"],
+                            ExternalSubmissionRow.step_id == graph.step["id"],
+                            ExternalSubmissionRow.submission_key
+                            == graph.submission["submission_key"],
+                            ExternalSubmissionRow.request_digest
+                            == graph.submission["request_digest"],
+                            ExternalSubmissionRow.submission_status.in_(("submitting", "unknown")),
+                            ExternalSubmissionRow.external_task_id.is_(None),
+                            ExternalSubmissionRow.intent_at
+                            == _database_datetime(_aware_utc(graph.submission["intent_at"])),
+                            ExternalSubmissionRow.deadline_at
+                            == _database_datetime(_aware_utc(graph.submission["deadline_at"])),
+                        )
+                        .values(
+                            submission_status="unknown",
+                            updated_at=_database_datetime(now),
+                        )
+                    )
+                    if submission_change.rowcount != 1:
+                        raise _OwnershipLost
+
+                    if _is_stopping(stop_signal):
+                        raise _OwnershipLost
+                    if expected.refund is not None:
+                        _apply_refund(session, expected.refund, now)
+        except _InvalidFinancialProof:
+            return "pending"
+        except Exception:
+            if original_graph is None:
+                return "pending"
+
+        return (
+            "settled"
+            if self._confirm_due(
+                scope, expected, original_graph, stop_signal=stop_signal
+            )
+            else "pending"
+        )
+
+    def _confirm_due(
+        self,
+        scope: OwnerTaskScope,
+        expected: _ExpectedTerminal,
+        original_graph: _LockedImageGraph | None,
+        *,
+        stop_signal: Event | None = None,
+    ) -> bool:
+        if original_graph is None or _is_stopping(stop_signal):
+            return False
+        try:
+            with self._session_factory() as session:
+                graph = _lock_image_graph(session, scope)
+                return (
+                    graph is not None
+                    and _valid_image_single_identity(graph, scope)
+                    and _same_static_graph(original_graph, graph)
+                    and _is_due_terminal(graph, scope, expected.result_value)
+                    and _confirm_due_finances(
+                        session, graph, scope, stop_signal=stop_signal
+                    )
+                )
+        except Exception:
+            return False
 
     def complete(
         self,
@@ -441,7 +646,7 @@ class SqlAlchemyImageSingleResults:
 
                     expected = _with_now(expected, now)
                     expected = self._with_financial_state(
-                        session, claim, graph, expected
+                        session, claim.scope, graph, expected
                     )
                     if expected.kind == "failure":
                         fresh_graph = _lock_image_graph(session, claim)
@@ -819,7 +1024,7 @@ class SqlAlchemyImageSingleResults:
     def _with_financial_state(
         self,
         session: Session,
-        claim: ClaimAuthority,
+        scope: OwnerTaskScope,
         graph: _LockedImageGraph,
         expected: _ExpectedTerminal,
     ) -> _ExpectedTerminal:
@@ -848,7 +1053,7 @@ class SqlAlchemyImageSingleResults:
                 select(CreditLogRow.id)
                 .where(
                     or_(
-                        CreditLogRow.task_id == claim.scope.task_id,
+                        CreditLogRow.task_id == scope.task_id,
                         CreditLogRow.billing_unit_id == unit["id"],
                     )
                 )
@@ -867,15 +1072,15 @@ class SqlAlchemyImageSingleResults:
 
         wallet = session.execute(
             select(UserCreditRow.__table__)
-            .where(UserCreditRow.user_id == claim.scope.user_id)
+            .where(UserCreditRow.user_id == scope.user_id)
             .with_for_update()
         ).mappings().one_or_none()
         debit = session.execute(
             select(CreditLogRow.__table__)
             .where(
                 CreditLogRow.business_key == f"debit:{unit['id']}",
-                CreditLogRow.user_id == claim.scope.user_id,
-                CreditLogRow.task_id == claim.scope.task_id,
+                CreditLogRow.user_id == scope.user_id,
+                CreditLogRow.task_id == scope.task_id,
                 CreditLogRow.billing_unit_id == unit["id"],
                 CreditLogRow.type == "usage",
                 CreditLogRow.amount == -amount,
@@ -912,8 +1117,8 @@ class SqlAlchemyImageSingleResults:
         if refund_id is None:
             raise _InvalidFinancialProof
         settlement = _RefundSettlement(
-            owner_id=claim.scope.user_id,
-            task_id=claim.scope.task_id,
+            owner_id=scope.user_id,
+            task_id=scope.task_id,
             unit_id=str(unit["id"]),
             debit_id=str(debit["id"]),
             refund_id=refund_id,
@@ -921,6 +1126,8 @@ class SqlAlchemyImageSingleResults:
             amount=amount,
             balance_before=int(wallet["credits"]),
             balance_after=int(wallet["credits"]) + amount,
+            description=expected.refund_description
+            or "image.single provider rejection refund",
         )
         return replace(
             expected,
@@ -992,7 +1199,7 @@ def _apply_refund(
             amount=settlement.amount,
             balance_after=settlement.balance_after,
             type="refund",
-            description="image.single provider rejection refund",
+            description=settlement.description,
             task_id=settlement.task_id,
             business_key=settlement.refund_key,
             billing_unit_id=settlement.unit_id,
@@ -1002,10 +1209,13 @@ def _apply_refund(
     )
 
 
-def _lock_image_graph(session: Session, claim: ClaimAuthority) -> _LockedImageGraph | None:
+def _lock_image_graph(
+    session: Session, authority: ClaimAuthority | OwnerTaskScope
+) -> _LockedImageGraph | None:
+    scope = authority.scope if isinstance(authority, ClaimAuthority) else authority
     user = session.execute(
         select(UserRow.id)
-        .where(UserRow.id == claim.scope.user_id)
+        .where(UserRow.id == scope.user_id)
         .with_for_update(skip_locked=True)
     ).scalar_one_or_none()
     if user is None:
@@ -1013,8 +1223,8 @@ def _lock_image_graph(session: Session, claim: ClaimAuthority) -> _LockedImageGr
     task_row = session.execute(
         select(AITaskRow.__table__)
         .where(
-            AITaskRow.id == claim.scope.task_id,
-            AITaskRow.user_id == claim.scope.user_id,
+            AITaskRow.id == scope.task_id,
+            AITaskRow.user_id == scope.user_id,
         )
         .with_for_update(skip_locked=True)
     ).mappings().one_or_none()
@@ -1022,7 +1232,7 @@ def _lock_image_graph(session: Session, claim: ClaimAuthority) -> _LockedImageGr
         return None
     units = session.execute(
         select(BillingUnitRow.__table__)
-        .where(BillingUnitRow.task_id == claim.scope.task_id)
+        .where(BillingUnitRow.task_id == scope.task_id)
         .order_by(BillingUnitRow.id)
         .with_for_update()
     ).mappings().all()
@@ -1050,7 +1260,7 @@ def _lock_image_graph(session: Session, claim: ClaimAuthority) -> _LockedImageGr
         select(TaskSubmissionRow.__table__)
         .where(
             TaskSubmissionRow.id == parent_id,
-            TaskSubmissionRow.user_id == claim.scope.user_id,
+            TaskSubmissionRow.user_id == scope.user_id,
         )
         .with_for_update()
     ).mappings().one_or_none()
@@ -1071,6 +1281,500 @@ def _lock_image_graph(session: Session, claim: ClaimAuthority) -> _LockedImageGr
         parent=dict(parent),
         submission=dict(submissions[0]),
         request_data=request_data,
+    )
+
+
+_UNRESOLVED_RESULT = json.dumps(
+    {"message": _TERMINAL_MESSAGE, "status": "reconciling"},
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
+
+
+def _due_terminal(scope: OwnerTaskScope) -> _ExpectedTerminal:
+    return _ExpectedTerminal(
+        kind="failure",
+        task_id=scope.task_id,
+        owner_id=scope.user_id,
+        unit_id="",
+        step_id="",
+        submission_id="",
+        result_value=json.dumps(
+            {
+                "code": "result_unconfirmed",
+                "message": "图片生成结果未能在期限内确认",
+                "status": "failed",
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        task_status="failed",
+        unit_status="failed",
+        step_status="failed",
+        submission_status="unknown",
+        stored=None,
+        receipt=None,
+        evidence_id=None,
+        now=datetime.min.replace(tzinfo=timezone.utc),
+        refund_description="image.single fixed-deadline refund",
+    )
+
+
+def _valid_image_single_identity(
+    graph: _LockedImageGraph, scope: OwnerTaskScope
+) -> bool:
+    """Validate original request, graph, snapshot and intent independently of status."""
+
+    task, unit, step = graph.task, graph.unit, graph.step
+    parent, submission, request = graph.parent, graph.submission, graph.request_data
+    step_snapshot = step.get("input_snapshot")
+    intent_snapshot = submission.get("request_snapshot")
+    first_intent, deadline = unit.get("first_intent_at"), unit.get("deadline_at")
+    if (
+        not isinstance(step_snapshot, dict)
+        or set(step_snapshot) != _STEP_SNAPSHOT_KEYS
+        or not isinstance(intent_snapshot, dict)
+        or set(intent_snapshot) != _INTENT_SNAPSHOT_KEYS
+        or not isinstance(first_intent, datetime)
+        or not isinstance(deadline, datetime)
+    ):
+        return False
+    digest = request.get("request_digest")
+    unit_id, step_id, parent_id = unit.get("id"), step.get("id"), parent.get("id")
+    attempt_id = request.get("server_attempt_id")
+    prepared_id = request.get("prepared_payload_id")
+    snapshot_digest = step_snapshot.get("snapshot_digest")
+    manifest_digest = step_snapshot.get("ordered_manifest_digest")
+    protected_ref = step_snapshot.get("protected_ref")
+    provider, model_id = submission.get("provider"), submission.get("model_ref")
+    model_source, model_owner = request.get("model_source"), request.get("model_owner_id")
+    binding_ref = intent_snapshot.get("credential_binding_ref")
+    if (
+        not isinstance(digest, str) or _DIGEST.fullmatch(digest) is None
+        or not all(isinstance(value, str) and value for value in (
+            unit_id, step_id, parent_id, attempt_id, prepared_id, protected_ref,
+            provider, model_id, binding_ref,
+        ))
+        or not isinstance(snapshot_digest, str)
+        or _DIGEST.fullmatch(snapshot_digest) is None
+        or not isinstance(manifest_digest, str)
+        or _DIGEST.fullmatch(manifest_digest) is None
+        or model_source not in {"system", "user"}
+        or (model_source == "system" and model_owner is not None)
+        or (model_source == "user" and model_owner != scope.user_id)
+    ):
+        return False
+    first_intent, deadline = _aware_utc(first_intent), _aware_utc(deadline)
+    expected_snapshot = {
+        "owner_id": scope.user_id, "task_id": scope.task_id,
+        "unit_id": unit_id, "step_id": step_id, "operation": _OPERATION,
+        "graph_version": _GRAPH_VERSION, "attempt_id": attempt_id,
+        "prepared_payload_id": prepared_id, "protected_ref": protected_ref,
+        "snapshot_digest": snapshot_digest,
+        "snapshot_ref": f"{_GRAPH_VERSION}:{prepared_id}:{snapshot_digest}:{manifest_digest}",
+        "credential_binding_ref": binding_ref,
+        "target_snapshot": request.get("target_snapshot"),
+        "provider": provider, "model_id": model_id,
+    }
+    return all((
+        task.get("id") == scope.task_id,
+        task.get("user_id") == scope.user_id,
+        task.get("type") == _TASK_TYPE,
+        task.get("model_name") == request.get("model_display_name"),
+        task.get("credit_cost") == unit.get("quoted_amount"),
+        request.get("operation") == _OPERATION,
+        request.get("step_graph_version") == _GRAPH_VERSION,
+        request.get("submission_id") == parent_id,
+        request.get("parent_attempt_id") == parent_id,
+        request.get("request_digest") == unit.get("input_digest")
+        == step.get("input_digest") == parent.get("request_digest")
+        == submission.get("request_digest"),
+        request.get("server_attempt_id") == unit.get("item_key")
+        == step_snapshot.get("server_attempt_id"),
+        request.get("billing_unit_id") == unit_id,
+        request.get("prepared_payload_id") == step_snapshot.get("prepared_payload_id"),
+        request.get("snapshot_digest") == snapshot_digest,
+        request.get("protected_ref") == protected_ref,
+        request.get("target_ref") == f"{protected_ref}#target",
+        request.get("model_ref") == f"{protected_ref}#model",
+        request.get("grant_ref") == f"{protected_ref}#grant",
+        request.get("item_id") == attempt_id,
+        request.get("unit_key") == unit.get("item_key") == attempt_id,
+        request.get("model_id") == model_id,
+        request.get("model_owner_id") == (None if model_source == "system" else scope.user_id),
+        request.get("target_snapshot") == intent_snapshot.get("target_snapshot"),
+        intent_snapshot == expected_snapshot,
+        step.get("id") == step_id and step.get("billing_unit_id") == unit_id,
+        step.get("step_key") == "generate" and step.get("required") is True,
+        step.get("step_order") == 0 and step.get("dependencies") in ([], ()),
+        unit.get("id") == unit_id and unit.get("task_id") == scope.task_id,
+        unit.get("operation") == _OPERATION,
+        unit.get("step_graph_version") == _GRAPH_VERSION,
+        parent.get("id") == parent_id and parent.get("user_id") == scope.user_id,
+        parent.get("operation") == _OPERATION and parent.get("request_digest") == digest,
+        parent.get("task_ids") == [scope.task_id] and bool(parent.get("idempotency_key")),
+        bool(submission.get("id")) and submission.get("step_id") == step_id,
+        submission.get("submission_key") == f"image-single-create-v1:{unit_id}:{step_id}",
+        submission.get("provider") == provider and submission.get("model_ref") == model_id,
+        submission.get("external_task_id") is None,
+        _time_matches(unit.get("first_intent_at"), first_intent),
+        _time_matches(unit.get("deadline_at"), deadline),
+        _time_matches(submission.get("intent_at"), first_intent),
+        _time_matches(submission.get("deadline_at"), deadline),
+        deadline == first_intent + timedelta(hours=2),
+    ))
+
+
+def _valid_due_graph(
+    graph: _LockedImageGraph, scope: OwnerTaskScope, now: datetime
+) -> bool:
+    if not _valid_image_single_identity(graph, scope):
+        return False
+    task = graph.task
+    unit = graph.unit
+    step = graph.step
+    parent = graph.parent
+    submission = graph.submission
+    request = graph.request_data
+    step_snapshot = step.get("input_snapshot")
+    intent_snapshot = submission.get("request_snapshot")
+    first_intent = unit.get("first_intent_at")
+    deadline = unit.get("deadline_at")
+    if (
+        not isinstance(step_snapshot, dict)
+        or set(step_snapshot) != _STEP_SNAPSHOT_KEYS
+        or not isinstance(intent_snapshot, dict)
+        or set(intent_snapshot) != _INTENT_SNAPSHOT_KEYS
+        or not isinstance(first_intent, datetime)
+        or not isinstance(deadline, datetime)
+    ):
+        return False
+    first_intent = _aware_utc(first_intent)
+    deadline = _aware_utc(deadline)
+    digest = request.get("request_digest")
+    prepared_id = request.get("prepared_payload_id")
+    attempt_id = request.get("server_attempt_id")
+    step_id = step.get("id")
+    unit_id = unit.get("id")
+    snapshot_digest = step_snapshot.get("snapshot_digest")
+    manifest_digest = step_snapshot.get("ordered_manifest_digest")
+    protected_ref = step_snapshot.get("protected_ref")
+    provider = submission.get("provider")
+    model_id = submission.get("model_ref")
+    model_source = request.get("model_source")
+    model_owner_id = request.get("model_owner_id")
+    binding_ref = intent_snapshot.get("credential_binding_ref")
+    if (
+        not isinstance(digest, str)
+        or _DIGEST.fullmatch(digest) is None
+        or not isinstance(prepared_id, str)
+        or not prepared_id
+        or not isinstance(attempt_id, str)
+        or not attempt_id
+        or not isinstance(step_id, str)
+        or not isinstance(unit_id, str)
+        or not isinstance(snapshot_digest, str)
+        or _DIGEST.fullmatch(snapshot_digest) is None
+        or not isinstance(manifest_digest, str)
+        or _DIGEST.fullmatch(manifest_digest) is None
+        or not isinstance(protected_ref, str)
+        or not protected_ref
+        or not isinstance(provider, str)
+        or not provider
+        or not isinstance(model_id, str)
+        or not model_id
+        or model_source not in {"system", "user"}
+        or (model_source == "system" and model_owner_id is not None)
+        or (model_source == "user" and model_owner_id != scope.user_id)
+        or not isinstance(binding_ref, str)
+        or not binding_ref
+    ):
+        return False
+    expected_snapshot_ref = (
+        f"{_GRAPH_VERSION}:{prepared_id}:{snapshot_digest}:{manifest_digest}"
+    )
+    expected_snapshot = {
+        "owner_id": scope.user_id,
+        "task_id": scope.task_id,
+        "unit_id": unit_id,
+        "step_id": step_id,
+        "operation": _OPERATION,
+        "graph_version": _GRAPH_VERSION,
+        "attempt_id": attempt_id,
+        "prepared_payload_id": prepared_id,
+        "protected_ref": protected_ref,
+        "snapshot_digest": snapshot_digest,
+        "snapshot_ref": expected_snapshot_ref,
+        "credential_binding_ref": binding_ref,
+        "target_snapshot": request.get("target_snapshot"),
+        "provider": provider,
+        "model_id": model_id,
+    }
+    amount = unit.get("debited_amount")
+    return all(
+        (
+            task.get("id") == scope.task_id,
+            task.get("user_id") == scope.user_id,
+            task.get("type") == _TASK_TYPE,
+            task.get("status") in {"processing", "reconciling", "queued"},
+            task.get("result") in (None, _UNRESOLVED_RESULT),
+            task.get("user_cancelled_at") is None,
+            task.get("billing_status") in {"charged", "no_charge"},
+            task.get("credit_cost") == unit.get("quoted_amount"),
+            task.get("model_name") == request.get("model_display_name"),
+            request.get("operation") == _OPERATION,
+            request.get("submission_id") == parent.get("id"),
+            request.get("parent_attempt_id") == parent.get("id"),
+            request.get("request_digest") == unit.get("input_digest") == step.get("input_digest") == submission.get("request_digest"),
+            request.get("server_attempt_id") == unit.get("item_key") == step_snapshot.get("server_attempt_id"),
+            request.get("billing_unit_id") == unit_id,
+            request.get("prepared_payload_id") == step_snapshot.get("prepared_payload_id"),
+            request.get("snapshot_digest") == snapshot_digest,
+            request.get("protected_ref") == protected_ref,
+            request.get("model_id") == model_id,
+            request.get("model_source") in {"system", "user"},
+            request.get("model_owner_id")
+            == (None if request.get("model_source") == "system" else scope.user_id),
+            request.get("target_snapshot") == intent_snapshot.get("target_snapshot"),
+            intent_snapshot == expected_snapshot,
+            step.get("id") == step_id,
+            step.get("billing_unit_id") == unit_id,
+            step.get("step_key") == "generate",
+            step.get("required") is True,
+            step.get("step_order") == 0,
+            step.get("dependencies") in ([], ()),
+            step.get("execution_status") in {"submitting", "reconciling"},
+            unit.get("id") == unit_id,
+            unit.get("task_id") == scope.task_id,
+            unit.get("operation") == _OPERATION,
+            unit.get("step_graph_version") == _GRAPH_VERSION,
+            unit.get("billing_status") == task.get("billing_status"),
+            unit.get("result_status") in {"pending", "unknown"},
+            type(amount) is int and amount >= 0,
+            unit.get("refunded_amount") == 0,
+            unit.get("user_cancelled_at") is None,
+            unit.get("success_confirmed_at") is None,
+            parent.get("id") == request.get("submission_id"),
+            parent.get("user_id") == scope.user_id,
+            parent.get("operation") == _OPERATION,
+            parent.get("task_ids") == [scope.task_id],
+            submission.get("step_id") == step_id,
+            submission.get("submission_key") == f"image-single-create-v1:{unit_id}:{step_id}",
+            submission.get("provider") == provider,
+            submission.get("model_ref") == model_id,
+            submission.get("submission_status") in {"submitting", "unknown"},
+            submission.get("external_task_id") is None,
+            _time_matches(unit.get("first_intent_at"), first_intent),
+            _time_matches(submission.get("intent_at"), first_intent),
+            _time_matches(submission.get("deadline_at"), deadline),
+            deadline == first_intent + timedelta(hours=2),
+            now >= deadline,
+        )
+    )
+
+
+def _is_strictly_before_deadline(value: datetime, deadline: datetime) -> bool:
+    return _aware_utc(value) < _aware_utc(deadline)
+
+
+def _has_timely_linked_success(
+    session: Session, graph: _LockedImageGraph, scope: OwnerTaskScope
+) -> bool:
+    unit = graph.unit
+    step = graph.step
+    submission = graph.submission
+    deadline_value = unit.get("deadline_at")
+    if not isinstance(deadline_value, datetime):
+        return False
+    deadline = _aware_utc(deadline_value)
+    receipts = session.execute(
+        select(GenerationResultReceiptRow.__table__).where(
+            GenerationResultReceiptRow.owner_id == scope.user_id,
+            GenerationResultReceiptRow.task_id == scope.task_id,
+            GenerationResultReceiptRow.unit_id == unit.get("id"),
+            GenerationResultReceiptRow.operation == _OPERATION,
+            GenerationResultReceiptRow.step_id == step.get("id"),
+            GenerationResultReceiptRow.submission_id == submission.get("id"),
+        )
+    ).mappings().all()
+    if len(receipts) != 1:
+        return False
+    receipt = receipts[0]
+    validated_at = receipt.get("validated_at")
+    fulfilled_at = receipt.get("generation_fulfilled_at")
+    digest = receipt.get("content_digest")
+    locator = receipt.get("recoverable_locator")
+    if (
+        not isinstance(validated_at, datetime)
+        or not isinstance(fulfilled_at, datetime)
+        or not isinstance(digest, str)
+        or _DIGEST.fullmatch(digest) is None
+        or not isinstance(locator, str)
+        or not locator
+        or not _is_strictly_before_deadline(validated_at, deadline)
+        or not _is_strictly_before_deadline(fulfilled_at, deadline)
+        or receipt.get("selected_attempt_id") != graph.request_data.get("server_attempt_id")
+        or receipt.get("validation_version") != "image-single-media-v1"
+        or receipt.get("late_disposition") is not None
+        or receipt.get("policy_stop_disposition") is not None
+        or receipt.get("automatic_application_allowed") is not True
+    ):
+        return False
+    evidence = session.execute(
+        select(ResultEvidenceRow.__table__).where(
+            ResultEvidenceRow.id == receipt.get("evidence_id"),
+            ResultEvidenceRow.step_id == step.get("id"),
+            ResultEvidenceRow.submission_id == submission.get("id"),
+        )
+    ).mappings().one_or_none()
+    if (
+        evidence is None
+        or evidence.get("source") != "provider"
+        or evidence.get("evidence_kind") != "provider_image"
+        or evidence.get("evidence_key") != f"image-single-result-v1:{submission.get('id')}"
+        or evidence.get("validity") != "valid"
+        or evidence.get("result_digest") != digest
+        or evidence.get("payload_digest") != digest
+        or evidence.get("result_location") != locator
+    ):
+        return False
+    try:
+        expected_result = json.dumps(
+            {
+                "kind": "image",
+                "url": locator,
+                "result_ref": receipt["result_ref"],
+                "content_digest": digest,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    projections_match = all(
+        (
+            graph.task.get("status") == "completed",
+            graph.task.get("result") == expected_result,
+            graph.task.get("billing_status") == unit.get("billing_status"),
+            graph.task.get("external_provider") == submission.get("provider"),
+            unit.get("billing_status") in {"charged", "no_charge"},
+            unit.get("result_status") == "succeeded",
+            unit.get("refunded_amount") == 0,
+            unit.get("success_confirmed_at") is not None
+            and _time_matches(unit.get("success_confirmed_at"), _aware_utc(fulfilled_at)),
+            step.get("execution_status") == "result_observed",
+            submission.get("submission_status") == "completed",
+            submission.get("external_task_id") is None,
+        )
+    )
+    if not projections_match:
+        return False
+    message_id = graph.task.get("message_id")
+    if not message_id:
+        return True
+    message = session.execute(
+        select(chat_messages.c.content).where(
+            chat_messages.c.id == message_id,
+            chat_messages.c.role == "assistant",
+        )
+    ).scalar_one_or_none()
+    return message == locator
+
+
+def _is_due_terminal(
+    graph: _LockedImageGraph, scope: OwnerTaskScope, result_value: str
+) -> bool:
+    return all(
+        (
+            graph.task.get("id") == scope.task_id,
+            graph.task.get("user_id") == scope.user_id,
+            graph.task.get("type") == _TASK_TYPE,
+            graph.task.get("status") == "failed",
+            graph.task.get("result") == result_value,
+            graph.unit.get("task_id") == scope.task_id,
+            graph.unit.get("operation") == _OPERATION,
+            graph.unit.get("result_status") == "failed",
+            graph.step.get("execution_status") == "failed",
+            graph.submission.get("submission_status") == "unknown",
+            graph.submission.get("external_task_id") is None,
+        )
+    )
+
+
+def _confirm_due_finances(
+    session: Session,
+    graph: _LockedImageGraph,
+    scope: OwnerTaskScope,
+    *,
+    stop_signal: Event | None = None,
+) -> bool:
+    unit = graph.unit
+    amount = unit.get("debited_amount")
+    refunded = unit.get("refunded_amount")
+    if type(amount) is not int or type(refunded) is not int:
+        return False
+    if amount == 0:
+        if (
+            _is_stopping(stop_signal)
+            or unit.get("billing_status") != "no_charge"
+            or graph.task.get("billing_status") != "no_charge"
+            or refunded != 0
+        ):
+            return False
+        entries = session.execute(
+            select(CreditLogRow.id).where(
+                or_(
+                    CreditLogRow.task_id == scope.task_id,
+                    CreditLogRow.billing_unit_id == unit.get("id"),
+                )
+            )
+        ).all()
+        return not _is_stopping(stop_signal) and not entries
+    if (
+        amount < 0
+        or refunded != amount
+        or unit.get("billing_status") != "refunded"
+        or graph.task.get("billing_status") != "refunded"
+        or _is_stopping(stop_signal)
+    ):
+        return False
+    debit = session.execute(
+        select(CreditLogRow.__table__).where(
+            CreditLogRow.business_key == f"debit:{unit.get('id')}",
+            CreditLogRow.user_id == scope.user_id,
+            CreditLogRow.task_id == scope.task_id,
+            CreditLogRow.billing_unit_id == unit.get("id"),
+            CreditLogRow.type == "usage",
+            CreditLogRow.amount == -amount,
+            CreditLogRow.related_debit_id.is_(None),
+        )
+    ).mappings().one_or_none()
+    if debit is None:
+        return False
+    refunds = session.execute(
+        select(CreditLogRow.__table__).where(
+            or_(
+                CreditLogRow.business_key == f"refund:{unit.get('id')}",
+                and_(
+                    CreditLogRow.type == "refund",
+                    CreditLogRow.related_debit_id == debit.get("id"),
+                ),
+            )
+        )
+    ).mappings().all()
+    return (
+        len(refunds) == 1
+        and refunds[0].get("user_id") == scope.user_id
+        and refunds[0].get("task_id") == scope.task_id
+        and refunds[0].get("billing_unit_id") == unit.get("id")
+        and refunds[0].get("related_debit_id") == debit.get("id")
+        and refunds[0].get("business_key") == f"refund:{unit.get('id')}"
+        and refunds[0].get("type") == "refund"
+        and refunds[0].get("amount") == amount
+        and type(refunds[0].get("balance_after")) is int
     )
 
 

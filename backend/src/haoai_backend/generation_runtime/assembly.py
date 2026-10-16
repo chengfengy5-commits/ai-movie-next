@@ -8,6 +8,12 @@ from haoai_backend.generation_contracts.ports import GenerationRuntimeConfig, In
 from haoai_backend.generation_credentials.application import RegistryCapabilities
 from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 from haoai_backend.generation_core.claims import SqlAlchemyImageSingleClaims
+from haoai_backend.generation_core.image_single_recovery import (
+    SqlAlchemyImageSingleRecovery,
+)
+from haoai_backend.generation_core.image_single_results import (
+    SqlAlchemyImageSingleResults,
+)
 
 from .configuration import RegisteredExecutorFactory
 from .image_single import ImageSingleExecutor
@@ -49,6 +55,15 @@ def build_generation_worker_runtime(
         executor_factory=lambda: ImageSingleExecutor(
             dependencies,
             configuration.registry_capabilities,
+        ),
+        recovery_factory=lambda: SqlAlchemyImageSingleRecovery(
+            dependencies.session_factory,
+            dependencies.db_clock,
+            SqlAlchemyImageSingleResults(
+                dependencies.session_factory,
+                dependencies.db_clock,
+                dependencies.id_factory,
+            ),
         ),
     )
     return build_runtime(dependencies, (factory,))
