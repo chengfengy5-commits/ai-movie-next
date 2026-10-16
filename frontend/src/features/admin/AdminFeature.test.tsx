@@ -1,11 +1,21 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { AdminFeature } from "./AdminFeature";
 import type { AdminFetcher } from "./adminApi";
 import type { AdminModel, AdminStats, AdminStorage } from "./adminTypes";
 import type { AdminUserRecord } from "./usersTypes";
 import type { SystemPrompt } from "./systemPromptsTypes";
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
 
 function jsonResponse(payload: unknown, status = 200): Response {
   return new Response(JSON.stringify(payload), {
@@ -727,5 +737,341 @@ describe("admin feature user flows", () => {
     ));
     expect(usersRequest).toBeDefined();
     expect(new Headers(usersRequest?.[1]?.headers).get("Authorization")).toBe("Bearer admin-token");
+  });
+});
+
+
+describe("admin membership host integration", () => {
+  it("mounts all five views through the real adapter and keeps confirmed receipts until return", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const redemption = {
+      id: "code-1", code: "SYNTHETIC-CODE-1", type: "membership", value: 30, is_used: false,
+      used_by: null, used_at: null, created_by: "admin-1", expires_at: null, created_at: "created",
+    };
+    let packageRow = {
+      id: "package-empty", category: "", name: "", price: 4, credits: 8, days: -2,
+      sort_order: 0, is_active: true, created_at: "created", updated_at: "updated",
+    };
+    let rejectNextCodeDelete = true;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/redemption-codes" && method === "GET") {
+        return jsonResponse({ data: [redemption], total: 1 });
+      }
+      if (url.pathname === "/api/admin/redemption-codes" && method === "POST") {
+        const body = JSON.parse(String(init?.body));
+        return jsonResponse({ ...redemption, type: body.type, value: body.value, _generated_count: body.count });
+      }
+      if (url.pathname === "/api/admin/redemption-codes/code-1" && method === "GET") return jsonResponse(redemption);
+      if (url.pathname === "/api/admin/redemption-codes/code-1" && method === "DELETE") {
+        if (rejectNextCodeDelete) {
+          rejectNextCodeDelete = false;
+          throw new TypeError("synthetic connection drop");
+        }
+        return jsonResponse({ message: "兑换码已删除" });
+      }
+      if (url.pathname === "/api/admin/purchase-packages" && method === "GET") {
+        return jsonResponse({ data: [packageRow], total: 1 });
+      }
+      if (url.pathname === "/api/admin/purchase-packages/package-empty" && method === "GET") {
+        return jsonResponse(packageRow);
+      }
+      if (url.pathname === "/api/admin/purchase-packages" && method === "POST") {
+        const body = JSON.parse(String(init?.body));
+        packageRow = { ...packageRow, ...body, id: "package-created" };
+        return jsonResponse(packageRow);
+      }
+      if (url.pathname === "/api/admin/purchase-packages/package-empty" && method === "PUT") {
+        const body = JSON.parse(String(init?.body));
+        packageRow = { ...packageRow, ...body };
+        return jsonResponse(packageRow);
+      }
+      if (url.pathname === "/api/admin/purchase-packages/package-empty" && method === "DELETE") {
+        return jsonResponse({ message: "套餐已删除" });
+      }
+      throw new Error("Unexpected membership integration request: " + method + " " + url.pathname);
+    });
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "兑换码管理" }));
+    expect(await screen.findByRole("heading", { name: "兑换码" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "生成兑换码" }));
+    expect(await screen.findByRole("heading", { name: "生成兑换码" })).toBeInTheDocument();
+    fireEvent.change(screen.getByLabelText("面值"), { target: { value: "30" } });
+    fireEvent.change(screen.getByLabelText("数量"), { target: { value: "2" } });
+    await user.click(screen.getByRole("button", { name: "生成" }));
+    expect(await screen.findByText("服务端已确认生成 2 个兑换码。")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "生成兑换码" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "返回目录" }));
+    expect(await screen.findByRole("heading", { name: "兑换码" })).toBeInTheDocument();
+    const codeRow = screen.getByText("code-1").closest("tr");
+    if (!codeRow) throw new Error("expected synthetic redemption row");
+    await user.click(within(codeRow).getByRole("button", { name: "删除" }));
+    expect(await screen.findByLabelText("删除结果待核对")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "只读查询记录" }));
+    expect(await screen.findByText(/只读核对：记录当前仍存在/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "购买套餐" }));
+    expect(await screen.findByRole("heading", { name: "购买套餐" })).toBeInTheDocument();
+    expect(await screen.findByText("package-empty")).toBeInTheDocument();
+    const packageRowElement = screen.getByText("package-empty").closest("tr");
+    if (!packageRowElement) throw new Error("expected empty legacy package row");
+    await user.click(within(packageRowElement).getByRole("button", { name: "编辑" }));
+    expect(await screen.findByRole("heading", { name: "编辑购买套餐" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "保存更改" })).toBeDisabled();
+    expect(fetcher.mock.calls.some(([input, init]) => (
+      new URL(String(input), window.location.href).pathname === "/api/admin/purchase-packages/package-empty"
+        && init?.method === "PUT"
+    ))).toBe(false);
+    fireEvent.change(screen.getByLabelText("价格（整数元）"), { target: { value: "0" } });
+    fireEvent.change(screen.getByLabelText("积分（空值表示 null）"), { target: { value: "" } });
+    await user.click(screen.getByLabelText("启用"));
+    await user.click(screen.getByRole("button", { name: "保存更改" }));
+    expect(await screen.findByText("服务端已确认套餐记录")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "编辑购买套餐" })).toBeInTheDocument();
+    const packageUpdate = fetcher.mock.calls.find(([input, init]) => (
+      new URL(String(input), window.location.href).pathname === "/api/admin/purchase-packages/package-empty"
+      && init?.method === "PUT"
+    ));
+    expect(JSON.parse(String(packageUpdate?.[1]?.body))).toEqual({ price: 0, credits: null, is_active: false });
+    expect(packageRow.category).toBe("");
+    expect(packageRow.name).toBe("");
+    expect(packageRow.price).toBe(0);
+    expect(packageRow.credits).toBeNull();
+    expect(packageRow.is_active).toBe(false);
+
+    await user.click(screen.getByRole("button", { name: "返回目录" }));
+    expect(await screen.findByRole("heading", { name: "购买套餐" })).toBeInTheDocument();
+    const deletePackageRow = screen.getByText("package-empty").closest("tr");
+    if (!deletePackageRow) throw new Error("expected synthetic package row for delete");
+    await user.click(within(deletePackageRow).getByRole("button", { name: "删除" }));
+    await waitFor(() => expect(fetcher.mock.calls.some(([input, init]) => (
+      new URL(String(input), window.location.href).pathname === "/api/admin/purchase-packages/package-empty"
+      && init?.method === "DELETE"
+    ))).toBe(true));
+    await user.click(screen.getByRole("button", { name: "新建套餐" }));
+    expect(await screen.findByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "创建套餐" }));
+    expect(await screen.findByText("服务端已确认套餐记录")).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+
+    const methodPath = fetcher.mock.calls.map(([input, init]) => (
+      (init?.method ?? "GET") + " " + new URL(String(input), window.location.href).pathname
+    ));
+    expect(methodPath).toEqual(expect.arrayContaining([
+      "GET /api/admin/redemption-codes", "POST /api/admin/redemption-codes",
+      "GET /api/admin/redemption-codes/code-1", "DELETE /api/admin/redemption-codes/code-1",
+      "GET /api/admin/purchase-packages", "GET /api/admin/purchase-packages/package-empty",
+      "POST /api/admin/purchase-packages", "PUT /api/admin/purchase-packages/package-empty",
+      "DELETE /api/admin/purchase-packages/package-empty",
+    ]));
+  });
+
+  it("uses the host guard for dirty, in-flight, and unknown states on sidebar and logout", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const create = deferred<Response>();
+    let createPending = false;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/auth/login") return jsonResponse({
+        access_token: "new-session-token",
+        user: { id: "admin-2", username: "operator-two", is_superuser: true },
+      });
+      if (url.pathname === "/api/admin/purchase-packages" && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ data: [], total: 0 });
+      }
+      if (url.pathname === "/api/admin/purchase-packages" && init?.method === "POST") {
+        createPending = true;
+        return create.promise;
+      }
+      if (url.pathname.startsWith("/api/admin/system-models")) return jsonResponse({ data: [], total: 0 });
+      return jsonResponse({ data: [], total: 0 });
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "购买套餐" }));
+    await screen.findByText("没有套餐记录");
+    await user.click(screen.getByRole("button", { name: "新建套餐" }));
+    await user.type(screen.getByLabelText("名称"), "dirty draft");
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(confirm).toHaveBeenCalled();
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: /Hao AI管理后台/ }));
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "创建套餐" }));
+    await waitFor(() => expect(createPending).toBe(true));
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(confirm.mock.calls.at(-1)?.[0]).toMatch(/请求已发出/);
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(await screen.findByRole("heading", { name: "管理后台" })).toBeInTheDocument();
+    expect(storage.getItem("admin_token")).toBeNull();
+    await user.type(screen.getByLabelText("用户名"), "operator-two");
+    await user.type(screen.getByLabelText("密码"), "synthetic-password");
+    await user.click(screen.getByRole("button", { name: "登录" }));
+    expect(await screen.findByRole("button", { name: "退出登录" })).toBeInTheDocument();
+    await act(async () => { create.resolve(jsonResponse({
+      id: "package-created", category: "credits", name: "dirty draft", price: 0, credits: null, days: null,
+      sort_order: 0, is_active: true, created_at: "created", updated_at: "updated",
+    })); });
+    expect(storage.getItem("admin_token")).toBe("new-session-token");
+    expect(screen.getAllByText("operator-two")).toHaveLength(2);
+  });
+
+  it("requires an explicit choice before abandoning an unknown package write and does not replay it", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    let createCalls = 0;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/purchase-packages" && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ data: [], total: 0 });
+      }
+      if (url.pathname === "/api/admin/purchase-packages" && init?.method === "POST") {
+        createCalls += 1;
+        throw new TypeError("synthetic connection drop");
+      }
+      if (url.pathname === "/api/admin/users") return jsonResponse({ data: [], total: 0 });
+      return jsonResponse({ data: [], total: 0 });
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "购买套餐" }));
+    await screen.findByText("没有套餐记录");
+    await user.click(screen.getByRole("button", { name: "新建套餐" }));
+    await user.type(screen.getByLabelText("名称"), "uncertain intent");
+    await user.click(screen.getByRole("button", { name: "创建套餐" }));
+    expect(await screen.findByRole("region", { name: "套餐写入结果待核对" })).toBeInTheDocument();
+    expect(createCalls).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "返回目录" }));
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+    await user.click(screen.getByRole("link", { name: /Hao AI管理后台/ }));
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+    expect(storage.getItem("admin_token")).toBe("admin-token");
+
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(await screen.findByText("没有符合条件的用户"))
+      .toBeInTheDocument();
+    expect(createCalls).toBe(1);
+    await user.click(screen.getByRole("button", { name: "购买套餐" }));
+    await user.click(screen.getByRole("button", { name: "新建套餐" }));
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+    expect(screen.queryByRole("region", { name: "套餐写入结果待核对" })).toBeNull();
+    expect(createCalls).toBe(1);
+  });
+
+});
+
+
+describe("admin membership confirmed exit states", () => {
+  it("keeps a non-default create receipt clean for beforeunload, return, and sidebar navigation", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const createdPackages: Array<Record<string, unknown>> = [];
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/purchase-packages" && method === "GET") {
+        return jsonResponse({ data: createdPackages, total: createdPackages.length });
+      }
+      if (url.pathname === "/api/admin/purchase-packages" && method === "POST") {
+        const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+        const created = {
+          id: "package-confirmed-" + (createdPackages.length + 1), category: "credits", name: "",
+          price: 0, credits: null, days: null, sort_order: 0, is_active: true,
+          created_at: "synthetic-created", updated_at: "synthetic-updated", ...body,
+        };
+        createdPackages.push(created);
+        return jsonResponse(created);
+      }
+      if (url.pathname === "/api/admin/users" && method === "GET") return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected synthetic request: " + method + " " + url.pathname);
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "购买套餐" }));
+    await screen.findByText("没有套餐记录");
+    await user.click(screen.getByRole("button", { name: "新建套餐" }));
+    await user.type(screen.getByLabelText("名称"), "Priority plan");
+    await user.type(screen.getByLabelText("价格（整数元）"), "37");
+    await user.click(screen.getByRole("button", { name: "创建套餐" }));
+
+    expect(await screen.findByText(/Priority plan · credits · 37 元/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "新建购买套餐" })).toBeInTheDocument();
+    const beforeUnload = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(beforeUnload)).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "返回目录" }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(await screen.findByRole("heading", { name: "购买套餐" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "新建套餐" }));
+    await user.type(screen.getByLabelText("名称"), "Sidebar plan");
+    await user.click(screen.getByRole("button", { name: "创建套餐" }));
+    expect(await screen.findByText(/Sidebar plan · credits · 0 元/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(confirm).not.toHaveBeenCalled();
+    expect(await screen.findByText("没有符合条件的用户")).toBeInTheDocument();
+  });
+
+  it("does not report a dirty edit after the host confirms its delete", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const packageRecord = {
+      id: "package-delete-confirmed", category: "credits", name: "Original plan", price: 12,
+      credits: null, days: null, sort_order: 0, is_active: true,
+      created_at: "synthetic-created", updated_at: "synthetic-updated",
+    };
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/purchase-packages" && method === "GET") {
+        return jsonResponse({ data: [packageRecord], total: 1 });
+      }
+      if (url.pathname === "/api/admin/purchase-packages/package-delete-confirmed" && method === "GET") {
+        return jsonResponse(packageRecord);
+      }
+      if (url.pathname === "/api/admin/purchase-packages/package-delete-confirmed" && method === "DELETE") {
+        return jsonResponse({ message: "套餐已删除" });
+      }
+      throw new Error("Unexpected synthetic request: " + method + " " + url.pathname);
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "购买套餐" }));
+    const row = (await screen.findByText("package-delete-confirmed")).closest("tr");
+    if (!row) throw new Error("expected synthetic package row");
+    await user.click(within(row).getByRole("button", { name: "编辑" }));
+    await user.type(await screen.findByLabelText("名称"), " edited");
+    await user.click(screen.getByRole("button", { name: "删除套餐" }));
+
+    expect(await screen.findByText("服务端已确认删除套餐。返回目录前保留此确认。")).toBeInTheDocument();
+    expect(confirm).toHaveBeenCalledTimes(1);
+    const beforeUnload = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(beforeUnload)).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "返回目录" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(await screen.findByRole("heading", { name: "购买套餐" })).toBeInTheDocument();
   });
 });

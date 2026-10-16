@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../shared/api/errors";
 import { resolveApiBaseUrl } from "../../shared/api/config";
 import { AdminDashboard } from "./AdminDashboard";
@@ -12,6 +12,10 @@ import { Users } from "./Users";
 import { UserCreditEditor, UserCreditsList } from "./UserCredits";
 import { createAdminUsersApi } from "./usersApi";
 import { SystemModels } from "./SystemModels";
+import { RedemptionCodes } from "../admin-membership/RedemptionCodes";
+import { PurchasePackages } from "../admin-membership/PurchasePackages";
+import { createAdminMembershipApi } from "../admin-membership/adminMembershipApi";
+import type { AdminMembershipApi, AdminMembershipExitSnapshot } from "../admin-membership/adminMembershipTypes";
 import "./Admin.css";
 
 const ADMIN_TOKEN_KEY = "admin_token";
@@ -38,11 +42,24 @@ type AdminView =
   | { kind: "user-edit"; id: string }
   | { kind: "user-credits" }
   | { kind: "credit-edit"; id: string }
-  | { kind: "credit-logs" };
+  | { kind: "credit-logs" }
+  | { kind: "redemption-codes" }
+  | { kind: "redemption-create" }
+  | { kind: "purchase-packages" }
+  | { kind: "purchase-package-create" }
+  | { kind: "purchase-package-edit"; id: string };
 
 interface AdminSession {
   token: string;
   user: AdminUser;
+}
+
+interface ActiveMembershipExit {
+  snapshot: AdminMembershipExitSnapshot;
+  pending: NonNullable<AdminMembershipExitSnapshot["pending"]>;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AdminMembershipApi;
 }
 
 interface AdminFeatureProps {
@@ -176,14 +193,34 @@ export function AdminFeature({
   const [session, setSession] = useState<AdminSession | null>(() => restoreAdminSession(storage));
   const [view, setView] = useState<AdminView>({ kind: "dashboard" });
   const viewIdentity = useRef(0);
+  const sessionGeneration = useRef(0);
+  const membershipExit = useRef<ActiveMembershipExit | null>(null);
+  const membershipApiRef = useRef<AdminMembershipApi | null>(null);
+  const [redemptionListVersion, setRedemptionListVersion] = useState(0);
+  const [packageListVersion, setPackageListVersion] = useState(0);
   const [modelListVersion, setModelListVersion] = useState(0);
   const [promptListVersion, setPromptListVersion] = useState(0);
   const [userListVersion, setUserListVersion] = useState(0);
   const [creditListVersion, setCreditListVersion] = useState(0);
 
-  const navigate = useCallback((nextView: AdminView) => {
+  const navigate = useCallback((nextView: AdminView, options?: { force?: boolean }) => {
+    const pending = membershipExit.current;
+    if (!options?.force && pending && pending.viewIdentity === viewIdentity.current
+      && pending.sessionGeneration === sessionGeneration.current && pending.api === membershipApiRef.current) {
+      const { kind, operation, recordId, message } = pending.pending;
+      const action = operation === "delete" ? "删除" : operation === "update" ? "更新" : "创建";
+      const target = recordId ? "记录 " + recordId : "当前表单";
+      const question = kind === "write-in-flight"
+        ? "正在" + action + target + "，请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : kind === "unknown-write"
+          ? message + "\n\n离开将放弃此意图的本地核对；之后重新提交会成为一项新操作。仍要离开吗？"
+          : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
+    membershipExit.current = null;
     viewIdentity.current += 1;
     setView(nextView);
+    return true;
   }, []);
 
   const api = useMemo(
@@ -202,22 +239,33 @@ export function AdminFeature({
     () => createAdminCreditsApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
+  const membershipApi = useMemo(
+    () => createAdminMembershipApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
+  membershipApiRef.current = membershipApi;
 
   const handleLogin = useCallback((nextSession: AdminSession) => {
+    sessionGeneration.current += 1;
+    membershipExit.current = null;
     setSession(nextSession);
-    navigate({ kind: "dashboard" });
+    navigate({ kind: "dashboard" }, { force: true });
   }, [navigate]);
 
   const handleUnauthorized = useCallback(() => {
+    sessionGeneration.current += 1;
+    membershipExit.current = null;
     clearAdminSession(storage);
     setSession(null);
-    navigate({ kind: "dashboard" });
+    navigate({ kind: "dashboard" }, { force: true });
   }, [navigate, storage]);
 
   const handleLogout = useCallback(() => {
+    if (!navigate({ kind: "dashboard" })) return;
+    sessionGeneration.current += 1;
+    membershipExit.current = null;
     clearAdminSession(storage);
     setSession(null);
-    navigate({ kind: "dashboard" });
   }, [navigate, storage]);
 
   const handleModelsSaved = useCallback(() => {
@@ -226,9 +274,53 @@ export function AdminFeature({
   }, [navigate]);
 
   const activeViewIdentity = viewIdentity.current;
+  const activeSessionGeneration = sessionGeneration.current;
+  const activeMembershipApi = membershipApi;
+  const activeAdministratorId = session?.user.id ?? "";
+  const membershipOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const membershipViewKey = view.kind === "redemption-codes" ? "redemption/list"
+    : view.kind === "redemption-create" ? "redemption/create"
+      : view.kind === "purchase-packages" ? "packages/list"
+        : view.kind === "purchase-package-create" ? "packages/create"
+          : view.kind === "purchase-package-edit" ? "packages/edit/" + view.id : "";
+  const handleMembershipExitState = useCallback((snapshot: AdminMembershipExitSnapshot) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || membershipApiRef.current !== activeMembershipApi || snapshot.ownerScope !== membershipOwnerScope
+      || snapshot.viewKey !== membershipViewKey || snapshot.administratorId !== activeAdministratorId) return;
+    if (snapshot.pending) {
+      membershipExit.current = {
+        snapshot, pending: snapshot.pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: activeMembershipApi,
+      };
+    } else if (membershipExit.current?.viewIdentity === activeViewIdentity
+      && membershipExit.current.sessionGeneration === activeSessionGeneration
+      && membershipExit.current.api === activeMembershipApi) {
+      membershipExit.current = null;
+    }
+  }, [activeAdministratorId, activeMembershipApi, activeSessionGeneration, activeViewIdentity, membershipOwnerScope, membershipViewKey]);
+  const leaveMembership = useCallback((nextView: AdminView, pending?: AdminMembershipExitSnapshot["pending"]) => {
+    if (pending && !membershipExit.current) {
+      const snapshot = { ownerScope: membershipOwnerScope, viewKey: membershipViewKey, administratorId: activeAdministratorId, pending };
+      membershipExit.current = {
+        snapshot, pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: activeMembershipApi,
+      };
+    }
+    navigate(nextView);
+  }, [activeAdministratorId, activeMembershipApi, activeSessionGeneration, activeViewIdentity, membershipOwnerScope, membershipViewKey, navigate]);
+  const handleMembershipUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && membershipApiRef.current === activeMembershipApi) handleUnauthorized();
+  }, [activeMembershipApi, activeSessionGeneration, activeViewIdentity, handleUnauthorized]);
+  const handleMembershipSaved = useCallback((resource: "redemption-codes" | "purchase-packages") => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || membershipApiRef.current !== activeMembershipApi) return;
+    if (resource === "redemption-codes") setRedemptionListVersion((value) => value + 1);
+    else setPackageListVersion((value) => value + 1);
+  }, [activeMembershipApi, activeSessionGeneration, activeViewIdentity]);
   const handleResourceUnauthorized = useCallback(() => {
-    if (viewIdentity.current === activeViewIdentity) handleUnauthorized();
-  }, [activeViewIdentity, handleUnauthorized]);
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration) handleUnauthorized();
+  }, [activeSessionGeneration, activeViewIdentity, handleUnauthorized]);
   const handleResourceSaved = useCallback((resource: "system-prompts" | "users" | "user-credits") => {
     if (viewIdentity.current !== activeViewIdentity) return;
     if (resource === "system-prompts") {
@@ -240,6 +332,18 @@ export function AdminFeature({
     }
     navigate({ kind: resource });
   }, [activeViewIdentity, navigate]);
+
+  useEffect(() => {
+    const handleBeforeUnload = (event: BeforeUnloadEvent) => {
+      const pending = membershipExit.current;
+      if (!pending || pending.viewIdentity !== viewIdentity.current
+        || pending.sessionGeneration !== sessionGeneration.current || pending.api !== membershipApiRef.current) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", handleBeforeUnload);
+    return () => window.removeEventListener("beforeunload", handleBeforeUnload);
+  }, []);
 
   if (!session) {
     return <AdminLogin api={api} storage={storage} onLogin={handleLogin} />;
@@ -315,6 +419,22 @@ export function AdminFeature({
             onClick={() => navigate({ kind: "user-credits" })}
           >
             <span aria-hidden="true">◉</span>用户积分
+          </button>
+          <button
+            className={view.kind === "redemption-codes" || view.kind === "redemption-create" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button" aria-label="兑换码管理" title="兑换码管理"
+            aria-current={view.kind === "redemption-codes" || view.kind === "redemption-create" ? "page" : undefined}
+            onClick={() => navigate({ kind: "redemption-codes" })}
+          >
+            <span aria-hidden="true">⌁</span>兑换码管理
+          </button>
+          <button
+            className={view.kind === "purchase-packages" || view.kind === "purchase-package-create" || view.kind === "purchase-package-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button" aria-label="购买套餐" title="购买套餐"
+            aria-current={view.kind === "purchase-packages" || view.kind === "purchase-package-create" || view.kind === "purchase-package-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "purchase-packages" })}
+          >
+            <span aria-hidden="true">◇</span>购买套餐
           </button>
           <button
             className={view.kind === "credit-logs" ? "admin-nav-item is-active" : "admin-nav-item"}
@@ -404,6 +524,38 @@ export function AdminFeature({
               key={activeViewIdentity}
               api={creditsApi}
               onAuthenticationError={handleResourceUnauthorized}
+            />
+          ) : view.kind === "redemption-codes" || view.kind === "redemption-create" ? (
+            <RedemptionCodes
+              key={activeViewIdentity}
+              api={membershipApi}
+              mode={view.kind === "redemption-codes" ? "list" : "create"}
+              ownerScope={membershipOwnerScope}
+              viewKey={membershipViewKey}
+              currentAdministratorId={session.user.id}
+              listVersion={redemptionListVersion}
+              onAuthenticationError={handleMembershipUnauthorized}
+              onCreate={() => navigate({ kind: "redemption-create" })}
+              onCancel={(pending) => leaveMembership({ kind: "redemption-codes" }, pending)}
+              onSaved={() => handleMembershipSaved("redemption-codes")}
+              onExitStateChange={handleMembershipExitState}
+            />
+          ) : view.kind === "purchase-packages" || view.kind === "purchase-package-create" || view.kind === "purchase-package-edit" ? (
+            <PurchasePackages
+              key={activeViewIdentity}
+              api={membershipApi}
+              mode={view.kind === "purchase-packages" ? "list" : view.kind === "purchase-package-create" ? "create" : "edit"}
+              {...(view.kind === "purchase-package-edit" ? { recordId: view.id } : {})}
+              ownerScope={membershipOwnerScope}
+              viewKey={membershipViewKey}
+              currentAdministratorId={session.user.id}
+              listVersion={packageListVersion}
+              onAuthenticationError={handleMembershipUnauthorized}
+              onCreate={() => navigate({ kind: "purchase-package-create" })}
+              onEdit={(id) => navigate({ kind: "purchase-package-edit", id })}
+              onCancel={(pending) => leaveMembership({ kind: "purchase-packages" }, pending)}
+              onSaved={() => handleMembershipSaved("purchase-packages")}
+              onExitStateChange={handleMembershipExitState}
             />
           ) : (
             <Users
