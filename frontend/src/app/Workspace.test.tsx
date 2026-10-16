@@ -22,6 +22,7 @@ import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../shared
 import type { MyTeam } from "../shared/api/teams";
 import type { CreatorModel, CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 import type { AccountProfileServicePort } from "../shared/api/accountProfile";
+import type { AccountSecurityServicePort } from "../shared/api/accountSecurity";
 
 type AssetLibraryCategory = "characters" | "scenes" | "props";
 
@@ -860,6 +861,11 @@ describe("read-only workspace", () => {
         };
       }),
     };
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn(async () => ({ message: "密码修改成功，请重新登录" })),
+    };
     const services: WorkspaceServices = {
       ...createDemoServices(window.localStorage),
       mode: "api",
@@ -867,6 +873,7 @@ describe("read-only workspace", () => {
       restore,
       listSeries,
       accountProfile,
+      accountSecurity,
     };
     const { container } = renderWorkspace(services);
 
@@ -882,7 +889,7 @@ describe("read-only workspace", () => {
     await user.type(screen.getByRole("textbox", { name: "个人简介" }), "账户草稿");
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     await user.click(within(topbar).getByRole("button", { name: "我的任务", hidden: true }));
-    expect(confirm).toHaveBeenCalledWith("当前有未保存的账户简介草稿或待核对操作，离开将丢弃页面状态。继续吗？");
+    expect(confirm).toHaveBeenCalledWith("当前有未保存的账户简介或安全表单，或待核对操作；离开将丢弃页面状态。继续吗？");
     expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
     expect(screen.getByRole("textbox", { name: "个人简介" })).toHaveValue("账户草稿");
 
@@ -897,6 +904,30 @@ describe("read-only workspace", () => {
     expect(restore).toHaveBeenCalledTimes(3);
     expect(listSeries).toHaveBeenCalledTimes(1);
     expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("当前密码"), "old-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+    confirm.mockClear();
+
+    await user.click(screen.getByRole("button", { name: "返回工作区" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+
+    await user.click(within(topbar).getByRole("button", { name: "我的任务", hidden: true }));
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(confirm).toHaveBeenCalledTimes(3);
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+
+    await user.clear(screen.getByLabelText("当前密码"));
+    await user.clear(screen.getByLabelText("新密码"));
+    await user.clear(screen.getByLabelText("确认新密码"));
+    await user.click(screen.getByRole("button", { name: "返回工作区" }));
+    expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
+    expect(confirm).toHaveBeenCalledTimes(3);
   });
 
   it("keeps the full-user cache and authenticated state current when an older /me response arrives late", async () => {

@@ -4,6 +4,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { User } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { AccountProfileReceipt, AccountProfileServicePort } from "../../shared/api/accountProfile";
+import type { AccountSecurityServicePort } from "../../shared/api/accountSecurity";
 import type { WorkspaceServices } from "../../shared/api/services";
 import { AccountPage, type AccountPageProps } from "./AccountPage";
 
@@ -54,6 +55,7 @@ function renderAccount(options: {
   const services = options.services ?? workspaceServices();
   const refreshCurrentUser = options.refreshCurrentUser ?? vi.fn(async () => user);
   const onUnauthorized = options.onUnauthorized ?? vi.fn();
+  const onLogout = vi.fn();
   const onBack = vi.fn();
   const onDirtyChange = options.onDirtyChange ?? vi.fn();
   const props: AccountPageProps = {
@@ -63,11 +65,12 @@ function renderAccount(options: {
     refreshCurrentUser,
     sessionGeneration: options.sessionGeneration ?? 1,
     onUnauthorized,
+    onLogout,
     onBack,
     onDirtyChange,
   };
   const view = render(<AccountPage {...props} />);
-  return { ...view, props, user, profile, onUnauthorized, onBack, onDirtyChange, refreshCurrentUser };
+  return { ...view, props, user, profile, onUnauthorized, onLogout, onBack, onDirtyChange, refreshCurrentUser };
 }
 
 function deferred<T>() {
@@ -81,6 +84,268 @@ function deferred<T>() {
 }
 
 describe("AccountPage", () => {
+  it.each(["closed", "open"] as const)(
+    "locks the bio editor when a password PUT is in flight with the editor %s",
+    async (editorState) => {
+      const user = userEvent.setup();
+      const pendingPassword = deferred<{ message: string }>();
+      const profile = profileService();
+      const accountSecurity: AccountSecurityServicePort = {
+        listSessions: vi.fn(async () => []),
+        revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+        changePassword: vi.fn(() => pendingPassword.promise),
+      };
+      const services = { ...workspaceServices(), accountSecurity } as WorkspaceServices;
+      const { onLogout } = renderAccount({ services, profile });
+
+      if (editorState === "open") await user.click(screen.getByRole("button", { name: "编辑简介" }));
+      await user.type(screen.getByLabelText("当前密码"), "current-secret");
+      await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+      await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+      await user.click(screen.getByRole("button", { name: "修改密码" }));
+      await user.click(await screen.findByRole("button", { name: "确认修改密码" }));
+      await waitFor(() => expect(accountSecurity.changePassword).toHaveBeenCalledTimes(1));
+
+      if (editorState === "open") {
+        const bio = screen.getByRole("textbox", { name: "个人简介" });
+        expect(bio).toHaveAttribute("readonly");
+        await user.type(bio, "新简介B");
+        expect(bio).toHaveValue(baseUser.bio);
+        expect(screen.getByRole("button", { name: "保存简介" })).toBeDisabled();
+      } else {
+        expect(screen.getByRole("button", { name: "编辑简介" })).toBeDisabled();
+      }
+      expect(profile.updateProfile).not.toHaveBeenCalled();
+
+      await act(async () => {
+        pendingPassword.resolve({ message: "密码修改成功，请重新登录" });
+        await pendingPassword.promise;
+      });
+      expect(onLogout).toHaveBeenCalledTimes(1);
+      expect(profile.updateProfile).not.toHaveBeenCalled();
+    },
+  );
+
+  it("keeps the bio lock after an unknown password outcome and a successful read-only /me check", async () => {
+    const user = userEvent.setup();
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn(async () => { throw new ApiError("timeout", "unknown"); }),
+    };
+    const services = { ...workspaceServices(), accountSecurity } as WorkspaceServices;
+    const { onLogout } = renderAccount({ services });
+
+    await user.type(screen.getByLabelText("当前密码"), "current-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    await user.click(await screen.findByRole("button", { name: "确认修改密码" }));
+    expect(await screen.findByRole("button", { name: "只读检查当前登录" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "只读检查当前登录" }));
+    expect(await screen.findByText(/当前登录检查通过，但改密结果仍未确定/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "编辑简介" })).toBeDisabled();
+    expect(onLogout).not.toHaveBeenCalled();
+    expect(accountSecurity.changePassword).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([400, 403, 422])("releases only the active bio lock after definite password HTTP %i", async (status) => {
+    const user = userEvent.setup();
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn(async () => { throw new ApiError("http", "rejected", status); }),
+    };
+    const services = { ...workspaceServices(), accountSecurity } as WorkspaceServices;
+    renderAccount({ services });
+
+    await user.type(screen.getByLabelText("当前密码"), "current-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    await user.click(await screen.findByRole("button", { name: "确认修改密码" }));
+    await screen.findByText(status === 403
+      ? "当前账号无权修改密码，登录状态保持不变。"
+      : "密码未被修改，请检查当前密码和新密码后重试。");
+
+    expect(screen.getByRole("button", { name: "编辑简介" })).toBeEnabled();
+  });
+
+  it("does not let an old password finally release the new session's bio lock", async () => {
+    const user = userEvent.setup();
+    const oldPassword = deferred<{ message: string }>();
+    const newPassword = deferred<{ message: string }>();
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn()
+        .mockReturnValueOnce(oldPassword.promise)
+        .mockReturnValueOnce(newPassword.promise),
+    };
+    const services = { ...workspaceServices(), accountSecurity } as WorkspaceServices;
+    const profile = profileService();
+    const onLogout = vi.fn();
+    const props: AccountPageProps = {
+      user: baseUser,
+      services,
+      profile,
+      refreshCurrentUser: vi.fn(async () => baseUser),
+      sessionGeneration: 1,
+      onUnauthorized: vi.fn(),
+      onLogout,
+      onBack: vi.fn(),
+    };
+    const view = render(<AccountPage {...props} />);
+
+    await user.type(screen.getByLabelText("当前密码"), "old-current");
+    await user.type(screen.getByLabelText("新密码"), "old-new-123");
+    await user.type(screen.getByLabelText("确认新密码"), "old-new-123");
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    await user.click(await screen.findByRole("button", { name: "确认修改密码" }));
+    await waitFor(() => expect(accountSecurity.changePassword).toHaveBeenCalledTimes(1));
+
+    view.rerender(<AccountPage {...props} sessionGeneration={2} />);
+    await screen.findByRole("button", { name: "编辑简介" });
+    await user.type(screen.getByLabelText("当前密码"), "new-current");
+    await user.type(screen.getByLabelText("新密码"), "new-session-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-session-123");
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    await user.click(await screen.findByRole("button", { name: "确认修改密码" }));
+    await waitFor(() => expect(accountSecurity.changePassword).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      oldPassword.resolve({ message: "密码修改成功，请重新登录" });
+      await oldPassword.promise;
+    });
+    expect(onLogout).not.toHaveBeenCalled();
+    expect(screen.getByRole("button", { name: "编辑简介" })).toBeDisabled();
+
+    await act(async () => {
+      newPassword.reject(new ApiError("http", "rejected", 403));
+      await newPassword.promise.catch(() => undefined);
+    });
+    await waitFor(() => expect(screen.getByRole("button", { name: "编辑简介" })).toBeEnabled());
+  });
+
+  it("requires explicit save verification before allowing a password-change confirmation", async () => {
+    const user = userEvent.setup();
+    let currentUser = baseUser;
+    const profile = profileService();
+    vi.mocked(profile.updateProfile).mockImplementation(async (input) => {
+      currentUser = { ...currentUser, bio: input.bio };
+      return {
+        id: currentUser.id,
+        username: currentUser.username,
+        avatar_url: currentUser.avatar_url,
+        bio: currentUser.bio,
+      };
+    });
+    const changePassword = vi.fn(async () => ({ message: "密码修改成功，请重新登录" }));
+    const services = {
+      ...workspaceServices(),
+      accountSecurity: {
+        listSessions: vi.fn(async () => []),
+        revokeSession: vi.fn(async (sessionId: string) => ({ message: "设备已下线", session_id: sessionId })),
+        changePassword,
+      },
+    } as WorkspaceServices;
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderAccount({
+      services,
+      profile,
+      refreshCurrentUser: vi.fn(async () => currentUser),
+    });
+
+    await user.type(screen.getByLabelText("当前密码"), "current-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    const bio = screen.getByRole("textbox", { name: "个人简介" });
+    await user.clear(bio);
+    await user.type(bio, "已保存并核对的简介");
+
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+
+    expect(await screen.findByRole("alertdialog", { name: "确认修改密码？" })).toBeInTheDocument();
+    expect(profile.updateProfile).toHaveBeenCalledTimes(1);
+    expect(currentUser.bio).toBe("已保存并核对的简介");
+    expect(changePassword).not.toHaveBeenCalled();
+  });
+
+  it("keeps profile changes on cancel and requires an explicit discard choice", async () => {
+    const user = userEvent.setup();
+    const profile = profileService();
+    const services = {
+      ...workspaceServices(),
+      accountSecurity: {
+        listSessions: vi.fn(async () => []),
+        revokeSession: vi.fn(async (sessionId: string) => ({ message: "设备已下线", session_id: sessionId })),
+        changePassword: vi.fn(async () => ({ message: "密码修改成功，请重新登录" })),
+      },
+    } as WorkspaceServices;
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    renderAccount({ services, profile });
+
+    await user.type(screen.getByLabelText("当前密码"), "current-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    const bio = screen.getByRole("textbox", { name: "个人简介" });
+    await user.clear(bio);
+    await user.type(bio, "保留草稿");
+
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    expect(confirm).toHaveBeenNthCalledWith(1, "个人简介有未保存的修改。确定先保存并核对后再修改密码吗？");
+    expect(confirm).toHaveBeenNthCalledWith(2, "明确放弃未保存的个人简介草稿并继续修改密码？");
+    expect(profile.updateProfile).not.toHaveBeenCalled();
+    expect(screen.getByRole("textbox", { name: "个人简介" })).toHaveValue("保留草稿");
+    expect(screen.getByRole("button", { name: "保存简介" })).toBeEnabled();
+    expect(screen.queryByRole("alertdialog", { name: "确认修改密码？" })).not.toBeInTheDocument();
+
+    confirm.mockReset().mockReturnValueOnce(false).mockReturnValueOnce(true);
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    expect(await screen.findByRole("alertdialog", { name: "确认修改密码？" })).toBeInTheDocument();
+    expect(profile.updateProfile).not.toHaveBeenCalled();
+    expect(screen.queryByRole("textbox", { name: "个人简介" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "编辑简介" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "取消" }));
+    expect(screen.getByRole("button", { name: "编辑简介" })).toBeEnabled();
+  });
+
+  it("keeps profile and security dirty state combined when either child becomes clean", async () => {
+    const user = userEvent.setup();
+    const onDirtyChange = vi.fn();
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn(async () => ({ message: "密码修改成功，请重新登录" })),
+    };
+    const services = { ...workspaceServices(), accountSecurity } as WorkspaceServices;
+    renderAccount({ services, onDirtyChange });
+
+    await screen.findByRole("heading", { name: "账户安全" });
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    const bio = screen.getByRole("textbox", { name: "个人简介" });
+    await user.clear(bio);
+    await user.type(bio, "修改后的简介");
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+
+    await user.type(screen.getByLabelText("当前密码"), "old-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+
+    await user.clear(bio);
+    await user.type(bio, baseUser.bio ?? "");
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+
+    await user.clear(screen.getByLabelText("当前密码"));
+    await user.clear(screen.getByLabelText("新密码"));
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+    await user.clear(screen.getByLabelText("确认新密码"));
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(false));
+  });
+
   it("loads profile and credits independently, keeps profile facts on balance failure, and retries credits", async () => {
     const accountUser = { ...baseUser, bio: null };
     const profile = profileService(0);
@@ -481,6 +746,7 @@ describe("AccountPage", () => {
       refreshCurrentUser,
       sessionGeneration: 1,
       onUnauthorized,
+      onLogout: vi.fn(),
       onBack: vi.fn(),
     };
     const view = render(<AccountPage {...props} />);

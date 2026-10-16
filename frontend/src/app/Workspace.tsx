@@ -122,7 +122,7 @@ function Dashboard() {
       return window.confirm("当前有未保存的创作者设置草稿或待核对操作，离开将丢弃页面状态。继续吗？");
     }
     if (selectedView === "account" && accountDirtyRef.current) {
-      if (!window.confirm("当前有未保存的账户简介草稿或待核对操作，离开将丢弃页面状态。继续吗？")) {
+      if (!window.confirm("当前有未保存的账户简介或安全表单，或待核对操作；离开将丢弃页面状态。继续吗？")) {
         return false;
       }
     }
@@ -509,6 +509,7 @@ function Dashboard() {
               refreshCurrentUser={refreshCurrentUser}
               sessionGeneration={sessionGeneration}
               onUnauthorized={logoutFromWorkspace}
+              onLogout={logoutFromWorkspace}
               onBack={() => {
                 if (!confirmLeaveCurrentView()) return;
                 setSelectedSeries(null);
@@ -524,7 +525,7 @@ function Dashboard() {
             {selectedView === "creator-settings"
               ? "个人模型与提示词"
               : selectedView === "account"
-                ? "本人资料与会员状态"
+                ? "本人资料、登录设备与密码"
               : selectedView === "tasks"
               ? "任务记录只读预览"
               : selectedSeries === null

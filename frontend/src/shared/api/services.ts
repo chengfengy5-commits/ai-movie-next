@@ -19,6 +19,13 @@ import {
   type AccountProfileServicePort,
 } from "./accountProfile";
 import {
+  InvalidAccountSecurityResponseError,
+  parseAccountPasswordChangeReceipt,
+  parseAccountSessionRevocationReceipt,
+  parseAccountSessions,
+  type AccountSecurityServicePort,
+} from "./accountSecurity";
+import {
   parseCreatedCharacter,
   parseCreatedProp,
   parseCreatedScene,
@@ -138,6 +145,7 @@ export interface WorkspaceServices {
   readonly apiBaseUrl: string | null;
   readonly accountAccess?: AccountAccessService;
   readonly accountProfile?: AccountProfileServicePort;
+  readonly accountSecurity?: AccountSecurityServicePort;
   restore(signal: AbortSignal): Promise<User | null>;
   login(credentials: Credentials, signal: AbortSignal): Promise<User>;
   listSeries(signal: AbortSignal): Promise<Series[]>;
@@ -389,6 +397,17 @@ function parseAccountProfileResponse<T>(parse: () => T): T {
     return parse();
   } catch (error) {
     if (error instanceof InvalidAccountProfileResponseError) {
+      throw new ApiError("invalid-response", error.message, null);
+    }
+    throw error;
+  }
+}
+
+function parseAccountSecurityResponse<T>(parse: () => T): T {
+  try {
+    return parse();
+  } catch (error) {
+    if (error instanceof InvalidAccountSecurityResponseError) {
       throw new ApiError("invalid-response", error.message, null);
     }
     throw error;
@@ -1847,6 +1866,9 @@ type ApiEndpoint =
   | "me"
   | "myCredits"
   | "updateMyProfile"
+  | "accountSessions"
+  | "revokeAccountSession"
+  | "changeAccountPassword"
   | "series"
   | "seriesDetail"
   | "createSeries"
@@ -1923,6 +1945,7 @@ function apiRequestDefinition(
     category?: string;
     modelId?: string;
     promptId?: string;
+    sessionId?: string;
   },
 ): ApiRequestDefinition {
   if (endpoint === "login") {
@@ -1951,6 +1974,16 @@ function apiRequestDefinition(
   }
   if (endpoint === "updateMyProfile") {
     return { path: "/users/me/profile", method: "PUT" };
+  }
+  if (endpoint === "accountSessions") {
+    return { path: "/auth/sessions", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "revokeAccountSession") {
+    const sessionId = encodeApiPathId(identifiers?.sessionId, "登录设备");
+    return { path: "/auth/sessions/" + sessionId, method: "DELETE", expectedStatus: 200 };
+  }
+  if (endpoint === "changeAccountPassword") {
+    return { path: "/auth/password", method: "PUT", expectedStatus: 200 };
   }
   if (endpoint === "series") {
     return { path: "/series", method: "GET" };
@@ -2181,6 +2214,7 @@ export function createApiServices(
       category?: string;
       modelId?: string;
       promptId?: string;
+      sessionId?: string;
     },
     requestBaseUrl = apiBaseUrl,
   ): Promise<unknown> {
@@ -2310,6 +2344,7 @@ export function createApiServices(
       category?: string;
       modelId?: string;
       promptId?: string;
+      sessionId?: string;
     },
   ): Promise<unknown> {
     try {
@@ -2548,11 +2583,32 @@ export function createApiServices(
     },
   };
 
+  const accountSecurity: AccountSecurityServicePort = {
+    async listSessions(signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("accountSessions", token, signal);
+      return parseAccountSecurityResponse(() => parseAccountSessions(payload));
+    },
+    async revokeSession(sessionId, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "revokeAccountSession", token, signal, undefined, { sessionId },
+      );
+      return parseAccountSecurityResponse(() => parseAccountSessionRevocationReceipt(payload, sessionId));
+    },
+    async changePassword(input, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("changeAccountPassword", token, signal, input);
+      return parseAccountSecurityResponse(() => parseAccountPasswordChangeReceipt(payload));
+    },
+  };
+
   return {
     mode: "api",
     apiBaseUrl,
     creatorSettings,
     accountProfile,
+    accountSecurity,
     accountAccess: {
       async register(input, signal) {
         return parseRegisteredUser(await request("register", null, signal, input));

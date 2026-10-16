@@ -3,6 +3,7 @@ import type { User } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { AccountProfileServicePort } from "../../shared/api/accountProfile";
 import type { WorkspaceServices } from "../../shared/api/services";
+import { AccountSecurityPanel } from "./AccountSecurityPanel";
 import "./account.css";
 
 type LoadStatus = "loading" | "ready" | "error";
@@ -41,6 +42,7 @@ export interface AccountPageProps {
   refreshCurrentUser(signal: AbortSignal): Promise<User>;
   sessionGeneration: number | string;
   onUnauthorized(): void;
+  onLogout(): void;
   onBack(): void;
   onDirtyChange?(dirty: boolean): void;
 }
@@ -135,6 +137,7 @@ export function AccountPage({
   refreshCurrentUser,
   sessionGeneration,
   onUnauthorized,
+  onLogout,
   onBack,
   onDirtyChange,
 }: AccountPageProps) {
@@ -145,6 +148,7 @@ export function AccountPage({
     refreshCurrentUser,
     sessionGeneration,
     onUnauthorized,
+    onLogout,
     onBack,
     ...(onDirtyChange === undefined ? {} : { onDirtyChange }),
   };
@@ -156,6 +160,8 @@ export function AccountPage({
   const [draft, setDraft] = useState<BioDraft | null>(null);
   const [pendingVerification, setPendingVerification] = useState<PendingVerification | null>(null);
   const [saving, setSaving] = useState(false);
+  const [securityDirty, setSecurityDirty] = useState(false);
+  const [passwordMutationOwner, setPasswordMutationOwner] = useState<object | null>(null);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const requestGeneration = useRef(0);
@@ -166,6 +172,11 @@ export function AccountPage({
   const controllers = useRef(new Set<AbortController>());
   const editorControllers = useRef(new Set<AbortController>());
   const unauthorizedNotifiedGeneration = useRef<number | null>(null);
+  const passwordMutationOwnerRef = useRef<object | null>(null);
+  const bioStateRef = useRef({ draft, pendingVerification, saving });
+  bioStateRef.current = { draft, pendingVerification, saving };
+  const saveBioDraftRef = useRef<(activeDraft: BioDraft) => Promise<boolean>>(async () => false);
+  const retireEditorRequestsRef = useRef<() => void>(() => undefined);
 
   const beginRequest = useCallback((editorOwned = false): RequestTicket => {
     const current = propsRef.current;
@@ -266,13 +277,13 @@ export function AccountPage({
     }
   }, [beginRequest, finishRequest, isCurrent, notifyUnauthorized]);
 
-  const verifyWriteTarget = useCallback(async (targetBio: string, ticket: RequestTicket) => {
-    if (!isCurrent(ticket)) return;
+  const verifyWriteTarget = useCallback(async (targetBio: string, ticket: RequestTicket): Promise<boolean> => {
+    if (!isCurrent(ticket)) return false;
     const readGeneration = claimProfileRead(ticket);
     setPendingVerification({ targetBio, status: "checking" });
     try {
       const fresh = await ticket.refreshCurrentUser(ticket.controller.signal);
-      if (!isCurrentProfileRead(ticket, readGeneration)) return;
+      if (!isCurrentProfileRead(ticket, readGeneration)) return false;
       if (fresh.id !== ticket.userId) {
         throw new ApiError("invalid-response", "账户资料回读与当前用户不匹配。");
       }
@@ -282,12 +293,14 @@ export function AccountPage({
         setPendingVerification(null);
         setSaveError(null);
         setSaveMessage("简介已由独立账户读取确认。");
+        return true;
       } else {
         setPendingVerification({ targetBio, status: "unresolved" });
         setSaveError("当前简介与本次提交内容不同。草稿已保留；只能继续核对，不能自动重发。");
+        return false;
       }
     } catch (error) {
-      if (!isCurrentProfileRead(ticket, readGeneration)) return;
+      if (!isCurrentProfileRead(ticket, readGeneration)) return false;
       if (error instanceof ApiError && error.status === 401) notifyUnauthorized(ticket);
       setProfileRead((current) => ({
         ...current,
@@ -296,6 +309,7 @@ export function AccountPage({
       }));
       setPendingVerification({ targetBio, status: "unresolved" });
       setSaveError("保存结果仍未确认。草稿已保留；请只读核对服务器状态，不要重复提交。");
+      return false;
     }
   }, [claimProfileRead, isCurrent, isCurrentProfileRead, notifyUnauthorized]);
 
@@ -308,7 +322,6 @@ export function AccountPage({
     controllers.current.clear();
     editorControllers.current.clear();
     unauthorizedNotifiedGeneration.current = null;
-    propsRef.current.onDirtyChange?.(false);
     setProfileRead({ status: "loading", value: user, message: null });
     setCreditsRead({ status: "loading", value: null, message: null });
     setDraft(null);
@@ -335,11 +348,31 @@ export function AccountPage({
   }, [user]);
 
   const isDirty = (draft !== null && draft.text !== (draft.baseline ?? "")) || pendingVerification !== null;
+  const combinedDirty = isDirty || securityDirty;
   useEffect(() => {
-    onDirtyChange?.(isDirty);
-  }, [isDirty, onDirtyChange]);
+    onDirtyChange?.(combinedDirty);
+  }, [combinedDirty, onDirtyChange]);
+
+  const handleSecurityDirtyChange = useCallback((dirty: boolean) => {
+    setSecurityDirty((current) => current === dirty ? current : dirty);
+  }, []);
+
+  const handlePasswordMutationOwnerChange = useCallback((owner: object, active: boolean) => {
+    if (active) {
+      const current = passwordMutationOwnerRef.current;
+      if (current !== null && current !== owner) return;
+      passwordMutationOwnerRef.current = owner;
+      setPasswordMutationOwner(owner);
+      return;
+    }
+
+    if (passwordMutationOwnerRef.current !== owner) return;
+    passwordMutationOwnerRef.current = null;
+    setPasswordMutationOwner(null);
+  }, []);
 
   function openBioEditor() {
+    if (passwordMutationOwnerRef.current !== null) return;
     retireEditorRequests();
     const currentUser = profileRead.value ?? user;
     setDraft({ text: currentUser.bio ?? "", baseline: currentUser.bio });
@@ -364,40 +397,41 @@ export function AccountPage({
     setSaveMessage(null);
   }
 
-  async function submitBio(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const activeDraft = draft;
+  async function saveBioDraft(activeDraft: BioDraft): Promise<boolean> {
     const ticket = beginRequest(true);
     const service = ticket.profile;
-    if (activeDraft === null || service === null || saving || pendingVerification !== null) {
+    if (passwordMutationOwnerRef.current !== null || service === null
+      || savingOwner.current !== null || bioStateRef.current.saving
+      || bioStateRef.current.pendingVerification !== null) {
       finishRequest(ticket);
-      return;
+      return false;
     }
     if (activeDraft.text === (activeDraft.baseline ?? "")) {
       setDraft(null);
       setSaveError(null);
       setSaveMessage(null);
       finishRequest(ticket);
-      return;
+      return true;
     }
 
     savingOwner.current = ticket.controller;
     setSaving(true);
     setSaveError(null);
     setSaveMessage(null);
+    let saved = false;
     try {
       const receipt = await service.updateProfile({ bio: activeDraft.text }, ticket.controller.signal);
-      if (!isCurrent(ticket)) return;
+      if (!isCurrent(ticket)) return false;
       if (receipt.id !== ticket.userId) {
         throw new ApiError("invalid-response", "简介保存回执与当前用户不匹配。");
       }
-      await verifyWriteTarget(activeDraft.text, ticket);
+      saved = await verifyWriteTarget(activeDraft.text, ticket);
     } catch (error) {
-      if (!isCurrent(ticket)) return;
+      if (!isCurrent(ticket)) return false;
       if (error instanceof ApiError && error.status === 401) notifyUnauthorized(ticket);
       if (isUnknownWriteOutcome(error)) {
         setSaveError("简介写入结果未知，已保留草稿并开始只读核对；不会自动重复提交。");
-        await verifyWriteTarget(activeDraft.text, ticket);
+        saved = await verifyWriteTarget(activeDraft.text, ticket);
       } else {
         setSaveError(errorMessage(error, "简介保存"));
       }
@@ -408,6 +442,17 @@ export function AccountPage({
       }
       finishRequest(ticket);
     }
+    return saved;
+  }
+
+  saveBioDraftRef.current = saveBioDraft;
+
+  async function submitBio(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (passwordMutationOwnerRef.current !== null) return;
+    const activeDraft = draft;
+    if (activeDraft === null) return;
+    await saveBioDraft(activeDraft);
   }
 
   async function retryPendingVerification() {
@@ -446,6 +491,36 @@ export function AccountPage({
     editorControllers.current.clear();
   }
 
+  retireEditorRequestsRef.current = retireEditorRequests;
+
+  const onBeforeSecurityMutation = useCallback(async (): Promise<boolean> => {
+    const current = bioStateRef.current;
+    if (savingOwner.current !== null || current.saving) {
+      setSaveError("简介保存或核对仍在进行，请等待完成后再修改密码。");
+      return false;
+    }
+    if (current.pendingVerification !== null) {
+      setSaveError("简介写入结果仍待核对，请先完成只读核对或明确放弃核对。");
+      return false;
+    }
+
+    const activeDraft = current.draft;
+    const dirty = activeDraft !== null && activeDraft.text !== (activeDraft.baseline ?? "");
+    if (!dirty || activeDraft === null) return true;
+
+    if (window.confirm("个人简介有未保存的修改。确定先保存并核对后再修改密码吗？")) {
+      return saveBioDraftRef.current(activeDraft);
+    }
+    if (!window.confirm("明确放弃未保存的个人简介草稿并继续修改密码？")) return false;
+
+    retireEditorRequestsRef.current();
+    setDraft(null);
+    setPendingVerification(null);
+    setSaveError(null);
+    setSaveMessage("已明确放弃未保存的简介草稿。");
+    return true;
+  }, []);
+
   const currentUser = profileRead.value ?? user;
   const bioEditing = draft !== null;
 
@@ -455,7 +530,7 @@ export function AccountPage({
         <div>
           <p className="eyebrow">账户</p>
           <h1 id="account-page-title">我的账户</h1>
-          <p>查看本人资料、会员状态与平台积分。</p>
+          <p>查看本人资料、管理登录设备与密码，并查看会员状态和平台积分。</p>
         </div>
         <button className="secondary-button account-back-button" onClick={() => onBack()} type="button">
           返回工作区
@@ -481,15 +556,26 @@ export function AccountPage({
             <div className="account-section-heading">
               <h3>个人简介</h3>
               {!bioEditing && profile !== null && (
-                <button className="text-button" onClick={openBioEditor} type="button">编辑简介</button>
+                <button
+                  className="text-button"
+                  disabled={passwordMutationOwner !== null}
+                  onClick={openBioEditor}
+                  type="button"
+                >编辑简介</button>
               )}
             </div>
+            {passwordMutationOwner !== null && (
+              <p className="account-verification-notice" role="status">
+                密码修改请求正在处理或结果待核对，个人简介暂时锁定。
+              </p>
+            )}
             {bioEditing ? (
               <form className="account-bio-form" onSubmit={submitBio}>
                 <label className="account-bio-label" htmlFor="account-bio-input">个人简介</label>
                 <button
                   className="text-button account-editor-refresh"
-                  disabled={profileRead.status === "loading" || saving || pendingVerification !== null}
+                  disabled={profileRead.status === "loading" || saving || pendingVerification !== null
+                    || passwordMutationOwner !== null}
                   onClick={() => void refreshProfile()}
                   type="button"
                 >
@@ -498,11 +584,14 @@ export function AccountPage({
                 <textarea
                   id="account-bio-input"
                   value={draft.text}
-                  readOnly={saving || pendingVerification !== null}
+                  readOnly={saving || pendingVerification !== null || passwordMutationOwner !== null}
                   rows={5}
-                  onChange={(event) => setDraft((current) => current === null
-                    ? current
-                    : { ...current, text: event.target.value })}
+                  onChange={(event) => {
+                    if (passwordMutationOwnerRef.current !== null) return;
+                    setDraft((current) => current === null
+                      ? current
+                      : { ...current, text: event.target.value });
+                  }}
                 />
                 {(currentUser.bio ?? "") !== (draft.baseline ?? "") && (
                   <p className="account-verification-notice" role="status">
@@ -533,7 +622,7 @@ export function AccountPage({
                     </>
                   ) : (
                     <>
-                      <button className="primary-button" disabled={saving} type="submit">
+                      <button className="primary-button" disabled={saving || passwordMutationOwner !== null} type="submit">
                         {saving ? "正在保存…" : "保存简介"}
                       </button>
                       <button className="secondary-button" disabled={saving} onClick={cancelBioEditor} type="button">
@@ -605,6 +694,19 @@ export function AccountPage({
           )}
           <p className="account-help">此处显示平台积分余额；不包含外部服务商余额或积分流水。</p>
         </section>
+
+        <AccountSecurityPanel
+          userId={user.id}
+          servicesIdentity={services}
+          service={services.accountSecurity ?? null}
+          sessionGeneration={sessionGeneration}
+          refreshCurrentUser={refreshCurrentUser}
+          onUnauthorized={onUnauthorized}
+          onLogout={onLogout}
+          onBeforeSecurityMutation={onBeforeSecurityMutation}
+          onDirtyChange={handleSecurityDirtyChange}
+          onPasswordMutationOwnerChange={handlePasswordMutationOwnerChange}
+        />
       </div>
     </section>
   );

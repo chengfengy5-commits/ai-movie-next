@@ -631,6 +631,129 @@ describe("API services", () => {
     expect(createDemoServices(storage).accountProfile).toBeUndefined();
   });
 
+  it("uses authenticated, exact-status session and password endpoints with scoped request fields", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "current-security-token");
+    const sessionId = "session / α?#";
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse([{
+        id: sessionId,
+        jti: "private-jwt-id",
+        device_name: "桌面浏览器",
+        ip_address: "127.0.0.1",
+        user_agent: "Example browser",
+        created_at: "2026-10-01T09:00:00",
+        last_seen_at: "2026-10-01T10:00:00+08:00",
+        revoked_at: null,
+        is_active: true,
+        is_current: false,
+      }]))
+      .mockResolvedValueOnce(jsonResponse({ message: "设备已下线", session_id: sessionId }))
+      .mockResolvedValueOnce(jsonResponse({ message: "密码修改成功，请重新登录" }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const security = services.accountSecurity;
+    if (security === undefined) throw new Error("Expected the API account security port.");
+    const signal = new AbortController().signal;
+
+    await expect(security.listSessions(signal)).resolves.toMatchObject([
+      { id: sessionId, deviceName: "桌面浏览器", isCurrent: false },
+    ]);
+    await expect(security.revokeSession(sessionId, signal)).resolves.toEqual({
+      message: "设备已下线",
+      session_id: sessionId,
+    });
+    await expect(security.changePassword({ old_password: "  current  ", new_password: " new pass " }, signal))
+      .resolves.toEqual({ message: "密码修改成功，请重新登录" });
+
+    const calls = fetcher.mock.calls.map(([input, init]) => ({
+      url: new URL(String(input)),
+      init,
+    }));
+    expect(calls.map(({ url, init }) => [url.pathname, init?.method])).toEqual([
+      ["/api/auth/sessions", "GET"],
+      ["/api/auth/sessions/session%20%2F%20%CE%B1%3F%23", "DELETE"],
+      ["/api/auth/password", "PUT"],
+    ]);
+    expect(calls[0]?.url.search).toBe("");
+    expect(calls[1]?.init?.body).toBeUndefined();
+    expect(calls[2]?.init?.body).toBe(JSON.stringify({ old_password: "  current  ", new_password: " new pass " }));
+    for (const { init } of calls) {
+      expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer current-security-token");
+      expect(init?.credentials).toBe("omit");
+      expect(init?.cache).toBe("no-store");
+      expect(init?.redirect).toBe("error");
+      expect(init?.referrerPolicy).toBe("no-referrer");
+    }
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("current-security-token");
+    expect(createDemoServices(storage).accountSecurity).toBeUndefined();
+  });
+
+  it.each([401, 403])("preserves the current session after account security HTTP %i", async (status) => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "preserved-security-token");
+    const fetcher = vi.fn(async () => jsonResponse({ detail: "denied" }, status));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const security = services.accountSecurity;
+    if (security === undefined) throw new Error("Expected the API account security port.");
+
+    await expect(security.listSessions(new AbortController().signal))
+      .rejects.toMatchObject({ kind: "http", status });
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("preserved-security-token");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["list", "revoke", "password"] as const)("requires exact 200 for the account security %s endpoint", async (operation) => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "current-security-token");
+    const fetcher = vi.fn(async () => jsonResponse({ message: "accepted" }, 201));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const security = services.accountSecurity;
+    if (security === undefined) throw new Error("Expected the API account security port.");
+
+    const signal = new AbortController().signal;
+    const request = operation === "list"
+      ? security.listSessions(signal)
+      : operation === "revoke"
+        ? security.revokeSession("session-one", signal)
+        : security.changePassword({ old_password: "old", new_password: "new password" }, signal);
+    await expect(request)
+      .rejects.toMatchObject({ kind: "invalid-response" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("current-security-token");
+  });
+
+  it("treats an unconfirmed password receipt as one unknown write", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "current-security-token");
+    const fetcher = vi.fn(async () => jsonResponse({ message: "密码已受理" }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const security = services.accountSecurity;
+    if (security === undefined) throw new Error("Expected the API account security port.");
+
+    await expect(security.changePassword(
+      { old_password: "old", new_password: "new password" }, new AbortController().signal,
+    )).rejects.toMatchObject({ kind: "invalid-response" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("current-security-token");
+  });
+
+  it("ignores a session-list response after the API bearer changes", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "old-security-token");
+    let resolveFetch!: (response: Response) => void;
+    const fetcher = vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const security = services.accountSecurity;
+    if (security === undefined) throw new Error("Expected the API account security port.");
+    const pending = security.listSessions(new AbortController().signal);
+
+    storage.setItem(API_TOKEN_KEY, "new-security-token");
+    resolveFetch(jsonResponse([]));
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("new-security-token");
+  });
+
   it("uses the current bearer and a once-encoded chapter path for the dedicated rough-cut GET", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "current-rough-cut-token");
