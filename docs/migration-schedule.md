@@ -6,7 +6,7 @@
 
 ## 当前基线与计数口径
 
-本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；本批后台会员证据在末尾增补。149 收据确认会员管理前端已提交并推送至 main@eca1978bd2453ca1e4cb486804c904a6aa89b1ba。后续文档或实现提交不改变既有证据归属；最新 Git 状态以仓库实时查询为准。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
+本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；本批后台会员证据在末尾增补。149 收据确认会员管理前端已提交并推送至 main@eca1978bd2453ca1e4cb486804c904a6aa89b1ba。单图原 intent 到期 recovery/due 消费者随后提交并推送至 main@1e07f90bb203b8ff6e7b534eb0e8b22a12f5ddfc；E166 收据确认 remoteExact=true。该提交是当前源码回归基线，不改变 102 的 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78 历史分析归属。后续文档或实现提交不改变既有证据归属；最新 Git 状态以仓库实时查询为准。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
 
 固定旧源共有 248 个显式 method/path 声明，当前运行时登记 250 个方法，其中包括两个新增两步分镜接口；248 个旧声明均已登记、差集为 0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前已登记 14 个视图，另 9 个旧视图待实现和接线。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 9 个。
 
@@ -68,7 +68,7 @@
 | U06.2 | 两步分镜生成、报价、SSE 预览和确认保存 | C | C | V=P / A=P；真实 JWT/Target API/owned SQLite + FakeRuntime 主链已通过 | 保留主链收据，补受影响的失败、断流、原 key 恢复和权限分支；FakeRuntime 不代表真实 provider。 |
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
 | U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；路由、解析和保存已有，提取 runtime 仍需注入 | 装配 StoryboardAssetRuntime，接提取结果编辑/确认和批量保存；验证失败不覆盖源内容及未知回读。 |
-| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；8 项 canonical records、P1–P6 合同、单图 claim/intent/result、P5 bridge 和 stream 金融已有；仅 1/5 worker 类型有 executor factory 登记 | 先完成 GEN-W01 真 recovery/due 消费，再做 review/optimize producer 与新 phase；完整取消、poll、五类执行和六项附加义务继续保留。 |
+| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；8 项 canonical records、P1–P6 合同、单图 claim/intent/result、P5 bridge 和 stream 金融已有；GEN-W01 原 intent recovery/due 消费者已实现；仅 1/5 worker 类型有 executor factory 登记 | GEN-W01 到期消费者已完成；仍需验证 PostgreSQL 锁等待/双消费者/commit 故障/真实进程重启。P6 HTTP/control cancel、poll、可验证原输出恢复、其余 worker consumer 和六项附加义务继续保留。 |
 | U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
 
 ### U07 多节点创作画布和结果回填
@@ -138,16 +138,16 @@
 | B-PRODUCTION | 便签、粗剪和媒体协调器已有 | 新写入者消费协调器；补真实媒体预览、字节导出/输出及多用户证据。 |
 | B-ACCOUNT | 账户、偏好、模型、提示词和兑换逻辑已有；会员批已并入 | 真实 SMTP sender 仍缺；各账户/运营工作流仍按 U01/U11/U12 补验证和 UI。 |
 | B-TEAMS | 管理、剧集协作和 reporting 后端共 25 旧接口已装配 | 完整团队前端及多用户权限接受，不用目录存在代替授权。 |
-| B-TASKS | 旧任务 read/status/cancel、通用/后台任务和 provider status 已有 | 新 P2/P6 可靠取消、恢复、到期消费和各 UI 真实状态仍缺；旧状态面和历史矩阵不能替代。 |
+| B-TASKS | 旧任务 read/status/cancel、通用/后台任务和 provider status 已有 | image.single 原 intent recovery/due 消费已实现并本地回归；P2/P6 可靠取消、poll/control、UI 真实状态和可验证原输出恢复仍缺。其他任务家族继续按各自消费者边界完成；旧状态面和历史矩阵不能替代。 |
 | B-ADMIN | 后台 API 家族已有，React 已有登录、仪表盘、14/23 个旧视图 | 完成剩余 9 个旧视图和真 SQL/浏览器动作验收；3 个积分扩展视图独立。 |
-| B-GENERATION | 六入口准入、合同、凭据、图/计费；单图受限 runtime 和文本 SSE 有真实组件，两步分镜有局部浏览器证据 | worker registry 五类中仅 image-single factory 有 executor 注册；另外四类需实际 executor。metadata/准入/claim 不是可执行证明。 |
+| B-GENERATION | 六入口准入、合同、凭据、图/计费；单图受限 runtime 与原 intent recovery/due consumer、文本 SSE 有实现，两步分镜有局部浏览器证据 | worker registry 五类中仅 image-single factory 有 executor 注册；另外四类需实际 executor。metadata/准入/claim 不是可执行证明。 |
 | B-INTEGRATIONS | DB/provider/storage/quota/download/SMTP ports 与部分 adapter 已存在 | 补本地组合根和真实 caller；逐项区分 owned fake/loopback 与外部账号验收。 |
 | B-ARCH | 扫描 106 个 domain/application 文件；多数模块使用 port/UoW 边界 | 收口 aistarslab application 直连 persistence/provider、generation_credentials application 直连 SQLAlchemy/concrete repository 的边界，同时保留现有同事务/主体约束。 |
 
 | 集成 | 当前证据 | 后续工作/边界 |
 | --- | --- | --- |
 | INT-LOCAL-COMPOSITION | create_app 显式配置，lifespan 可拥有 image-single service；没有全特性 launcher 证据 | 建可复现本地组合根，明确 DB/auth/providers/media ports、readiness 和 shutdown；不依赖旧 app/env 自动发现或隐式建表。 |
-| INT-DB | SQLAlchemy UoW、generation migration/readiness、credential migration 和 scoped owned PG 收据存在 | 核完整基础投影/兼容与 recovery、due、continuation、cancel 受影响事务；不连接或写生产 DB。 |
+| INT-DB | SQLAlchemy UoW、generation migration/readiness、credential migration 和 scoped owned PG 收据存在 | 验证 PostgreSQL recovery/due 锁等待、双消费者和 commit 故障；并核 continuation/cancel 受影响事务。不连接或写真实数据库。 |
 | INT-PROVIDERS | 部分真实 transport adapter 和显式 ports 已有 | 完成剩余 adapter、loopback/fake 协议、原 credential principal/snapshot 绑定及配置消费者；实际账号/付费调用另授权。 |
 | INT-STORAGE | media storage typed ports、OwnedMediaRuntime、R2 upload storage 和本地读取器存在 | 接入四类能力、upload application/fused storage/MediaStore；本地验证权限、大小/MIME、DNS、重定向、内容绑定和清理；R2 账号另授权。 |
 | INT-SMTP | sender callbacks、加密 SMTP 账户配置与每日重置已有 | 开发 sender 和 owned SMTP sink；真实邮箱交付需后续适用授权，本轮不索要密钥。 |
@@ -195,13 +195,13 @@ A39 指定的 GPT-5.6 Sol/xhigh Grillme 外审仍为 OFFLINE_PENDING，尚未使
 
 | 工作包 | 范围 | 粗略有效工时/信心 | 当前状态与下步 |
 | --- | --- | --- | --- |
-| GEN-W01 | image.single 原 intent 的独立 recovery/due 消费者 | 16–32 小时；低信心 | 原 RED 仍未解决，114 的 repo 写因自动审批拒绝而停止；E145 纯文本候选已生成但未应用、未执行、未完成独立审查。历史 119/126/139 发现仍按原证据保留，不把 119 列为当前待审状态。原收据仍为真实 ASGI 准入到 worker HTTP 500 后进入 reconciling；推进原 due 后仍停在 pending/reconciling，RED 预期 failed 与实际 reconciling 有 1 项失败。任务恢复仍待；恢复后再按既有边界处理、运行门禁及 owned PG 验收。 |
+| GEN-W01 | image.single 原 intent 的独立 recovery/due 消费者 | 16–32 小时；低信心（原工作包估算，不是当前剩余工时或整体 ETA） | 已实现并提交推送 1e07f90bb203b8ff6e7b534eb0e8b22a12f5ddfc，E166 remoteExact=true。E160 三参数 SQL 边界 RED 为 2 failed/1 passed；加入 queued 恢复后 E163 为 3 passed/277 deselected。E165 全后端回归为 2434 passed、558 warnings、267 subtests passed（actualWaitExit=0、timeout=false、916 输入前后 exact、进程组及 TMP 清理）；create_app registry 的 250 methods/35 parameters 与 E88 一致。剩余工作是 PostgreSQL 锁等待/双消费者/commit 故障/真实进程重启，以及 P6 cancel control、poll 和可验证原输出恢复。以上本地回归不等于浏览器或真实 Provider 验收。 |
 | 后台兑换码/套餐 | U12.8 与 U12.9，合计 5 个旧视图 | 8–16 小时原始估算；中低信心 | 已完成并由149收据确认提交推送 eca1978；源码复核见129-02/03、148。143是基于142冻结的前端门禁（87 files/1297 tests、TSC/build 均实际 exit 0）；137为独立真实 HTTP/owned SQL 验收，144为独立桌面浏览器验收。剩余证据缺口见末尾；8–16小时保留为原估算，不作为剩余工时或ETA；不包含真实支付。 |
 | 团队管理/邀请 | U03.1 与 U03.2 首批 | 16–32 小时；低信心 | 待开发；后端接口已有。独立团队 feature/API，Workspace/services 由单一集成作者最后接线；团队剧集、reporting 另列。 |
 
 其余 family、画布、媒体导出、真实 provider/SMTP/R2 和完整 A01–A39 接受未逐项深审，因此整体剩余工时和 ETA 保持未知，不复用 10 月 9 日的周数或日期，也不按 routes/files 数量线性外推。
 
-共享 writer 协作仍按北京时间每日 12:00–14:00、20:00–次日 09:00 的窗口；窗口外在安全边界串行收口，不新建自动化。U03.4 与 U10.3 先依赖共同稳定的 reporting 契约，再各自建设消费者，避免相互依赖循环。GEN-W01 完成后再扩展 review/optimize 的真实 Work 和 continuation；结果应用、媒体、画布、缺项工作流按真实消费者边界衔接。
+共享 writer 协作仍按北京时间每日 12:00–14:00、20:00–次日 09:00 的窗口；窗口外在安全边界串行收口，不新建自动化。U03.4 与 U10.3 先依赖共同稳定的 reporting 契约，再各自建设消费者，避免相互依赖循环。GEN-W01 的 image.single 原 intent recovery/due 消费已落地；随后继续扩展 review/optimize 的真实 Work 和 continuation。结果应用、媒体、画布、缺项工作流按真实消费者边界衔接。
 
 ## 特殊证据边界与最终阶段
 
@@ -213,6 +213,6 @@ U11.2 的最新证据来自 9df：MEMBERSHIP97-I01 已由 97-02 finding 闭合�
 
 后台会员管理批次的验收层彼此独立：136 是基于前端冻结135的门禁（87 files/1295 tests，TSC、Vitest、build 实际 exit 0）；137 是基于同一前端冻结与 backend 5ca522c 的真实路由/owned SQL 检查，15 组、32 个真实 HTTP 请求通过，后台9种操作成功响应 exact 200，鉴权覆盖401/403，套餐/兑换码字段覆盖 0、null、false 和空字符串，used/expired/unused 码删除均通过；删除后两账户积分13/4、账本0、会员free不变。143 是更新的前端冻结142门禁（87 files/1297 tests，TSC、Vitest、build 实际 exit 0）；147 仅将11个新目录文件各去掉一个EOF LF，148证明可逆，因此143未在格式收尾后的字节上重跑。144 是独立桌面浏览器正向验收：套餐 list/create/edit、兑换码 list/create，0/null/false 保存回读和确认后离开；最终 SQL 为套餐5、兑换码6，两账户积分13/4、账本0、会员free不变，并留有桌面截图。144因硬TTL以exit 1结束，但进程组、端口、临时目录和凭据已清理，不把整个run记为PASS。CSV下载工具等待超时未验，移动端、unknown/in-flight/cross-session浏览器负例、GUI删除及生成码到用户兑换闭环仍待；137的API删除不能替代GUI删除。
 
-生成原规范另有 5 种 source worker type；当前默认 factory 只有 image-single 实际登记 executor，其他四类只有准入/策略/元数据不等于可执行。BATCH/优化/视频/提取等完整 consumer 和原始 A01–A39 矩阵仍待完成。单图恢复的 500/reconciling/due pending 状态见 GEN-W01 当前动态状态，不能记为完成。
+生成原规范另有 5 种 source worker type；当前默认 factory 只有 image-single 实际登记 executor，其他四类只有准入/策略/元数据不等于可执行。BATCH/优化/视频/提取等完整 consumer 和原始 A01–A39 矩阵仍待完成。image.single 的真实 ASGI auth→fake Provider 500→reconciling→原 deadline 后 failed/refund 路径已由本地合成 SQLite/fake 用例覆盖；非空 unknown 前后保留原 first/deadline、及时成功 retained、BYOK zero 不建 wallet、唯一退款后合法消费的 replay、commit-ACK/rollback 和 cooperative shutdown 也有合成用例。这不是浏览器或真实 Provider 证据。PostgreSQL 锁等待/双消费者/commit 故障/真实进程 restart、P6 cancel HTTP/control、poll、可验证原输出恢复和其余四类 worker 仍待完成。
 
-全部 backend 与 12 类 React 工作流、跨用户/权限/故障恢复及适用 owned 验收完成后，最后才做后端语言评估。真实 Provider/付费调用、真实邮件交付、R2 账号/存储及生产部署保留为整体目标中各自待适用授权的验收层；当前阶段仅不执行这些外部、付费、生产或真实发送动作，本地实现、owned/fake/loopback 验证继续推进。现在不索取密钥；外部等待不计入有效开发工时，也不视为整体目标已完成。
+全部 backend 与 12 类 React 工作流、跨用户/权限/故障恢复及适用 owned 验收完成后，最后才做后端语言评估。本批明确授权仅涵盖本地源码和临时 SQLite/PostgreSQL 合成测试。真实数据库写入、资金操作、Provider/付费调用、SMTP 真实发送、R2 账号/存储及生产部署仍是各自独立授权的验收层；本地实现与 owned/fake/loopback 验证继续推进。现在不索取密钥；外部等待不计入有效开发工时，也不视为整体目标已完成。
