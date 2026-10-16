@@ -26,6 +26,9 @@ import type { AdminSeriesApi, AdminSeriesExitSnapshot, AdminSeriesListState, Adm
 import { AdminTasks } from "../admin-tasks/AdminTasks";
 import { createAdminTasksApi } from "../admin-tasks/adminTasksApi";
 import { DEFAULT_ADMIN_TASK_LIST_STATE, type AdminTaskListState, type AdminTasksApi } from "../admin-tasks/adminTasksTypes";
+import { AdminSmtpAccounts } from "../admin-smtp-accounts/AdminSmtpAccounts";
+import { createAdminSmtpAccountsApi } from "../admin-smtp-accounts/adminSmtpAccountsApi";
+import type { AdminSmtpAccountExitSnapshot, AdminSmtpAccountMode, AdminSmtpAccountsApi, PendingAdminSmtpAccountExit } from "../admin-smtp-accounts/adminSmtpAccountsTypes";
 import "./Admin.css";
 
 const ADMIN_TOKEN_KEY = "admin_token";
@@ -63,7 +66,10 @@ type AdminView =
   | { kind: "series" }
   | { kind: "series-create" }
   | { kind: "series-edit"; id: string }
-  | { kind: "admin-tasks" };
+  | { kind: "admin-tasks" }
+  | { kind: "smtp-accounts" }
+  | { kind: "smtp-account-create" }
+  | { kind: "smtp-account-edit"; id: string };
 
 interface AdminSession {
   token: string;
@@ -92,6 +98,14 @@ interface ActiveSeriesExit {
   viewIdentity: number;
   sessionGeneration: number;
   api: AdminSeriesApi;
+}
+
+interface ActiveSmtpAccountExit {
+  snapshot: AdminSmtpAccountExitSnapshot;
+  pending: NonNullable<AdminSmtpAccountExitSnapshot["pending"]>;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AdminSmtpAccountsApi;
 }
 
 interface AdminFeatureProps {
@@ -233,6 +247,8 @@ export function AdminFeature({
   const seriesExit = useRef<ActiveSeriesExit | null>(null);
   const seriesApiRef = useRef<AdminSeriesApi | null>(null);
   const tasksApiRef = useRef<AdminTasksApi | null>(null);
+  const smtpAccountsExit = useRef<ActiveSmtpAccountExit | null>(null);
+  const smtpAccountsApiRef = useRef<AdminSmtpAccountsApi | null>(null);
   const [seriesListState, setSeriesListState] = useState<AdminSeriesListState>(DEFAULT_ADMIN_SERIES_LIST_STATE);
   const [taskListState, setTaskListState] = useState<AdminTaskListState>(DEFAULT_ADMIN_TASK_LIST_STATE);
   const [seriesListVersion, setSeriesListVersion] = useState(0);
@@ -244,6 +260,7 @@ export function AdminFeature({
   const [userListVersion, setUserListVersion] = useState(0);
   const [creditListVersion, setCreditListVersion] = useState(0);
   const [systemConfigListVersion, setSystemConfigListVersion] = useState(0);
+  const [smtpAccountsListVersion, setSmtpAccountsListVersion] = useState(0);
 
   const navigate = useCallback((nextView: AdminView, options?: { force?: boolean }) => {
     const pending = membershipExit.current;
@@ -284,9 +301,24 @@ export function AdminFeature({
           : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
       if (!window.confirm(question)) return false;
     }
+    const smtpPending = smtpAccountsExit.current;
+    if (!options?.force && smtpPending && smtpPending.viewIdentity === viewIdentity.current
+      && smtpPending.sessionGeneration === sessionGeneration.current
+      && smtpPending.api === smtpAccountsApiRef.current) {
+      const { kind, operation, recordId, message } = smtpPending.pending;
+      const action = operation === "delete" ? "删除" : operation === "update" ? "更新" : "创建";
+      const target = recordId ? "账号 " + recordId : "当前表单";
+      const question = kind === "write-in-flight"
+        ? "正在" + action + target + "，请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : kind === "unknown-write"
+          ? message + "\n\n离开将放弃此意图的本地核对；之后重新提交会成为一项新操作。仍要离开吗？"
+          : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
     membershipExit.current = null;
     systemConfigExit.current = null;
     seriesExit.current = null;
+    smtpAccountsExit.current = null;
     viewIdentity.current += 1;
     setView(nextView);
     return true;
@@ -324,16 +356,22 @@ export function AdminFeature({
     () => createAdminTasksApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
+  const smtpAccountsApi = useMemo(
+    () => createAdminSmtpAccountsApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), () => session?.user.id ?? "", safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, session?.user.id, storage],
+  );
   membershipApiRef.current = membershipApi;
   systemConfigApiRef.current = systemConfigApi;
   seriesApiRef.current = seriesApi;
   tasksApiRef.current = tasksApi;
+  smtpAccountsApiRef.current = smtpAccountsApi;
 
   const handleLogin = useCallback((nextSession: AdminSession) => {
     sessionGeneration.current += 1;
     membershipExit.current = null;
     systemConfigExit.current = null;
     seriesExit.current = null;
+    smtpAccountsExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -347,6 +385,7 @@ export function AdminFeature({
     membershipExit.current = null;
     systemConfigExit.current = null;
     seriesExit.current = null;
+    smtpAccountsExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -362,6 +401,7 @@ export function AdminFeature({
     membershipExit.current = null;
     systemConfigExit.current = null;
     seriesExit.current = null;
+    smtpAccountsExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -395,6 +435,13 @@ export function AdminFeature({
       : view.kind === "series-edit" ? "series/edit/" + view.id : "";
   const tasksOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
   const tasksViewKey = view.kind === "admin-tasks" ? "admin-tasks/list" : "";
+  const smtpAccountsOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const smtpAccountsMode: AdminSmtpAccountMode = view.kind === "smtp-account-create" ? "create"
+    : view.kind === "smtp-account-edit" ? "edit" : "list";
+  const smtpAccountsRecordId = view.kind === "smtp-account-edit" ? view.id : "";
+  const smtpAccountsViewKey = view.kind === "smtp-accounts" ? "smtp-accounts/list"
+    : view.kind === "smtp-account-create" ? "smtp-accounts/create"
+      : view.kind === "smtp-account-edit" ? "smtp-accounts/edit/" + view.id : "";
   const handleMembershipExitState = useCallback((snapshot: AdminMembershipExitSnapshot) => {
     if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
       || membershipApiRef.current !== activeMembershipApi || snapshot.ownerScope !== membershipOwnerScope
@@ -508,6 +555,46 @@ export function AdminFeature({
     if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
       && tasksApiRef.current === tasksApi) setTaskListState(state);
   }, [activeSessionGeneration, activeViewIdentity, tasksApi]);
+  const handleSmtpAccountsExitState = useCallback((snapshot: AdminSmtpAccountExitSnapshot) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || smtpAccountsApiRef.current !== smtpAccountsApi || snapshot.ownerScope !== smtpAccountsOwnerScope
+      || snapshot.viewKey !== smtpAccountsViewKey || snapshot.administratorId !== activeAdministratorId
+      || snapshot.mode !== smtpAccountsMode || snapshot.recordId !== smtpAccountsRecordId) return;
+    if (snapshot.pending) {
+      smtpAccountsExit.current = { snapshot, pending: snapshot.pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: smtpAccountsApi };
+    } else if (smtpAccountsExit.current?.viewIdentity === activeViewIdentity
+      && smtpAccountsExit.current.sessionGeneration === activeSessionGeneration
+      && smtpAccountsExit.current.api === smtpAccountsApi) {
+      smtpAccountsExit.current = null;
+    }
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, smtpAccountsApi,
+    smtpAccountsMode, smtpAccountsOwnerScope, smtpAccountsRecordId, smtpAccountsViewKey]);
+  const leaveSmtpAccounts = useCallback((nextView: AdminView, pending?: PendingAdminSmtpAccountExit) => {
+    if (pending) {
+      const snapshot: AdminSmtpAccountExitSnapshot = {
+        ownerScope: smtpAccountsOwnerScope,
+        viewKey: smtpAccountsViewKey,
+        administratorId: activeAdministratorId,
+        mode: smtpAccountsMode,
+        recordId: smtpAccountsRecordId,
+        pending,
+      };
+      smtpAccountsExit.current = { snapshot, pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: smtpAccountsApi };
+    }
+    navigate(nextView);
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, navigate, smtpAccountsApi,
+    smtpAccountsMode, smtpAccountsOwnerScope, smtpAccountsRecordId, smtpAccountsViewKey]);
+  const handleSmtpAccountsUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && smtpAccountsApiRef.current === smtpAccountsApi) handleUnauthorized();
+  }, [activeSessionGeneration, activeViewIdentity, handleUnauthorized, smtpAccountsApi]);
+  const handleSmtpAccountsSaved = useCallback(() => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || smtpAccountsApiRef.current !== smtpAccountsApi) return;
+    setSmtpAccountsListVersion((value) => value + 1);
+  }, [activeSessionGeneration, activeViewIdentity, smtpAccountsApi]);
   const openSeriesCreate = useCallback(() => {
     setSeriesNotice(null);
     navigate({ kind: "series-create" });
@@ -551,6 +638,7 @@ export function AdminFeature({
       const membershipPending = membershipExit.current;
       const systemConfigPending = systemConfigExit.current;
       const seriesPending = seriesExit.current;
+      const smtpAccountsPending = smtpAccountsExit.current;
       const protectsExit = (membershipPending && membershipPending.viewIdentity === viewIdentity.current
         && membershipPending.sessionGeneration === sessionGeneration.current
         && membershipPending.api === membershipApiRef.current)
@@ -559,7 +647,10 @@ export function AdminFeature({
           && systemConfigPending.api === systemConfigApiRef.current)
         || (seriesPending && seriesPending.viewIdentity === viewIdentity.current
           && seriesPending.sessionGeneration === sessionGeneration.current
-          && seriesPending.api === seriesApiRef.current);
+          && seriesPending.api === seriesApiRef.current)
+        || (smtpAccountsPending && smtpAccountsPending.viewIdentity === viewIdentity.current
+          && smtpAccountsPending.sessionGeneration === sessionGeneration.current
+          && smtpAccountsPending.api === smtpAccountsApiRef.current);
       if (!protectsExit) return;
       event.preventDefault();
       event.returnValue = "";
@@ -697,6 +788,16 @@ export function AdminFeature({
           >
             <span aria-hidden="true">≡</span>全局任务
           </button>
+          <button
+            className={view.kind === "smtp-accounts" || view.kind === "smtp-account-create" || view.kind === "smtp-account-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="SMTP 账号"
+            title="SMTP 账号"
+            aria-current={view.kind === "smtp-accounts" || view.kind === "smtp-account-create" || view.kind === "smtp-account-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "smtp-accounts" })}
+          >
+            <span aria-hidden="true">✉</span>SMTP 账号
+          </button>
         </nav>
         <div className="admin-sidebar-account">
           <span className="admin-sidebar-avatar" aria-hidden="true">
@@ -821,6 +922,25 @@ export function AdminFeature({
               listState={taskListState}
               onListStateChange={handleTaskListStateChange}
               onAuthenticationError={handleTasksUnauthorized}
+            />
+          ) : view.kind === "smtp-accounts" || view.kind === "smtp-account-create" || view.kind === "smtp-account-edit" ? (
+            <AdminSmtpAccounts
+              key={activeViewIdentity}
+              api={smtpAccountsApi}
+              mode={smtpAccountsMode}
+              {...(smtpAccountsMode === "edit" ? { recordId: smtpAccountsRecordId } : {})}
+              ownerScope={smtpAccountsOwnerScope}
+              viewKey={smtpAccountsViewKey}
+              administratorId={activeAdministratorId}
+              listVersion={smtpAccountsListVersion}
+              onAuthenticationError={handleSmtpAccountsUnauthorized}
+              onCreate={() => navigate({ kind: "smtp-account-create" })}
+              onEdit={(id) => navigate({ kind: "smtp-account-edit", id })}
+              onCancel={(pending) => leaveSmtpAccounts(
+                smtpAccountsMode === "list" ? { kind: "dashboard" } : { kind: "smtp-accounts" }, pending,
+              )}
+              onSaved={handleSmtpAccountsSaved}
+              onExitStateChange={handleSmtpAccountsExitState}
             />
           ) : view.kind === "redemption-codes" || view.kind === "redemption-create" ? (
             <RedemptionCodes

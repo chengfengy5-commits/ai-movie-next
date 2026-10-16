@@ -1,0 +1,190 @@
+.admin-smtp-page {
+  display: grid;
+  gap: 18px;
+}
+
+.admin-smtp-heading {
+  align-items: flex-start;
+  gap: 20px;
+}
+
+.admin-smtp-heading-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.admin-smtp-list-note,
+.admin-smtp-secret-note {
+  color: var(--admin-muted, #a1a1aa);
+  font-size: 13px;
+  margin: 0;
+}
+
+.admin-smtp-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--admin-line, #2a2a30);
+  border-radius: 12px;
+  background: var(--admin-surface, #18181b);
+}
+
+.admin-smtp-table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+}
+
+.admin-smtp-table th,
+.admin-smtp-table td {
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--admin-line, #2a2a30);
+  text-align: left;
+  vertical-align: middle;
+}
+
+.admin-smtp-table th {
+  color: var(--admin-muted, #a1a1aa);
+  font-size: 12px;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.admin-smtp-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.admin-smtp-row-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.admin-smtp-row-actions .admin-button {
+  padding: 6px 10px;
+}
+
+.admin-smtp-empty {
+  padding: 28px !important;
+  color: var(--admin-muted, #a1a1aa);
+  text-align: center !important;
+}
+
+.admin-smtp-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 14px;
+}
+
+.admin-smtp-back {
+  justify-self: start;
+}
+
+.admin-smtp-form {
+  display: grid;
+  gap: 15px;
+  max-width: 720px;
+  padding: 22px;
+  border: 1px solid var(--admin-line, #2a2a30);
+  border-radius: 14px;
+  background: var(--admin-surface, #18181b);
+}
+
+.admin-smtp-field {
+  display: grid;
+  gap: 7px;
+  color: var(--admin-text);
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.admin-smtp-field input {
+  width: 100%;
+  min-height: 42px;
+  padding: 9px 11px;
+  border: 1px solid var(--admin-line, #2a2a30);
+  border-radius: 9px;
+  background: #1a1a1e;
+  color: var(--admin-text, #e4e4e7);
+  font: inherit;
+}
+
+.admin-smtp-field input:focus-visible,
+.admin-smtp-toggle input:focus-visible {
+  outline: 2px solid var(--admin-accent, #8b5cf6);
+  outline-offset: 2px;
+}
+
+.admin-smtp-toggle {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--admin-text);
+  font-size: 13px;
+}
+
+.admin-smtp-toggle input {
+  width: 16px;
+  height: 16px;
+}
+
+.admin-smtp-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.admin-smtp-error {
+  margin: 0;
+  color: var(--admin-danger, #b42318);
+}
+
+.admin-smtp-notice,
+.admin-smtp-receipt {
+  margin: 0;
+  color: var(--admin-success, #087443);
+}
+
+.admin-smtp-unknown {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--admin-warning-border, #f0cc88);
+  border-radius: 10px;
+  background: var(--admin-warning-soft, #fff8e8);
+}
+
+.admin-smtp-unknown p {
+  margin: 0;
+}
+
+.admin-smtp-snapshot {
+  display: grid;
+  grid-template-columns: minmax(110px, auto) 1fr;
+  gap: 6px 12px;
+  margin: 0;
+}
+
+.admin-smtp-snapshot dt {
+  color: var(--admin-muted, #a1a1aa);
+}
+
+.admin-smtp-snapshot dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 760px) {
+  .admin-smtp-heading {
+    flex-direction: column;
+  }
+
+  .admin-smtp-heading-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .admin-smtp-form {
+    padding: 16px;
+  }
+}
