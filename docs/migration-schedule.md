@@ -6,11 +6,11 @@
 
 ## 当前基线与计数口径
 
-本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；本批后台会员证据在末尾增补。149 收据确认会员管理前端已提交并推送至 main@eca1978bd2453ca1e4cb486804c904a6aa89b1ba。单图原 intent 到期 recovery/due 消费者随后提交并推送至 main@1e07f90bb203b8ff6e7b534eb0e8b22a12f5ddfc；E166 收据确认 remoteExact=true。该提交是当前源码回归基线，不改变 102 的 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78 历史分析归属。后续文档或实现提交不改变既有证据归属；最新 Git 状态以仓库实时查询为准。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
+本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；本批后台会员证据在末尾增补。149 收据确认会员管理前端已提交并推送至 main@eca1978bd2453ca1e4cb486804c904a6aa89b1ba。单图原 intent 到期 recovery/due 消费者随后提交并推送至 main@1e07f90bb203b8ff6e7b534eb0e8b22a12f5ddfc；E166 收据确认 remoteExact=true。该1e07提交是当前后端源码回归基线，不改变 102 的 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78 历史分析归属。系统配置 list/edit 前端已由本批提交并推送至 main@32b3f721a8436a270b58b73c2a2c138ca8dc6b5a；196 为前端门禁，201 为真实 HTTP/owned SQL，209 为局部 GUI 与独立 SQL，生命周期结果另列。后续文档或实现提交不改变既有证据归属；最新 Git 状态以仓库实时查询为准。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
 
-固定旧源共有 248 个显式 method/path 声明，当前运行时登记 250 个方法，其中包括两个新增两步分镜接口；248 个旧声明均已登记、差集为 0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前已登记 14 个视图，另 9 个旧视图待实现和接线。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 9 个。
+固定旧源共有 248 个显式 method/path 声明，当前运行时登记 250 个方法，其中包括两个新增两步分镜接口；248 个旧声明均已登记、差集为 0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前已登记 16 个视图，另 7 个旧视图待实现和接线。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 7 个待实现旧视图。
 
-清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。本批 U12.8/U12.9 两行完成开发和接线，按原计数口径当前为 30、26、51；51 行各自的验证/接受动作仍待完整证据，局部验收不减少该数。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
+清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。本批 U12.8/U12.9 两行完成开发和接线，按原计数口径为 30、26、51；本批系统配置 U12.6 再闭合开发动作，当前为 29、26、51：开发 33−U11.2−U12.8−U12.9−U12.6=29，接线 28−U12.8−U12.9=26，验证/接受仍为 51。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
 
 状态简写：C＝已实现或已接入；P＝部分；M＝缺失；I＝进行中；U＝当前没有足够验证；E＝依赖外部授权或外部环境。验证和接受状态分别以 V/A 标明。实现、接线状态为 C 的行只在相应列记为完成；局部测试、历史浏览器和当前完整接受不可互相替代。
 
@@ -117,12 +117,12 @@
 
 | ID | 交付内容 | 实现 | 接入 | 验证/验收 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| U12.1 | 后台登录、会话隔离和仪表盘 | C | C | V=P / A=U；独立后台身份和 dashboard API 已接 | 验真实管理员、过期/撤销、普通用户 403、仪表盘失败与恢复。 |
+| U12.1 | 后台登录、会话隔离和仪表盘 | C | C | V=P / A=P；独立后台身份和 dashboard API 已接，209 已证真实管理员登录、dashboard 和 GUI 退出；服务端 session 撤销未证 | 补过期/撤销、权限及失败恢复；390px 无横向溢出已证，共享 68px 侧栏文字拥挤待修/复验。 |
 | U12.2 | 系统模型 list/create/edit/delete | C | C | V=P / A=U；旧 3 个视图及删除已登记 | 用当前 SQL/API 浏览器验字段、密钥脱敏、未知写入回读和权限。 |
 | U12.3 | 系统提示词 list/create/edit/delete | C | C | V=P / A=U；旧 3 个视图及删除已登记 | 验分类、原文保全、系统权限和真实 API 浏览器行为。 |
 | U12.4 | 用户管理、积分/流水及关联记录 | C | C | V=P / A=U；旧用户 3 视图已登记；积分/流水/关联记录是额外扩展读取 | 验管理员自删、外键、未知写入与用户隔离；关联记录只读不等于旧全局剧集/任务资源。 |
 | U12.5 | 后台剧集 3 视图和全局任务 1 视图 | P | M | V=P / A=U；admin_series/admin_tasks 已装配，关联用户任务只有部分读取 | 补独立后台 adapter、筛选/导出和写入确认；验证全局/按用户权限及前台访问保全。 |
-| U12.6 | 系统配置 list/edit | P | M | V=P / A=U；admin_system_config/public_site_config 后端有，React view 缺失 | 补 2 视图；逐字段处理支付、倍率、配额、锁时长、CORS、上传目录等即时/重启语义和敏感值。 |
+| U12.6 | 系统配置 list/edit | C | P | V=P / A=P；32b3 已提交页面、19 字段、真实 API 与 host 接线；194 源码复核、196 前端门禁、201 真实 HTTP/owned SQL 通过，209 局部 GUI 及独立 SQL 已证 | 页面/API 接线已完成；运行配置桥接仍待，不能由保存 metadata 推断 CORS/frontend_url/worker 已生效。补脏离开取消保稿、in-flight/unknown/cross-session GUI 及移动侧栏可读性；其它消费者实际生效按原边界验。 |
 | U12.7 | SMTP 账户 list/create/edit/delete、启停和计数 | P | M | V=P / A=U；加密配置与每日重置后端已有 | 补 3 视图和密钥保留/替换；接配置接口；发送行为仍归 U01.3，secret 不回显。 |
 | U12.8 | 兑换码列表/筛选/导出/批量创建/删除 | C | C | V=P / A=P；129-02/03 与 148 源码复核完成；137 owned HTTP/SQL 覆盖后台方法、鉴权及 used/expired/unused 删除，144 桌面浏览器已验列表/创建 | 补验筛选、导出和 GUI 删除；CSV 下载工具超时未证，移动端及 unknown/in-flight/cross-session 浏览器负例仍待；137 的 API 删除不等于 GUI 删除，生成至用户兑换/账本闭环另待。 |
 | U12.9 | 套餐 CRUD、启停、分类与排序 | C | C | V=P / A=P；129-02/03 与 148 源码复核完成；137 owned HTTP/SQL 覆盖管理 CRUD/公开读取，144 桌面浏览器已验列表、创建、编辑及 0/null/false 保存回读 | 继续补停用显示/排序及未知、在途、跨会话等浏览器负例；不虚构真实支付。 |
@@ -139,7 +139,7 @@
 | B-ACCOUNT | 账户、偏好、模型、提示词和兑换逻辑已有；会员批已并入 | 真实 SMTP sender 仍缺；各账户/运营工作流仍按 U01/U11/U12 补验证和 UI。 |
 | B-TEAMS | 管理、剧集协作和 reporting 后端共 25 旧接口已装配 | 完整团队前端及多用户权限接受，不用目录存在代替授权。 |
 | B-TASKS | 旧任务 read/status/cancel、通用/后台任务和 provider status 已有 | image.single 原 intent recovery/due 消费已实现；E179/E181/E185 的有界 owned PG 合成回归覆盖已声明的到期锁、双消费者、退款回滚/ACK确认和 cooperative shutdown 范围。P2/P6 可靠取消、poll/control、UI 真实状态和可验证原输出恢复仍缺；其他任务家族继续按各自消费者边界完成。 |
-| B-ADMIN | 后台 API 家族已有，React 已有登录、仪表盘、14/23 个旧视图 | 完成剩余 9 个旧视图和真 SQL/浏览器动作验收；3 个积分扩展视图独立。 |
+| B-ADMIN | 后台 API 家族已有，React 已有登录、仪表盘、16/23 个旧视图 | 完成剩余 7 个旧视图和真 SQL/浏览器动作验收；3 个积分扩展视图独立。 |
 | B-GENERATION | 六入口准入、合同、凭据、图/计费；单图受限 runtime 与原 intent recovery/due consumer、文本 SSE 有实现，两步分镜有局部浏览器证据 | worker registry 五类中仅 image-single factory 有 executor 注册；另外四类需实际 executor。metadata/准入/claim 不是可执行证明。 |
 | B-INTEGRATIONS | DB/provider/storage/quota/download/SMTP ports 与部分 adapter 已存在 | 补本地组合根和真实 caller；逐项区分 owned fake/loopback 与外部账号验收。 |
 | B-ARCH | 扫描 106 个 domain/application 文件；多数模块使用 port/UoW 边界 | 收口 aistarslab application 直连 persistence/provider、generation_credentials application 直连 SQLAlchemy/concrete repository 的边界，同时保留现有同事务/主体约束。 |
@@ -212,6 +212,8 @@ U11.2 的最新证据来自 9df：MEMBERSHIP97-I01 已由 97-02 finding 闭合�
 局部状态另外保留：E17 的直接跨域连接偶发差异仍未定位根因，同源 proxy 路径已验；章节锁局部 badge/交互有真实本地浏览器验收。两项都不扩展成全站 CORS 或全部锁流程已验收。
 
 后台会员管理批次的验收层彼此独立：136 是基于前端冻结135的门禁（87 files/1295 tests，TSC、Vitest、build 实际 exit 0）；137 是基于同一前端冻结与 backend 5ca522c 的真实路由/owned SQL 检查，15 组、32 个真实 HTTP 请求通过，后台9种操作成功响应 exact 200，鉴权覆盖401/403，套餐/兑换码字段覆盖 0、null、false 和空字符串，used/expired/unused 码删除均通过；删除后两账户积分13/4、账本0、会员free不变。143 是更新的前端冻结142门禁（87 files/1297 tests，TSC、Vitest、build 实际 exit 0）；147 仅将11个新目录文件各去掉一个EOF LF，148证明可逆，因此143未在格式收尾后的字节上重跑。144 是独立桌面浏览器正向验收：套餐 list/create/edit、兑换码 list/create，0/null/false 保存回读和确认后离开；最终 SQL 为套餐5、兑换码6，两账户积分13/4、账本0、会员free不变，并留有桌面截图。144因硬TTL以exit 1结束，但进程组、端口、临时目录和凭据已清理，不把整个run记为PASS。CSV下载工具等待超时未验，移动端、unknown/in-flight/cross-session浏览器负例、GUI删除及生成码到用户兑换闭环仍待；137的API删除不能替代GUI删除。
+
+系统配置 list/edit 批次已提交推送至 main@32b3f721a8436a270b58b73c2a2c138ca8dc6b5a。194 为源码复核；196 基于 233 项前端输入，90 files/1324 tests、TSC/build 均 actual exit 0，输入前后 exact、进程组和 TMP 清理通过。201 为真实 loopback HTTP/owned SQLite，21 请求/11 检查通过，19 字段转换、隐藏/非目标配置及 wallet/ledger 保全分层核对；统计经既有 BalanceReader fake 隔绝默认 127.0.0.1:8765，不代表真实余额上游。209 在同一 233 前端/916 后端冻结上完成 nonce/PID 和 HTML 探针，Root 实际 GUI 已验管理员登录、dashboard、19 字段装载、5 字段保存确认及保存后 disabled；独立 SQL 仅这 5 字段改变，其它目标字段、非目标行、users/wallet/ledger 不变，0 存储与回包默认 3 差异已证。桌面及 390px JPG 已留，client/scroll/body 宽均 390、无横向溢出，但 68px 共享侧栏文字拥挤仍待修。dirty 确认弹窗已见，dismiss 工具超时，未证取消保稿；in-flight/unknown/cross-session GUI、服务端 logout 撤销仍待。两个 owned tab 均已关闭并核 absent、viewport 已 reset。209 supervisor 实际 exit 0 且 lifecycle-stopped，233/916 source/snapshot/Git/保护尾 exact，groups/ports/TMP 及凭据清理通过；Root UI receipt 明确 partial，生命周期成功不等于全部 UI 接受，更不等于部署。204 phase A 仅在独立工作树进行，尚未合并到本基线，不增加 main 的 executor 登记或 A01–A39 接受数。后续修复与定向复核在隔离工作树推进，尚未并入 main，不增加 main 的 worker factory 登记数。
 
 生成原规范另有 5 种 source worker type；当前默认 factory 只有 image-single 实际登记 executor，其他四类只有准入/策略/元数据不等于可执行。BATCH/优化/视频/提取等完整 consumer 和原始 A01–A39 矩阵仍待完成。image.single 的真实 ASGI auth→fake Provider 500→reconciling→原 deadline 后 failed/refund 路径已由本地合成 SQLite/fake 用例覆盖；非空 unknown 前后保留原 first/deadline、及时成功 retained、BYOK zero 不建 wallet、唯一退款后合法消费的 replay、commit-ACK/rollback 和 cooperative shutdown 也有合成用例。这不是浏览器或真实 Provider 证据。PG owned 合成收据 E179/E181（cases-177）与 E185（cases-183）在同一 916 项 1e07 源清单上通过各自选定范围，覆盖具体到期锁/双消费者、退款回滚与 ACK 确认及 shutdown gate。E181 F 是两个不同 worker PID 读取同一持久 PG 图，不代表 PG 或完整服务重启、任意 crash；受控 SQL UTC 时钟不是墙钟两小时等待。P6 cancel HTTP/control、poll、可验证原输出恢复及其余四类 worker 仍待完成。
 
