@@ -18,6 +18,8 @@ export interface AccountSecurityPanelProps {
   onUnauthorized(): void;
   onLogout(): void;
   onBeforeSecurityMutation(): boolean | Promise<boolean>;
+  /** Synchronous final admission immediately before establishing the password write owner. */
+  onPasswordMutationAdmission?(): boolean;
   onDirtyChange?(dirty: boolean): void;
   onPasswordMutationOwnerChange?(owner: object, active: boolean): void;
 }
@@ -115,6 +117,7 @@ export function AccountSecurityPanel({
   onUnauthorized,
   onLogout,
   onBeforeSecurityMutation,
+  onPasswordMutationAdmission,
   onDirtyChange,
   onPasswordMutationOwnerChange,
 }: AccountSecurityPanelProps) {
@@ -127,6 +130,7 @@ export function AccountSecurityPanel({
     onUnauthorized,
     onLogout,
     onBeforeSecurityMutation,
+    ...(onPasswordMutationAdmission === undefined ? {} : { onPasswordMutationAdmission }),
     ...(onDirtyChange === undefined ? {} : { onDirtyChange }),
     ...(onPasswordMutationOwnerChange === undefined ? {} : { onPasswordMutationOwnerChange }),
   };
@@ -512,11 +516,13 @@ export function AccountSecurityPanel({
     setPasswordMessage(null);
 
     const permissionCheck = propsRef.current.onBeforeSecurityMutation;
+    const admissionCheck = propsRef.current.onPasswordMutationAdmission;
     let checkingPermission = true;
     try {
       const allowed = await permissionCheck();
       if (!isCurrent(ticket)) return;
       if (propsRef.current.onBeforeSecurityMutation !== permissionCheck
+        || propsRef.current.onPasswordMutationAdmission !== admissionCheck
         || writeOwner.current !== ticket.controller) {
         setPasswordError("账户状态已变化，请重新确认简介状态后再试。");
         return;
@@ -528,6 +534,11 @@ export function AccountSecurityPanel({
 
       if (passwordMutationOwner.current !== null) {
         setPasswordError("已有密码修改结果待处理，请先退出或重新登录后再继续。");
+        return;
+      }
+
+      if (admissionCheck !== undefined && !admissionCheck()) {
+        setPasswordError("会员兑换已进入最终授权或请求阶段；请等待结果明确后再修改密码。");
         return;
       }
 

@@ -631,6 +631,147 @@ describe("API services", () => {
     expect(createDemoServices(storage).accountProfile).toBeUndefined();
   });
 
+  it("uses the three account membership routes with anonymous reads, exact fields, and safe request options", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "membership-token");
+    const config = {
+      site_title: "创作平台",
+      site_tagline: "",
+      membership_benefits: "权益一\n权益二",
+      tutorial_url: "",
+      purchase_qr_code_url: "",
+      purchase_contact_info: "联系管理员",
+      storyboard_cost_multiplier: 1,
+      payments_enabled: true,
+    };
+    const membershipPackages = [
+      { id: "later", category: "membership", name: "后置顺序", price: 88, credits: null, days: 30, sort_order: 9 },
+      { id: "first", category: "membership", name: "服务端首项", price: 29, credits: null, days: null, sort_order: 1 },
+    ];
+    const creditPackages = [
+      { id: "credits-one", category: "credits", name: "积分包", price: 10, credits: 1000, days: null, sort_order: 2 },
+    ];
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse(config))
+      .mockResolvedValueOnce(jsonResponse(membershipPackages))
+      .mockResolvedValueOnce(jsonResponse(creditPackages))
+      .mockResolvedValueOnce(jsonResponse({ message: "兑换成功", type: "credits", value: 1000, detail: null }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const membership = services.accountMembership;
+    if (membership === undefined) throw new Error("Expected the API account membership port.");
+    const signal = new AbortController().signal;
+
+    await expect(membership.getPublicConfig(signal)).resolves.toEqual(config);
+    await expect(membership.listPurchasePackages("membership", signal)).resolves.toMatchObject([
+      { id: "later", price: 88, credits: null, days: 30, sort_order: 9 },
+      { id: "first", price: 29, credits: null, days: null, sort_order: 1 },
+    ]);
+    await expect(membership.listPurchasePackages("credits", signal)).resolves.toMatchObject([
+      { id: "credits-one", price: 10, credits: 1000, days: null, sort_order: 2 },
+    ]);
+    await expect(membership.redeem({ code: "  one-time-code  " }, signal)).resolves.toEqual({
+      message: "兑换成功",
+      type: "credits",
+      value: 1000,
+      detail: null,
+    });
+
+    const calls = fetcher.mock.calls.map(([input, init]) => ({ url: new URL(String(input)), init }));
+    expect(calls.map(({ url, init }) => [url.pathname, url.search, init?.method])).toEqual([
+      ["/api/site-config", "", "GET"],
+      ["/api/purchase-packages", "?category=membership", "GET"],
+      ["/api/purchase-packages", "?category=credits", "GET"],
+      ["/api/redemption-codes/redeem", "", "POST"],
+    ]);
+    for (const { init } of calls) {
+      expect(init?.credentials).toBe("omit");
+      expect(init?.cache).toBe("no-store");
+      expect(init?.redirect).toBe("error");
+      expect(init?.referrerPolicy).toBe("no-referrer");
+      expect(init?.signal).toBeInstanceOf(AbortSignal);
+    }
+    expect(new Headers(calls[0]?.init?.headers).has("Authorization")).toBe(false);
+    expect(new Headers(calls[1]?.init?.headers).has("Authorization")).toBe(false);
+    expect(new Headers(calls[2]?.init?.headers).has("Authorization")).toBe(false);
+    expect(new Headers(calls[3]?.init?.headers).get("Authorization")).toBe("Bearer membership-token");
+    expect(calls[3]?.init?.body).toBe(JSON.stringify({ code: "  one-time-code  " }));
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("membership-token");
+    expect(createDemoServices(storage).accountMembership).toBeUndefined();
+  });
+
+  it.each([201, 202, 204])("requires exact HTTP 200 for redemption, including successful status %i", async (status) => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "membership-token");
+    const fetcher = vi.fn(async () => jsonResponse({ message: "accepted", type: "credits", value: 10, detail: null }, status));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const membership = services.accountMembership;
+    if (membership === undefined) throw new Error("Expected the API account membership port.");
+
+    await expect(membership.redeem({ code: "one-time-code" }, new AbortController().signal))
+      .rejects.toMatchObject({ kind: "invalid-response" });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("membership-token");
+  });
+
+  it("requires exact HTTP 200 for both public membership reads and rejects unsupported categories locally", async () => {
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({}, 201))
+      .mockResolvedValueOnce(jsonResponse([], 202));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage: new MemoryStorage(), fetcher });
+    const membership = services.accountMembership;
+    if (membership === undefined) throw new Error("Expected the API account membership port.");
+    const signal = new AbortController().signal;
+
+    await expect(membership.getPublicConfig(signal)).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(membership.listPurchasePackages("credits", signal)).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(membership.listPurchasePackages("admin" as never, signal))
+      .rejects.toMatchObject({ kind: "invalid-response" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("keeps an anonymous 401 in-session and converts malformed membership payloads to invalid-response", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "preserved-token");
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ detail: "expired" }, 401))
+      .mockResolvedValueOnce(jsonResponse({
+        message: "兑换成功",
+        type: "unknown",
+        value: 10,
+        detail: null,
+      }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const membership = services.accountMembership;
+    if (membership === undefined) throw new Error("Expected the API account membership port.");
+
+    await expect(membership.getPublicConfig(new AbortController().signal))
+      .rejects.toMatchObject({ kind: "http", status: 401 });
+    await expect(membership.redeem({ code: "one-time-code" }, new AbortController().signal))
+      .rejects.toMatchObject({ kind: "invalid-response" });
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).has("Authorization")).toBe(false);
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("preserved-token");
+  });
+
+  it("ignores a late redemption 401 after the API bearer changes", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "old-membership-token");
+    let resolveFetch!: (response: Response) => void;
+    const fetcher = vi.fn((_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const membership = services.accountMembership;
+    if (membership === undefined) throw new Error("Expected the API account membership port.");
+    const pending = membership.redeem({ code: "one-time-code" }, new AbortController().signal);
+
+    storage.setItem(API_TOKEN_KEY, "new-membership-token");
+    resolveFetch(jsonResponse({ detail: "expired" }, 401));
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(new Headers(fetcher.mock.calls[0]?.[1]?.headers).get("Authorization"))
+      .toBe("Bearer old-membership-token");
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("new-membership-token");
+  });
+
   it("uses authenticated, exact-status session and password endpoints with scoped request fields", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "current-security-token");

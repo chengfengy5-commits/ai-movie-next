@@ -1,0 +1,237 @@
+.account-membership-panel {
+  display: grid;
+  gap: 1.25rem;
+  min-width: 0;
+  color: var(--text-primary, #17212b);
+}
+
+.account-membership-header,
+.account-membership-section-heading,
+.account-membership-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.account-membership-header h2,
+.account-membership-section-heading h3 {
+  margin: 0;
+}
+
+.account-membership-header .eyebrow,
+.account-membership-section-heading .eyebrow {
+  margin: 0 0 0.3rem;
+}
+
+.account-membership-account,
+.account-membership-benefits,
+.account-membership-package-section,
+.account-membership-contact,
+.account-membership-redemption {
+  min-width: 0;
+  padding: 1.15rem;
+  border: 1px solid var(--border-subtle, #dce3e8);
+  border-radius: 0.9rem;
+  background: var(--surface, #fff);
+}
+
+.account-membership-account {
+  display: grid;
+  gap: 0.45rem;
+  background: var(--surface-subtle, #f7f9fa);
+}
+
+.account-membership-account p,
+.account-membership-contact-text,
+.account-membership-benefit-text {
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.account-membership-package-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: 1rem;
+}
+
+.account-membership-section-heading {
+  margin-bottom: 0.75rem;
+}
+
+.account-membership-packages {
+  display: grid;
+  gap: 0.7rem;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.account-membership-packages li {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.8rem;
+  padding: 0.8rem 0;
+  border-top: 1px solid var(--border-subtle, #dce3e8);
+}
+
+.account-membership-package-copy {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 0;
+}
+
+.account-membership-package-copy strong {
+  overflow-wrap: anywhere;
+}
+
+.account-membership-package-copy span,
+.account-membership-muted,
+.account-membership-help {
+  color: var(--text-muted, #687782);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.account-membership-muted,
+.account-membership-help,
+.account-membership-load-error p {
+  margin: 0;
+}
+
+.account-membership-load-error {
+  display: grid;
+  justify-items: start;
+  gap: 0.5rem;
+}
+
+.account-membership-load-error p,
+.account-membership-error {
+  color: var(--danger, #a93232);
+}
+
+.account-membership-contact {
+  display: grid;
+  gap: 0.7rem;
+}
+
+.account-membership-contact .account-membership-section-heading {
+  margin-bottom: 0;
+}
+
+.account-membership-contact-text {
+  padding: 0.8rem;
+  border-radius: 0.6rem;
+  background: var(--surface-subtle, #f7f9fa);
+}
+
+.account-membership-qr {
+  display: block;
+  width: min(100%, 18rem);
+  max-height: 24rem;
+  justify-self: start;
+  object-fit: contain;
+  border: 1px solid var(--border-subtle, #dce3e8);
+  border-radius: 0.6rem;
+}
+
+.account-membership-redemption {
+  display: grid;
+  gap: 0.8rem;
+}
+
+.account-membership-redemption-form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.account-membership-redemption-form > label {
+  font-weight: 600;
+}
+
+.account-membership-redemption-form input {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  padding: 0.7rem 0.75rem;
+  border: 1px solid var(--border-strong, #aebbc5);
+  border-radius: 0.6rem;
+  background: var(--surface, #fff);
+  color: inherit;
+  font: inherit;
+}
+
+.account-membership-redemption-form input[readonly] {
+  background: var(--surface-subtle, #f7f9fa);
+}
+
+.account-membership-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.account-membership-error,
+.account-membership-status,
+.account-membership-policy-notice,
+.account-membership-unknown-note,
+.account-membership-receipt {
+  margin: 0;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.account-membership-status,
+.account-membership-receipt {
+  color: var(--success, #276749);
+}
+
+.account-membership-policy-notice,
+.account-membership-unknown-note {
+  padding: 0.75rem;
+  border-radius: 0.6rem;
+  background: var(--warning-soft, #fff6df);
+  color: var(--warning-strong, #76520a);
+}
+
+.account-membership-receipt {
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem;
+  border-radius: 0.6rem;
+  background: var(--success-soft, #eaf7ef);
+}
+
+.account-membership-receipt p {
+  margin: 0;
+}
+
+@media (max-width: 680px) {
+  .account-membership-package-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .account-membership-packages li {
+    flex-direction: column;
+  }
+}
+
+@media (max-width: 420px) {
+  .account-membership-account,
+  .account-membership-benefits,
+  .account-membership-package-section,
+  .account-membership-contact,
+  .account-membership-redemption {
+    padding: 0.9rem;
+  }
+
+  .account-membership-section-heading {
+    align-items: flex-start;
+  }
+
+  .account-membership-actions > button {
+    flex: 1 1 auto;
+  }
+}

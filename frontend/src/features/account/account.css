@@ -48,6 +48,15 @@
   grid-column: 1 / -1;
 }
 
+.account-membership-card {
+  grid-column: 1 / -1;
+}
+
+.account-membership-mutation-notice {
+  margin: 1rem 0 0;
+  color: var(--danger-strong, #9d2d2d);
+}
+
 .account-profile-heading {
   justify-content: flex-start;
   margin-bottom: 1.25rem;

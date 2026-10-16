@@ -1,10 +1,11 @@
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { User } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { AccountProfileReceipt, AccountProfileServicePort } from "../../shared/api/accountProfile";
 import type { AccountSecurityServicePort } from "../../shared/api/accountSecurity";
+import type { AccountMembershipServicePort } from "../../shared/api/accountMembership";
 import type { WorkspaceServices } from "../../shared/api/services";
 import { AccountPage, type AccountPageProps } from "./AccountPage";
 
@@ -38,6 +39,23 @@ function profileService(credits = 42): AccountProfileServicePort {
       avatar_url: baseUser.avatar_url,
       bio: input.bio,
     })),
+  };
+}
+
+function membershipService(): AccountMembershipServicePort {
+  return {
+    getPublicConfig: vi.fn(async () => ({
+      site_title: "创作平台",
+      site_tagline: "",
+      membership_benefits: "权益说明",
+      tutorial_url: "",
+      purchase_qr_code_url: "",
+      purchase_contact_info: "",
+      storyboard_cost_multiplier: 1,
+      payments_enabled: false,
+    })),
+    listPurchasePackages: vi.fn(async () => []),
+    redeem: vi.fn(async () => ({ message: "兑换成功", type: "credits" as const, value: 10, detail: null })),
   };
 }
 
@@ -354,17 +372,17 @@ describe("AccountPage", () => {
       .mockResolvedValueOnce({ credits: -3 });
     const { onUnauthorized } = renderAccount({ user: accountUser, profile });
 
-    expect(await screen.findByText("会员 · 有效至 2999-03-04 12:30:00+05:30")).toBeInTheDocument();
+    expect(await screen.findAllByText("会员 · 有效至 2999-03-04 12:30:00+05:30")).toHaveLength(2);
     expect(screen.getByText("尚未填写简介。" )).toBeInTheDocument();
     expect(await screen.findByText(/积分读取暂时无法连接服务/)).toBeInTheDocument();
-    expect(screen.getByText("账户用户")).toBeInTheDocument();
+    expect(screen.getAllByText("账户用户")).toHaveLength(2);
     expect(onUnauthorized).not.toHaveBeenCalled();
 
     const interaction = userEvent.setup();
     await interaction.click(screen.getByRole("button", { name: "重试读取积分" }));
     expect(await screen.findByText("-3")).toBeInTheDocument();
     expect(profile.getCredits).toHaveBeenCalledTimes(2);
-    expect(screen.getByText("账户用户")).toBeInTheDocument();
+    expect(screen.getAllByText("账户用户")).toHaveLength(2);
   });
 
   it("preserves a null bio as a no-op and does not send a profile PUT", async () => {
@@ -391,7 +409,7 @@ describe("AccountPage", () => {
       .mockResolvedValueOnce(updatedUser);
     renderAccount({ profile, refreshCurrentUser });
 
-    await screen.findByText(baseUser.username);
+    await screen.findAllByText(baseUser.username);
     await user.click(screen.getByRole("button", { name: "编辑简介" }));
     await user.clear(screen.getByRole("textbox", { name: "个人简介" }));
     await user.click(screen.getByRole("button", { name: "保存简介" }));
@@ -413,7 +431,7 @@ describe("AccountPage", () => {
       .mockResolvedValueOnce(updatedUser);
     renderAccount({ profile, refreshCurrentUser });
 
-    await screen.findByText(baseUser.username);
+    await screen.findAllByText(baseUser.username);
     await user.click(screen.getByRole("button", { name: "编辑简介" }));
     await user.clear(screen.getByRole("textbox", { name: "个人简介" }));
     await user.type(screen.getByRole("textbox", { name: "个人简介" }), "新简介");
@@ -445,7 +463,7 @@ describe("AccountPage", () => {
       vi.spyOn(window, "confirm").mockReturnValue(true);
       renderAccount({ profile, refreshCurrentUser, onDirtyChange });
 
-      await screen.findByText(baseUser.username);
+      await screen.findAllByText(baseUser.username);
       await user.click(screen.getByRole("button", { name: "编辑简介" }));
       await user.clear(screen.getByRole("textbox", { name: "个人简介" }));
       await user.type(screen.getByRole("textbox", { name: "个人简介" }), "旧目标A");
@@ -541,7 +559,7 @@ describe("AccountPage", () => {
       expect(screen.getByRole("textbox", { name: "个人简介" })).toHaveValue("新草稿B");
       expect(screen.getByRole("textbox", { name: "个人简介" })).not.toHaveAttribute("readonly");
       expect(screen.getByRole("button", { name: "保存简介" })).toBeEnabled();
-      expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+      expect(screen.queryByText(/保存结果仍未确认/)).not.toBeInTheDocument();
       expect(profile.updateProfile).toHaveBeenCalledTimes(1);
     },
   );
@@ -600,7 +618,7 @@ describe("AccountPage", () => {
       vi.spyOn(window, "confirm").mockReturnValue(true);
       renderAccount({ profile, refreshCurrentUser, onDirtyChange });
 
-      await screen.findByText(baseUser.username);
+      await screen.findAllByText(baseUser.username);
       await user.click(screen.getByRole("button", { name: "编辑简介" }));
       await user.clear(screen.getByRole("textbox", { name: "个人简介" }));
       await user.type(screen.getByRole("textbox", { name: "个人简介" }), "旧目标A");
@@ -655,7 +673,7 @@ describe("AccountPage", () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     renderAccount({ profile, refreshCurrentUser });
 
-    await screen.findByText(baseUser.username);
+    await screen.findAllByText(baseUser.username);
     await user.click(screen.getByRole("button", { name: "编辑简介" }));
     await user.clear(screen.getByRole("textbox", { name: "个人简介" }));
     await user.type(screen.getByRole("textbox", { name: "个人简介" }), "旧目标A");
@@ -726,6 +744,382 @@ describe("AccountPage", () => {
     expect(profile.updateProfile).toHaveBeenCalledTimes(1);
   });
 
+  it("ORs membership and security drafts, blocks password preflight, and preserves manual cleanup", async () => {
+    const user = userEvent.setup();
+    const membership = membershipService();
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn(async () => ({ message: "密码修改成功" })),
+    };
+    const services = { ...workspaceServices(), accountMembership: membership, accountSecurity } as WorkspaceServices;
+    const onDirtyChange = vi.fn();
+    renderAccount({ services, onDirtyChange });
+
+    const code = await screen.findByLabelText("兑换码");
+    await user.type(code, "keep-this-code");
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+    await user.type(screen.getByLabelText("当前密码"), "current-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    expect(await screen.findByText("会员面板仍有兑换码草稿。请手动清空输入后再修改密码；系统不会替你放弃兑换码。"))
+      .toBeInTheDocument();
+    expect(code).toHaveValue("keep-this-code");
+    expect(accountSecurity.changePassword).not.toHaveBeenCalled();
+
+    await user.clear(code);
+    await waitFor(() => expect(onDirtyChange).toHaveBeenLastCalledWith(true));
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    expect(await screen.findByRole("alertdialog", { name: "确认修改密码？" })).toBeInTheDocument();
+    expect(accountSecurity.changePassword).not.toHaveBeenCalled();
+  });
+
+  it("locks membership input and POST during a password write and its unknown outcome", async () => {
+    const user = userEvent.setup();
+    const pendingPassword = deferred<{ message: string }>();
+    const membership = membershipService();
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn(() => pendingPassword.promise),
+    };
+    const services = { ...workspaceServices(), accountMembership: membership, accountSecurity } as WorkspaceServices;
+    renderAccount({ services });
+
+    const code = await screen.findByLabelText("兑换码");
+    await user.type(screen.getByLabelText("当前密码"), "current-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+    await user.click(screen.getByRole("button", { name: "修改密码" }));
+    await user.click(await screen.findByRole("button", { name: "确认修改密码" }));
+    await waitFor(() => expect(accountSecurity.changePassword).toHaveBeenCalledTimes(1));
+
+    expect(code).toHaveAttribute("readonly");
+    expect(screen.getByRole("button", { name: "兑换" })).toBeDisabled();
+    await user.type(code, "blocked-code");
+    expect(code).toHaveValue("");
+    expect(membership.redeem).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingPassword.reject(new ApiError("network", "offline"));
+      await pendingPassword.promise.catch(() => undefined);
+    });
+    expect(await screen.findAllByText(/改密结果未确定/)).not.toHaveLength(0);
+    expect(code).toHaveAttribute("readonly");
+    expect(screen.getByRole("button", { name: "兑换" })).toBeDisabled();
+    expect(membership.redeem).not.toHaveBeenCalled();
+  });
+
+  it("serializes a same-tick password preflight against the final redemption authorization", async () => {
+    const user = userEvent.setup();
+    const pendingRedemption = deferred<Awaited<ReturnType<AccountMembershipServicePort["redeem"]>>>();
+    const membership = membershipService();
+    vi.mocked(membership.redeem).mockImplementation(() => pendingRedemption.promise);
+    const accountSecurity: AccountSecurityServicePort = {
+      listSessions: vi.fn(async () => []),
+      revokeSession: vi.fn(async (sessionId) => ({ message: "设备已下线", session_id: sessionId })),
+      changePassword: vi.fn(async () => ({ message: "密码修改成功" })),
+    };
+    const services = { ...workspaceServices(), accountMembership: membership, accountSecurity } as WorkspaceServices;
+    renderAccount({ services });
+
+    const code = await screen.findByLabelText("兑换码");
+    await user.type(code, "same-tick-code");
+    await user.type(screen.getByLabelText("当前密码"), "current-secret");
+    await user.type(screen.getByLabelText("新密码"), "new-secret-123");
+    await user.type(screen.getByLabelText("确认新密码"), "new-secret-123");
+
+    const membershipForm = code.closest("form");
+    const passwordForm = screen.getByLabelText("新密码").closest("form");
+    expect(membershipForm).not.toBeNull();
+    expect(passwordForm).not.toBeNull();
+    act(() => {
+      fireEvent.submit(membershipForm!);
+      fireEvent.submit(passwordForm!);
+    });
+
+    await waitFor(() => expect(membership.redeem).toHaveBeenCalledTimes(1));
+    expect(membership.redeem).toHaveBeenCalledWith({ code: "same-tick-code" }, expect.any(AbortSignal));
+    expect(accountSecurity.changePassword).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog", { name: "确认修改密码？" })).not.toBeInTheDocument();
+    expect(screen.getByLabelText("兑换码")).toHaveAttribute("readonly");
+
+    await act(async () => {
+      pendingRedemption.reject(new ApiError("network", "offline"));
+      await pendingRedemption.promise.catch(() => undefined);
+    });
+    expect(await screen.findByText(/兑换结果未确定/)).toBeInTheDocument();
+    expect(accountSecurity.changePassword).not.toHaveBeenCalled();
+  });
+
+  it("refreshes parent and membership snapshots after confirmation and rejects late initial reads", async () => {
+    const user = userEvent.setup();
+    const initialProfile = deferred<User>();
+    const initialCredits = deferred<{ credits: number }>();
+    const freshUser = { ...baseUser, membership_type: "free", membership_expires_at: null, bio: "兑换后的简介" };
+    const refreshCurrentUser = vi.fn()
+      .mockImplementationOnce(() => initialProfile.promise)
+      .mockResolvedValueOnce(freshUser);
+    const profile = profileService();
+    vi.mocked(profile.getCredits)
+      .mockImplementationOnce(() => initialCredits.promise)
+      .mockResolvedValueOnce({ credits: 150 });
+    const membership = membershipService();
+    const services = { ...workspaceServices(), accountMembership: membership } as WorkspaceServices;
+    renderAccount({ profile, refreshCurrentUser, services });
+
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    const bio = screen.getByRole("textbox", { name: "个人简介" });
+    await user.clear(bio);
+    await user.type(bio, "保留中的简介草稿");
+    const code = await screen.findByLabelText("兑换码");
+    await user.type(code, "one-time-code");
+    await user.click(screen.getByRole("button", { name: "兑换" }));
+
+    expect(await screen.findByText("兑换已确认；账户资料与积分余额已分别重新读取。"))
+      .toBeInTheDocument();
+    expect(refreshCurrentUser).toHaveBeenCalledTimes(2);
+    expect(profile.getCredits).toHaveBeenCalledTimes(2);
+    expect(bio).toHaveValue("保留中的简介草稿");
+    expect(screen.getAllByText("普通账号")).toHaveLength(2);
+    expect(screen.getAllByText("150")).toHaveLength(2);
+
+    await act(async () => {
+      initialProfile.resolve({ ...baseUser, bio: "迟到的旧资料" });
+      initialCredits.resolve({ credits: 999 });
+      await Promise.all([initialProfile.promise, initialCredits.promise]);
+    });
+    expect(screen.getAllByText("普通账号")).toHaveLength(2);
+    expect(screen.getAllByText("150")).toHaveLength(2);
+    expect(bio).toHaveValue("保留中的简介草稿");
+    expect(membership.redeem).toHaveBeenCalledTimes(1);
+  });
+
+  it("retires a pending bio verification when membership takes profile ownership and preserves a newer retry", async () => {
+    const user = userEvent.setup();
+    const pendingRedemption = deferred<Awaited<ReturnType<AccountMembershipServicePort["redeem"]>>>();
+    const pendingBioVerification = deferred<User>();
+    const pendingMembershipRead = deferred<User>();
+    const pendingBioRetry = deferred<User>();
+    const profileSignals: AbortSignal[] = [];
+    const refreshCurrentUser = vi.fn((signal: AbortSignal): Promise<User> => {
+      profileSignals.push(signal);
+      switch (profileSignals.length) {
+        case 1: return Promise.resolve(baseUser);
+        case 2: return pendingBioVerification.promise;
+        case 3: return pendingMembershipRead.promise;
+        case 4: return pendingBioRetry.promise;
+        default: return Promise.resolve(baseUser);
+      }
+    });
+    const profile = profileService();
+    const pendingBioPut = deferred<AccountProfileReceipt>();
+    vi.mocked(profile.updateProfile).mockReturnValueOnce(pendingBioPut.promise);
+    const membership = membershipService();
+    vi.mocked(membership.redeem).mockReturnValueOnce(pendingRedemption.promise);
+    const services = { ...workspaceServices(), accountMembership: membership } as WorkspaceServices;
+    const onUnauthorized = vi.fn();
+    renderAccount({ profile, refreshCurrentUser, services, onUnauthorized });
+
+    await screen.findAllByText(baseUser.username);
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    const bio = screen.getByRole("textbox", { name: "个人简介" });
+    await user.clear(bio);
+    await user.type(bio, "待确认的简介目标");
+    await user.type(await screen.findByLabelText("兑换码"), "membership-code-once");
+    await user.click(screen.getByRole("button", { name: "兑换" }));
+    await waitFor(() => expect(membership.redeem).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "保存简介" }));
+    await waitFor(() => expect(profile.updateProfile).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      pendingBioPut.resolve({
+        id: baseUser.id,
+        username: baseUser.username,
+        avatar_url: baseUser.avatar_url,
+        bio: "待确认的简介目标",
+      });
+      await pendingBioPut.promise;
+    });
+    expect(await screen.findByText("正在独立读取账户资料核对本次保存。")).toBeInTheDocument();
+    expect(refreshCurrentUser).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      pendingRedemption.resolve({ message: "兑换成功", type: "credits", value: 10, detail: null });
+      await pendingRedemption.promise;
+    });
+    await waitFor(() => expect(refreshCurrentUser).toHaveBeenCalledTimes(3));
+    expect(profileSignals[1]?.aborted).toBe(true);
+
+    const verificationButton = screen.getByRole("button", { name: "只核对服务器状态" });
+    try {
+      expect(verificationButton).toBeEnabled();
+    } catch (error) {
+      await act(async () => {
+        pendingMembershipRead.resolve({ ...baseUser, membership_type: "free", membership_expires_at: null });
+        pendingBioVerification.resolve({ ...baseUser, bio: "旧读取中的简介" });
+        await Promise.all([pendingMembershipRead.promise, pendingBioVerification.promise]);
+      });
+      throw error;
+    }
+
+    await act(async () => {
+      pendingMembershipRead.resolve({
+        ...baseUser,
+        membership_type: "free",
+        membership_expires_at: null,
+        bio: "会员读取的资料不确认简介写入",
+      });
+      await pendingMembershipRead.promise;
+    });
+    await waitFor(() => expect(verificationButton).toBeEnabled());
+    expect(bio).toHaveValue("待确认的简介目标");
+
+    await user.click(verificationButton);
+    await waitFor(() => expect(refreshCurrentUser).toHaveBeenCalledTimes(4));
+    expect(verificationButton).toBeDisabled();
+    await act(async () => {
+      pendingBioVerification.resolve({ ...baseUser, bio: "旧读取中的简介" });
+      await pendingBioVerification.promise;
+    });
+    expect(verificationButton).toBeDisabled();
+    expect(bio).toHaveValue("待确认的简介目标");
+    expect(onUnauthorized).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingBioRetry.resolve({ ...baseUser, bio: "待确认的简介目标" });
+      await pendingBioRetry.promise;
+    });
+    expect(await screen.findByText("简介已由独立账户读取确认。")).toBeInTheDocument();
+    expect(profile.updateProfile).toHaveBeenCalledTimes(1);
+    expect(membership.redeem).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("keeps a bio verification retry available when membership and the aborted old read both fail", async () => {
+    const user = userEvent.setup();
+    const pendingRedemption = deferred<Awaited<ReturnType<AccountMembershipServicePort["redeem"]>>>();
+    const pendingBioVerification = deferred<User>();
+    const pendingMembershipRead = deferred<User>();
+    const pendingBioRetry = deferred<User>();
+    const profileSignals: AbortSignal[] = [];
+    const refreshCurrentUser = vi.fn((signal: AbortSignal): Promise<User> => {
+      profileSignals.push(signal);
+      switch (profileSignals.length) {
+        case 1: return Promise.resolve(baseUser);
+        case 2: return pendingBioVerification.promise;
+        case 3: return pendingMembershipRead.promise;
+        case 4: return pendingBioRetry.promise;
+        default: return Promise.resolve(baseUser);
+      }
+    });
+    const profile = profileService();
+    const pendingBioPut = deferred<AccountProfileReceipt>();
+    vi.mocked(profile.updateProfile).mockReturnValueOnce(pendingBioPut.promise);
+    const membership = membershipService();
+    vi.mocked(membership.redeem).mockReturnValueOnce(pendingRedemption.promise);
+    const services = { ...workspaceServices(), accountMembership: membership } as WorkspaceServices;
+    const onUnauthorized = vi.fn();
+    renderAccount({ profile, refreshCurrentUser, services, onUnauthorized });
+
+    await screen.findAllByText(baseUser.username);
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    const bio = screen.getByRole("textbox", { name: "个人简介" });
+    await user.clear(bio);
+    await user.type(bio, "保留的核对目标");
+    await user.type(await screen.findByLabelText("兑换码"), "membership-code-once");
+    await user.click(screen.getByRole("button", { name: "兑换" }));
+    await waitFor(() => expect(membership.redeem).toHaveBeenCalledTimes(1));
+
+    await user.click(screen.getByRole("button", { name: "保存简介" }));
+    await waitFor(() => expect(profile.updateProfile).toHaveBeenCalledTimes(1));
+    await act(async () => {
+      pendingBioPut.resolve({
+        id: baseUser.id,
+        username: baseUser.username,
+        avatar_url: baseUser.avatar_url,
+        bio: "保留的核对目标",
+      });
+      await pendingBioPut.promise;
+    });
+    expect(await screen.findByText("正在独立读取账户资料核对本次保存。")).toBeInTheDocument();
+
+    await act(async () => {
+      pendingRedemption.resolve({ message: "兑换成功", type: "credits", value: 10, detail: null });
+      await pendingRedemption.promise;
+    });
+    await waitFor(() => expect(refreshCurrentUser).toHaveBeenCalledTimes(3));
+    expect(profileSignals[1]?.aborted).toBe(true);
+
+    const verificationButton = screen.getByRole("button", { name: "只核对服务器状态" });
+    try {
+      expect(verificationButton).toBeEnabled();
+    } catch (error) {
+      await act(async () => {
+        pendingBioVerification.reject(new ApiError("http", "expired old editor read", 401));
+        pendingMembershipRead.reject(new ApiError("network", "membership read failed"));
+        await Promise.all([
+          pendingBioVerification.promise.catch(() => undefined),
+          pendingMembershipRead.promise.catch(() => undefined),
+        ]);
+      });
+      throw error;
+    }
+
+    await act(async () => {
+      pendingMembershipRead.reject(new ApiError("network", "membership read failed"));
+      await pendingMembershipRead.promise.catch(() => undefined);
+    });
+    expect(await screen.findByText("兑换已确认，最新账户读取失败；可只读重试读取。")).toBeInTheDocument();
+    expect(verificationButton).toBeEnabled();
+    expect(bio).toHaveValue("保留的核对目标");
+
+    await user.click(verificationButton);
+    await waitFor(() => expect(refreshCurrentUser).toHaveBeenCalledTimes(4));
+    expect(verificationButton).toBeDisabled();
+
+    await act(async () => {
+      pendingBioVerification.reject(new ApiError("http", "expired old editor read", 401));
+      await pendingBioVerification.promise.catch(() => undefined);
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(verificationButton).toBeDisabled();
+
+    await act(async () => {
+      pendingBioRetry.resolve({ ...baseUser, bio: "保留的核对目标" });
+      await pendingBioRetry.promise;
+    });
+
+    expect(await screen.findByText("简介已由独立账户读取确认。")).toBeInTheDocument();
+    expect(profile.updateProfile).toHaveBeenCalledTimes(1);
+    expect(membership.redeem).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("keeps an unknown membership result read-only and only refreshes account state", async () => {
+    const user = userEvent.setup();
+    const membership = membershipService();
+    vi.mocked(membership.redeem).mockRejectedValueOnce(new ApiError("network", "offline"));
+    const services = { ...workspaceServices(), accountMembership: membership } as WorkspaceServices;
+    const profile = profileService();
+    const refreshCurrentUser = vi.fn(async () => baseUser);
+    renderAccount({ profile, refreshCurrentUser, services });
+
+    await user.type(await screen.findByLabelText("兑换码"), "uncertain-code");
+    await user.click(screen.getByRole("button", { name: "兑换" }));
+    expect(await screen.findByText(/兑换结果未确定/)).toBeInTheDocument();
+    expect(screen.getByLabelText("兑换码")).toHaveAttribute("readonly");
+    expect(membership.redeem).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "只刷新账户状态" }));
+    await waitFor(() => expect(refreshCurrentUser).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(profile.getCredits).toHaveBeenCalledTimes(2));
+    expect(membership.redeem).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("兑换码")).toHaveValue("uncertain-code");
+  });
+
   it("ignores a late old-session 401 after the same user opens a new session generation", async () => {
     const oldProfileRead = deferred<User>();
     const oldCreditsRead = deferred<{ credits: number }>();
@@ -778,7 +1172,7 @@ describe("AccountPage", () => {
 
   it("shows a safe initial avatar and does not load the external avatar URL", async () => {
     renderAccount();
-    await screen.findByText(baseUser.username);
+    await screen.findAllByText(baseUser.username);
 
     expect(screen.getByRole("img", { name: "头像首字" })).toHaveTextContent("账");
     expect(document.querySelector("img[src*='qlogo']")).toBeNull();

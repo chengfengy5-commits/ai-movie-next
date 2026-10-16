@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type FormEvent, type KeyboardEvent } from "react";
 import type { User } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { AccountProfileServicePort } from "../../shared/api/accountProfile";
 import type { WorkspaceServices } from "../../shared/api/services";
+import { AccountMembershipPanel, type AccountRedemptionState } from "./AccountMembershipPanel";
 import { AccountSecurityPanel } from "./AccountSecurityPanel";
 import "./account.css";
 
@@ -22,6 +23,12 @@ interface BioDraft {
 interface PendingVerification {
   targetBio: string;
   status: "checking" | "unresolved";
+}
+
+interface ProfileVerificationOwner {
+  ticket: RequestTicket;
+  readGeneration: number;
+  targetBio: string;
 }
 
 interface RequestTicket {
@@ -108,6 +115,14 @@ function errorMessage(error: unknown, action: string): string {
   return `${action}暂时无法确认，请保留当前内容并重试读取。`;
 }
 
+function forwardAbort(signal: AbortSignal | undefined, controller: AbortController): () => void {
+  if (signal === undefined) return () => undefined;
+  const abort = () => controller.abort();
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  return () => signal.removeEventListener("abort", abort);
+}
+
 function isUnknownWriteOutcome(error: unknown): boolean {
   if (!(error instanceof ApiError)) return true;
   if (error.kind === "network" || error.kind === "timeout" || error.kind === "invalid-response") return true;
@@ -161,18 +176,31 @@ export function AccountPage({
   const [pendingVerification, setPendingVerification] = useState<PendingVerification | null>(null);
   const [saving, setSaving] = useState(false);
   const [securityDirty, setSecurityDirty] = useState(false);
+  const [membershipDirty, setMembershipDirty] = useState(false);
   const [passwordMutationOwner, setPasswordMutationOwner] = useState<object | null>(null);
   const [saveMessage, setSaveMessage] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
+  const [membershipMutationNotice, setMembershipMutationNotice] = useState<string | null>(null);
   const requestGeneration = useRef(0);
   const editorGeneration = useRef(0);
   const profileReadGeneration = useRef(0);
   const profileReadController = useRef<AbortController | null>(null);
+  const profileVerificationOwner = useRef<ProfileVerificationOwner | null>(null);
+  const creditsReadGeneration = useRef(0);
+  const creditsReadController = useRef<AbortController | null>(null);
   const savingOwner = useRef<AbortController | null>(null);
   const controllers = useRef(new Set<AbortController>());
   const editorControllers = useRef(new Set<AbortController>());
   const unauthorizedNotifiedGeneration = useRef<number | null>(null);
   const passwordMutationOwnerRef = useRef<object | null>(null);
+  const redemptionPreflightOwnerRef = useRef<object | null>(null);
+  const membershipDirtyRef = useRef(false);
+  const membershipStateRef = useRef<AccountRedemptionState>({
+    phase: "idle",
+    hasCodeDraft: false,
+    writeInFlight: false,
+    outcomeUnknown: false,
+  });
   const bioStateRef = useRef({ draft, pendingVerification, saving });
   bioStateRef.current = { draft, pendingVerification, saving };
   const saveBioDraftRef = useRef<(activeDraft: BioDraft) => Promise<boolean>>(async () => false);
@@ -203,20 +231,51 @@ export function AccountPage({
     controllers.current.delete(ticket.controller);
     editorControllers.current.delete(ticket.controller);
     if (profileReadController.current === ticket.controller) profileReadController.current = null;
+    if (creditsReadController.current === ticket.controller) creditsReadController.current = null;
   }, []);
 
   const claimProfileRead = useCallback((ticket: RequestTicket): number => {
     const previous = profileReadController.current;
-    if (previous !== null && previous !== ticket.controller) previous.abort();
+    if (previous !== null && previous !== ticket.controller) {
+      const verification = profileVerificationOwner.current;
+      if (verification?.ticket.controller === previous) {
+        profileVerificationOwner.current = null;
+        if (savingOwner.current === previous) {
+          savingOwner.current = null;
+          setSaving(false);
+        }
+        setPendingVerification((current) => current?.status === "checking"
+          && current.targetBio === verification.targetBio
+          ? { ...current, status: "unresolved" }
+          : current);
+        setSaveError("简介核对读取已被较新的账户读取接管。核对目标和草稿已保留；请继续只读核对。");
+        finishRequest(verification.ticket);
+      }
+      previous.abort();
+    }
     profileReadController.current = ticket.controller;
     profileReadGeneration.current += 1;
     return profileReadGeneration.current;
-  }, []);
+  }, [finishRequest]);
 
   const isCurrentProfileRead = useCallback((ticket: RequestTicket, readGeneration: number): boolean => (
     isCurrent(ticket)
     && profileReadGeneration.current === readGeneration
     && profileReadController.current === ticket.controller
+  ), [isCurrent]);
+
+  const claimCreditsRead = useCallback((ticket: RequestTicket): number => {
+    const previous = creditsReadController.current;
+    if (previous !== null && previous !== ticket.controller) previous.abort();
+    creditsReadController.current = ticket.controller;
+    creditsReadGeneration.current += 1;
+    return creditsReadGeneration.current;
+  }, []);
+
+  const isCurrentCreditsRead = useCallback((ticket: RequestTicket, readGeneration: number): boolean => (
+    isCurrent(ticket)
+    && creditsReadGeneration.current === readGeneration
+    && creditsReadController.current === ticket.controller
   ), [isCurrent]);
 
   const notifyUnauthorized = useCallback((ticket: RequestTicket) => {
@@ -249,41 +308,80 @@ export function AccountPage({
     }
   }, [beginRequest, claimProfileRead, finishRequest, isCurrentProfileRead, notifyUnauthorized]);
 
-  const refreshCredits = useCallback(async () => {
+  const readProfileForMembership = useCallback(async (signal: AbortSignal): Promise<User> => {
     const ticket = beginRequest();
+    const unlinkAbort = forwardAbort(signal, ticket.controller);
+    const readGeneration = claimProfileRead(ticket);
+    setProfileRead((current) => ({ ...current, status: "loading", message: null }));
+    try {
+      const fresh = await ticket.refreshCurrentUser(ticket.controller.signal);
+      if (!isCurrentProfileRead(ticket, readGeneration)) throw new ApiError("aborted", "账户资料读取已被更新的请求取代。");
+      if (fresh.id !== ticket.userId) throw new ApiError("invalid-response", "账户资料回读与当前用户不匹配。");
+      setProfileRead({ status: "ready", value: fresh, message: null });
+      return fresh;
+    } catch (error) {
+      if (!isCurrentProfileRead(ticket, readGeneration)) throw new ApiError("aborted", "账户资料读取已被更新的请求取代。");
+      if (error instanceof ApiError && error.status === 401) notifyUnauthorized(ticket);
+      setProfileRead((current) => ({
+        ...current,
+        status: "error",
+        message: errorMessage(error, "账户资料读取"),
+      }));
+      throw error;
+    } finally {
+      unlinkAbort();
+      finishRequest(ticket);
+    }
+  }, [beginRequest, claimProfileRead, finishRequest, isCurrentProfileRead, notifyUnauthorized]);
+
+  const readCreditsForMembership = useCallback(async (signal?: AbortSignal): Promise<number> => {
+    const ticket = beginRequest();
+    const unlinkAbort = forwardAbort(signal, ticket.controller);
+    const readGeneration = claimCreditsRead(ticket);
     if (ticket.profile === null) {
       setCreditsRead({ status: "error", value: null, message: "当前运行模式尚未接入真实积分读取。" });
+      unlinkAbort();
       finishRequest(ticket);
-      return;
+      throw new ApiError("invalid-response", "当前运行模式尚未接入真实积分读取。");
     }
     setCreditsRead((current) => ({ ...current, status: "loading", message: null }));
     try {
       const snapshot = await ticket.profile.getCredits(ticket.controller.signal);
-      if (!isCurrent(ticket)) return;
+      if (!isCurrentCreditsRead(ticket, readGeneration)) throw new ApiError("aborted", "积分读取已被更新的请求取代。");
       if (!Number.isSafeInteger(snapshot.credits)) {
         throw new ApiError("invalid-response", "服务器返回的积分余额无效。");
       }
       setCreditsRead({ status: "ready", value: snapshot.credits, message: null });
+      return snapshot.credits;
     } catch (error) {
-      if (!isCurrent(ticket)) return;
+      if (!isCurrentCreditsRead(ticket, readGeneration)) throw new ApiError("aborted", "积分读取已被更新的请求取代。");
       if (error instanceof ApiError && error.status === 401) notifyUnauthorized(ticket);
       setCreditsRead((current) => ({
         ...current,
         status: "error",
         message: errorMessage(error, "积分读取"),
       }));
+      throw error;
     } finally {
+      unlinkAbort();
       finishRequest(ticket);
     }
-  }, [beginRequest, finishRequest, isCurrent, notifyUnauthorized]);
+  }, [beginRequest, claimCreditsRead, finishRequest, isCurrentCreditsRead, notifyUnauthorized]);
+
+  const refreshCredits = useCallback(async () => {
+    await readCreditsForMembership().catch(() => undefined);
+  }, [readCreditsForMembership]);
 
   const verifyWriteTarget = useCallback(async (targetBio: string, ticket: RequestTicket): Promise<boolean> => {
     if (!isCurrent(ticket)) return false;
     const readGeneration = claimProfileRead(ticket);
+    const verificationOwner = { ticket, readGeneration, targetBio };
+    profileVerificationOwner.current = verificationOwner;
     setPendingVerification({ targetBio, status: "checking" });
     try {
       const fresh = await ticket.refreshCurrentUser(ticket.controller.signal);
-      if (!isCurrentProfileRead(ticket, readGeneration)) return false;
+      if (profileVerificationOwner.current !== verificationOwner
+        || !isCurrentProfileRead(ticket, readGeneration)) return false;
       if (fresh.id !== ticket.userId) {
         throw new ApiError("invalid-response", "账户资料回读与当前用户不匹配。");
       }
@@ -300,7 +398,8 @@ export function AccountPage({
         return false;
       }
     } catch (error) {
-      if (!isCurrentProfileRead(ticket, readGeneration)) return false;
+      if (profileVerificationOwner.current !== verificationOwner
+        || !isCurrentProfileRead(ticket, readGeneration)) return false;
       if (error instanceof ApiError && error.status === 401) notifyUnauthorized(ticket);
       setProfileRead((current) => ({
         ...current,
@@ -310,6 +409,10 @@ export function AccountPage({
       setPendingVerification({ targetBio, status: "unresolved" });
       setSaveError("保存结果仍未确认。草稿已保留；请只读核对服务器状态，不要重复提交。");
       return false;
+    } finally {
+      if (profileVerificationOwner.current === verificationOwner) {
+        profileVerificationOwner.current = null;
+      }
     }
   }, [claimProfileRead, isCurrent, isCurrentProfileRead, notifyUnauthorized]);
 
@@ -318,12 +421,25 @@ export function AccountPage({
     const generation = requestGeneration.current;
     profileReadGeneration.current += 1;
     profileReadController.current = null;
+    profileVerificationOwner.current = null;
+    creditsReadGeneration.current += 1;
+    creditsReadController.current = null;
+    membershipDirtyRef.current = false;
+    membershipStateRef.current = {
+      phase: "idle",
+      hasCodeDraft: false,
+      writeInFlight: false,
+      outcomeUnknown: false,
+    };
+    redemptionPreflightOwnerRef.current = null;
     for (const controller of controllers.current) controller.abort();
     controllers.current.clear();
     editorControllers.current.clear();
     unauthorizedNotifiedGeneration.current = null;
     setProfileRead({ status: "loading", value: user, message: null });
     setCreditsRead({ status: "loading", value: null, message: null });
+    setMembershipDirty(false);
+    setMembershipMutationNotice(null);
     setDraft(null);
     setPendingVerification(null);
     savingOwner.current = null;
@@ -348,13 +464,57 @@ export function AccountPage({
   }, [user]);
 
   const isDirty = (draft !== null && draft.text !== (draft.baseline ?? "")) || pendingVerification !== null;
-  const combinedDirty = isDirty || securityDirty;
+  const combinedDirty = isDirty || securityDirty || membershipDirty;
   useEffect(() => {
     onDirtyChange?.(combinedDirty);
   }, [combinedDirty, onDirtyChange]);
 
   const handleSecurityDirtyChange = useCallback((dirty: boolean) => {
     setSecurityDirty((current) => current === dirty ? current : dirty);
+  }, []);
+
+  const handleMembershipDirtyChange = useCallback((dirty: boolean) => {
+    membershipDirtyRef.current = dirty;
+    setMembershipDirty((current) => current === dirty ? current : dirty);
+    if (!dirty) setMembershipMutationNotice(null);
+  }, []);
+
+  const handleMembershipStateChange = useCallback((state: AccountRedemptionState) => {
+    membershipStateRef.current = state;
+    if (state.phase !== "authorizing") redemptionPreflightOwnerRef.current = null;
+  }, []);
+
+  const membershipProfile = useMemo<AccountProfileServicePort | null>(() => {
+    if (profile === null) return null;
+    return {
+      ...profile,
+      getCredits: async (signal) => ({ credits: await readCreditsForMembership(signal) }),
+    };
+  }, [profile, readCreditsForMembership]);
+
+  const canRedeem = passwordMutationOwner === null
+    && !bioStateRef.current.saving
+    && bioStateRef.current.pendingVerification === null;
+
+  const authorizeRedeem = useCallback(async (): Promise<boolean> => {
+    if (passwordMutationOwnerRef.current !== null) {
+      setMembershipMutationNotice("密码修改请求正在处理或结果待核对；兑换码已保留，请等待账户安全状态明确后再操作。");
+      return false;
+    }
+    if (redemptionPreflightOwnerRef.current !== null) {
+      setMembershipMutationNotice("兑换请求正在完成最终账户安全检查；请等待当前检查结束后再提交。");
+      return false;
+    }
+    const currentBio = bioStateRef.current;
+    const redemption = membershipStateRef.current;
+    if (savingOwner.current !== null || currentBio.saving || currentBio.pendingVerification !== null
+      || redemption.writeInFlight || redemption.outcomeUnknown || redemption.phase === "confirmed-refreshing") {
+      setMembershipMutationNotice("账户写入或核对仍在进行；本次兑换请求未发送，请等待只读核对完成后再操作。");
+      return false;
+    }
+    redemptionPreflightOwnerRef.current = {};
+    setMembershipMutationNotice(null);
+    return true;
   }, []);
 
   const handlePasswordMutationOwnerChange = useCallback((owner: object, active: boolean) => {
@@ -369,6 +529,18 @@ export function AccountPage({
     if (passwordMutationOwnerRef.current !== owner) return;
     passwordMutationOwnerRef.current = null;
     setPasswordMutationOwner(null);
+  }, []);
+
+  const admitPasswordMutation = useCallback((): boolean => {
+    const redemption = membershipStateRef.current;
+    if (passwordMutationOwnerRef.current !== null) return false;
+    if (redemptionPreflightOwnerRef.current !== null || membershipDirtyRef.current
+      || redemption.hasCodeDraft || redemption.writeInFlight || redemption.outcomeUnknown
+      || redemption.phase === "authorizing" || redemption.phase === "confirmed-refreshing") {
+      setMembershipMutationNotice("会员兑换已进入最终授权或请求阶段；请等待结果明确后再修改密码。");
+      return false;
+    }
+    return true;
   }, []);
 
   function openBioEditor() {
@@ -471,6 +643,7 @@ export function AccountPage({
 
   function retireEditorRequests() {
     editorGeneration.current += 1;
+    profileVerificationOwner.current = null;
     const previousSavingOwner = savingOwner.current;
     if (previousSavingOwner !== null && editorControllers.current.has(previousSavingOwner)) {
       savingOwner.current = null;
@@ -494,6 +667,21 @@ export function AccountPage({
   retireEditorRequestsRef.current = retireEditorRequests;
 
   const onBeforeSecurityMutation = useCallback(async (): Promise<boolean> => {
+    const redemption = membershipStateRef.current;
+    if (redemptionPreflightOwnerRef.current !== null || membershipDirtyRef.current || redemption.hasCodeDraft || redemption.writeInFlight
+      || redemption.outcomeUnknown || redemption.phase === "authorizing"
+      || redemption.phase === "confirmed-refreshing") {
+      const message = redemption.outcomeUnknown
+        ? "兑换结果仍未确定。请先只读刷新账户状态，或在会员面板明确放弃本次核对；不会替你清除或重发兑换码。"
+        : redemptionPreflightOwnerRef.current !== null
+          ? "兑换请求正在完成最终账户安全检查；请等待当前检查结束后再修改密码。"
+          : redemption.writeInFlight || redemption.phase === "authorizing" || redemption.phase === "confirmed-refreshing"
+            ? "兑换请求或账户回读仍在进行，请等待完成后再修改密码。"
+            : "会员面板仍有兑换码草稿。请手动清空输入后再修改密码；系统不会替你放弃兑换码。";
+      setMembershipMutationNotice(message);
+      return false;
+    }
+
     const current = bioStateRef.current;
     if (savingOwner.current !== null || current.saving) {
       setSaveError("简介保存或核对仍在进行，请等待完成后再修改密码。");
@@ -695,6 +883,24 @@ export function AccountPage({
           <p className="account-help">此处显示平台积分余额；不包含外部服务商余额或积分流水。</p>
         </section>
 
+        <div className="account-card account-membership-card">
+          <AccountMembershipPanel
+            user={user}
+            membership={services.accountMembership ?? null}
+            profile={services.accountMembership === undefined ? null : membershipProfile}
+            refreshCurrentUser={readProfileForMembership}
+            sessionGeneration={sessionGeneration}
+            onUnauthorized={onUnauthorized}
+            onDirtyChange={handleMembershipDirtyChange}
+            onRedemptionStateChange={handleMembershipStateChange}
+            canRedeem={canRedeem}
+            authorizeRedeem={authorizeRedeem}
+          />
+          {membershipMutationNotice !== null && (
+            <p className="account-membership-mutation-notice" role="alert">{membershipMutationNotice}</p>
+          )}
+        </div>
+
         <AccountSecurityPanel
           userId={user.id}
           servicesIdentity={services}
@@ -704,6 +910,7 @@ export function AccountPage({
           onUnauthorized={onUnauthorized}
           onLogout={onLogout}
           onBeforeSecurityMutation={onBeforeSecurityMutation}
+          onPasswordMutationAdmission={admitPasswordMutation}
           onDirtyChange={handleSecurityDirtyChange}
           onPasswordMutationOwnerChange={handlePasswordMutationOwnerChange}
         />

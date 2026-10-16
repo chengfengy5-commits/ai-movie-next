@@ -60,6 +60,8 @@ function renderPanel(options: {
   onUnauthorized?: () => void;
   onLogout?: () => void;
   onBeforeSecurityMutation?: AccountSecurityPanelProps["onBeforeSecurityMutation"];
+  onPasswordMutationAdmission?: AccountSecurityPanelProps["onPasswordMutationAdmission"];
+  onPasswordMutationOwnerChange?: AccountSecurityPanelProps["onPasswordMutationOwnerChange"];
   onDirtyChange?: AccountSecurityPanelProps["onDirtyChange"];
 } = {}) {
   const currentUser = options.user ?? user;
@@ -71,6 +73,8 @@ function renderPanel(options: {
   const onUnauthorized = options.onUnauthorized ?? vi.fn();
   const onLogout = options.onLogout ?? vi.fn();
   const onBeforeSecurityMutation = options.onBeforeSecurityMutation ?? vi.fn(async () => true);
+  const onPasswordMutationAdmission = options.onPasswordMutationAdmission;
+  const onPasswordMutationOwnerChange = options.onPasswordMutationOwnerChange;
   const onDirtyChange = options.onDirtyChange ?? vi.fn();
   const props: AccountSecurityPanelProps = {
     userId: options.userId ?? currentUser.id,
@@ -81,6 +85,8 @@ function renderPanel(options: {
     onUnauthorized,
     onLogout,
     onBeforeSecurityMutation,
+    ...(onPasswordMutationAdmission === undefined ? {} : { onPasswordMutationAdmission }),
+    ...(onPasswordMutationOwnerChange === undefined ? {} : { onPasswordMutationOwnerChange }),
     onDirtyChange,
   };
   const view = render(<AccountSecurityPanel {...props} />);
@@ -280,6 +286,40 @@ describe("AccountSecurityPanel", () => {
     expect(screen.getByLabelText("当前密码")).toHaveValue("");
     expect(screen.getByLabelText("新密码")).toHaveValue("");
     expect(screen.getByLabelText("确认新密码")).toHaveValue("");
+  });
+
+  it("rechecks synchronous admission after the final permission await before claiming the password owner", async () => {
+    const interaction = userEvent.setup();
+    const service = createService();
+    const finalPermission = deferred<boolean>();
+    const onBeforeSecurityMutation = vi.fn()
+      .mockResolvedValueOnce(true)
+      .mockReturnValueOnce(finalPermission.promise);
+    const reservation = { active: false };
+    const onPasswordMutationAdmission = vi.fn(() => !reservation.active);
+    const onPasswordMutationOwnerChange = vi.fn();
+    renderPanel({
+      service,
+      onBeforeSecurityMutation,
+      onPasswordMutationAdmission,
+      onPasswordMutationOwnerChange,
+    });
+    await screen.findByText("手机浏览器");
+
+    await openPasswordConfirmation(interaction);
+    await interaction.click(screen.getByRole("button", { name: "确认修改密码" }));
+    await waitFor(() => expect(onBeforeSecurityMutation).toHaveBeenCalledTimes(2));
+
+    reservation.active = true;
+    await act(async () => {
+      finalPermission.resolve(true);
+      await finalPermission.promise;
+    });
+
+    expect(onPasswordMutationAdmission).toHaveBeenCalledTimes(1);
+    expect(service.changePassword).not.toHaveBeenCalled();
+    expect(onPasswordMutationOwnerChange).not.toHaveBeenCalled();
+    expect(await screen.findByText("会员兑换已进入最终授权或请求阶段；请等待结果明确后再修改密码。")).toBeInTheDocument();
   });
 
   it("requires exact confirmation and does not write when new and current passwords match", async () => {

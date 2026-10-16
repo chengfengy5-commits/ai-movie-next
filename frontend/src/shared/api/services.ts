@@ -19,6 +19,14 @@ import {
   type AccountProfileServicePort,
 } from "./accountProfile";
 import {
+  InvalidAccountMembershipResponseError,
+  parseAccountRedemptionReceipt,
+  parsePublicSiteConfig,
+  parsePurchasePackages,
+  type AccountMembershipServicePort,
+  type PurchasePackageCategory,
+} from "./accountMembership";
+import {
   InvalidAccountSecurityResponseError,
   parseAccountPasswordChangeReceipt,
   parseAccountSessionRevocationReceipt,
@@ -145,6 +153,7 @@ export interface WorkspaceServices {
   readonly apiBaseUrl: string | null;
   readonly accountAccess?: AccountAccessService;
   readonly accountProfile?: AccountProfileServicePort;
+  readonly accountMembership?: AccountMembershipServicePort;
   readonly accountSecurity?: AccountSecurityServicePort;
   restore(signal: AbortSignal): Promise<User | null>;
   login(credentials: Credentials, signal: AbortSignal): Promise<User>;
@@ -397,6 +406,17 @@ function parseAccountProfileResponse<T>(parse: () => T): T {
     return parse();
   } catch (error) {
     if (error instanceof InvalidAccountProfileResponseError) {
+      throw new ApiError("invalid-response", error.message, null);
+    }
+    throw error;
+  }
+}
+
+function parseAccountMembershipResponse<T>(parse: () => T): T {
+  try {
+    return parse();
+  } catch (error) {
+    if (error instanceof InvalidAccountMembershipResponseError) {
       throw new ApiError("invalid-response", error.message, null);
     }
     throw error;
@@ -1865,6 +1885,9 @@ type ApiEndpoint =
   | "resetPassword"
   | "me"
   | "myCredits"
+  | "publicSiteConfig"
+  | "purchasePackages"
+  | "redeemCode"
   | "updateMyProfile"
   | "accountSessions"
   | "revokeAccountSession"
@@ -1971,6 +1994,20 @@ function apiRequestDefinition(
   }
   if (endpoint === "myCredits") {
     return { path: "/auth/credits/me", method: "GET" };
+  }
+  if (endpoint === "publicSiteConfig") {
+    return { path: "/site-config", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "purchasePackages") {
+    const category = identifiers?.category;
+    if (category !== "membership" && category !== "credits") {
+      throw new ApiError("invalid-response", "套餐类别无效。", null);
+    }
+    const query = new URLSearchParams({ category });
+    return { path: "/purchase-packages?" + query.toString(), method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "redeemCode") {
+    return { path: "/redemption-codes/redeem", method: "POST", expectedStatus: 200 };
   }
   if (endpoint === "updateMyProfile") {
     return { path: "/users/me/profile", method: "PUT" };
@@ -2583,6 +2620,22 @@ export function createApiServices(
     },
   };
 
+  const accountMembership: AccountMembershipServicePort = {
+    async getPublicConfig(signal) {
+      const payload = await request("publicSiteConfig", null, signal);
+      return parseAccountMembershipResponse(() => parsePublicSiteConfig(payload));
+    },
+    async listPurchasePackages(category: PurchasePackageCategory, signal) {
+      const payload = await request("purchasePackages", null, signal, undefined, { category });
+      return parseAccountMembershipResponse(() => parsePurchasePackages(payload, category));
+    },
+    async redeem(input, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("redeemCode", token, signal, { code: input.code });
+      return parseAccountMembershipResponse(() => parseAccountRedemptionReceipt(payload));
+    },
+  };
+
   const accountSecurity: AccountSecurityServicePort = {
     async listSessions(signal) {
       const token = requireApiToken(storage);
@@ -2608,6 +2661,7 @@ export function createApiServices(
     apiBaseUrl,
     creatorSettings,
     accountProfile,
+    accountMembership,
     accountSecurity,
     accountAccess: {
       async register(input, signal) {
