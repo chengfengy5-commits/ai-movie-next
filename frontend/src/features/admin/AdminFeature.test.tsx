@@ -1459,3 +1459,48 @@ describe("admin series integration", () => {
     expect(confirm).toHaveBeenCalledTimes(4);
   });
 });
+
+describe("admin tasks integration", () => {
+  it("opens the read-only global task list with the server query contract", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const task = {
+      id: "task-1",
+      user_id: "writer-1",
+      type: "new-task-type",
+      status: "queued-for-review",
+      credit_cost: 0,
+      message_id: null,
+      model_name: "",
+      created_at: null,
+      updated_at: null,
+    };
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/tasks") return jsonResponse({ data: [task], total: 1 });
+      throw new Error("Unexpected synthetic request: " + (init?.method ?? "GET") + " " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "全局任务" }));
+
+    expect(await screen.findByRole("heading", { name: "全局任务" })).toBeInTheDocument();
+    expect(screen.getByText("new-task-type")).toBeInTheDocument();
+    expect(screen.getByText("queued-for-review")).toBeInTheDocument();
+    const tasksCall = fetcher.mock.calls.find((call) => (
+      new URL(String(call[0]), window.location.href).pathname === "/api/admin/tasks"
+    ));
+    expect(tasksCall).toBeDefined();
+    expect(new URL(String(tasksCall?.[0]), window.location.href).search).toBe(
+      "?skip=0&limit=25&sort_field=created_at&sort_order=desc",
+    );
+    expect(new Headers(tasksCall?.[1]?.headers).get("Authorization")).toBe("Bearer admin-token");
+    expect(fetcher.mock.calls.some((call) => String(call[0]).includes("/api/admin/tasks/task-1"))).toBe(false);
+    expect(screen.getByRole("button", { name: "退出登录" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "运营概览" }));
+    expect(await screen.findByRole("heading", { name: "运营概览" })).toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+});
