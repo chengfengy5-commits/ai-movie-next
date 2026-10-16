@@ -8,9 +8,10 @@
 .admin-series-field textarea { min-height: 110px; resize: vertical; line-height: 1.55; }
 .admin-series-filters input:focus, .admin-series-field input:focus, .admin-series-field textarea:focus { border-color: var(--admin-accent, #8b5cf6); outline: 3px solid rgba(139, 92, 246, .12); }
 .admin-series-table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid var(--admin-line, #2a2a30); border-radius: 11px; }
-.admin-series-table { width: 100%; border-collapse: collapse; text-align: left; }
+.admin-series-table { width: 100%; min-width: 760px; border-collapse: collapse; text-align: left; }
 .admin-series-table th, .admin-series-table td { max-width: 320px; padding: 12px 14px; border-bottom: 1px solid var(--admin-line, #2a2a30); overflow-wrap: anywhere; color: var(--admin-text, #e4e4e7); font-size: 12px; }
 .admin-series-table th { color: var(--admin-muted, #a1a1aa); font-weight: 650; }
+.admin-series-table th, .admin-series-table td:nth-child(4), .admin-series-table td:last-child { white-space: nowrap; }
 .admin-series-table th button { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; cursor: pointer; }
 .admin-series-table th button:focus-visible { outline: 2px solid var(--admin-accent, #8b5cf6); outline-offset: 3px; }
 .admin-series-pagination { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 14px; color: var(--admin-muted, #a1a1aa); font-size: 12px; }
