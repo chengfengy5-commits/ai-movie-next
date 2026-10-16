@@ -4,12 +4,45 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import TypeAlias
 
-from haoai_backend.generation_contracts.ports import GenerationExecutor, GenerationRuntimeConfig
+from haoai_backend.generation_contracts.ports import (
+    GenerationExecutionPort,
+    GenerationExecutor,
+    GenerationRuntimeConfig,
+)
 
 
 ExecutorFactory: TypeAlias = Callable[[], GenerationExecutor]
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredExecutorFactory:
+    """Lazy executor route paired with its explicit task-family claim port."""
+
+    task_type: str
+    execution_port_factory: Callable[[], GenerationExecutionPort]
+    executor_factory: ExecutorFactory
+
+    def __post_init__(self) -> None:
+        if (
+            not isinstance(self.task_type, str)
+            or not self.task_type
+            or len(self.task_type) > 64
+            or any(
+                character not in "abcdefghijklmnopqrstuvwxyz0123456789-"
+                for character in self.task_type
+            )
+        ):
+            raise ValueError("registered task type must be a canonical lowercase identifier")
+        if not callable(self.execution_port_factory) or not callable(self.executor_factory):
+            raise TypeError("registered executor dependencies must be lazy callables")
+
+    def __call__(self) -> GenerationExecutor:
+        """Preserve the public zero-argument executor-factory shape."""
+
+        return self.executor_factory()
 
 
 def validate_runtime_configuration(
@@ -52,7 +85,18 @@ def validate_runtime_configuration(
     factories = tuple(executor_factories)
     if any(not callable(factory) for factory in factories):
         raise TypeError("executor factories must be callable")
+    registered_types = [
+        factory.task_type
+        for factory in factories
+        if isinstance(factory, RegisteredExecutorFactory)
+    ]
+    if len(registered_types) != len(set(registered_types)):
+        raise ValueError("registered task types must be unique")
     return factories
 
 
-__all__ = ("ExecutorFactory", "validate_runtime_configuration")
+__all__ = (
+    "ExecutorFactory",
+    "RegisteredExecutorFactory",
+    "validate_runtime_configuration",
+)
