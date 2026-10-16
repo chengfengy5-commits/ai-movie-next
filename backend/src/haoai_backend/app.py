@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from contextlib import asynccontextmanager
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
@@ -98,6 +99,11 @@ from .chat_text_generation import ChatTextGenerationConfiguration
 from .chat_text_generation.http import build_chat_text_generation_router
 from .generation_core.admission_staging import build_media_snapshot_producer
 from .generation_contracts.errors import GenerationError
+from .generation_runtime.assembly import (
+    GenerationWorkerConfiguration,
+    build_generation_worker_runtime,
+)
+from .generation_runtime.worker_service import GenerationWorkerService
 from .provider_status import ProviderStatusRuntime
 from .runtime_status.authentication import create_account_only_current_user_resolver
 from .runtime_status.configuration import RuntimeStatusConfiguration
@@ -147,6 +153,7 @@ from .task_observation.persistence import task_observation_unit_of_work_factory
 from .task_observation.ports import CancellationConnectionFactory, CancellationSignalRegistry
 
 SessionFactory = Callable[[], Session]
+_GENERATION_WORKER_POLL_INTERVAL_SECONDS = 0.25
 
 
 class _LazyAiohttpPublicImageFetcher:
@@ -230,9 +237,51 @@ def create_app(
     storyboard_asset_generation_runtime: StoryboardAssetRuntime | None = None,
     chat_media_admission_configuration: ChatMediaAdmissionConfiguration | None = None,
     chat_text_generation_configuration: ChatTextGenerationConfiguration | None = None,
+    generation_worker_configuration: GenerationWorkerConfiguration | None = None,
 ) -> FastAPI:
-    """Compose authentication and business routes without startup I/O."""
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    """Compose routes; explicitly configured generation workers start in lifespan."""
+    generation_worker_runtime = (
+        build_generation_worker_runtime(generation_worker_configuration)
+        if generation_worker_configuration is not None
+        else None
+    )
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI):
+        worker_service: GenerationWorkerService | None = None
+        try:
+            if (
+                generation_worker_runtime is not None
+                and generation_worker_configuration is not None
+            ):
+                worker_service = GenerationWorkerService(
+                    generation_worker_runtime,
+                    task_type="image-single",
+                    poll_interval_seconds=_GENERATION_WORKER_POLL_INTERVAL_SECONDS,
+                    shutdown_timeout_seconds=(
+                        generation_worker_configuration.runtime.shutdown_timeout_seconds
+                    ),
+                )
+                application.state.generation_worker_service = worker_service
+                worker_service.start()
+            yield
+        finally:
+            if worker_service is not None:
+                receipt = await run_in_threadpool(
+                    worker_service.shutdown,
+                    "application lifespan shutdown",
+                )
+                application.state.generation_worker_shutdown = receipt
+                application.state.generation_worker_service = None
+
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+    )
+    app.state.generation_worker_runtime = generation_worker_runtime
+    app.state.generation_worker_service = None
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
         def make_authentication_uow():

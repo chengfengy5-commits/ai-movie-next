@@ -271,6 +271,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "storyboard_asset_generation_runtime",
             "chat_media_admission_configuration",
             "chat_text_generation_configuration",
+            "generation_worker_configuration",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
         assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
