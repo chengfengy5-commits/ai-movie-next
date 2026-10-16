@@ -9,6 +9,8 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
+from haoai_backend.generation_credentials.application import RegistryCapabilities
+
 
 class SessionFactory(Protocol):
     def __call__(self) -> Session: ...
@@ -41,11 +43,23 @@ class ChatTextGenerationRuntime(Protocol):
 
 
 @dataclass(frozen=True, slots=True)
+class FrameReviewAdmissionConfiguration:
+    """Explicit opt-in to the registered frame.review admission graph."""
+
+    registry_capabilities: RegistryCapabilities
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.registry_capabilities, RegistryCapabilities):
+            raise TypeError("frame review requires explicit registry capabilities")
+
+
+@dataclass(frozen=True, slots=True)
 class ChatTextGenerationConfiguration:
     runtime: ChatTextGenerationRuntime | None
     max_user_concurrency: int = 0
     server_id_factory: Callable[[], str] | None = None
     clock: Callable[[], datetime] | None = None
+    frame_review_admission: FrameReviewAdmissionConfiguration | None = None
 
 
 ApiKeyDecryptor = Callable[[str], str]

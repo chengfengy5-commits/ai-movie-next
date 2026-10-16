@@ -18,6 +18,7 @@ from haoai_backend.storyboard_generation.execution import (
     run_owned_awaitable,
     run_owned_in_threadpool,
 )
+from haoai_backend.generation_core.frame_review_admission import admit_frame_review
 from haoai_backend.task_observation.authentication import resolve_active_actor
 
 from .configuration import ChatTextGenerationConfiguration
@@ -172,6 +173,22 @@ def build_chat_text_generation_router(
         actor = await active_actor(request)
         payload = await parse_request(request, AIReviewRequest)
         try:
+            frame_review = (
+                configuration.frame_review_admission
+                if configuration is not None
+                else None
+            )
+            if frame_review is not None:
+                return await run_owned_in_threadpool(
+                    admit_frame_review,
+                    session_factory,
+                    actor.user_id,
+                    payload,
+                    registry_capabilities=frame_review.registry_capabilities,
+                    max_user_concurrency=configuration.max_user_concurrency,
+                    id_factory=configuration.server_id_factory,
+                    clock=configuration.clock,
+                )
             return await run_owned_in_threadpool(
                 admit_ai_review,
                 session_factory,

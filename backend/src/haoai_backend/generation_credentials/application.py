@@ -84,6 +84,15 @@ class CredentialRegistryReadiness:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class CapturedCredentialBinding:
+    """Verified original principal and endpoint metadata, without API-key resolution."""
+
+    binding_id: str
+    binding: CredentialBinding
+    endpoint_policy: EndpointPolicy
+
+
 class CredentialRegistry:
     """Caller-transaction registry service with inert, fail-closed defaults."""
 
@@ -536,6 +545,123 @@ class CredentialRegistry:
                 principal_id=str(row["principal_id"]),
                 secret=secret,
             )
+        except Exception:
+            return None
+
+    def capture_original_binding(
+        self,
+        caller_session: Session,
+        scope: CredentialScope,
+    ) -> CapturedCredentialBinding | None:
+        """Freeze the exact registered principal without resolving its secret."""
+
+        source = self._capabilities.enrollment_source
+        if (
+            not isinstance(caller_session, Session)
+            or not isinstance(scope, CredentialScope)
+            or source is None
+            or not source.ready
+            or self._capabilities.proof_authority is None
+        ):
+            return None
+        try:
+            now = self._now()
+            with caller_session.no_autoflush:
+                repository = RegistryReadRepository(caller_session)
+                config = repository.lock_config_identity(scope)
+                current = repository.lock_binding(scope)
+                if (
+                    config is None
+                    or current is None
+                    or not current["enabled"]
+                    or type(current["revision"]) is not int
+                    or type(current["current_version"]) is not int
+                ):
+                    return None
+
+                version_number = int(current["current_version"])
+                binding_id = str(current["binding_id"])
+                version = repository.read_version(binding_id, version_number)
+                if (
+                    version is None
+                    or version["binding_id"] != binding_id
+                    or version["binding_version"] != version_number
+                    or version["version_kind"] == "disabled"
+                ):
+                    return None
+                allowed_paths_value = json.loads(str(version["allowed_content_paths"]))
+                if not isinstance(allowed_paths_value, list) or any(
+                    not isinstance(path, str) for path in allowed_paths_value
+                ):
+                    return None
+                allowed_paths = tuple(allowed_paths_value)
+                binding = CredentialBinding(
+                    source=scope.source,
+                    row_id=scope.row_id,
+                    owner_or_system=scope.owner_or_system,
+                    provider=scope.provider,
+                    original_principal_id=str(version["principal_id"]),
+                    endpoint_origin=str(version["endpoint_origin"]),
+                    allowed_content_paths=allowed_paths,
+                    binding_version=str(version_number),
+                    rotation_provenance=(
+                        str(version["rotation_proof_ref"])
+                        if version["rotation_proof_ref"] is not None
+                        else None
+                    ),
+                )
+                head = self._verify_resolution_chain(
+                    binding,
+                    scope,
+                    current,
+                    repository.read_versions(binding_id),
+                    now=now,
+                )
+                if head is None or int(head["binding_version"]) != version_number:
+                    return None
+
+                record = self._record_by_id(str(head["record_id"]))
+                principal = repository.find_principal(str(head["principal_id"]))
+                if (
+                    record is None
+                    or principal is None
+                    or principal["source_state"] != "valid"
+                    or principal["provider"] != scope.provider
+                    or principal["owner_scope"] != scope.owner_or_system
+                    or principal["issuer_namespace"] != record.issuer_namespace
+                    or principal["stable_account_subject"]
+                    != record.stable_account_subject
+                    or source.load_account(scope, record.key_generation, now=now) != record
+                ):
+                    return None
+
+                config_facts = LegacyConfigFacts(
+                    scope=config.scope,
+                    category=config.category,
+                    provider=config.provider,
+                    model=config.model,
+                    base_url=config.base_url,
+                    api_key="",
+                    active=config.active,
+                )
+                if not self._config_matches_record(config_facts, record):
+                    return None
+                configured_base_url = config.base_url or (
+                    record.endpoint_policy.provider_origin
+                    + record.endpoint_policy.api_base_path
+                )
+                endpoint_policy = EndpointPolicy.from_base_url(
+                    configured_base_url,
+                    allowed_content_paths=allowed_paths,
+                    policy_version=str(version["endpoint_policy_version"]),
+                )
+                if endpoint_policy != record.endpoint_policy:
+                    return None
+                return CapturedCredentialBinding(
+                    binding_id=binding_id,
+                    binding=binding,
+                    endpoint_policy=endpoint_policy,
+                )
         except Exception:
             return None
 

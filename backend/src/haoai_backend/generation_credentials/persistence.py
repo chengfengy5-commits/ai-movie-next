@@ -277,6 +277,18 @@ class LegacyConfigFacts:
     active: bool
 
 
+@dataclass(frozen=True, slots=True)
+class LegacyConfigIdentityFacts:
+    """Endpoint identity read without selecting the legacy API-key column."""
+
+    scope: CredentialScope
+    category: str
+    provider: str
+    model: str | None
+    base_url: str | None
+    active: bool
+
+
 class RegistryReadRepository:
     """Fresh Core projections only; all writes enlist in the supplied Session."""
 
@@ -351,6 +363,62 @@ class RegistryReadRepository:
             model=str(row["model"]) if row["model"] is not None else None,
             base_url=str(row["base_url"]) if row["base_url"] is not None else None,
             api_key=api_key,
+            active=active,
+        )
+
+    def lock_config_identity(
+        self,
+        scope: CredentialScope,
+        *,
+        require_active: bool = True,
+    ) -> LegacyConfigIdentityFacts | None:
+        """Lock model endpoint metadata without reading credential material."""
+
+        if scope.source == "system":
+            row = self._session.execute(
+                select(
+                    system_models.c.id,
+                    system_models.c.category,
+                    system_models.c.provider,
+                    system_models.c.model,
+                    system_models.c.base_url,
+                    system_models.c.is_active,
+                )
+                .where(system_models.c.id == scope.row_id)
+                .with_for_update()
+            ).mappings().first()
+            if row is None or (require_active and not row["is_active"]):
+                return None
+            owner = "system"
+            active = bool(row["is_active"])
+        else:
+            row = self._session.execute(
+                select(
+                    model_configs.c.id,
+                    model_configs.c.user_id,
+                    model_configs.c.category,
+                    model_configs.c.provider,
+                    model_configs.c.model,
+                    model_configs.c.base_url,
+                )
+                .where(
+                    model_configs.c.id == scope.row_id,
+                    model_configs.c.user_id == scope.owner_or_system,
+                )
+                .with_for_update()
+            ).mappings().first()
+            if row is None:
+                return None
+            owner = str(row["user_id"])
+            active = True
+        if str(row["provider"]) != scope.provider or owner != scope.owner_or_system:
+            return None
+        return LegacyConfigIdentityFacts(
+            scope=scope,
+            category=str(row["category"]),
+            provider=str(row["provider"]),
+            model=str(row["model"]) if row["model"] is not None else None,
+            base_url=str(row["base_url"]) if row["base_url"] is not None else None,
             active=active,
         )
 
