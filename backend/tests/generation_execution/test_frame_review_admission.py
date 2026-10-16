@@ -94,7 +94,11 @@ def _review_body() -> dict[str, object]:
     }
 
 
-async def _post_review(app, token: str) -> httpx.Response:
+async def _post_review(
+    app,
+    token: str,
+    body: dict[str, object] | None = None,
+) -> httpx.Response:
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
         base_url="http://frame-review.test",
@@ -102,7 +106,7 @@ async def _post_review(app, token: str) -> httpx.Response:
         return await client.post(
             "/api/chat/ai-review",
             headers={"Authorization": f"Bearer {token}"},
-            json=_review_body(),
+            json=_review_body() if body is None else body,
         )
 
 
@@ -346,6 +350,132 @@ def test_opted_in_review_post_persists_one_frozen_post_apply_graph_without_debit
         engine.dispose()
 
 
+def test_review_persists_both_independent_snapshot_digests_and_v1_aad_bytes(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    import generation_core.test_admission_staging as admission_fixtures
+
+    original_crypto_builder = admission_fixtures._joint_local_dummy_crypto
+    sealed_review_inputs: list[tuple[str, bytes]] = []
+
+    def recording_crypto_builder(secrets_by_reference):
+        crypto, state = original_crypto_builder(secrets_by_reference)
+        original_seal = crypto.seal
+
+        def record_review_aad(plaintext: str, associated_data: bytes):
+            try:
+                decoded = json.loads(plaintext)
+            except (TypeError, ValueError):
+                decoded = None
+            if isinstance(decoded, dict) and decoded.get("schema") == "frame-review-snapshot-v1":
+                sealed_review_inputs.append((plaintext, associated_data))
+            return original_seal(plaintext, associated_data)
+
+        return replace(crypto, seal=record_review_aad), state
+
+    monkeypatch.setattr(
+        admission_fixtures,
+        "_joint_local_dummy_crypto",
+        recording_crypto_builder,
+    )
+    engine, app, token, _, _ = _build_app(tmp_path, monkeypatch)
+    sealed_review_inputs.clear()
+    try:
+        response = asyncio.run(_post_review(app, token))
+        assert response.status_code == 200, response.text
+        with engine.connect() as connection:
+            task = connection.execute(
+                select(AITaskRow.__table__).where(
+                    AITaskRow.__table__.c.id == response.json()["task_id"]
+                )
+            ).mappings().one()
+            unit = connection.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.__table__.c.task_id == response.json()["task_id"]
+                )
+            ).mappings().one()
+            step = connection.execute(
+                select(ExecutionStepRow.__table__).where(
+                    ExecutionStepRow.__table__.c.billing_unit_id
+                    == unit["id"]
+                )
+            ).mappings().one()
+            payload = connection.execute(select(prepared_payloads)).mappings().one()
+
+        request_data = json.loads(task["request_data"])
+        step_snapshot = step["input_snapshot"]
+        assert set(step_snapshot) == {
+            "server_attempt_id",
+            "prepared_payload_id",
+            "protected_ref",
+            "snapshot_digest",
+            "manifest_snapshot_digest",
+        }
+        assert step_snapshot["snapshot_digest"] == request_data["snapshot_digest"]
+        assert step_snapshot["manifest_snapshot_digest"] == request_data[
+            "manifest_snapshot_digest"
+        ]
+        assert request_data["snapshot_digest"] != request_data["manifest_snapshot_digest"]
+        assert len(sealed_review_inputs) == 1
+
+        plaintext, actual_associated_data = sealed_review_inputs[0]
+        protected_payload = json.loads(plaintext)
+        execution_snapshot = protected_payload["execution_snapshot"]
+        def canonical(value: object) -> bytes:
+            return json.dumps(
+                value,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        expected_manifest_digest = hashlib.sha256(canonical(execution_snapshot)).hexdigest()
+        assert expected_manifest_digest == request_data["manifest_snapshot_digest"]
+        assert protected_payload["manifest"]["snapshot_digest"] == expected_manifest_digest
+
+        manifest = {
+            "purpose": "prepared-frame-review-input-v1",
+            "owner_id": task["user_id"],
+            "operation": "frame.review",
+            "submission_id": request_data["submission_id"],
+            "task_id": task["id"],
+            "unit_id": unit["id"],
+            "step_id": step["id"],
+            "server_attempt_id": request_data["server_attempt_id"],
+            "prepared_payload_id": request_data["prepared_payload_id"],
+            "request_digest": request_data["request_digest"],
+            "rule_digest": request_data["rule_digest"],
+            "snapshot_digest": expected_manifest_digest,
+            "target_ref": payload["target_ref"],
+            "model_ref": payload["model_ref"],
+            "grant_ref": payload["grant_ref"],
+        }
+        expected_aad = {
+            "purpose": "protected-frame-review-input-v1",
+            **manifest,
+            "scope": {
+                "source": payload["source"],
+                "row_id": payload["row_id"],
+                "owner_or_system": payload["owner_or_system"],
+                "provider": payload["provider"],
+            },
+            "binding_id": payload["binding_id"],
+            "binding_version": payload["binding_version"],
+            "principal_id": payload["principal_id"],
+            "schema_version": payload["schema_version"],
+            "projector_version": payload["projector_version"],
+            "reference_policy_version": payload["reference_policy_version"],
+            "target_ref": payload["target_ref"],
+            "model_ref": payload["model_ref"],
+            "grant_ref": payload["grant_ref"],
+        }
+        assert expected_aad["purpose"] == "prepared-frame-review-input-v1"
+        assert actual_associated_data == canonical(expected_aad)
+    finally:
+        engine.dispose()
+
+
 def test_payload_stage_failure_rolls_back_every_admission_row(
     tmp_path: Path,
     monkeypatch,
@@ -446,6 +576,59 @@ def test_commit_acknowledgement_loss_confirms_graph_without_reinsertion(
             assert len(connection.execute(select(ExecutionStepRow.__table__)).all()) == 1
             assert len(connection.execute(select(TaskSubmissionRow.__table__)).all()) == 1
             assert len(connection.execute(select(prepared_payloads)).all()) == 1
+            assert connection.execute(
+                select(UserCreditRow.__table__.c.credits)
+            ).scalar_one() == 500
+            assert connection.execute(select(CreditLogRow.__table__)).all() == []
+    finally:
+        engine.dispose()
+
+
+def test_commit_acknowledgement_does_not_confirm_a_changed_manifest_digest(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    engine, app, token, _, _ = _build_app(tmp_path, monkeypatch)
+    staged_sessions: list[Session] = []
+    staged_reviews: list[object] = []
+    original_stage = frame_review_admission._stage_review
+    original_commit = Session.commit
+    commit_error_injected = False
+
+    def capture_writer(session, **kwargs):
+        staged = original_stage(session, **kwargs)
+        staged_sessions.append(session)
+        staged_reviews.append(staged)
+        return staged
+
+    def commit_corrupt_step_then_lose_ack(session):
+        nonlocal commit_error_injected
+        if staged_sessions and session is staged_sessions[0] and not commit_error_injected:
+            staged = staged_reviews[0]
+            step = session.execute(
+                select(ExecutionStepRow).where(ExecutionStepRow.id == staged.step_id)
+            ).scalar_one()
+            corrupted_snapshot = dict(step.input_snapshot)
+            corrupted_snapshot["manifest_snapshot_digest"] = "0" * 64
+            step.input_snapshot = corrupted_snapshot
+            original_commit(session)
+            commit_error_injected = True
+            raise RuntimeError("synthetic commit acknowledgement loss")
+        return original_commit(session)
+
+    monkeypatch.setattr(frame_review_admission, "_stage_review", capture_writer)
+    monkeypatch.setattr(Session, "commit", commit_corrupt_step_then_lose_ack)
+    try:
+        response = asyncio.run(_post_review(app, token))
+        assert commit_error_injected is True
+        assert response.status_code == 503
+        with engine.connect() as connection:
+            assert len(connection.execute(select(AITaskRow.__table__)).all()) == 1
+            assert len(connection.execute(select(BillingUnitRow.__table__)).all()) == 1
+            step = connection.execute(
+                select(ExecutionStepRow.__table__)
+            ).mappings().one()
+            assert step["input_snapshot"]["manifest_snapshot_digest"] == "0" * 64
             assert connection.execute(
                 select(UserCreditRow.__table__.c.credits)
             ).scalar_one() == 500

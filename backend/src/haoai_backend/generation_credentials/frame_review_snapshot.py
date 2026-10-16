@@ -58,6 +58,7 @@ class FrameReviewSnapshot:
     protected_ref: str
     request_digest: str
     rule_digest: str
+    manifest_snapshot_digest: str
     payload: PreparedPayload
 
 
@@ -214,6 +215,7 @@ def build_frame_review_snapshot(
             "target_digest": target.full_frame_digest,
         }
     )
+    manifest_snapshot_digest = _sha256_json(_plain(snapshot))
     manifest = {
         "purpose": _PROOF_PURPOSE,
         "owner_id": actor_id,
@@ -226,7 +228,7 @@ def build_frame_review_snapshot(
         "prepared_payload_id": prepared_payload_id,
         "request_digest": request_digest,
         "rule_digest": rule_digest,
-        "snapshot_digest": _sha256_json(_plain(snapshot)),
+        "snapshot_digest": manifest_snapshot_digest,
         "target_ref": target_ref,
         "model_ref": model_ref,
         "grant_ref": grant_ref,
@@ -264,21 +266,18 @@ def build_frame_review_snapshot(
             "rotation_provenance": endpoint.binding.rotation_provenance,
         },
     }
-    associated_data = _canonical_bytes(
-        {
-            "purpose": _PAYLOAD_PURPOSE,
-            **manifest,
-            "scope": scope.identity(),
-            "binding_id": endpoint.binding_id,
-            "binding_version": int(endpoint.binding.binding_version),
-            "principal_id": endpoint.binding.original_principal_id,
-            "schema_version": context.fingerprint.schema_version,
-            "projector_version": SNAPSHOT_VERSION,
-            "reference_policy_version": "frame-review-no-references-v1",
-            "target_ref": target_ref,
-            "model_ref": model_ref,
-            "grant_ref": grant_ref,
-        }
+    associated_data = frame_review_payload_associated_data(
+        manifest,
+        scope=scope,
+        binding_id=endpoint.binding_id,
+        binding_version=int(endpoint.binding.binding_version),
+        principal_id=endpoint.binding.original_principal_id,
+        schema_version=context.fingerprint.schema_version,
+        projector_version=SNAPSHOT_VERSION,
+        reference_policy_version="frame-review-no-references-v1",
+        target_ref=target_ref,
+        model_ref=model_ref,
+        grant_ref=grant_ref,
     )
     sealed = crypto.seal_secret(_canonical_bytes(payload_value).decode("utf-8"), associated_data)
     payload = PreparedPayload(
@@ -310,8 +309,54 @@ def build_frame_review_snapshot(
         protected_ref=protected_ref,
         request_digest=request_digest,
         rule_digest=rule_digest,
+        manifest_snapshot_digest=manifest_snapshot_digest,
         payload=payload,
     )
+
+
+def frame_review_payload_associated_data(
+    manifest: Mapping[str, object],
+    *,
+    scope: CredentialScope,
+    binding_id: str,
+    binding_version: int,
+    principal_id: str,
+    schema_version: str,
+    projector_version: str,
+    reference_policy_version: str,
+    target_ref: str,
+    model_ref: str,
+    grant_ref: str,
+) -> bytes:
+    """Rebuild the exact v1 associated data for a persisted review payload.
+
+    In the original v1 envelope, the manifest spread follows ``purpose`` and
+    replaces that key with its proof purpose. Keep that ordering for stored
+    ciphertext compatibility.
+    """
+
+    return canonical_frame_review_bytes(
+        {
+            "purpose": _PAYLOAD_PURPOSE,
+            **manifest,
+            "scope": scope.identity(),
+            "binding_id": binding_id,
+            "binding_version": binding_version,
+            "principal_id": principal_id,
+            "schema_version": schema_version,
+            "projector_version": projector_version,
+            "reference_policy_version": reference_policy_version,
+            "target_ref": target_ref,
+            "model_ref": model_ref,
+            "grant_ref": grant_ref,
+        }
+    )
+
+
+def canonical_frame_review_bytes(value: object) -> bytes:
+    """Serialize a frozen frame-review value using the producer's v1 format."""
+
+    return _canonical_bytes(value)
 
 
 def _prepared_item(preparation: AdmissionPreparationFacts) -> PreparedItemFacts:

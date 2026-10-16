@@ -229,6 +229,7 @@ def _stage_review(
         payload_id=payload_id,
         protected_ref=protected_ref,
         snapshot_digest=graph.items[0].snapshot_digest,
+        manifest_snapshot_digest=snapshot.manifest_snapshot_digest,
     )
     model_name = preparation.items[0].model.display_name
     session.add(
@@ -308,6 +309,7 @@ def _stage_review(
                 "prepared_payload_id": payload_id,
                 "protected_ref": protected_ref,
                 "snapshot_digest": graph.items[0].snapshot_digest,
+                "manifest_snapshot_digest": snapshot.manifest_snapshot_digest,
             },
             required=True,
             step_order=0,
@@ -358,6 +360,7 @@ def _safe_request_data(
     payload_id: str,
     protected_ref: str,
     snapshot_digest: str,
+    manifest_snapshot_digest: str,
 ) -> str:
     model = item.model
     target = snapshot.target
@@ -379,6 +382,7 @@ def _safe_request_data(
             "request_digest": snapshot.request_digest,
             "rule_digest": snapshot.rule_digest,
             "snapshot_digest": snapshot_digest,
+            "manifest_snapshot_digest": manifest_snapshot_digest,
             "chapter_id": target.chapter_id,
             "frame_index": target.compat_frame_index,
             "prompt_id": str(request.get("prompt_id") or ""),
@@ -458,6 +462,7 @@ def _confirm_committed_graph(
                 "prepared_payload_id": staged.snapshot.prepared_payload_id,
                 "protected_ref": staged.snapshot.protected_ref,
                 "snapshot_digest": json.loads(staged.request_data)["snapshot_digest"],
+                "manifest_snapshot_digest": staged.snapshot.manifest_snapshot_digest,
             }
             and submission is not None
             and submission.user_id == staged.owner_id
@@ -475,6 +480,20 @@ def _confirm_committed_graph(
             and payload["binding_id"] == staged.snapshot.payload.binding_id
             and payload["binding_version"] == staged.snapshot.payload.binding_version
             and payload["principal_id"] == staged.snapshot.payload.principal_id
+            and payload["schema_version"] == staged.snapshot.payload.schema_version
+            and payload["projector_version"] == staged.snapshot.payload.projector_version
+            and payload["reference_policy_version"]
+            == staged.snapshot.payload.reference_policy_version
+            and payload["target_ref"] == staged.snapshot.payload.target_ref
+            and payload["model_ref"] == staged.snapshot.payload.model_ref
+            and payload["grant_ref"] == staged.snapshot.payload.grant_ref
+            and payload["source"] == staged.snapshot.payload.scope.source
+            and payload["row_id"] == staged.snapshot.payload.scope.row_id
+            and payload["owner_or_system"]
+            == staged.snapshot.payload.scope.owner_or_system
+            and payload["provider"] == staged.snapshot.payload.scope.provider
+            and payload["encryption_key_id"]
+            == staged.snapshot.payload.encryption_key_id
             and payload["command_proof"] == staged.snapshot.payload.command_proof
             and payload["ciphertext"] == staged.snapshot.payload.ciphertext
             and payload["nonce"] == staged.snapshot.payload.nonce
