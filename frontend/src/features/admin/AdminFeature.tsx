@@ -23,6 +23,9 @@ import { AdminSeries } from "../admin-series/AdminSeries";
 import { createAdminSeriesApi } from "../admin-series/adminSeriesApi";
 import { DEFAULT_ADMIN_SERIES_LIST_STATE } from "../admin-series/adminSeriesTypes";
 import type { AdminSeriesApi, AdminSeriesExitSnapshot, AdminSeriesListState, AdminSeriesRecord, PendingAdminSeriesExit } from "../admin-series/adminSeriesTypes";
+import { AdminTasks } from "../admin-tasks/AdminTasks";
+import { createAdminTasksApi } from "../admin-tasks/adminTasksApi";
+import { DEFAULT_ADMIN_TASK_LIST_STATE, type AdminTaskListState, type AdminTasksApi } from "../admin-tasks/adminTasksTypes";
 import "./Admin.css";
 
 const ADMIN_TOKEN_KEY = "admin_token";
@@ -59,7 +62,8 @@ type AdminView =
   | { kind: "system-config-edit"; id: string }
   | { kind: "series" }
   | { kind: "series-create" }
-  | { kind: "series-edit"; id: string };
+  | { kind: "series-edit"; id: string }
+  | { kind: "admin-tasks" };
 
 interface AdminSession {
   token: string;
@@ -228,7 +232,9 @@ export function AdminFeature({
   const systemConfigApiRef = useRef<AdminSystemConfigApi | null>(null);
   const seriesExit = useRef<ActiveSeriesExit | null>(null);
   const seriesApiRef = useRef<AdminSeriesApi | null>(null);
+  const tasksApiRef = useRef<AdminTasksApi | null>(null);
   const [seriesListState, setSeriesListState] = useState<AdminSeriesListState>(DEFAULT_ADMIN_SERIES_LIST_STATE);
+  const [taskListState, setTaskListState] = useState<AdminTaskListState>(DEFAULT_ADMIN_TASK_LIST_STATE);
   const [seriesListVersion, setSeriesListVersion] = useState(0);
   const [seriesNotice, setSeriesNotice] = useState<string | null>(null);
   const [redemptionListVersion, setRedemptionListVersion] = useState(0);
@@ -314,9 +320,14 @@ export function AdminFeature({
     () => createAdminSeriesApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), () => session?.user.id ?? "", safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, session?.user.id, storage],
   );
+  const tasksApi = useMemo(
+    () => createAdminTasksApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
   membershipApiRef.current = membershipApi;
   systemConfigApiRef.current = systemConfigApi;
   seriesApiRef.current = seriesApi;
+  tasksApiRef.current = tasksApi;
 
   const handleLogin = useCallback((nextSession: AdminSession) => {
     sessionGeneration.current += 1;
@@ -324,6 +335,7 @@ export function AdminFeature({
     systemConfigExit.current = null;
     seriesExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
     setSeriesListVersion(0);
     setSession(nextSession);
@@ -336,6 +348,7 @@ export function AdminFeature({
     systemConfigExit.current = null;
     seriesExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
     setSeriesListVersion(0);
     clearAdminSession(storage);
@@ -350,6 +363,7 @@ export function AdminFeature({
     systemConfigExit.current = null;
     seriesExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
     setSeriesListVersion(0);
     clearAdminSession(storage);
@@ -379,6 +393,8 @@ export function AdminFeature({
   const seriesViewKey = view.kind === "series" ? "series/list"
     : view.kind === "series-create" ? "series/create"
       : view.kind === "series-edit" ? "series/edit/" + view.id : "";
+  const tasksOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const tasksViewKey = view.kind === "admin-tasks" ? "admin-tasks/list" : "";
   const handleMembershipExitState = useCallback((snapshot: AdminMembershipExitSnapshot) => {
     if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
       || membershipApiRef.current !== activeMembershipApi || snapshot.ownerScope !== membershipOwnerScope
@@ -484,6 +500,14 @@ export function AdminFeature({
       || seriesApiRef.current !== seriesApi) return;
     setSeriesListState(state);
   }, [activeSessionGeneration, activeViewIdentity, seriesApi]);
+  const handleTasksUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && tasksApiRef.current === tasksApi) handleUnauthorized();
+  }, [activeSessionGeneration, activeViewIdentity, handleUnauthorized, tasksApi]);
+  const handleTaskListStateChange = useCallback((state: AdminTaskListState) => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && tasksApiRef.current === tasksApi) setTaskListState(state);
+  }, [activeSessionGeneration, activeViewIdentity, tasksApi]);
   const openSeriesCreate = useCallback(() => {
     setSeriesNotice(null);
     navigate({ kind: "series-create" });
@@ -663,6 +687,16 @@ export function AdminFeature({
           >
             <span aria-hidden="true">▣</span>剧集管理
           </button>
+          <button
+            className={view.kind === "admin-tasks" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="全局任务"
+            title="全局任务"
+            aria-current={view.kind === "admin-tasks" ? "page" : undefined}
+            onClick={() => navigate({ kind: "admin-tasks" })}
+          >
+            <span aria-hidden="true">≡</span>全局任务
+          </button>
         </nav>
         <div className="admin-sidebar-account">
           <span className="admin-sidebar-avatar" aria-hidden="true">
@@ -777,6 +811,16 @@ export function AdminFeature({
               onCancel={(pending) => leaveSeries({ kind: "series" }, pending)}
               onSaved={handleSeriesSaved}
               onExitStateChange={handleSeriesExitState}
+            />
+          ) : view.kind === "admin-tasks" ? (
+            <AdminTasks
+              key={activeViewIdentity}
+              api={tasksApi}
+              ownerScope={tasksOwnerScope}
+              viewKey={tasksViewKey}
+              listState={taskListState}
+              onListStateChange={handleTaskListStateChange}
+              onAuthenticationError={handleTasksUnauthorized}
             />
           ) : view.kind === "redemption-codes" || view.kind === "redemption-create" ? (
             <RedemptionCodes
