@@ -19,6 +19,10 @@ import { createAdminSystemConfigApi } from "../admin-system-config/adminSystemCo
 import type { AdminSystemConfigApi, AdminSystemConfigExitSnapshot, PendingAdminSystemConfigExit } from "../admin-system-config/adminSystemConfigTypes";
 import { createAdminMembershipApi } from "../admin-membership/adminMembershipApi";
 import type { AdminMembershipApi, AdminMembershipExitSnapshot } from "../admin-membership/adminMembershipTypes";
+import { AdminSeries } from "../admin-series/AdminSeries";
+import { createAdminSeriesApi } from "../admin-series/adminSeriesApi";
+import { DEFAULT_ADMIN_SERIES_LIST_STATE } from "../admin-series/adminSeriesTypes";
+import type { AdminSeriesApi, AdminSeriesExitSnapshot, AdminSeriesListState, AdminSeriesRecord, PendingAdminSeriesExit } from "../admin-series/adminSeriesTypes";
 import "./Admin.css";
 
 const ADMIN_TOKEN_KEY = "admin_token";
@@ -52,7 +56,10 @@ type AdminView =
   | { kind: "purchase-package-create" }
   | { kind: "purchase-package-edit"; id: string }
   | { kind: "system-config" }
-  | { kind: "system-config-edit"; id: string };
+  | { kind: "system-config-edit"; id: string }
+  | { kind: "series" }
+  | { kind: "series-create" }
+  | { kind: "series-edit"; id: string };
 
 interface AdminSession {
   token: string;
@@ -73,6 +80,14 @@ interface ActiveSystemConfigExit {
   viewIdentity: number;
   sessionGeneration: number;
   api: AdminSystemConfigApi;
+}
+
+interface ActiveSeriesExit {
+  snapshot: AdminSeriesExitSnapshot;
+  pending: NonNullable<AdminSeriesExitSnapshot["pending"]>;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AdminSeriesApi;
 }
 
 interface AdminFeatureProps {
@@ -211,6 +226,11 @@ export function AdminFeature({
   const membershipApiRef = useRef<AdminMembershipApi | null>(null);
   const systemConfigExit = useRef<ActiveSystemConfigExit | null>(null);
   const systemConfigApiRef = useRef<AdminSystemConfigApi | null>(null);
+  const seriesExit = useRef<ActiveSeriesExit | null>(null);
+  const seriesApiRef = useRef<AdminSeriesApi | null>(null);
+  const [seriesListState, setSeriesListState] = useState<AdminSeriesListState>(DEFAULT_ADMIN_SERIES_LIST_STATE);
+  const [seriesListVersion, setSeriesListVersion] = useState(0);
+  const [seriesNotice, setSeriesNotice] = useState<string | null>(null);
   const [redemptionListVersion, setRedemptionListVersion] = useState(0);
   const [packageListVersion, setPackageListVersion] = useState(0);
   const [modelListVersion, setModelListVersion] = useState(0);
@@ -245,8 +265,22 @@ export function AdminFeature({
           : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
       if (!window.confirm(question)) return false;
     }
+    const seriesPending = seriesExit.current;
+    if (!options?.force && seriesPending && seriesPending.viewIdentity === viewIdentity.current
+      && seriesPending.sessionGeneration === sessionGeneration.current && seriesPending.api === seriesApiRef.current) {
+      const { kind, operation, recordId, message } = seriesPending.pending;
+      const action = operation === "update" ? "更新" : "创建";
+      const target = recordId ? "记录 " + recordId : "当前表单";
+      const question = kind === "write-in-flight"
+        ? "正在" + action + target + "，请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : kind === "unknown-write"
+          ? message + "\n\n离开将放弃此意图的本地核对；之后重新提交会成为一项新操作。仍要离开吗？"
+          : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
     membershipExit.current = null;
     systemConfigExit.current = null;
+    seriesExit.current = null;
     viewIdentity.current += 1;
     setView(nextView);
     return true;
@@ -276,13 +310,22 @@ export function AdminFeature({
     () => createAdminSystemConfigApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
+  const seriesApi = useMemo(
+    () => createAdminSeriesApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), () => session?.user.id ?? "", safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, session?.user.id, storage],
+  );
   membershipApiRef.current = membershipApi;
   systemConfigApiRef.current = systemConfigApi;
+  seriesApiRef.current = seriesApi;
 
   const handleLogin = useCallback((nextSession: AdminSession) => {
     sessionGeneration.current += 1;
     membershipExit.current = null;
     systemConfigExit.current = null;
+    seriesExit.current = null;
+    setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setSeriesNotice(null);
+    setSeriesListVersion(0);
     setSession(nextSession);
     navigate({ kind: "dashboard" }, { force: true });
   }, [navigate]);
@@ -291,6 +334,10 @@ export function AdminFeature({
     sessionGeneration.current += 1;
     membershipExit.current = null;
     systemConfigExit.current = null;
+    seriesExit.current = null;
+    setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setSeriesNotice(null);
+    setSeriesListVersion(0);
     clearAdminSession(storage);
     setSession(null);
     navigate({ kind: "dashboard" }, { force: true });
@@ -301,6 +348,10 @@ export function AdminFeature({
     sessionGeneration.current += 1;
     membershipExit.current = null;
     systemConfigExit.current = null;
+    seriesExit.current = null;
+    setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setSeriesNotice(null);
+    setSeriesListVersion(0);
     clearAdminSession(storage);
     setSession(null);
   }, [navigate, storage]);
@@ -324,6 +375,10 @@ export function AdminFeature({
   const systemConfigOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
   const systemConfigViewKey = view.kind === "system-config" ? "system-config/list"
     : view.kind === "system-config-edit" ? "system-config/edit/" + view.id : "";
+  const seriesOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const seriesViewKey = view.kind === "series" ? "series/list"
+    : view.kind === "series-create" ? "series/create"
+      : view.kind === "series-edit" ? "series/edit/" + view.id : "";
   const handleMembershipExitState = useCallback((snapshot: AdminMembershipExitSnapshot) => {
     if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
       || membershipApiRef.current !== activeMembershipApi || snapshot.ownerScope !== membershipOwnerScope
@@ -387,6 +442,52 @@ export function AdminFeature({
     }
     navigate(nextView);
   }, [activeAdministratorId, activeSessionGeneration, activeSystemConfigApi, activeViewIdentity, systemConfigOwnerScope, systemConfigRecordId, systemConfigViewKey, navigate]);
+  const handleSeriesExitState = useCallback((snapshot: AdminSeriesExitSnapshot) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || seriesApiRef.current !== seriesApi || snapshot.ownerScope !== seriesOwnerScope
+      || snapshot.viewKey !== seriesViewKey || snapshot.administratorId !== activeAdministratorId) return;
+    if (snapshot.pending) {
+      seriesExit.current = {
+        snapshot, pending: snapshot.pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: seriesApi,
+      };
+    } else if (seriesExit.current?.viewIdentity === activeViewIdentity
+      && seriesExit.current.sessionGeneration === activeSessionGeneration && seriesExit.current.api === seriesApi) {
+      seriesExit.current = null;
+    }
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, seriesApi, seriesOwnerScope, seriesViewKey]);
+  const leaveSeries = useCallback((nextView: AdminView, pending?: PendingAdminSeriesExit) => {
+    if (pending && !seriesExit.current) {
+      const snapshot: AdminSeriesExitSnapshot = { ownerScope: seriesOwnerScope, viewKey: seriesViewKey,
+        administratorId: activeAdministratorId, mode: view.kind === "series-create" ? "create" : "edit",
+        recordId: view.kind === "series-edit" ? view.id : "", pending };
+      seriesExit.current = { snapshot, pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: seriesApi };
+    }
+    navigate(nextView);
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, navigate, seriesApi, seriesOwnerScope, seriesViewKey, view]);
+  const handleSeriesUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && seriesApiRef.current === seriesApi) handleUnauthorized();
+  }, [activeSessionGeneration, activeViewIdentity, handleUnauthorized, seriesApi]);
+  const handleSeriesSaved = useCallback((record: AdminSeriesRecord, operation: "create" | "update") => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || seriesApiRef.current !== seriesApi) return;
+    setSeriesNotice(operation === "create"
+      ? `服务端已确认创建剧集 ${record.id}。`
+      : `服务端已确认更新剧集 ${record.id}。`);
+    setSeriesListVersion((value) => value + 1);
+    navigate({ kind: "series" });
+  }, [activeSessionGeneration, activeViewIdentity, navigate, seriesApi]);
+  const handleSeriesListStateChange = useCallback((state: AdminSeriesListState) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || seriesApiRef.current !== seriesApi) return;
+    setSeriesListState(state);
+  }, [activeSessionGeneration, activeViewIdentity, seriesApi]);
+  const openSeriesCreate = useCallback(() => {
+    setSeriesNotice(null);
+    navigate({ kind: "series-create" });
+  }, [navigate]);
   const handleSystemConfigUnauthorized = useCallback(() => {
     if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
       && systemConfigApiRef.current === activeSystemConfigApi) handleUnauthorized();
@@ -425,12 +526,16 @@ export function AdminFeature({
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
       const membershipPending = membershipExit.current;
       const systemConfigPending = systemConfigExit.current;
+      const seriesPending = seriesExit.current;
       const protectsExit = (membershipPending && membershipPending.viewIdentity === viewIdentity.current
         && membershipPending.sessionGeneration === sessionGeneration.current
         && membershipPending.api === membershipApiRef.current)
         || (systemConfigPending && systemConfigPending.viewIdentity === viewIdentity.current
           && systemConfigPending.sessionGeneration === sessionGeneration.current
-          && systemConfigPending.api === systemConfigApiRef.current);
+          && systemConfigPending.api === systemConfigApiRef.current)
+        || (seriesPending && seriesPending.viewIdentity === viewIdentity.current
+          && seriesPending.sessionGeneration === sessionGeneration.current
+          && seriesPending.api === seriesApiRef.current);
       if (!protectsExit) return;
       event.preventDefault();
       event.returnValue = "";
@@ -548,6 +653,16 @@ export function AdminFeature({
           >
             <span aria-hidden="true">↕</span>积分流水
           </button>
+          <button
+            className={view.kind === "series" || view.kind === "series-create" || view.kind === "series-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="剧集管理"
+            title="剧集管理"
+            aria-current={view.kind === "series" || view.kind === "series-create" || view.kind === "series-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "series" })}
+          >
+            <span aria-hidden="true">▣</span>剧集管理
+          </button>
         </nav>
         <div className="admin-sidebar-account">
           <span className="admin-sidebar-avatar" aria-hidden="true">
@@ -642,6 +757,26 @@ export function AdminFeature({
               key={activeViewIdentity}
               api={creditsApi}
               onAuthenticationError={handleResourceUnauthorized}
+            />
+          ) : view.kind === "series" || view.kind === "series-create" || view.kind === "series-edit" ? (
+            <AdminSeries
+              key={activeViewIdentity}
+              api={seriesApi}
+              mode={view.kind === "series" ? "list" : view.kind === "series-create" ? "create" : "edit"}
+              {...(view.kind === "series-edit" ? { recordId: view.id } : {})}
+              ownerScope={seriesOwnerScope}
+              viewKey={seriesViewKey}
+              administratorId={activeAdministratorId}
+              listVersion={seriesListVersion}
+              listState={seriesListState}
+              notice={view.kind === "series" ? seriesNotice : null}
+              onListStateChange={handleSeriesListStateChange}
+              onAuthenticationError={handleSeriesUnauthorized}
+              onCreate={openSeriesCreate}
+              onEdit={(id) => navigate({ kind: "series-edit", id })}
+              onCancel={(pending) => leaveSeries({ kind: "series" }, pending)}
+              onSaved={handleSeriesSaved}
+              onExitStateChange={handleSeriesExitState}
             />
           ) : view.kind === "redemption-codes" || view.kind === "redemption-create" ? (
             <RedemptionCodes
