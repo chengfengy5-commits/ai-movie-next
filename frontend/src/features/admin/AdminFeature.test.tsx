@@ -1504,3 +1504,126 @@ describe("admin tasks integration", () => {
     expect(confirm).not.toHaveBeenCalled();
   });
 });
+
+describe("admin SMTP account integration", () => {
+  it("opens the unpaginated SMTP account list from the sidebar and never renders the returned password", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const syntheticPassword = "synthetic-smtp-secret-253";
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/smtp-accounts" && (init?.method ?? "GET") === "GET") {
+        return jsonResponse({ data: [{
+          id: "smtp-account-1",
+          host: "smtp.example.test",
+          port: 465,
+          user: "operator@example.test",
+          password: syntheticPassword,
+          daily_sent: 0,
+          is_active: true,
+          created_at: "2026-10-16T08:00:00",
+          updated_at: "2026-10-16T08:00:00",
+        }], total: 1 });
+      }
+      throw new Error("Unexpected synthetic request: " + (init?.method ?? "GET") + " " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "SMTP 账号" }));
+
+    expect(await screen.findByRole("heading", { name: "SMTP 账号" })).toBeInTheDocument();
+    expect(screen.getByText("operator@example.test")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain(syntheticPassword);
+    const listCall = fetcher.mock.calls.find((call) => new URL(String(call[0]), window.location.href).pathname === "/api/admin/smtp-accounts");
+    expect(listCall).toBeDefined();
+    expect(new URL(String(listCall?.[0]), window.location.href).search).toBe("");
+    expect(new Headers(listCall?.[1]?.headers).get("Authorization")).toBe("Bearer admin-token");
+  });
+
+  it("uses the shared host guard for dirty SMTP drafts, including beforeunload and sidebar navigation", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(false)
+      .mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const fetcher = vi.fn<AdminFetcher>(async (input) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/smtp-accounts") return jsonResponse({ data: [], total: 0 });
+      if (url.pathname === "/api/admin/tasks") return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected synthetic request: " + url.pathname);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "SMTP 账号" }));
+    await user.click(await screen.findByRole("button", { name: "新建 SMTP 账号" }));
+    await user.type(await screen.findByLabelText("SMTP 邮箱"), "draft@example.test");
+    await user.type(screen.getByLabelText("SMTP 授权码"), "synthetic-local-secret-253");
+
+    const beforeUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(beforeUnload);
+    expect(beforeUnload.defaultPrevented).toBe(true);
+    const brand = document.querySelector<HTMLAnchorElement>(".admin-workspace-brand");
+    if (!brand) throw new Error("expected synthetic admin brand link");
+    await user.click(brand);
+    await user.click(screen.getByRole("button", { name: "全局任务" }));
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(screen.getByLabelText("SMTP 邮箱")).toHaveValue("draft@example.test");
+    expect(confirm).toHaveBeenCalledTimes(3);
+
+    await user.click(screen.getByRole("button", { name: "全局任务" }));
+    expect(await screen.findByRole("heading", { name: "全局任务" })).toBeInTheDocument();
+    expect(confirm).toHaveBeenCalledTimes(4);
+    expect(screen.queryByLabelText("SMTP 授权码")).not.toBeInTheDocument();
+  });
+
+  it("routes through the real host list, create and edit receipts, and returns without a false exit prompt", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const stored = {
+      id: "smtp-1", host: "smtp.example.test", port: 465, user: "sender@example.test",
+      password: "synthetic-wire-secret-253", daily_sent: 0, is_active: true,
+      created_at: "2026-10-16T08:00:00", updated_at: "2026-10-16T08:00:00",
+    };
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/smtp-accounts" && method === "GET") return jsonResponse({ data: [stored], total: 1 });
+      if (url.pathname === "/api/admin/smtp-accounts/smtp-1" && method === "GET") return jsonResponse(stored);
+      if (url.pathname === "/api/admin/smtp-accounts" && method === "POST") {
+        return jsonResponse({ id: "smtp-created", user: "new@example.test", message: "添加成功" });
+      }
+      if (url.pathname === "/api/admin/smtp-accounts/smtp-1" && method === "PUT") {
+        return jsonResponse({ message: "更新成功" });
+      }
+      throw new Error("Unexpected synthetic request: " + method + " " + url.pathname);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={adminStorage()} />);
+    await user.click(screen.getByRole("button", { name: "SMTP 账号" }));
+    expect(await screen.findByText("sender@example.test")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "新建 SMTP 账号" }));
+    await user.type(await screen.findByLabelText("SMTP 邮箱"), "new@example.test");
+    await user.type(screen.getByLabelText("SMTP 授权码"), "synthetic-local-secret-253");
+    await user.click(screen.getByRole("button", { name: "保存账号" }));
+    expect(await screen.findByText(/服务端已确认创建 SMTP 账号 smtp-created/)).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "新建 SMTP 账号" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "SMTP 账号" }));
+    expect(await screen.findByRole("heading", { name: "SMTP 账号" })).toBeInTheDocument();
+    await user.click(await screen.findByRole("button", { name: "编辑" }));
+    expect(await screen.findByRole("heading", { name: "编辑 SMTP 账号" })).toBeInTheDocument();
+    expect(await screen.findByDisplayValue("sender@example.test")).toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("synthetic-wire-secret-253");
+    await user.clear(screen.getByLabelText("SMTP 主机"));
+    await user.type(screen.getByLabelText("SMTP 主机"), "smtp-updated.example.test");
+    await user.click(screen.getByRole("button", { name: "保存账号" }));
+    expect(await screen.findByText("服务端已确认更新操作。该接口不返回字段回显。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "SMTP 账号" }));
+    expect(await screen.findByRole("heading", { name: "SMTP 账号" })).toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
+    const smtpCalls = fetcher.mock.calls.filter((call) => new URL(String(call[0]), window.location.href).pathname.startsWith("/api/admin/smtp-accounts"));
+    expect(smtpCalls.map((call) => call[1]?.method ?? "GET")).toEqual(["GET", "POST", "GET", "GET", "PUT", "GET"]);
+  });
+});
