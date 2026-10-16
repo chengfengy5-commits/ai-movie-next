@@ -24,6 +24,8 @@ type AuthState =
 interface AuthContextValue {
   services: WorkspaceServices;
   state: AuthState;
+  sessionGeneration: number;
+  refreshCurrentUser(signal: AbortSignal): Promise<User>;
   login(credentials: Credentials): Promise<void>;
   logout(): void;
   retryRestore(): void;
@@ -38,12 +40,29 @@ interface AuthProviderProps {
 
 export function AuthProvider({ services, children }: AuthProviderProps) {
   const [state, setState] = useState<AuthState>({ status: "restoring" });
+  const [sessionGeneration, setSessionGeneration] = useState(0);
+  const stateRef = useRef(state);
+  stateRef.current = state;
+  const servicesRef = useRef(services);
+  servicesRef.current = services;
   const generation = useRef(0);
+  const sessionGenerationRef = useRef(0);
+  const refreshSequence = useRef(0);
+  const latestRefresh = useRef<{ sequence: number; user: User } | null>(null);
   const loginInFlight = useRef(false);
   const loginAttempt = useRef(0);
   const pendingControllers = useRef(new Set<AbortController>());
+  const activeRefreshController = useRef<AbortController | null>(null);
+
+  const advanceSessionGeneration = useCallback(() => {
+    const next = sessionGenerationRef.current + 1;
+    sessionGenerationRef.current = next;
+    latestRefresh.current = null;
+    setSessionGeneration(next);
+  }, []);
 
   const abortPending = useCallback(() => {
+    activeRefreshController.current = null;
     for (const controller of pendingControllers.current) {
       controller.abort();
     }
@@ -52,6 +71,7 @@ export function AuthProvider({ services, children }: AuthProviderProps) {
 
   const runRestore = useCallback(() => {
     const ticket = ++generation.current;
+    advanceSessionGeneration();
     abortPending();
     const controller = new AbortController();
     pendingControllers.current.add(controller);
@@ -70,7 +90,7 @@ export function AuthProvider({ services, children }: AuthProviderProps) {
     }).finally(() => {
       pendingControllers.current.delete(controller);
     });
-  }, [abortPending, services]);
+  }, [abortPending, advanceSessionGeneration, services]);
 
   useEffect(() => {
     runRestore();
@@ -87,6 +107,7 @@ export function AuthProvider({ services, children }: AuthProviderProps) {
     loginInFlight.current = true;
     const attempt = ++loginAttempt.current;
     const ticket = ++generation.current;
+    advanceSessionGeneration();
     abortPending();
     const controller = new AbortController();
     pendingControllers.current.add(controller);
@@ -107,20 +128,77 @@ export function AuthProvider({ services, children }: AuthProviderProps) {
         loginInFlight.current = false;
       }
     }
-  }, [abortPending, services]);
+  }, [abortPending, advanceSessionGeneration, services]);
 
   const logout = useCallback(() => {
     generation.current += 1;
+    advanceSessionGeneration();
     loginAttempt.current += 1;
     loginInFlight.current = false;
     abortPending();
     services.logout();
     setState({ status: "anonymous", error: null });
-  }, [abortPending, services]);
+  }, [abortPending, advanceSessionGeneration, services]);
+
+  const refreshCurrentUser = useCallback(async (signal: AbortSignal): Promise<User> => {
+    const current = stateRef.current;
+    if (current.status !== "authenticated") {
+      throw new ApiError("aborted", "当前登录会话已结束。");
+    }
+    if (signal.aborted) {
+      throw new ApiError("aborted", "Request was cancelled.");
+    }
+
+    const captured = {
+      generation: generation.current,
+      sessionGeneration: sessionGenerationRef.current,
+      services,
+      userId: current.user.id,
+      sequence: ++refreshSequence.current,
+    };
+    activeRefreshController.current?.abort();
+    const controller = new AbortController();
+    activeRefreshController.current = controller;
+    const abortFromCaller = () => controller.abort();
+    signal.addEventListener("abort", abortFromCaller, { once: true });
+    pendingControllers.current.add(controller);
+
+    try {
+      const fresh = await services.restore(controller.signal);
+      const latest = stateRef.current;
+      if (controller.signal.aborted
+        || captured.generation !== generation.current
+        || captured.sessionGeneration !== sessionGenerationRef.current
+        || captured.services !== servicesRef.current
+        || latest.status !== "authenticated"
+        || latest.user.id !== captured.userId) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+
+      if (fresh === null || fresh.id !== captured.userId) {
+        runRestore();
+        throw new ApiError("aborted", "当前登录会话需要重新验证。");
+      }
+
+      const applied = latestRefresh.current;
+      if (applied === null || captured.sequence > applied.sequence) {
+        latestRefresh.current = { sequence: captured.sequence, user: fresh };
+        setState({ status: "authenticated", user: fresh });
+        return fresh;
+      }
+      return applied.user;
+    } finally {
+      pendingControllers.current.delete(controller);
+      if (activeRefreshController.current === controller) activeRefreshController.current = null;
+      signal.removeEventListener("abort", abortFromCaller);
+    }
+  }, [runRestore, services]);
 
   const value: AuthContextValue = {
     services,
     state,
+    sessionGeneration,
+    refreshCurrentUser,
     login,
     logout,
     retryRestore: runRestore,

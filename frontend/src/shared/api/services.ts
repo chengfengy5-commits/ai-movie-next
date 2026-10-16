@@ -13,6 +13,12 @@ import {
   type AccountAccessService,
 } from "./accountAccess";
 import {
+  InvalidAccountProfileResponseError,
+  parseAccountCredits,
+  parseAccountProfileReceipt,
+  type AccountProfileServicePort,
+} from "./accountProfile";
+import {
   parseCreatedCharacter,
   parseCreatedProp,
   parseCreatedScene,
@@ -131,6 +137,7 @@ export interface WorkspaceServices {
   readonly mode: AppMode;
   readonly apiBaseUrl: string | null;
   readonly accountAccess?: AccountAccessService;
+  readonly accountProfile?: AccountProfileServicePort;
   restore(signal: AbortSignal): Promise<User | null>;
   login(credentials: Credentials, signal: AbortSignal): Promise<User>;
   listSeries(signal: AbortSignal): Promise<Series[]>;
@@ -371,6 +378,17 @@ function parseCreatorSettingsResponse<T>(parse: () => T): T {
     return parse();
   } catch (error) {
     if (error instanceof InvalidCreatorSettingsResponseError) {
+      throw new ApiError("invalid-response", error.message, null);
+    }
+    throw error;
+  }
+}
+
+function parseAccountProfileResponse<T>(parse: () => T): T {
+  try {
+    return parse();
+  } catch (error) {
+    if (error instanceof InvalidAccountProfileResponseError) {
       throw new ApiError("invalid-response", error.message, null);
     }
     throw error;
@@ -1827,6 +1845,8 @@ type ApiEndpoint =
   | "forgotPassword"
   | "resetPassword"
   | "me"
+  | "myCredits"
+  | "updateMyProfile"
   | "series"
   | "seriesDetail"
   | "createSeries"
@@ -1925,6 +1945,12 @@ function apiRequestDefinition(
   }
   if (endpoint === "me") {
     return { path: "/auth/me", method: "GET" };
+  }
+  if (endpoint === "myCredits") {
+    return { path: "/auth/credits/me", method: "GET" };
+  }
+  if (endpoint === "updateMyProfile") {
+    return { path: "/users/me/profile", method: "PUT" };
   }
   if (endpoint === "series") {
     return { path: "/series", method: "GET" };
@@ -2509,10 +2535,24 @@ export function createApiServices(
     },
   };
 
+  const accountProfile: AccountProfileServicePort = {
+    async getCredits(signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("myCredits", token, signal);
+      return parseAccountProfileResponse(() => parseAccountCredits(payload));
+    },
+    async updateProfile(input, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession("updateMyProfile", token, signal, { bio: input.bio });
+      return parseAccountProfileResponse(() => parseAccountProfileReceipt(payload));
+    },
+  };
+
   return {
     mode: "api",
     apiBaseUrl,
     creatorSettings,
+    accountProfile,
     accountAccess: {
       async register(input, signal) {
         return parseRegisteredUser(await request("register", null, signal, input));

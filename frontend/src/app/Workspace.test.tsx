@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement, useEffect } from "react";
-import { AuthProvider } from "../features/auth/AuthProvider";
+import { AuthProvider, useAuth } from "../features/auth/AuthProvider";
 import { Workspace } from "./Workspace";
 import { createApiServices, createDemoServices, type WorkspaceServices } from "../shared/api/services";
 import { demoSeries } from "../features/series/demoSeries";
@@ -11,6 +11,7 @@ import {
   API_USER_KEY,
   MOCK_SESSION_KEY,
   MOCK_USER_KEY,
+  type StorageLike,
 } from "../shared/api/storage";
 import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, User } from "../shared/api/contracts";
 import { ApiError } from "../shared/api/errors";
@@ -20,6 +21,7 @@ import type { PersonalRoughCutSnapshot } from "../shared/api/personalRoughCut";
 import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../shared/api/myTasks";
 import type { MyTeam } from "../shared/api/teams";
 import type { CreatorModel, CreatorSettingsServicePort } from "../shared/api/creatorSettings";
+import type { AccountProfileServicePort } from "../shared/api/accountProfile";
 
 type AssetLibraryCategory = "characters" | "scenes" | "props";
 
@@ -269,6 +271,31 @@ function deferred<T>() {
     reject = fail;
   });
   return { promise, resolve, reject };
+}
+
+class MemoryStorage implements StorageLike {
+  private readonly values = new Map<string, string>();
+
+  getItem(key: string): string | null {
+    return this.values.get(key) ?? null;
+  }
+
+  setItem(key: string, value: string): void {
+    this.values.set(key, value);
+  }
+
+  removeItem(key: string): void {
+    this.values.delete(key);
+  }
+}
+
+function AuthenticatedUserSnapshot() {
+  const { state } = useAuth();
+  return (
+    <output data-testid="authenticated-user-snapshot">
+      {state.status === "authenticated" ? JSON.stringify(state.user) : state.status}
+    </output>
+  );
 }
 
 function chapterSnapshot(
@@ -814,6 +841,155 @@ describe("read-only workspace", () => {
     expect(await screen.findByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "返回工作空间" }));
     expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
+  });
+
+  it("routes to account on mobile, protects its dirty draft, and refreshes the full user in-session", async () => {
+    const user = userEvent.setup();
+    let currentUser = authenticatedFixtureUser("account-route-user", "账户作者");
+    const restore = vi.fn(async () => currentUser);
+    const listSeries = vi.fn(async () => demoSeries);
+    const accountProfile: AccountProfileServicePort = {
+      getCredits: vi.fn(async () => ({ credits: -2 })),
+      updateProfile: vi.fn(async ({ bio }) => {
+        currentUser = { ...currentUser, bio: bio === "" ? null : bio };
+        return {
+          id: currentUser.id,
+          username: currentUser.username,
+          avatar_url: currentUser.avatar_url,
+          bio: currentUser.bio,
+        };
+      }),
+    };
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      mode: "api",
+      apiBaseUrl: "http://127.0.0.1:4175/api",
+      restore,
+      listSeries,
+      accountProfile,
+    };
+    const { container } = renderWorkspace(services);
+
+    await screen.findByRole("heading", { name: "我的剧集" });
+    await waitFor(() => expect(listSeries).toHaveBeenCalledTimes(1));
+    const topbar = container.querySelector("header.topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("Expected the workspace topbar.");
+    await user.click(within(topbar).getByRole("button", { name: "我的账户", hidden: true }));
+    await screen.findByRole("heading", { name: "我的账户" });
+    expect(await screen.findByText("-2")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    await user.type(screen.getByRole("textbox", { name: "个人简介" }), "账户草稿");
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(within(topbar).getByRole("button", { name: "我的任务", hidden: true }));
+    expect(confirm).toHaveBeenCalledWith("当前有未保存的账户简介草稿或待核对操作，离开将丢弃页面状态。继续吗？");
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "个人简介" })).toHaveValue("账户草稿");
+
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "保存简介" }));
+    expect(await screen.findByText("账户草稿")).toBeInTheDocument();
+    expect(await screen.findByText("简介已由独立账户读取确认。")).toBeInTheDocument();
+    expect(accountProfile.updateProfile).toHaveBeenCalledTimes(1);
+    expect(restore).toHaveBeenCalledTimes(3);
+    expect(listSeries).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+  });
+
+  it("keeps the full-user cache and authenticated state current when an older /me response arrives late", async () => {
+    const user = userEvent.setup();
+    const storage = new MemoryStorage();
+    const oldUser = authenticatedFixtureUser("account-cache-race", "缓存顺序作者");
+    const updatedUser = { ...oldUser, bio: "保存后的完整简介" };
+    storage.setItem(API_TOKEN_KEY, "account-cache-token");
+    storage.setItem(API_USER_KEY, JSON.stringify(oldUser));
+
+    const lateInitialProfileRead = deferred<Response>();
+    const lateProfileReadSignal = { value: null as AbortSignal | null };
+    let notifyLateProfileReadStarted!: () => void;
+    const lateProfileReadStarted = new Promise<void>((resolve) => {
+      notifyLateProfileReadStarted = resolve;
+    });
+    let currentUser = oldUser;
+    let meRequestCount = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/auth/me")) {
+        meRequestCount += 1;
+        if (meRequestCount === 1) return jsonResponse(oldUser);
+        if (meRequestCount === 2) {
+          lateProfileReadSignal.value = init?.signal ?? null;
+          notifyLateProfileReadStarted();
+          return lateInitialProfileRead.promise;
+        }
+        return jsonResponse(currentUser);
+      }
+      if (url.pathname.endsWith("/auth/credits/me")) return jsonResponse({ credits: 17 });
+      if (url.pathname.endsWith("/users/me/profile") && init?.method === "PUT") {
+        const body = JSON.parse(String(init.body)) as { bio: string };
+        currentUser = { ...currentUser, bio: body.bio };
+        return jsonResponse({
+          id: currentUser.id,
+          username: currentUser.username,
+          avatar_url: currentUser.avatar_url,
+          bio: currentUser.bio,
+        });
+      }
+      if (url.pathname.endsWith("/series") || url.pathname.endsWith("/teams/my")) {
+        return jsonResponse([]);
+      }
+      return jsonResponse({ detail: `Unexpected test request: ${url.pathname}` }, 404);
+    });
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const listSeries = vi.spyOn(services, "listSeries");
+
+    render(
+      <AuthProvider services={services}>
+        <>
+          <Workspace />
+          <AuthenticatedUserSnapshot />
+        </>
+      </AuthProvider>,
+    );
+
+    await screen.findByRole("heading", { name: "我的剧集" });
+    await waitFor(() => expect(listSeries).toHaveBeenCalledTimes(1));
+    await user.click(within(screen.getByRole("banner")).getByRole("button", {
+      name: "我的账户",
+      hidden: true,
+    }));
+    await screen.findByRole("heading", { name: "我的账户" });
+    await lateProfileReadStarted;
+
+    await user.click(screen.getByRole("button", { name: "编辑简介" }));
+    await user.clear(screen.getByRole("textbox", { name: "个人简介" }));
+    await user.type(screen.getByRole("textbox", { name: "个人简介" }), "保存后的完整简介");
+    await user.click(screen.getByRole("button", { name: "保存简介" }));
+
+    expect(await screen.findByText("简介已由独立账户读取确认。")).toBeInTheDocument();
+    expect(JSON.parse(screen.getByTestId("authenticated-user-snapshot").textContent ?? "null"))
+      .toEqual(updatedUser);
+    expect(JSON.parse(storage.getItem(API_USER_KEY) ?? "null")).toEqual(updatedUser);
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("account-cache-token");
+    expect(lateProfileReadSignal.value?.aborted).toBe(true);
+    expect(listSeries).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
+
+    await act(async () => {
+      lateInitialProfileRead.resolve(jsonResponse(oldUser));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(JSON.parse(screen.getByTestId("authenticated-user-snapshot").textContent ?? "null"))
+      .toEqual(updatedUser);
+    expect(JSON.parse(storage.getItem(API_USER_KEY) ?? "null")).toEqual(updatedUser);
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("account-cache-token");
+    expect(listSeries).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("heading", { name: "我的账户" })).toBeInTheDocument();
   });
 
   it("keeps the workspace leave guard after cancelling an editor while ordering is still dirty", async () => {

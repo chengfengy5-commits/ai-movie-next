@@ -1,0 +1,236 @@
+.account-page {
+  display: grid;
+  gap: 1.25rem;
+  width: 100%;
+  min-width: 0;
+  color: var(--text-primary, #17212b);
+}
+
+.account-page-header,
+.account-profile-heading,
+.account-section-heading,
+.account-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.account-page-header h1,
+.account-profile-heading h2,
+.account-section-heading h2,
+.account-bio-section h3 {
+  margin: 0;
+}
+
+.account-page-header > div > p:last-child {
+  margin: 0.4rem 0 0;
+  color: var(--text-muted, #687782);
+}
+
+.account-page-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1.35fr) minmax(17rem, 0.8fr);
+  align-items: start;
+  gap: 1rem;
+}
+
+.account-card {
+  min-width: 0;
+  padding: 1.25rem;
+  border: 1px solid var(--border-subtle, #dce3e8);
+  border-radius: 1rem;
+  background: var(--surface, #fff);
+  box-shadow: 0 0.5rem 1.5rem rgb(26 43 57 / 5%);
+}
+
+.account-profile-heading {
+  justify-content: flex-start;
+  margin-bottom: 1.25rem;
+}
+
+.account-profile-heading .eyebrow,
+.account-section-heading .eyebrow {
+  margin: 0 0 0.3rem;
+}
+
+.account-avatar {
+  display: grid;
+  flex: 0 0 3.25rem;
+  width: 3.25rem;
+  height: 3.25rem;
+  place-items: center;
+  border-radius: 50%;
+  background: var(--accent-soft, #e7f1f8);
+  color: var(--accent-strong, #24577c);
+  font-size: 1.35rem;
+  font-weight: 700;
+}
+
+.account-facts {
+  display: grid;
+  gap: 0;
+  margin: 0;
+}
+
+.account-facts > div {
+  display: grid;
+  grid-template-columns: minmax(6rem, 0.4fr) minmax(0, 1fr);
+  gap: 1rem;
+  padding: 0.8rem 0;
+  border-bottom: 1px solid var(--border-subtle, #dce3e8);
+}
+
+.account-facts dt {
+  color: var(--text-muted, #687782);
+}
+
+.account-facts dd {
+  min-width: 0;
+  margin: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+
+.account-bio-section {
+  padding-top: 1.2rem;
+}
+
+.account-section-heading h3 {
+  font-size: 1rem;
+}
+
+.account-bio-value {
+  min-height: 3.2rem;
+  margin: 0.7rem 0 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.account-bio-form {
+  display: grid;
+  gap: 0.7rem;
+  margin-top: 0.75rem;
+}
+
+.account-bio-label {
+  font-weight: 600;
+}
+
+.account-bio-form textarea {
+  box-sizing: border-box;
+  width: 100%;
+  min-height: 8rem;
+  padding: 0.75rem;
+  border: 1px solid var(--border-strong, #aebbc5);
+  border-radius: 0.65rem;
+  background: var(--surface, #fff);
+  color: inherit;
+  font: inherit;
+  line-height: 1.5;
+  resize: vertical;
+}
+
+.account-form-actions {
+  flex-wrap: wrap;
+  justify-content: flex-start;
+}
+
+.account-credit-balance {
+  display: flex;
+  align-items: baseline;
+  gap: 0.6rem;
+  margin: 1.5rem 0;
+}
+
+.account-credit-balance strong {
+  font-size: clamp(2rem, 5vw, 3rem);
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.account-credit-balance span {
+  color: var(--text-muted, #687782);
+}
+
+.account-muted,
+.account-help {
+  color: var(--text-muted, #687782);
+  font-size: 0.9rem;
+  line-height: 1.5;
+}
+
+.account-help {
+  margin: 0.75rem 0 0;
+}
+
+.account-error,
+.account-load-message p {
+  color: var(--danger, #a93232);
+}
+
+.account-error,
+.account-success,
+.account-verification-notice {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.account-success {
+  color: var(--success, #276749);
+}
+
+.account-verification-notice {
+  padding: 0.75rem;
+  border-radius: 0.6rem;
+  background: var(--warning-soft, #fff6df);
+  color: var(--warning-strong, #76520a);
+}
+
+.account-load-message {
+  display: grid;
+  justify-items: start;
+  gap: 0.4rem;
+}
+
+.account-load-message p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.account-refresh-profile {
+  margin-top: 0.6rem;
+}
+
+@media (max-width: 760px) {
+  .account-page-header {
+    align-items: flex-start;
+  }
+
+  .account-page-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 420px) {
+  .account-card {
+    padding: 1rem;
+  }
+
+  .account-page-header {
+    flex-direction: column;
+  }
+
+  .account-back-button {
+    align-self: flex-start;
+  }
+
+  .account-facts > div {
+    grid-template-columns: minmax(5rem, 0.38fr) minmax(0, 1fr);
+    gap: 0.65rem;
+  }
+
+  .account-form-actions > button {
+    flex: 1 1 auto;
+  }
+}

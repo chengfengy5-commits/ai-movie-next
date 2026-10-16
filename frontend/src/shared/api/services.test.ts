@@ -589,6 +589,48 @@ describe("API services", () => {
     expect(storage.getItem(API_TOKEN_KEY)).toBe("current-team-token");
   });
 
+  it("reads real account credits and sends only the bio field for profile updates", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "current-account-token");
+    const fetcher = vi.fn()
+      .mockResolvedValueOnce(jsonResponse({ credits: -7 }))
+      .mockResolvedValueOnce(jsonResponse({
+        id: "account-user",
+        username: "创作者",
+        avatar_url: null,
+        bio: "",
+      }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const accountProfile = services.accountProfile;
+    if (accountProfile === undefined) throw new Error("Expected the API account profile port.");
+    const signal = new AbortController().signal;
+
+    await expect(accountProfile.getCredits(signal)).resolves.toEqual({ credits: -7 });
+    await expect(accountProfile.updateProfile({ bio: "" }, signal)).resolves.toEqual({
+      id: "account-user",
+      username: "创作者",
+      avatar_url: null,
+      bio: "",
+    });
+
+    const [creditsInput, creditsInit] = fetcher.mock.calls[0] ?? [];
+    expect(new URL(String(creditsInput)).pathname).toBe("/api/auth/credits/me");
+    expect(creditsInit?.method).toBe("GET");
+    expect(new Headers(creditsInit?.headers).get("Authorization")).toBe("Bearer current-account-token");
+    expect(creditsInit?.credentials).toBe("omit");
+    expect(creditsInit?.cache).toBe("no-store");
+
+    const [profileInput, profileInit] = fetcher.mock.calls[1] ?? [];
+    expect(new URL(String(profileInput)).pathname).toBe("/api/users/me/profile");
+    expect(profileInit?.method).toBe("PUT");
+    expect(profileInit?.body).toBe(JSON.stringify({ bio: "" }));
+    expect(new Headers(profileInit?.headers).get("Authorization")).toBe("Bearer current-account-token");
+    expect(profileInit?.credentials).toBe("omit");
+    expect(profileInit?.cache).toBe("no-store");
+
+    expect(createDemoServices(storage).accountProfile).toBeUndefined();
+  });
+
   it("uses the current bearer and a once-encoded chapter path for the dedicated rough-cut GET", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "current-rough-cut-token");
