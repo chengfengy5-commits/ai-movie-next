@@ -14,6 +14,9 @@ import { createAdminUsersApi } from "./usersApi";
 import { SystemModels } from "./SystemModels";
 import { RedemptionCodes } from "../admin-membership/RedemptionCodes";
 import { PurchasePackages } from "../admin-membership/PurchasePackages";
+import { AdminSystemConfig } from "../admin-system-config/AdminSystemConfig";
+import { createAdminSystemConfigApi } from "../admin-system-config/adminSystemConfigApi";
+import type { AdminSystemConfigApi, AdminSystemConfigExitSnapshot, PendingAdminSystemConfigExit } from "../admin-system-config/adminSystemConfigTypes";
 import { createAdminMembershipApi } from "../admin-membership/adminMembershipApi";
 import type { AdminMembershipApi, AdminMembershipExitSnapshot } from "../admin-membership/adminMembershipTypes";
 import "./Admin.css";
@@ -47,7 +50,9 @@ type AdminView =
   | { kind: "redemption-create" }
   | { kind: "purchase-packages" }
   | { kind: "purchase-package-create" }
-  | { kind: "purchase-package-edit"; id: string };
+  | { kind: "purchase-package-edit"; id: string }
+  | { kind: "system-config" }
+  | { kind: "system-config-edit"; id: string };
 
 interface AdminSession {
   token: string;
@@ -60,6 +65,14 @@ interface ActiveMembershipExit {
   viewIdentity: number;
   sessionGeneration: number;
   api: AdminMembershipApi;
+}
+
+interface ActiveSystemConfigExit {
+  snapshot: AdminSystemConfigExitSnapshot;
+  pending: NonNullable<AdminSystemConfigExitSnapshot["pending"]>;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AdminSystemConfigApi;
 }
 
 interface AdminFeatureProps {
@@ -196,12 +209,15 @@ export function AdminFeature({
   const sessionGeneration = useRef(0);
   const membershipExit = useRef<ActiveMembershipExit | null>(null);
   const membershipApiRef = useRef<AdminMembershipApi | null>(null);
+  const systemConfigExit = useRef<ActiveSystemConfigExit | null>(null);
+  const systemConfigApiRef = useRef<AdminSystemConfigApi | null>(null);
   const [redemptionListVersion, setRedemptionListVersion] = useState(0);
   const [packageListVersion, setPackageListVersion] = useState(0);
   const [modelListVersion, setModelListVersion] = useState(0);
   const [promptListVersion, setPromptListVersion] = useState(0);
   const [userListVersion, setUserListVersion] = useState(0);
   const [creditListVersion, setCreditListVersion] = useState(0);
+  const [systemConfigListVersion, setSystemConfigListVersion] = useState(0);
 
   const navigate = useCallback((nextView: AdminView, options?: { force?: boolean }) => {
     const pending = membershipExit.current;
@@ -217,7 +233,20 @@ export function AdminFeature({
           : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
       if (!window.confirm(question)) return false;
     }
+    const configPending = systemConfigExit.current;
+    if (!options?.force && configPending && configPending.viewIdentity === viewIdentity.current
+      && configPending.sessionGeneration === sessionGeneration.current
+      && configPending.api === systemConfigApiRef.current) {
+      const { kind, message } = configPending.pending;
+      const question = kind === "write-in-flight"
+        ? "系统配置保存请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : kind === "unknown-write"
+          ? message + "\n\n离开将放弃此意图的本地核对；之后重新提交会成为一项新操作。仍要离开吗？"
+          : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
     membershipExit.current = null;
+    systemConfigExit.current = null;
     viewIdentity.current += 1;
     setView(nextView);
     return true;
@@ -243,11 +272,17 @@ export function AdminFeature({
     () => createAdminMembershipApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
+  const systemConfigApi = useMemo(
+    () => createAdminSystemConfigApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
   membershipApiRef.current = membershipApi;
+  systemConfigApiRef.current = systemConfigApi;
 
   const handleLogin = useCallback((nextSession: AdminSession) => {
     sessionGeneration.current += 1;
     membershipExit.current = null;
+    systemConfigExit.current = null;
     setSession(nextSession);
     navigate({ kind: "dashboard" }, { force: true });
   }, [navigate]);
@@ -255,6 +290,7 @@ export function AdminFeature({
   const handleUnauthorized = useCallback(() => {
     sessionGeneration.current += 1;
     membershipExit.current = null;
+    systemConfigExit.current = null;
     clearAdminSession(storage);
     setSession(null);
     navigate({ kind: "dashboard" }, { force: true });
@@ -264,6 +300,7 @@ export function AdminFeature({
     if (!navigate({ kind: "dashboard" })) return;
     sessionGeneration.current += 1;
     membershipExit.current = null;
+    systemConfigExit.current = null;
     clearAdminSession(storage);
     setSession(null);
   }, [navigate, storage]);
@@ -276,6 +313,7 @@ export function AdminFeature({
   const activeViewIdentity = viewIdentity.current;
   const activeSessionGeneration = sessionGeneration.current;
   const activeMembershipApi = membershipApi;
+  const activeSystemConfigApi = systemConfigApi;
   const activeAdministratorId = session?.user.id ?? "";
   const membershipOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
   const membershipViewKey = view.kind === "redemption-codes" ? "redemption/list"
@@ -283,6 +321,9 @@ export function AdminFeature({
       : view.kind === "purchase-packages" ? "packages/list"
         : view.kind === "purchase-package-create" ? "packages/create"
           : view.kind === "purchase-package-edit" ? "packages/edit/" + view.id : "";
+  const systemConfigOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const systemConfigViewKey = view.kind === "system-config" ? "system-config/list"
+    : view.kind === "system-config-edit" ? "system-config/edit/" + view.id : "";
   const handleMembershipExitState = useCallback((snapshot: AdminMembershipExitSnapshot) => {
     if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
       || membershipApiRef.current !== activeMembershipApi || snapshot.ownerScope !== membershipOwnerScope
@@ -308,6 +349,53 @@ export function AdminFeature({
     }
     navigate(nextView);
   }, [activeAdministratorId, activeMembershipApi, activeSessionGeneration, activeViewIdentity, membershipOwnerScope, membershipViewKey, navigate]);
+  const handleSystemConfigExitState = useCallback((snapshot: AdminSystemConfigExitSnapshot) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || systemConfigApiRef.current !== activeSystemConfigApi || snapshot.ownerScope !== systemConfigOwnerScope
+      || snapshot.viewKey !== systemConfigViewKey || snapshot.administratorId !== activeAdministratorId) return;
+    if (snapshot.pending) {
+      systemConfigExit.current = {
+        snapshot,
+        pending: snapshot.pending,
+        viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration,
+        api: activeSystemConfigApi,
+      };
+    } else if (systemConfigExit.current?.viewIdentity === activeViewIdentity
+      && systemConfigExit.current.sessionGeneration === activeSessionGeneration
+      && systemConfigExit.current.api === activeSystemConfigApi) {
+      systemConfigExit.current = null;
+    }
+  }, [activeAdministratorId, activeSessionGeneration, activeSystemConfigApi, activeViewIdentity, systemConfigOwnerScope, systemConfigViewKey]);
+  const systemConfigRecordId = view.kind === "system-config-edit" ? view.id : "";
+  const leaveSystemConfig = useCallback((nextView: AdminView, pending?: PendingAdminSystemConfigExit) => {
+    if (pending && pending.configId === systemConfigRecordId) {
+      const snapshot: AdminSystemConfigExitSnapshot = {
+        ownerScope: systemConfigOwnerScope,
+        viewKey: systemConfigViewKey,
+        administratorId: activeAdministratorId,
+        configId: pending.configId,
+        pending,
+      };
+      systemConfigExit.current = {
+        snapshot,
+        pending,
+        viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration,
+        api: activeSystemConfigApi,
+      };
+    }
+    navigate(nextView);
+  }, [activeAdministratorId, activeSessionGeneration, activeSystemConfigApi, activeViewIdentity, systemConfigOwnerScope, systemConfigRecordId, systemConfigViewKey, navigate]);
+  const handleSystemConfigUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && systemConfigApiRef.current === activeSystemConfigApi) handleUnauthorized();
+  }, [activeSystemConfigApi, activeSessionGeneration, activeViewIdentity, handleUnauthorized]);
+  const handleSystemConfigSaved = useCallback(() => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || systemConfigApiRef.current !== activeSystemConfigApi) return;
+    setSystemConfigListVersion((value) => value + 1);
+  }, [activeSystemConfigApi, activeSessionGeneration, activeViewIdentity]);
   const handleMembershipUnauthorized = useCallback(() => {
     if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
       && membershipApiRef.current === activeMembershipApi) handleUnauthorized();
@@ -335,9 +423,15 @@ export function AdminFeature({
 
   useEffect(() => {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      const pending = membershipExit.current;
-      if (!pending || pending.viewIdentity !== viewIdentity.current
-        || pending.sessionGeneration !== sessionGeneration.current || pending.api !== membershipApiRef.current) return;
+      const membershipPending = membershipExit.current;
+      const systemConfigPending = systemConfigExit.current;
+      const protectsExit = (membershipPending && membershipPending.viewIdentity === viewIdentity.current
+        && membershipPending.sessionGeneration === sessionGeneration.current
+        && membershipPending.api === membershipApiRef.current)
+        || (systemConfigPending && systemConfigPending.viewIdentity === viewIdentity.current
+          && systemConfigPending.sessionGeneration === sessionGeneration.current
+          && systemConfigPending.api === systemConfigApiRef.current);
+      if (!protectsExit) return;
       event.preventDefault();
       event.returnValue = "";
     };
@@ -367,6 +461,14 @@ export function AdminFeature({
             onClick={() => navigate({ kind: "dashboard" })}
           >
             <span aria-hidden="true">◫</span>运营概览
+          </button>
+          <button
+            className={view.kind === "system-config" || view.kind === "system-config-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button" aria-label="系统配置" title="系统配置"
+            aria-current={view.kind === "system-config" || view.kind === "system-config-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "system-config" })}
+          >
+            <span aria-hidden="true">⚙</span>系统配置
           </button>
           <button
             className={view.kind === "system-models" || view.kind === "model-create" || view.kind === "model-edit"
@@ -469,6 +571,22 @@ export function AdminFeature({
         <div className="admin-content">
           {view.kind === "dashboard" ? (
             <AdminDashboard api={api} onUnauthorized={handleUnauthorized} />
+          ) : view.kind === "system-config" || view.kind === "system-config-edit" ? (
+            <AdminSystemConfig
+              key={activeViewIdentity}
+              api={systemConfigApi}
+              mode={view.kind === "system-config" ? "list" : "edit"}
+              {...(view.kind === "system-config-edit" ? { configId: view.id } : {})}
+              ownerScope={systemConfigOwnerScope}
+              viewKey={systemConfigViewKey}
+              administratorId={activeAdministratorId}
+              listVersion={systemConfigListVersion}
+              onAuthenticationError={handleSystemConfigUnauthorized}
+              onEdit={(id) => navigate({ kind: "system-config-edit", id })}
+              onCancel={(pending) => leaveSystemConfig({ kind: "system-config" }, pending)}
+              onSaved={handleSystemConfigSaved}
+              onExitStateChange={handleSystemConfigExitState}
+            />
           ) : view.kind === "system-models" ? (
             <SystemModels
               api={api}

@@ -1075,3 +1075,259 @@ describe("admin membership confirmed exit states", () => {
     expect(await screen.findByRole("heading", { name: "购买套餐" })).toBeInTheDocument();
   });
 });
+
+describe("admin system config integration", () => {
+  it("opens the first real config by encoded ID and keeps a sparse confirmed edit on the page", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const original = {
+      id: "config/primary",
+      muse_token: "synthetic-muse-value",
+      site_title: "Hao AI",
+      site_tagline: "创作工具",
+      storyboard_cost_multiplier: 4,
+      membership_benefits: "权益说明",
+      payments_enabled: false,
+      tutorial_url: "",
+      purchase_qr_code_url: "",
+      purchase_contact_info: "",
+      team_created_limit: 3,
+      team_joined_limit: 3,
+      team_member_limit: 20,
+      invite_code_ttl_hours: 24,
+      chapter_lock_idle_minutes: 15,
+      aistarslab_credit_multiplier: 1.5,
+      frontend_url: "",
+      allowed_origins: "",
+      upload_dir: "",
+      worker_max_concurrency: "0",
+    };
+    let current = { ...original };
+    const configWrites: Array<Record<string, unknown>> = [];
+    const configRequests: Array<{ method: string; path: string; authorization: string | null }> = [];
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const method = init?.method ?? "GET";
+      const path = requestPath(input);
+      if (path === "/api/admin/stats") return jsonResponse(stats());
+      if (path.startsWith("/api/admin/system-config")) {
+        configRequests.push({
+          method,
+          path,
+          authorization: new Headers(init?.headers).get("Authorization"),
+        });
+        if (path === "/api/admin/system-config" && method === "GET") {
+          return jsonResponse({ data: [current], total: 1 });
+        }
+        if (path === "/api/admin/system-config/config%2Fprimary" && method === "GET") {
+          return jsonResponse(current);
+        }
+        if (path === "/api/admin/system-config/config%2Fprimary" && method === "PUT") {
+          const body = JSON.parse(String(init?.body)) as Record<string, unknown>;
+          configWrites.push(body);
+          current = { ...current, ...body };
+          return jsonResponse(current);
+        }
+      }
+      if (path.startsWith("/api/admin/users")) return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected synthetic request: " + method + " " + path);
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "系统配置" }));
+    expect(await screen.findByRole("heading", { name: "系统配置" })).toBeInTheDocument();
+    expect(configRequests.map(({ method, path }) => method + " " + path)).toEqual([
+      "GET /api/admin/system-config",
+      "GET /api/admin/system-config/config%2Fprimary",
+    ]);
+    expect(configRequests.every(({ authorization }) => authorization === "Bearer admin-token")).toBe(true);
+    expect(screen.getByLabelText("Muse 令牌")).toHaveAttribute("type", "password");
+    expect(screen.getByLabelText("Muse 令牌")).toHaveValue("synthetic-muse-value");
+    expect(screen.getByRole("button", { name: "保存配置" })).toBeDisabled();
+    expect(configWrites).toHaveLength(0);
+
+    await user.clear(screen.getByLabelText("网站标题"));
+    await user.type(screen.getByLabelText("网站标题"), "新标题");
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+    expect(await screen.findByText("服务端已确认更新系统配置。"))
+      .toBeInTheDocument();
+    expect(configWrites).toEqual([{ site_title: "新标题" }]);
+    expect(configRequests.map(({ method, path }) => method + " " + path)).toEqual([
+      "GET /api/admin/system-config",
+      "GET /api/admin/system-config/config%2Fprimary",
+      "PUT /api/admin/system-config/config%2Fprimary",
+    ]);
+    expect(screen.getByRole("heading", { name: "系统配置" })).toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
+
+    const beforeUnload = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(beforeUnload)).toBe(true);
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(await screen.findByText("没有符合条件的用户")).toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
+  });
+
+  it("guards dirty drafts across sidebar, brand, logout, and beforeunload, then clears after explicit leave", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const original = {
+      id: "config-1", muse_token: "synthetic-muse-value", site_title: "Original title",
+      site_tagline: "", storyboard_cost_multiplier: 1, membership_benefits: "",
+      payments_enabled: false, tutorial_url: "", purchase_qr_code_url: "",
+      purchase_contact_info: "", team_created_limit: 3, team_joined_limit: 3,
+      team_member_limit: 20, invite_code_ttl_hours: 24, chapter_lock_idle_minutes: 15,
+      aistarslab_credit_multiplier: 1, frontend_url: "", allowed_origins: "",
+      upload_dir: "", worker_max_concurrency: "0",
+    };
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-config" && method === "GET") {
+        return jsonResponse({ data: [original], total: 1 });
+      }
+      if (url.pathname === "/api/admin/system-config/config-1" && method === "GET") return jsonResponse(original);
+      if (url.pathname === "/api/admin/users" && method === "GET") return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected synthetic request: " + method + " " + url.pathname);
+    });
+    const confirm = vi.spyOn(window, "confirm")
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(false)
+      .mockReturnValueOnce(true);
+    const { container } = render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "系统配置" }));
+    await user.clear(await screen.findByLabelText("网站标题"));
+    await user.type(screen.getByLabelText("网站标题"), "Unsaved title");
+
+    const beforeUnload = new Event("beforeunload", { cancelable: true });
+    expect(window.dispatchEvent(beforeUnload)).toBe(false);
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("网站标题")).toHaveValue("Unsaved title");
+
+    const brand = container.querySelector<HTMLAnchorElement>(".admin-workspace-brand");
+    if (!brand) throw new Error("expected synthetic admin brand link");
+    await user.click(brand);
+    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    expect(confirm).toHaveBeenCalledTimes(3);
+    expect(screen.getByLabelText("网站标题")).toHaveValue("Unsaved title");
+    expect(confirm.mock.calls.flat().join(" ")).not.toContain("synthetic-muse-value");
+
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(await screen.findByRole("heading", { name: "用户管理" })).toBeInTheDocument();
+    expect(confirm).toHaveBeenCalledTimes(4);
+    await user.click(brand);
+    expect(await screen.findByRole("heading", { name: "运营概览" })).toBeInTheDocument();
+    expect(confirm).toHaveBeenCalledTimes(4);
+  });
+
+  it("tracks an in-flight save synchronously and removes the exit guard after exact-200 confirmation", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const original = {
+      id: "config-1", muse_token: "synthetic-muse-value", site_title: "Original title",
+      site_tagline: "", storyboard_cost_multiplier: 1, membership_benefits: "",
+      payments_enabled: false, tutorial_url: "", purchase_qr_code_url: "",
+      purchase_contact_info: "", team_created_limit: 3, team_joined_limit: 3,
+      team_member_limit: 20, invite_code_ttl_hours: 24, chapter_lock_idle_minutes: 15,
+      aistarslab_credit_multiplier: 1, frontend_url: "", allowed_origins: "",
+      upload_dir: "", worker_max_concurrency: "0",
+    };
+    let resolveWrite!: (response: Response) => void;
+    let markWriteStarted!: () => void;
+    const started = new Promise<void>((resolve) => { markWriteStarted = resolve; });
+    const writeResponse = new Promise<Response>((resolve) => { resolveWrite = resolve; });
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-config" && method === "GET") {
+        return jsonResponse({ data: [original], total: 1 });
+      }
+      if (url.pathname === "/api/admin/system-config/config-1" && method === "GET") return jsonResponse(original);
+      if (url.pathname === "/api/admin/system-config/config-1" && method === "PUT") {
+        markWriteStarted();
+        return writeResponse;
+      }
+      if (url.pathname === "/api/admin/users" && method === "GET") return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected synthetic request: " + method + " " + url.pathname);
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "系统配置" }));
+    await user.clear(await screen.findByLabelText("网站标题"));
+    await user.type(screen.getByLabelText("网站标题"), "Saved title");
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+    await started;
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByLabelText("网站标题")).toHaveValue("Saved title");
+
+    resolveWrite(jsonResponse({ ...original, site_title: "Saved title" }));
+    expect(await screen.findByText("服务端已确认更新系统配置。"))
+      .toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(await screen.findByRole("heading", { name: "用户管理" })).toBeInTheDocument();
+    expect(confirm).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an unknown system-config write frozen until navigation is explicitly confirmed", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const original = {
+      id: "config-1", muse_token: "synthetic-muse-value", site_title: "Original title",
+      site_tagline: "", storyboard_cost_multiplier: 1, membership_benefits: "",
+      payments_enabled: false, tutorial_url: "", purchase_qr_code_url: "",
+      purchase_contact_info: "", team_created_limit: 3, team_joined_limit: 3,
+      team_member_limit: 20, invite_code_ttl_hours: 24, chapter_lock_idle_minutes: 15,
+      aistarslab_credit_multiplier: 1, frontend_url: "", allowed_origins: "",
+      upload_dir: "", worker_max_concurrency: "0",
+    };
+    let putCount = 0;
+    let detailReads = 0;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-config" && method === "GET") {
+        return jsonResponse({ data: [original], total: 1 });
+      }
+      if (url.pathname === "/api/admin/system-config/config-1" && method === "GET") {
+        detailReads += 1;
+        return jsonResponse(original);
+      }
+      if (url.pathname === "/api/admin/system-config/config-1" && method === "PUT") {
+        putCount += 1;
+        return jsonResponse({ detail: "synthetic unavailable" }, 503);
+      }
+      if (url.pathname === "/api/admin/users" && method === "GET") return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected synthetic request: " + method + " " + url.pathname);
+    });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+
+    await user.click(screen.getByRole("button", { name: "系统配置" }));
+    await user.clear(await screen.findByLabelText("网站标题"));
+    await user.type(screen.getByLabelText("网站标题"), "New intent");
+    await user.click(screen.getByRole("button", { name: "保存配置" }));
+    expect(await screen.findByRole("region", { name: "系统配置写入结果待核对" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("region", { name: "系统配置写入结果待核对" })).toBeInTheDocument();
+    expect(putCount).toBe(1);
+    expect(confirm.mock.calls.flat().join(" ")).not.toContain("synthetic-muse-value");
+
+    await user.click(screen.getByRole("button", { name: "只读核对当前配置" }));
+    expect(await screen.findByText("只读快照已读取；当前值不能归因到刚才的保存请求。"))
+      .toBeInTheDocument();
+    expect(detailReads).toBe(2);
+    expect(putCount).toBe(1);
+    await user.click(screen.getByRole("button", { name: "用户管理" }));
+    expect(await screen.findByRole("heading", { name: "用户管理" })).toBeInTheDocument();
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(putCount).toBe(1);
+  });
+});
