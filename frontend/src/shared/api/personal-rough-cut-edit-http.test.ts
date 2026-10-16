@@ -135,6 +135,20 @@ function createServices(
   return { services, storage };
 }
 
+function createServicesWithIndependentReadTimeout(
+  baseUrl: string,
+  records: RequestRecord[],
+  writeTimeoutMs: number,
+) {
+  const storage = new MemoryStorage();
+  storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
+  const fetcher = recordedFetcher(records);
+  return {
+    writeServices: createApiServices(baseUrl, { storage, fetcher, timeoutMs: writeTimeoutMs }),
+    readServices: createApiServices(baseUrl, { storage, fetcher }),
+  };
+}
+
 function sourceAssetId(frame: unknown): string | null {
   if (typeof frame !== "object" || frame === null || Array.isArray(frame)) {
     return null;
@@ -410,9 +424,14 @@ describe("personal rough-cut save over real HTTP", () => {
     }
 
     const bodyTimeoutFixture = await startFixture({ FIXTURE_ROUGH_CUT_SAVE_MODE: "body-timeout" });
-    const bodyTimeout = createServices(bodyTimeoutFixture.baseUrl, [], { timeoutMs: 40 });
+    const bodyTimeoutRecords: RequestRecord[] = [];
+    const bodyTimeout = createServicesWithIndependentReadTimeout(
+      bodyTimeoutFixture.baseUrl,
+      bodyTimeoutRecords,
+      40,
+    );
     try {
-      await expect(bodyTimeout.services.savePersonalRoughCut!(
+      await expect(bodyTimeout.writeServices.savePersonalRoughCut!(
         chapterId,
         updateFor(6, [
           { asset_id: seriesId + "-chapter-02-shot-b", included: true },
@@ -420,16 +439,17 @@ describe("personal rough-cut save over real HTTP", () => {
         ]),
         new AbortController().signal,
       )).rejects.toMatchObject({ kind: "timeout" });
-      expect((await bodyTimeout.services.getPersonalRoughCut(chapterId, new AbortController().signal)).revision)
+      expect((await bodyTimeout.readServices.getPersonalRoughCut(chapterId, new AbortController().signal)).revision)
         .toBe(7);
     } finally {
       await bodyTimeoutFixture.stop();
     }
 
     const timeoutFixture = await startFixture({ FIXTURE_ROUGH_CUT_SAVE_MODE: "timeout" });
-    const timeout = createServices(timeoutFixture.baseUrl, [], { timeoutMs: 40 });
+    const timeoutRecords: RequestRecord[] = [];
+    const timeout = createServicesWithIndependentReadTimeout(timeoutFixture.baseUrl, timeoutRecords, 40);
     try {
-      await expect(timeout.services.savePersonalRoughCut!(
+      await expect(timeout.writeServices.savePersonalRoughCut!(
         chapterId,
         updateFor(6, [
           { asset_id: seriesId + "-chapter-02-shot-b", included: true },
@@ -437,7 +457,7 @@ describe("personal rough-cut save over real HTTP", () => {
         ]),
         new AbortController().signal,
       )).rejects.toMatchObject({ kind: "timeout" });
-      expect((await timeout.services.getPersonalRoughCut(chapterId, new AbortController().signal)).revision)
+      expect((await timeout.readServices.getPersonalRoughCut(chapterId, new AbortController().signal)).revision)
         .toBe(6);
     } finally {
       await timeoutFixture.stop();
