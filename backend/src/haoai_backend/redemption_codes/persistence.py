@@ -16,8 +16,11 @@ from sqlalchemy import (
     Table,
     Text,
     UniqueConstraint,
+    select,
     update,
 )
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session, declarative_base, relationship
 from sqlalchemy.orm.exc import StaleDataError
 
@@ -26,7 +29,7 @@ from .domain import (
     NewRedemptionCode,
     NewUserCredit,
     RedemptionCode,
-    UserCredit,
+    UserMembership,
 )
 from .ports import RedemptionCodesUnitOfWork
 
@@ -209,8 +212,6 @@ class SqlAlchemyRedemptionCodesUnitOfWork(RedemptionCodesUnitOfWork):
     def __init__(self, session: Session) -> None:
         self._session = session
         self._generated_rows: dict[str, RedemptionCodeRow] = {}
-        self._loaded_codes: dict[str, RedemptionCodeRow] = {}
-        self._credits_by_user_id: dict[str, UserCreditRow] = {}
 
     def code_exists(self, code: str) -> bool:
         return (
@@ -248,7 +249,33 @@ class SqlAlchemyRedemptionCodesUnitOfWork(RedemptionCodesUnitOfWork):
         )
         if row is None:
             return None
-        self._loaded_codes[row.id] = row
+        return _redemption_code(row)
+
+    def claim_code_for_redemption(
+        self,
+        code: str,
+        *,
+        user_id: str,
+    ) -> RedemptionCode | None:
+        result = self._session.execute(
+            update(RedemptionCodeRow)
+            .where(
+                RedemptionCodeRow.code == code,
+                RedemptionCodeRow.is_used.is_(False),
+                RedemptionCodeRow.used_by.is_(None),
+                RedemptionCodeRow.used_at.is_(None),
+            )
+            .values(used_by=user_id)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            return None
+
+        row = self._session.execute(
+            select(RedemptionCodeRow).where(RedemptionCodeRow.code == code)
+        ).scalar_one_or_none()
+        if row is None:
+            raise StaleDataError("claimed redemption code disappeared")
         return _redemption_code(row)
 
     def mark_code_used(
@@ -258,10 +285,19 @@ class SqlAlchemyRedemptionCodesUnitOfWork(RedemptionCodesUnitOfWork):
         user_id: str,
         used_at: datetime,
     ) -> None:
-        row = self._loaded_codes[code_id]
-        row.is_used = True
-        row.used_by = user_id
-        row.used_at = used_at
+        result = self._session.execute(
+            update(RedemptionCodeRow)
+            .where(
+                RedemptionCodeRow.id == code_id,
+                RedemptionCodeRow.is_used.is_(False),
+                RedemptionCodeRow.used_by == user_id,
+                RedemptionCodeRow.used_at.is_(None),
+            )
+            .values(is_used=True, used_at=used_at)
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount != 1:
+            raise StaleDataError("claimed redemption code changed before completion")
 
     def set_membership(
         self,
@@ -282,31 +318,63 @@ class SqlAlchemyRedemptionCodesUnitOfWork(RedemptionCodesUnitOfWork):
         if result.rowcount != 1:
             raise StaleDataError("redemption user changed during membership update")
 
-    def load_user_credit(self, user_id: str) -> UserCredit | None:
-        row = (
-            self._session.query(UserCreditRow)
-            .filter(UserCreditRow.user_id == user_id)
-            .first()
-        )
+    def lock_membership(self, user_id: str) -> UserMembership | None:
+        row = self._session.execute(
+            update(UserRow)
+            .where(UserRow.id == user_id)
+            .values(
+                membership_type=UserRow.membership_type,
+                membership_expires_at=UserRow.membership_expires_at,
+            )
+            .returning(UserRow.membership_type, UserRow.membership_expires_at)
+            .execution_options(synchronize_session=False)
+        ).one_or_none()
         if row is None:
             return None
-        self._credits_by_user_id[user_id] = row
-        return UserCredit(id=row.id, user_id=row.user_id, credits=row.credits)
-
-    def add_user_credit(self, credit: NewUserCredit) -> None:
-        row = UserCreditRow(
-            id=credit.id,
-            user_id=credit.user_id,
-            credits=credit.credits,
+        return UserMembership(
+            membership_type=row.membership_type,
+            membership_expires_at=row.membership_expires_at,
         )
-        self._credits_by_user_id[credit.user_id] = row
-        self._session.add(row)
 
-    def flush(self) -> None:
-        self._session.flush()
+    def increase_user_credit_balance(
+        self,
+        credit: NewUserCredit,
+        amount: int,
+    ) -> int:
+        dialect_name = self._session.get_bind().dialect.name
+        values = {
+            "id": credit.id,
+            "user_id": credit.user_id,
+            "credits": credit.credits,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        if dialect_name == "postgresql":
+            wallet_insert = postgresql_insert(UserCreditRow).values(**values)
+        elif dialect_name == "sqlite":
+            wallet_insert = sqlite_insert(UserCreditRow).values(**values)
+        else:
+            raise RuntimeError(
+                f"redemption wallet upsert is unsupported for {dialect_name!r}"
+            )
 
-    def set_user_credit_balance(self, user_id: str, credits: int) -> None:
-        self._credits_by_user_id[user_id].credits = credits
+        self._session.execute(
+            wallet_insert.on_conflict_do_nothing(index_elements=[UserCreditRow.user_id])
+        )
+        result = self._session.execute(
+            update(UserCreditRow)
+            .where(UserCreditRow.user_id == credit.user_id)
+            .values(
+                credits=UserCreditRow.credits + amount,
+                updated_at=datetime.utcnow(),
+            )
+            .returning(UserCreditRow.credits)
+            .execution_options(synchronize_session=False)
+        )
+        balance_after = result.scalar_one_or_none()
+        if balance_after is None:
+            raise StaleDataError("redemption wallet disappeared during increment")
+        return int(balance_after)
 
     def add_credit_log(self, log: NewCreditLog) -> None:
         self._session.add(
@@ -321,8 +389,12 @@ class SqlAlchemyRedemptionCodesUnitOfWork(RedemptionCodesUnitOfWork):
         )
 
     def user_credit_balance(self, user_id: str) -> int:
-        # Read the same ORM identity after commit so expire_on_commit remains observable.
-        return self._credits_by_user_id[user_id].credits
+        balance = self._session.execute(
+            select(UserCreditRow.credits).where(UserCreditRow.user_id == user_id)
+        ).scalar_one_or_none()
+        if balance is None:
+            raise StaleDataError("committed redemption wallet could not be read")
+        return int(balance)
 
     def commit(self) -> None:
         self._session.commit()

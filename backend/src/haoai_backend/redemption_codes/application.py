@@ -132,12 +132,21 @@ def redeem_redemption_code(
     now = datetime.utcnow if clock is None else clock
 
     def redeem_with(unit_of_work: RedemptionCodesUnitOfWork) -> dict[str, object]:
-        code = unit_of_work.load_code(command.code.strip().upper())
+        normalized_code = command.code.strip().upper()
+        code = unit_of_work.claim_code_for_redemption(
+            normalized_code,
+            user_id=actor.user_id,
+        )
+        claimed = code is not None
+        if code is None:
+            code = unit_of_work.load_code(normalized_code)
         if code is None:
             raise RedemptionCodeNotFound()
 
-        if code.is_used:
+        if not claimed and (code.is_used or code.used_by is not None):
             raise RedemptionCodeAlreadyUsed()
+        if not claimed:
+            raise RuntimeError("unused redemption code could not be claimed")
 
         if code.expires_at and now() > code.expires_at:
             raise RedemptionCodeExpired()
@@ -149,10 +158,17 @@ def redeem_redemption_code(
         )
 
         if code.type == "membership":
+            membership = unit_of_work.lock_membership(actor.user_id)
+            if membership is None:
+                raise RuntimeError("redemption user disappeared before membership update")
+
             current_time = now()
             days = code.value
-            if actor.membership_type == "premium" and actor.membership_expires_at:
-                new_expiry = actor.membership_expires_at + timedelta(days=days)
+            if (
+                membership.membership_type == "premium"
+                and membership.membership_expires_at
+            ):
+                new_expiry = membership.membership_expires_at + timedelta(days=days)
             else:
                 new_expiry = current_time + timedelta(days=days)
 
@@ -171,22 +187,14 @@ def redeem_redemption_code(
 
         if code.type == "credits":
             amount = code.value
-            credit = unit_of_work.load_user_credit(actor.user_id)
-            if credit is None:
-                unit_of_work.add_user_credit(
-                    NewUserCredit(
-                        id=str(uuid4()),
-                        user_id=actor.user_id,
-                        credits=0,
-                    )
-                )
-                unit_of_work.flush()
-                old_balance = 0
-            else:
-                old_balance = credit.credits
-
-            balance_after = old_balance + amount
-            unit_of_work.set_user_credit_balance(actor.user_id, balance_after)
+            balance_after = unit_of_work.increase_user_credit_balance(
+                NewUserCredit(
+                    id=str(uuid4()),
+                    user_id=actor.user_id,
+                    credits=0,
+                ),
+                amount,
+            )
             unit_of_work.add_credit_log(
                 NewCreditLog(
                     id=str(uuid4()),

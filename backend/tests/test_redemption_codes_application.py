@@ -14,7 +14,7 @@ from haoai_backend.redemption_codes.domain import (
     RedemptionCode,
     RedemptionCodesActor,
     RedeemRedemptionCodeCommand,
-    UserCredit,
+    UserMembership,
 )
 from haoai_backend.redemption_codes.errors import (
     RedemptionCodeAlreadyUsed,
@@ -44,11 +44,21 @@ class FalseyCallable:
 
 
 class MemoryUnitOfWork:
-    def __init__(self, *, existing_codes=(), record=None, wallet_balance=None):
+    def __init__(
+        self,
+        *,
+        existing_codes=(),
+        record=None,
+        wallet_balance=None,
+        membership_type="free",
+        membership_expires_at=None,
+    ):
         self.existing_codes = set(existing_codes)
         self.record = record
         self.wallet_exists = wallet_balance is not None
         self.wallet_balance = wallet_balance
+        self.membership_type = membership_type
+        self.membership_expires_at = membership_expires_at
         self.events: list[tuple[Any, ...]] = []
         self.generated: dict[str, NewRedemptionCode] = {}
         self.commit_count = 0
@@ -91,8 +101,48 @@ class MemoryUnitOfWork:
             return None
         return self.record
 
+    def claim_code_for_redemption(
+        self,
+        code: str,
+        *,
+        user_id: str,
+    ) -> RedemptionCode | None:
+        self.events.append(("claim_code", code, user_id))
+        if self.record is None or self.record.code != code or self.record.is_used:
+            return None
+        self.record = RedemptionCode(
+            id=self.record.id,
+            code=self.record.code,
+            type=self.record.type,
+            value=self.record.value,
+            is_used=False,
+            used_by=user_id,
+            used_at=None,
+            created_by=self.record.created_by,
+            expires_at=self.record.expires_at,
+            created_at=self.record.created_at,
+        )
+        return self.record
+
     def mark_code_used(self, code_id: str, *, user_id: str, used_at: datetime) -> None:
         self.events.append(("mark_used", code_id, user_id, used_at))
+        if self.record is not None and self.record.id == code_id:
+            self.record = RedemptionCode(
+                id=self.record.id,
+                code=self.record.code,
+                type=self.record.type,
+                value=self.record.value,
+                is_used=True,
+                used_by=user_id,
+                used_at=used_at,
+                created_by=self.record.created_by,
+                expires_at=self.record.expires_at,
+                created_at=self.record.created_at,
+            )
+
+    def lock_membership(self, user_id: str) -> UserMembership:
+        self.events.append(("lock_membership", user_id))
+        return UserMembership(self.membership_type, self.membership_expires_at)
 
     def set_membership(
         self,
@@ -103,23 +153,13 @@ class MemoryUnitOfWork:
     ) -> None:
         self.events.append(("set_membership", user_id, membership_type, membership_expires_at))
 
-    def load_user_credit(self, user_id: str) -> UserCredit | None:
-        self.events.append(("load_credit", user_id))
+    def increase_user_credit_balance(self, credit: NewUserCredit, amount: int) -> int:
+        self.events.append(("increase_credit", credit.id, credit.user_id, amount))
         if not self.wallet_exists:
-            return None
-        return UserCredit("credit-id", user_id, self.wallet_balance)
-
-    def add_user_credit(self, credit: NewUserCredit) -> None:
-        self.events.append(("add_credit", credit.id, credit.user_id, credit.credits))
-        self.wallet_exists = True
-        self.wallet_balance = credit.credits
-
-    def flush(self) -> None:
-        self.events.append(("flush",))
-
-    def set_user_credit_balance(self, user_id: str, credits: int) -> None:
-        self.events.append(("set_credit_balance", user_id, credits))
-        self.wallet_balance = credits
+            self.wallet_exists = True
+            self.wallet_balance = credit.credits
+        self.wallet_balance += amount
+        return self.wallet_balance
 
     def add_credit_log(self, log: NewCreditLog) -> None:
         self.events.append(("add_credit_log", log))
@@ -258,14 +298,21 @@ def test_generate_invalid_iso_rolls_back_and_non_admin_never_opens_business_uow(
         ("free", NOW + timedelta(days=100), NOW + timedelta(seconds=2, days=5)),
     ],
 )
-def test_membership_uses_actor_snapshot_and_preserves_source_clock_order(
+def test_membership_uses_locked_database_state_and_preserves_source_clock_order(
     membership_type: str,
     old_expiry: datetime | None,
     expected_expiry: datetime,
 ):
-    actor = RedemptionCodesActor("member", False, membership_type, old_expiry)
+    actor = RedemptionCodesActor(
+        "member",
+        False,
+        "premium",
+        NOW + timedelta(days=999),
+    )
     uow = MemoryUnitOfWork(
-        record=make_code(expires_at=NOW + timedelta(days=1))
+        record=make_code(expires_at=NOW + timedelta(days=1)),
+        membership_type=membership_type,
+        membership_expires_at=old_expiry,
     )
     clock = FalseyCallable([NOW, NOW + timedelta(seconds=1), NOW + timedelta(seconds=2)])
 
@@ -279,9 +326,10 @@ def test_membership_uses_actor_snapshot_and_preserves_source_clock_order(
     assert response["type"] == "membership" and response["value"] == 5
     assert response["detail"] == f"会员有效期至：{expected_expiry.strftime('%Y-%m-%d %H:%M')}"
     assert clock.calls == 3
-    assert uow.events[0] == ("load_code", "HAOAI-TEST-0001")
+    assert uow.events[0] == ("claim_code", "HAOAI-TEST-0001", "member")
     assert uow.events[1] == ("mark_used", "code-id", "member", NOW + timedelta(seconds=1))
-    assert uow.events[2] == (
+    assert uow.events[2] == ("lock_membership", "member")
+    assert uow.events[3] == (
         "set_membership",
         "member",
         "premium",
@@ -291,13 +339,12 @@ def test_membership_uses_actor_snapshot_and_preserves_source_clock_order(
 
 
 @pytest.mark.parametrize(
-    ("existing_balance", "expected_balance", "flush_count"),
-    [(13, 20, 0), (None, 7, 1)],
+    ("existing_balance", "expected_balance"),
+    [(13, 20), (None, 7)],
 )
-def test_credit_redemption_flushes_only_new_wallet_and_reads_after_commit(
+def test_credit_redemption_increments_wallet_and_reads_after_commit(
     existing_balance: int | None,
     expected_balance: int,
-    flush_count: int,
 ):
     uow = MemoryUnitOfWork(
         record=make_code(code_type="credits", value=7),
@@ -319,7 +366,6 @@ def test_credit_redemption_flushes_only_new_wallet_and_reads_after_commit(
         "detail": f"当前积分余额：{expected_balance}",
     }
     assert clock.calls == 1
-    assert sum(event[0] == "flush" for event in uow.events) == flush_count
     assert sum(event[0] == "commit" for event in uow.events) == 1
     assert uow.events.index(("commit",)) < uow.events.index(("read_credit_balance", "member"))
     assert len(uow.credit_logs) == 1
@@ -374,6 +420,47 @@ def test_redemption_validation_precedence_and_unknown_type_rollback(
     else:
         assert clock.calls == 1
         assert any(event[0] == "mark_used" for event in uow.events)
+
+
+@pytest.mark.parametrize(
+    ("clock_value", "error_type"),
+    [
+        (NOW, None),
+        (NOW + timedelta(microseconds=1), RedemptionCodeExpired),
+    ],
+)
+def test_redemption_expiry_uses_strict_greater_than_boundary(
+    clock_value: datetime,
+    error_type: type[Exception] | None,
+):
+    uow = MemoryUnitOfWork(
+        record=make_code(
+            code_type="credits",
+            value=4,
+            expires_at=NOW,
+        ),
+        wallet_balance=2,
+    )
+    clock = FalseyCallable([clock_value, NOW + timedelta(seconds=1)])
+
+    if error_type is None:
+        response = application.redeem_redemption_code(
+            lambda: uow,
+            MEMBER,
+            RedeemRedemptionCodeCommand("HAOAI-TEST-0001"),
+            clock=clock,
+        )
+        assert response["type"] == "credits"
+        assert uow.commit_count == 1 and uow.rollback_count == 0
+    else:
+        with pytest.raises(error_type):
+            application.redeem_redemption_code(
+                lambda: uow,
+                MEMBER,
+                RedeemRedemptionCodeCommand("HAOAI-TEST-0001"),
+                clock=clock,
+            )
+        assert uow.commit_count == 0 and uow.rollback_count == 1
 
 
 def test_uncertain_commit_is_not_replayed():

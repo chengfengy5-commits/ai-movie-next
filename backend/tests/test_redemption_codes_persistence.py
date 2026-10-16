@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
 from pathlib import Path
+from threading import Barrier
 
 import pytest
-from sqlalchemy import create_engine, event, insert
+from sqlalchemy import create_engine, event, insert, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -13,6 +15,10 @@ from haoai_backend.redemption_codes.domain import (
     GenerateRedemptionCodesCommand,
     RedemptionCodesActor,
     RedeemRedemptionCodeCommand,
+)
+from haoai_backend.redemption_codes.errors import (
+    RedemptionCodeAlreadyUsed,
+    RedemptionCodeExpired,
 )
 from haoai_backend.redemption_codes.persistence import (
     Base,
@@ -287,10 +293,9 @@ def test_credit_redemption_keeps_identity_and_reads_expired_wallet_after_commit(
             statement for statement in statements
             if statement.lstrip().upper().startswith("SELECT")
         ]
-        assert len(select_statements) == 3
+        assert len(select_statements) == 2
         assert "FROM redemption_codes" in select_statements[0]
         assert "FROM user_credits" in select_statements[1]
-        assert "FROM user_credits" in select_statements[2]
         with Session(engine) as verify:
             credit = verify.query(UserCreditRow).filter_by(user_id="user").one()
             code = verify.query(RedemptionCodeRow).filter_by(code="HAOAI-CREDITS-0001").one()
@@ -355,4 +360,326 @@ def test_missing_wallet_flushes_with_code_before_log_and_keeps_fk_valid(tmp_path
             assert verify.query(CreditLogRow).filter_by(user_id="user").one().balance_after == 6
     finally:
         event.remove(engine, "before_cursor_execute", capture)
+        engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("clock_value", "expired"),
+    [
+        (NOW, False),
+        (NOW + timedelta(microseconds=1), True),
+    ],
+)
+def test_expiry_boundary_keeps_claim_and_financial_changes_in_one_transaction(
+    tmp_path: Path,
+    clock_value: datetime,
+    expired: bool,
+):
+    engine, factory, sessions = build_database(tmp_path / "expiry-claim-rollback.sqlite")
+    try:
+        with engine.begin() as connection:
+            insert_user(connection, "admin", is_superuser=True)
+            insert_user(connection, "user")
+            insert_code(
+                connection,
+                code="HAOAI-EXPIRY-TX-0001",
+                code_type="credits",
+                value=4,
+                expires_at=NOW,
+            )
+            connection.execute(
+                insert(UserCreditRow.__table__).values(
+                    id="credit-user",
+                    user_id="user",
+                    credits=5,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+
+        if expired:
+            with pytest.raises(RedemptionCodeExpired):
+                application.redeem_redemption_code(
+                    factory,
+                    USER,
+                    RedeemRedemptionCodeCommand("HAOAI-EXPIRY-TX-0001"),
+                    clock=lambda: clock_value,
+                )
+        else:
+            result = application.redeem_redemption_code(
+                factory,
+                USER,
+                RedeemRedemptionCodeCommand("HAOAI-EXPIRY-TX-0001"),
+                clock=lambda: clock_value,
+            )
+            assert result["type"] == "credits"
+
+        assert sessions[0].closed
+        with Session(engine) as verify:
+            code = verify.query(RedemptionCodeRow).filter_by(
+                code="HAOAI-EXPIRY-TX-0001"
+            ).one()
+            wallet = verify.query(UserCreditRow).filter_by(user_id="user").one()
+            logs = verify.query(CreditLogRow).filter_by(user_id="user").all()
+            if expired:
+                assert sessions[0].commit_count == 0
+                assert sessions[0].rollback_count == 1
+                assert code.is_used is False and code.used_by is None and code.used_at is None
+                assert wallet.credits == 5 and logs == []
+            else:
+                assert sessions[0].commit_count == 1
+                assert sessions[0].rollback_count == 0
+                assert code.is_used is True and code.used_by == "user"
+                assert wallet.credits == 9
+                assert len(logs) == 1 and logs[0].balance_after == 9
+    finally:
+        engine.dispose()
+
+
+def test_concurrent_redemption_code_is_consumed_once_with_one_credit_grant(
+    tmp_path: Path,
+):
+    engine, factory, _sessions = build_database(tmp_path / "same-code-concurrent.sqlite")
+    barrier = Barrier(2)
+
+    def arrive_once(connection):
+        if connection.info.get("same_code_redemption_barrier"):
+            return
+        connection.info["same_code_redemption_barrier"] = True
+        barrier.wait(timeout=10)
+
+    def before_execute(connection, _cursor, statement, _parameters, _context, _many):
+        normalized = statement.lstrip().upper()
+        if normalized.startswith("UPDATE") and "REDEMPTION_CODES" in normalized:
+            arrive_once(connection)
+
+    def after_execute(connection, _cursor, statement, _parameters, _context, _many):
+        normalized = statement.lstrip().upper()
+        if normalized.startswith("SELECT") and "FROM REDEMPTION_CODES" in normalized:
+            arrive_once(connection)
+
+    listeners_installed = False
+    try:
+        with engine.begin() as connection:
+            insert_user(connection, "admin", is_superuser=True)
+            insert_user(connection, "alice")
+            insert_user(connection, "bob")
+            for user_id in ("alice", "bob"):
+                connection.execute(
+                    insert(UserCreditRow.__table__).values(
+                        id=f"credit-{user_id}",
+                        user_id=user_id,
+                        credits=5,
+                        created_at=NOW,
+                        updated_at=NOW,
+                    )
+                )
+            insert_code(
+                connection,
+                code="HAOAI-SAME-CODE-RACE-0001",
+                code_type="credits",
+                value=10,
+            )
+
+        event.listen(engine, "before_cursor_execute", before_execute)
+        event.listen(engine, "after_cursor_execute", after_execute)
+        listeners_installed = True
+
+        def redeem(user_id: str):
+            try:
+                response = application.redeem_redemption_code(
+                    factory,
+                    RedemptionCodesActor(user_id, False, "free", None),
+                    RedeemRedemptionCodeCommand("HAOAI-SAME-CODE-RACE-0001"),
+                    clock=lambda: NOW,
+                )
+                return ("success", response["type"])
+            except Exception as error:
+                return ("error", type(error).__name__)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(pool.map(redeem, ("alice", "bob")))
+        event.remove(engine, "before_cursor_execute", before_execute)
+        event.remove(engine, "after_cursor_execute", after_execute)
+        listeners_installed = False
+
+        assert outcomes.count(("success", "credits")) == 1
+        assert outcomes.count(("error", RedemptionCodeAlreadyUsed.__name__)) == 1
+        with Session(engine) as verify:
+            code = verify.query(RedemptionCodeRow).filter_by(
+                code="HAOAI-SAME-CODE-RACE-0001"
+            ).one()
+            balances = dict(
+                verify.execute(
+                    select(UserCreditRow.user_id, UserCreditRow.credits)
+                ).all()
+            )
+            logs = verify.query(CreditLogRow).filter_by(type="charge").all()
+            assert code.is_used is True
+            assert code.used_by in {"alice", "bob"}
+            assert sum(balances.values()) == 20
+            assert len(logs) == 1
+            assert logs[0].user_id == code.used_by
+            assert (logs[0].amount, logs[0].balance_after) == (10, 15)
+    finally:
+        if listeners_installed:
+            event.remove(engine, "before_cursor_execute", before_execute)
+            event.remove(engine, "after_cursor_execute", after_execute)
+        engine.dispose()
+
+
+def test_concurrent_credit_redemptions_add_to_the_same_wallet_atomically(
+    tmp_path: Path,
+):
+    engine, factory, _sessions = build_database(tmp_path / "same-wallet-concurrent.sqlite")
+    barrier = Barrier(2)
+
+    def arrive_once(connection):
+        if connection.info.get("same_wallet_redemption_barrier"):
+            return
+        connection.info["same_wallet_redemption_barrier"] = True
+        barrier.wait(timeout=10)
+
+    def before_execute(connection, _cursor, statement, _parameters, _context, _many):
+        normalized = statement.lstrip().upper()
+        if normalized.startswith(("UPDATE", "INSERT", "DELETE")):
+            connection.info["same_wallet_redemption_wrote"] = True
+
+    def after_execute(connection, _cursor, statement, _parameters, _context, _many):
+        normalized = statement.lstrip().upper()
+        if (
+            normalized.startswith("SELECT")
+            and "FROM USER_CREDITS" in normalized
+            and not connection.info.get("same_wallet_redemption_wrote")
+        ):
+            arrive_once(connection)
+
+    listeners_installed = False
+    try:
+        with engine.begin() as connection:
+            insert_user(connection, "admin", is_superuser=True)
+            insert_user(connection, "wallet-user")
+            connection.execute(
+                insert(UserCreditRow.__table__).values(
+                    id="credit-wallet-user",
+                    user_id="wallet-user",
+                    credits=13,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            insert_code(
+                connection,
+                code="HAOAI-WALLET-RACE-A-0001",
+                code_type="credits",
+                value=8,
+            )
+            insert_code(
+                connection,
+                code="HAOAI-WALLET-RACE-B-0001",
+                code_type="credits",
+                value=6,
+            )
+
+        event.listen(engine, "before_cursor_execute", before_execute)
+        event.listen(engine, "after_cursor_execute", after_execute)
+        listeners_installed = True
+
+        def redeem(code: str):
+            return application.redeem_redemption_code(
+                factory,
+                RedemptionCodesActor("wallet-user", False, "free", None),
+                RedeemRedemptionCodeCommand(code),
+                clock=lambda: NOW,
+            )
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            outcomes = list(
+                pool.map(
+                    redeem,
+                    ("HAOAI-WALLET-RACE-A-0001", "HAOAI-WALLET-RACE-B-0001"),
+                )
+            )
+        event.remove(engine, "before_cursor_execute", before_execute)
+        event.remove(engine, "after_cursor_execute", after_execute)
+        listeners_installed = False
+
+        assert [outcome["type"] for outcome in outcomes] == ["credits", "credits"]
+        with Session(engine) as verify:
+            credit = verify.query(UserCreditRow).filter_by(user_id="wallet-user").one()
+            codes = verify.query(RedemptionCodeRow).filter(
+                RedemptionCodeRow.code.in_(
+                    ("HAOAI-WALLET-RACE-A-0001", "HAOAI-WALLET-RACE-B-0001")
+                )
+            ).all()
+            logs = verify.query(CreditLogRow).filter_by(user_id="wallet-user").all()
+            assert credit.credits == 27
+            assert len(codes) == 2 and all(code.is_used for code in codes)
+            assert len(logs) == 2
+            assert sum(log.amount for log in logs) == 14
+            observed = {(log.amount, log.balance_after) for log in logs}
+            assert observed in (
+                {(8, 21), (6, 27)},
+                {(6, 19), (8, 27)},
+            )
+    finally:
+        if listeners_installed:
+            event.remove(engine, "before_cursor_execute", before_execute)
+            event.remove(engine, "after_cursor_execute", after_execute)
+        engine.dispose()
+
+
+def test_old_auth_actor_cannot_overwrite_membership_days_from_prior_redemption(
+    tmp_path: Path,
+):
+    engine, factory, _sessions = build_database(tmp_path / "old-actor-membership.sqlite")
+    initial_expiry = NOW + timedelta(days=30)
+    try:
+        with engine.begin() as connection:
+            insert_user(connection, "admin", is_superuser=True)
+            insert_user(connection, "member")
+            connection.execute(
+                update(UserRow)
+                .where(UserRow.id == "member")
+                .values(
+                    membership_type="premium",
+                    membership_expires_at=initial_expiry,
+                )
+            )
+            insert_code(
+                connection,
+                code="HAOAI-OLD-ACTOR-A-0001",
+                code_type="membership",
+                value=5,
+            )
+            insert_code(
+                connection,
+                code="HAOAI-OLD-ACTOR-B-0001",
+                code_type="membership",
+                value=7,
+            )
+
+        with Session(engine) as auth_reader:
+            row = auth_reader.query(UserRow).filter_by(id="member").one()
+            actor = RedemptionCodesActor(
+                row.id,
+                row.is_superuser,
+                row.membership_type,
+                row.membership_expires_at,
+            )
+
+        for code in ("HAOAI-OLD-ACTOR-A-0001", "HAOAI-OLD-ACTOR-B-0001"):
+            application.redeem_redemption_code(
+                factory,
+                actor,
+                RedeemRedemptionCodeCommand(code),
+                clock=lambda: NOW,
+            )
+
+        with Session(engine) as verify:
+            expiry = verify.query(UserRow.membership_expires_at).filter_by(
+                id="member"
+            ).scalar()
+            assert expiry == initial_expiry + timedelta(days=12)
+    finally:
         engine.dispose()

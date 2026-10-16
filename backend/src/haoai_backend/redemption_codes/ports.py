@@ -11,7 +11,7 @@ from .domain import (
     NewRedemptionCode,
     NewUserCredit,
     RedemptionCode,
-    UserCredit,
+    UserMembership,
 )
 
 
@@ -23,6 +23,13 @@ class RedemptionCodesUnitOfWork(Protocol):
     def refresh_generated_code(self, code_id: str) -> RedemptionCode | None: ...
 
     def load_code(self, code: str) -> RedemptionCode | None: ...
+
+    def claim_code_for_redemption(
+        self,
+        code: str,
+        *,
+        user_id: str,
+    ) -> RedemptionCode | None: ...
 
     def mark_code_used(
         self,
@@ -40,13 +47,13 @@ class RedemptionCodesUnitOfWork(Protocol):
         membership_expires_at: datetime,
     ) -> None: ...
 
-    def load_user_credit(self, user_id: str) -> UserCredit | None: ...
+    def lock_membership(self, user_id: str) -> UserMembership | None: ...
 
-    def add_user_credit(self, credit: NewUserCredit) -> None: ...
-
-    def flush(self) -> None: ...
-
-    def set_user_credit_balance(self, user_id: str, credits: int) -> None: ...
+    def increase_user_credit_balance(
+        self,
+        credit: NewUserCredit,
+        amount: int,
+    ) -> int: ...
 
     def add_credit_log(self, log: NewCreditLog) -> None: ...
 

@@ -62,6 +62,12 @@ class UserCredit:
 
 
 @dataclass(frozen=True, slots=True)
+class UserMembership:
+    membership_type: str
+    membership_expires_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class NewUserCredit:
     id: str
     user_id: str
