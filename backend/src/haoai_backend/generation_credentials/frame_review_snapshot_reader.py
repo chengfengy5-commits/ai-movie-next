@@ -27,6 +27,7 @@ from haoai_backend.generation_core.base_schema import (
     AITaskRow,
     BillingUnitRow,
     ExecutionStepRow,
+    ResultEvidenceRow,
     TaskSubmissionRow,
 )
 from haoai_backend.generation_core.graph_planning import (
@@ -46,6 +47,10 @@ from haoai_backend.generation_credentials.frame_review_snapshot import (
     frame_review_payload_associated_data,
 )
 from haoai_backend.generation_credentials.persistence import prepared_payloads
+from haoai_backend.generation_core.schema import (
+    GenerationResultReceiptRow,
+    LocalContinuationWorkRow,
+)
 
 _OPERATION = "frame.review"
 _GRAPH_VERSION = "frame-review-v1"
@@ -155,6 +160,20 @@ class PersistedFrameReviewExecutionBinding:
 
 
 @dataclass(frozen=True, slots=True)
+class _FrameReviewResultAckProof:
+    owner_id: str
+    task_id: str
+    unit_id: str
+    step_id: str
+    parent_submission_id: str
+    external_submission_id: str
+    result_ref: str
+    evidence_id: str
+    work_id: str
+    content_digest: str
+
+
+@dataclass(frozen=True, slots=True)
 class VerifiedFrameReviewExecutionInput:
     """Authenticated frozen review data; it contains no Provider credential."""
 
@@ -188,6 +207,48 @@ def read_original_frame_review_execution_input(
     claim capability and grants no authority to call a Provider or apply output.
     """
 
+    return _read_authenticated_frame_review_execution_input(
+        session,
+        binding,
+        crypto=crypto,
+        proof_authority=proof_authority,
+        allow_nonzero_task_cost=False,
+    )
+
+
+def _read_frame_review_execution_input_after_result_ack(
+    session: Session,
+    binding: PersistedFrameReviewExecutionBinding,
+    result_proof: _FrameReviewResultAckProof,
+    *,
+    crypto: CredentialCrypto,
+    proof_authority: HmacProofAuthority,
+) -> VerifiedFrameReviewExecutionInput | None:
+    """Reopen frozen input after the result adapter authenticated its staged proof."""
+
+    if (
+        type(result_proof) is not _FrameReviewResultAckProof
+        or not _result_ack_proof_matches_binding(result_proof, binding)
+        or not _persisted_result_ack_proof_matches(session, result_proof)
+    ):
+        return None
+    return _read_authenticated_frame_review_execution_input(
+        session,
+        binding,
+        crypto=crypto,
+        proof_authority=proof_authority,
+        allow_nonzero_task_cost=True,
+    )
+
+
+def _read_authenticated_frame_review_execution_input(
+    session: Session,
+    binding: PersistedFrameReviewExecutionBinding,
+    *,
+    crypto: CredentialCrypto,
+    proof_authority: HmacProofAuthority,
+    allow_nonzero_task_cost: bool,
+) -> VerifiedFrameReviewExecutionInput | None:
     if (
         not isinstance(session, Session)
         or type(binding) is not PersistedFrameReviewExecutionBinding
@@ -199,7 +260,11 @@ def read_original_frame_review_execution_input(
         return None
     try:
         with session.no_autoflush:
-            graph = _read_persisted_graph(session, binding)
+            graph = _read_persisted_graph(
+                session,
+                binding,
+                require_zero_cost=not allow_nonzero_task_cost,
+            )
             if graph is None:
                 return None
             task, unit, step, submission, request_data = graph
@@ -389,7 +454,95 @@ def _valid_binding(binding: PersistedFrameReviewExecutionBinding) -> bool:
     )
 
 
-def _read_persisted_graph(session: Session, binding: PersistedFrameReviewExecutionBinding):
+def _result_ack_proof_matches_binding(
+    proof: _FrameReviewResultAckProof,
+    binding: PersistedFrameReviewExecutionBinding,
+) -> bool:
+    return all(
+        (
+            type(binding) is PersistedFrameReviewExecutionBinding,
+            proof.owner_id == binding.owner_id,
+            proof.task_id == binding.task_id,
+            proof.unit_id == binding.unit_id,
+            proof.step_id == binding.step_id,
+            proof.parent_submission_id == binding.submission_id,
+            all(
+                isinstance(value, str) and bool(value)
+                for value in (
+                    proof.external_submission_id,
+                    proof.result_ref,
+                    proof.evidence_id,
+                    proof.work_id,
+                )
+            ),
+            _is_digest(proof.content_digest),
+        )
+    )
+
+
+def _persisted_result_ack_proof_matches(
+    session: Session, proof: _FrameReviewResultAckProof
+) -> bool:
+    if not isinstance(session, Session):
+        return False
+    try:
+        with session.no_autoflush:
+            receipt = session.execute(
+                select(GenerationResultReceiptRow.__table__)
+                .where(
+                    GenerationResultReceiptRow.__table__.c.result_ref == proof.result_ref,
+                    GenerationResultReceiptRow.__table__.c.owner_id == proof.owner_id,
+                    GenerationResultReceiptRow.__table__.c.task_id == proof.task_id,
+                    GenerationResultReceiptRow.__table__.c.unit_id == proof.unit_id,
+                    GenerationResultReceiptRow.__table__.c.operation == _OPERATION,
+                    GenerationResultReceiptRow.__table__.c.step_id == proof.step_id,
+                    GenerationResultReceiptRow.__table__.c.submission_id
+                    == proof.external_submission_id,
+                    GenerationResultReceiptRow.__table__.c.evidence_id == proof.evidence_id,
+                    GenerationResultReceiptRow.__table__.c.content_digest
+                    == proof.content_digest,
+                )
+                .with_for_update()
+            ).mappings().one_or_none()
+            evidence = session.execute(
+                select(ResultEvidenceRow.__table__)
+                .where(
+                    ResultEvidenceRow.id == proof.evidence_id,
+                    ResultEvidenceRow.step_id == proof.step_id,
+                    ResultEvidenceRow.submission_id == proof.external_submission_id,
+                    ResultEvidenceRow.source == "provider",
+                    ResultEvidenceRow.evidence_kind == "provider_text",
+                    ResultEvidenceRow.payload_digest == proof.content_digest,
+                    ResultEvidenceRow.result_digest == proof.content_digest,
+                    ResultEvidenceRow.validity == "valid",
+                )
+                .with_for_update()
+            ).mappings().one_or_none()
+            work = session.execute(
+                select(LocalContinuationWorkRow.__table__)
+                .where(
+                    LocalContinuationWorkRow.__table__.c.work_id == proof.work_id,
+                    LocalContinuationWorkRow.__table__.c.owner_id == proof.owner_id,
+                    LocalContinuationWorkRow.__table__.c.task_id == proof.task_id,
+                    LocalContinuationWorkRow.__table__.c.unit_id == proof.unit_id,
+                    LocalContinuationWorkRow.__table__.c.operation == _OPERATION,
+                    LocalContinuationWorkRow.__table__.c.result_ref == proof.result_ref,
+                    LocalContinuationWorkRow.__table__.c.content_digest
+                    == proof.content_digest,
+                )
+                .with_for_update()
+            ).mappings().one_or_none()
+        return receipt is not None and evidence is not None and work is not None
+    except Exception:
+        return False
+
+
+def _read_persisted_graph(
+    session: Session,
+    binding: PersistedFrameReviewExecutionBinding,
+    *,
+    require_zero_cost: bool = True,
+):
     task = session.execute(
         select(AITaskRow.__table__).where(AITaskRow.id == binding.task_id)
     ).mappings().one_or_none()
@@ -430,7 +583,6 @@ def _read_persisted_graph(session: Session, binding: PersistedFrameReviewExecuti
             task["user_id"] == binding.owner_id,
             task["type"] == _TASK_TYPE,
             task["model_name"] == binding.task_model_name,
-            task["credit_cost"] == 0,
             (task["message_id"] or None) == binding.task_message_id,
             unit["id"] == binding.unit_id,
             unit["task_id"] == binding.task_id,
@@ -486,7 +638,7 @@ def _read_persisted_graph(session: Session, binding: PersistedFrameReviewExecuti
             request_data.get("cost_per_call") == binding.quoted_amount,
         )
     )
-    if not valid:
+    if not valid or (require_zero_cost and task["credit_cost"] != 0):
         return None
     return dict(task), dict(unit), dict(step), dict(submission), dict(request_data)
 
