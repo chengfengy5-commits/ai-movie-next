@@ -1103,4 +1103,32 @@ describe("SeriesPage list behavior", () => {
     expect(screen.getByRole("dialog", { name: "导入剧集或章节" })).toBeInTheDocument();
   });
 
+  it("reloads the hidden team directory after a confirmed management revision and clears a removed selection", async () => {
+    const user = userEvent.setup();
+    const listMyTeams = vi.fn()
+      .mockResolvedValueOnce([teamAlpha, teamBeta])
+      .mockResolvedValueOnce([teamBeta]);
+    const rows = [...manyTeamSeries(1, "team-alpha"), ...manyTeamSeries(1, "team-beta")];
+    const services = servicesWithSeries(rows, false, listMyTeams);
+    const props = {
+      active: true,
+      services,
+      userId: currentUserId,
+      onUnauthorized: vi.fn(),
+      onViewChapters: () => undefined,
+      onViewAssets: () => undefined,
+    };
+    const view = render(<SeriesPage {...props} teamDirectoryRevision={0} />);
+    await screen.findAllByRole("article");
+    await user.click(screen.getByRole("button", { name: "团队剧集" }));
+    await screen.findByRole("option", { name: "共享工作室" });
+    await user.selectOptions(screen.getByLabelText("筛选团队"), teamAlpha.id);
+    expect(screen.getByLabelText("筛选团队")).toHaveValue(teamAlpha.id);
+
+    view.rerender(<SeriesPage {...props} teamDirectoryRevision={1} />);
+    await waitFor(() => expect(listMyTeams).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(screen.getByLabelText("筛选团队")).toHaveValue(""));
+    expect(screen.getByRole("status")).toHaveTextContent("团队名单已变化");
+  });
+
 });

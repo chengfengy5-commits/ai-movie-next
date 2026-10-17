@@ -5189,4 +5189,203 @@ describe("read-only workspace", () => {
     expect(await screen.findAllByRole("article")).toHaveLength(20);
     expect(window.localStorage.getItem("muse_series_list")).toBe("this is not valid JSON");
   });
+
+  it("routes into team management and preserves its draft when a shared-sidebar exit is cancelled", async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem(API_TOKEN_KEY, "synthetic-team-session");
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const createdTeam = {
+      id: "team-created-through-api",
+      name: "真实API团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-05T10:00:00",
+    };
+    let teamCreated = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/teams/my" && init?.method === "GET") {
+        return jsonResponse(teamCreated ? [{ ...createdTeam, member_count: 1, my_role: "owner" }] : []);
+      }
+      if (url.pathname === "/api/teams" && init?.method === "POST") {
+        teamCreated = true;
+        return jsonResponse(createdTeam, 201);
+      }
+      if (url.pathname === `/api/teams/${createdTeam.id}` && init?.method === "GET") {
+        return jsonResponse({
+          ...createdTeam,
+          members: [{
+            user_id: "fixture-user",
+            username: "演示创作者",
+            avatar_url: null,
+            role: "owner",
+            permissions: [],
+            joined_at: "2026-10-05T10:00:00",
+          }],
+          my_role: "owner",
+          my_permissions: [],
+        });
+      }
+      throw new Error(`Unexpected team API request: ${init?.method ?? "GET"} ${url.pathname}`);
+    });
+    const base = createDemoServices(window.localStorage);
+    await base.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const apiServices = createApiServices(apiBaseUrl, {
+      storage: window.localStorage,
+      fetcher,
+    });
+    if (apiServices.teamManagement === undefined) {
+      throw new Error("API services did not expose the team management adapter.");
+    }
+    const services: WorkspaceServices = {
+      ...base,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      teamManagement: apiServices.teamManagement,
+    };
+    renderWorkspace(services);
+    await screen.findAllByRole("article");
+    const nav = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(nav).getByRole("button", { name: "我的团队" }));
+    await screen.findByRole("heading", { name: "团队管理" });
+    await screen.findByText("当前账号还没有加入团队。");
+    expect(fetcher).toHaveBeenCalled();
+    const nameInput = screen.getByLabelText("团队名称");
+    await user.type(nameInput, "保留这份草稿");
+    const blockedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(blockedUnload);
+    expect(blockedUnload.defaultPrevented).toBe(true);
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(within(nav).getByRole("button", { name: "我的任务" }));
+    expect(screen.getByRole("heading", { name: "团队管理" })).toBeInTheDocument();
+    expect(screen.getByLabelText("团队名称")).toHaveValue("保留这份草稿");
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await user.click(within(nav).getByRole("button", { name: "我的任务" }));
+    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+    const allowedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(allowedUnload);
+    expect(allowedUnload.defaultPrevented).toBe(false);
+
+    await user.click(within(nav).getByRole("button", { name: "我的团队" }));
+    await screen.findByText("当前账号还没有加入团队。");
+    await user.type(screen.getByLabelText("团队名称"), " 真实API团队 ");
+    await user.click(screen.getByRole("button", { name: "创建团队" }));
+    expect(await screen.findByRole("heading", { name: "真实API团队" })).toBeInTheDocument();
+    expect(fetcher.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual(
+      expect.arrayContaining([
+        "/api/teams/my",
+        "/api/teams",
+        `/api/teams/${createdTeam.id}`,
+      ]),
+    );
+    const createRequest = fetcher.mock.calls.find(([input, init]) =>
+      new URL(String(input)).pathname === "/api/teams" && init?.method === "POST",
+    );
+    expect(createRequest?.[1]?.method).toBe("POST");
+    expect(new Headers(createRequest?.[1]?.headers).get("authorization")).toBe("Bearer synthetic-team-session");
+    expect(JSON.parse(String(createRequest?.[1]?.body))).toEqual({ name: " 真实API团队 " });
+  });
+
+  it("ignores a late team-invite 401 after a view switch but logs out for the current invite view", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const team = {
+      id: "host-team",
+      name: "宿主团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-05T10:00:00",
+    };
+    const teamDetail = {
+      ...team,
+      members: [
+        {
+          user_id: "fixture-user",
+          username: "演示创作者",
+          avatar_url: null,
+          role: "owner",
+          permissions: [],
+          joined_at: "2026-10-05T10:00:00",
+        },
+        {
+          user_id: "member-1",
+          username: "合成成员",
+          avatar_url: null,
+          role: "member",
+          permissions: [],
+          joined_at: "2026-10-05T10:00:00",
+        },
+      ],
+      my_role: "owner",
+      my_permissions: [],
+    };
+    const firstInviteResponse = deferred<Response>();
+    let inviteReadCount = 0;
+    const inviteSignals: AbortSignal[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/teams/my" && init?.method === "GET") {
+        return jsonResponse([{ ...team, member_count: 2, my_role: "owner" }]);
+      }
+      if (url.pathname === `/api/teams/${team.id}` && init?.method === "GET") {
+        return jsonResponse(teamDetail);
+      }
+      if (url.pathname === `/api/teams/${team.id}/invites` && init?.method === "GET") {
+        inviteReadCount += 1;
+        if (inviteReadCount === 1) {
+          inviteSignals.push(init.signal as AbortSignal);
+          return firstInviteResponse.promise;
+        }
+        return jsonResponse({ detail: "合成401" }, 401);
+      }
+      throw new Error(`Unexpected team API request: ${init?.method ?? "GET"} ${url.pathname}`);
+    });
+    const base = createDemoServices(window.localStorage);
+    await base.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    window.localStorage.setItem(API_TOKEN_KEY, "synthetic-host-session");
+    const apiServices = createApiServices(apiBaseUrl, {
+      storage: window.localStorage,
+      fetcher,
+    });
+    const services: WorkspaceServices = {
+      ...base,
+      ...apiServices,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: base.listSeries,
+      listMyTeams: base.listMyTeams,
+      listMyTasks: base.listMyTasks,
+    };
+    renderWorkspace(services);
+    await screen.findAllByRole("article");
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    await user.click(await screen.findByRole("button", { name: /宿主团队/ }));
+    await screen.findByRole("heading", { name: "宿主团队" });
+    await user.click(screen.getByRole("tab", { name: "邀请码" }));
+    await user.click(screen.getByRole("button", { name: "读取邀请码" }));
+    await waitFor(() => expect(inviteReadCount).toBe(1));
+
+    await user.click(screen.getByRole("tab", { name: "成员与权限" }));
+    await user.selectOptions(screen.getByLabelText("角色"), "admin");
+    const dirtyUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(dirtyUnload);
+    expect(dirtyUnload.defaultPrevented).toBe(true);
+    expect(inviteSignals[0]?.aborted).toBe(true);
+
+    await act(async () => {
+      firstInviteResponse.resolve(jsonResponse({ detail: "old session" }, 401));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByRole("heading", { name: "团队管理" })).toBeInTheDocument();
+    expect(screen.getByLabelText("角色")).toHaveValue("admin");
+    expect(window.localStorage.getItem(API_TOKEN_KEY)).toBe("synthetic-host-session");
+
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await user.click(screen.getByRole("tab", { name: "邀请码" }));
+    await user.click(screen.getByRole("button", { name: "读取邀请码" }));
+    expect(await screen.findByRole("button", { name: "登录工作台" })).toBeInTheDocument();
+    expect(window.localStorage.getItem(API_TOKEN_KEY)).toBeNull();
+    expect(inviteReadCount).toBe(2);
+  });
 });

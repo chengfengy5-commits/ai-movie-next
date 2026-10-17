@@ -222,3 +222,13 @@ U11.2 的最新证据来自 9df：MEMBERSHIP97-I01 已由 97-02 finding 闭合�
 生成原规范另有 5 种 source worker type；当前默认 factory 只有 image-single 实际登记 executor，其他四类只有准入/策略/元数据不等于可执行。BATCH/优化/视频/提取等完整 consumer 和原始 A01–A39 矩阵仍待完成。image.single 的真实 ASGI auth→fake Provider 500→reconciling→原 deadline 后 failed/refund 路径已由本地合成 SQLite/fake 用例覆盖；非空 unknown 前后保留原 first/deadline、及时成功 retained、BYOK zero 不建 wallet、唯一退款后合法消费的 replay、commit-ACK/rollback 和 cooperative shutdown 也有合成用例。这不是浏览器或真实 Provider 证据。PG owned 合成收据 E179/E181（cases-177）与 E185（cases-183）在同一 916 项 1e07 源清单上通过各自选定范围，覆盖具体到期锁/双消费者、退款回滚与 ACK 确认及 shutdown gate。E181 F 是两个不同 worker PID 读取同一持久 PG 图，不代表 PG 或完整服务重启、任意 crash；受控 SQL UTC 时钟不是墙钟两小时等待。P6 cancel HTTP/control、poll、可验证原输出恢复及其余四类 worker 仍待完成。
 
 全部 backend 与 12 类 React 工作流、跨用户/权限/故障恢复及适用 owned 验收完成后，最后才做后端语言评估。真实数据库写入、资金操作、Provider/付费调用、SMTP 真实发送、R2 账号/存储及生产部署仍是各自独立授权的验收层；本清单的局部源码、测试、HTTP/SQL 或浏览器证据均不扩大这些授权。
+
+## 团队管理与邀请开发批交接（2026-10-17）
+
+隔离分支 `codex/team-management-294` 已实现并接入团队管理、成员角色与六项权限、邀请生成/读取/撤销、加入/离开等 13 个方法，包含 Workspace 导航、同步草稿保护和 SeriesPage 团队目录失效通知。团队剧集协作 7 方法、reporting 5 方法及其页面仍待后续。本批尚未合入 main，因此前文按主分支统计的 27 行开发、24 行接线、51 行验证/接受义务保持原口径，不提前扣减。
+
+源码复核305发现同团队切换面板后旧邀请码读取可迟到登出并丢弃新草稿，以及共名按钮样式缺少局部作用域。修复306先取得4项真实 RED，再在修复后取得4项 GREEN；独立复核308确认两项关闭。相关团队/适配器/SeriesPage 定向套件为56项通过，Workspace真实适配器与假fetch宿主回归为2项通过、75项按名称过滤；TypeScript检查通过。上述宿主证据属于假传输测试，不代表真实后端HTTP、JWT或SQL验收。
+
+Root完整前端检查309固定271项输入，TypeScript通过，Vitest为1267通过、162失败：154项对应本地HTTP夹具启动被拒绝（listen EPERM），另8项超时。随后310仅修正本地监听执行权限，使用相同源码、原项目配置和默认5000ms测试超时；该次Vitest达到420秒进程上限后被终止，没有完整汇总，不能记作全量通过。旧界面超时根因仍未证实。独立生产构建313实际exit 0；各次检查源码前后均一致。310即时进程组检查为未清空，312后续实测该组已消失，无需发送清理信号；自有依赖链接目录、构建目录和临时目录已移除。
+
+本批以独立分支开发检查点保存，当前main基线仍为 `bedffc03f94adb8368dfd6bdd38c99eac9e53eff`。完整前端回归、这13个管理/邀请接口的真实后端HTTP与owned SQL、多账号权限/会员/JoinQuota，以及桌面和移动浏览器验收均待完成；尚未部署。按用户要求，保存本批提交并推送后暂停整体开发，后续恢复时从这些待验收事项接续。

@@ -19,6 +19,7 @@ interface SeriesPageProps {
   onViewChapters(series: Series): void;
   onViewAssets(series: Series): void;
   isSuperuser?: boolean;
+  teamDirectoryRevision?: number;
   onImported?(result: { seriesId: string; name: string; chapterIds: string[]; kind: "json" | "markdown" }): void;
 }
 
@@ -122,6 +123,7 @@ export function SeriesPage({
   onViewChapters,
   onViewAssets,
   isSuperuser = false,
+  teamDirectoryRevision = 0,
   onImported,
 }: SeriesPageProps) {
   const [series, setSeries] = useState<Awaited<ReturnType<WorkspaceServices["listSeries"]>>>([]);
@@ -140,6 +142,7 @@ export function SeriesPage({
   const [teamDirectory, setTeamDirectory] = useState<TeamDirectoryState>(() =>
     emptyTeamDirectory(userId, services),
   );
+  const teamDirectoryRevisionRef = useRef(teamDirectoryRevision);
   const [editor, setEditor] = useState<{ mode: "create" | "edit"; series?: Series } | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Series | null>(null);
   const [mutationNotice, setMutationNotice] = useState<string | null>(null);
@@ -283,6 +286,20 @@ export function SeriesPage({
       setMutationNotice(null);
     }
   }, [active, services, userId]);
+
+  useLayoutEffect(() => {
+    if (teamDirectoryRevisionRef.current === teamDirectoryRevision) {
+      return;
+    }
+    teamDirectoryRevisionRef.current = teamDirectoryRevision;
+    cancelTeamRequest();
+    setTeamDirectory((previous) => {
+      if (previous.userId !== userId || previous.services !== services) {
+        return emptyTeamDirectory(userId, services);
+      }
+      return { ...previous, status: "idle", error: null };
+    });
+  }, [cancelTeamRequest, services, teamDirectoryRevision, userId]);
 
   useLayoutEffect(() => {
     if (!directoryMatchesScope) {
