@@ -716,4 +716,3 @@ def _aware_utc(value: datetime) -> datetime:
 
 def _database_datetime(value: datetime) -> datetime:
     return _aware_utc(value).replace(tzinfo=None)
-

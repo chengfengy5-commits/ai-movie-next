@@ -1085,6 +1085,3 @@ def _as_utc(value: datetime) -> datetime:
 
 def _db_time(value: datetime) -> datetime:
     return _as_utc(value).replace(tzinfo=None)
-
-
-

@@ -419,4 +419,3 @@ def _running_loop_exists() -> bool:
     except RuntimeError:
         return False
     return True
-
