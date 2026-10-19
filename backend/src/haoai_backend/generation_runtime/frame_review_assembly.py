@@ -18,6 +18,9 @@ from haoai_backend.generation_core.frame_review_continuation import (
 from haoai_backend.generation_core.frame_review_continuation_claims import (
     SqlAlchemyFrameReviewContinuationClaims,
 )
+from haoai_backend.generation_core.frame_review_recovery import (
+    SqlAlchemyFrameReviewRecovery,
+)
 from haoai_backend.generation_credentials.application import RegistryCapabilities
 from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 from haoai_backend.generation_contracts.types import ClaimAuthority, ContinuationClaimAuthority
@@ -94,12 +97,23 @@ def build_frame_review_worker_runtime(
     if not _review_registry_ready(capabilities):
         return build_runtime(runtime, ())
 
+    recovery: SqlAlchemyFrameReviewRecovery | None = None
+
+    def get_recovery() -> SqlAlchemyFrameReviewRecovery:
+        nonlocal recovery
+        if recovery is None:
+            recovery = _build_review_recovery(runtime, capabilities)
+        return recovery
+
     factory = RegisteredExecutorFactory(
         task_type="ai-review",
         execution_port_factory=lambda: _build_review_execution_port(
             runtime, capabilities
         ),
-        executor_factory=lambda: FrameReviewExecutor(runtime, capabilities),
+        executor_factory=lambda: FrameReviewExecutor(
+            runtime, capabilities, get_recovery()
+        ),
+        recovery_factory=get_recovery,
     )
     return build_runtime(runtime, (factory,))
 
@@ -134,6 +148,16 @@ def _build_review_execution_port(runtime, capabilities) -> _FrameReviewExecution
         continuations,
     )
     return _FrameReviewExecutionPort(generation, continuations, consumer)
+
+
+def _build_review_recovery(runtime, capabilities) -> SqlAlchemyFrameReviewRecovery:
+    return SqlAlchemyFrameReviewRecovery(
+        session_factory=runtime.session_factory,
+        db_clock=runtime.db_clock,
+        id_factory=runtime.id_factory,
+        crypto=capabilities.crypto,
+        proof_authority=capabilities.proof_authority,
+    )
 
 
 __all__ = (

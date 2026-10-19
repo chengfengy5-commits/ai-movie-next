@@ -68,6 +68,7 @@ class SqlAlchemyFrameReviewContinuationClaims:
     id_factory: IdFactory
     lease_seconds: int = _DEFAULT_LEASE_SECONDS
     _signals: dict[str, Event] = field(default_factory=dict, init=False, repr=False)
+    _release_failures: dict[str, int] = field(default_factory=dict, init=False, repr=False)
     _signals_lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
     def __post_init__(self) -> None:
@@ -110,6 +111,7 @@ class SqlAlchemyFrameReviewContinuationClaims:
                 if authority is not None:
                     with self._signals_lock:
                         self._signals[token] = signal
+                        self._release_failures.pop(token, None)
                     return authority
                 cursor = (candidate[3], candidate[1], candidate[2])
 
@@ -164,69 +166,112 @@ class SqlAlchemyFrameReviewContinuationClaims:
                         require_phase_version=False,
                         require_lease_until=False,
                     )
-                    if graph is None or not _claim_identity_matches(graph["task"], claim):
-                        return False
-                    task = graph["task"]
-                    work = graph["work"]
-                    status = task["status"]
-                    if not _release_transition_is_authorized(graph, claim):
-                        return False
-                    phase = work["phase"]
-                    if phase not in _TERMINAL_PHASES:
-                        status = "queued"
-                    elif phase == "done":
-                        status = "completed"
-                    else:
-                        status = "failed"
-                    now = self._server_now()
-                    updated_at = _db_time(now)
-                    table = AITaskRow.__table__
-                    changed = session.execute(
-                        update(table)
-                        .where(
-                            table.c.id == claim.owner_scope.task_id,
-                            table.c.user_id == claim.owner_scope.user_id,
-                            table.c.status == task["status"],
-                            table.c.claimed_by == claim.worker_instance,
-                            table.c.claim_token == claim.token,
-                            table.c.execution_generation == claim.execution_generation,
-                            table.c.lease_until == task["lease_until"],
-                            table.c.user_cancelled_at == task["user_cancelled_at"],
-                        )
-                        .values(
-                            status=status,
-                            claimed_by=None,
-                            claim_token=None,
-                            lease_until=None,
-                            updated_at=updated_at,
-                        )
-                    )
-                    released = changed.rowcount == 1
-                    if released:
-                        expected_release.append(
-                            _ReleaseExpectation(
-                                status=status,
-                                updated_at=updated_at,
-                                user_cancelled_at=task["user_cancelled_at"],
-                                work_phase=work["phase"],
-                                work_phase_version=work["phase_version"],
-                                work_last_execution_generation=work[
-                                    "last_execution_generation"
-                                ],
-                                work_application_ref=work.get("application_ref"),
-                                work_fee_decision_ref=work.get("fee_decision_ref"),
-                                work_terminal_reason=work.get("terminal_reason"),
+                    if graph is not None and _claim_identity_matches(graph["task"], claim):
+                        task = graph["task"]
+                        work = graph["work"]
+                        status = task["status"]
+                        if _release_transition_is_authorized(graph, claim):
+                            phase = work["phase"]
+                            if phase not in _TERMINAL_PHASES:
+                                status = "queued"
+                            elif phase == "done":
+                                status = "completed"
+                            else:
+                                status = "failed"
+                            now = self._server_now()
+                            updated_at = _db_time(now)
+                            table = AITaskRow.__table__
+                            changed = session.execute(
+                                update(table)
+                                .where(
+                                    table.c.id == claim.owner_scope.task_id,
+                                    table.c.user_id == claim.owner_scope.user_id,
+                                    table.c.status == task["status"],
+                                    table.c.claimed_by == claim.worker_instance,
+                                    table.c.claim_token == claim.token,
+                                    table.c.execution_generation == claim.execution_generation,
+                                    table.c.lease_until == task["lease_until"],
+                                    table.c.user_cancelled_at == task["user_cancelled_at"],
+                                )
+                                .values(
+                                    status=status,
+                                    claimed_by=None,
+                                    claim_token=None,
+                                    lease_until=None,
+                                    updated_at=updated_at,
+                                )
                             )
-                        )
+                            released = changed.rowcount == 1
+                            if released:
+                                expected_release.append(
+                                    _ReleaseExpectation(
+                                        status=status,
+                                        updated_at=updated_at,
+                                        user_cancelled_at=task["user_cancelled_at"],
+                                        work_phase=work["phase"],
+                                        work_phase_version=work["phase_version"],
+                                        work_last_execution_generation=work[
+                                            "last_execution_generation"
+                                        ],
+                                        work_application_ref=work.get("application_ref"),
+                                        work_fee_decision_ref=work.get("fee_decision_ref"),
+                                        work_terminal_reason=work.get("terminal_reason"),
+                                    )
+                                )
         except Exception:
             released = self._confirm_release(
                 claim, expected_release[0] if expected_release else None
             )
-        finally:
+
+        if not released:
+            released = self._confirm_release(
+                claim, expected_release[0] if expected_release else None
+            )
+        if released:
             signal.set()
+            self._forget_signal(claim, signal)
+            return True
+
+        if self._claim_is_still_current(claim):
             with self._signals_lock:
-                self._signals.pop(claim.token, None)
+                if (
+                    self._signals.get(claim.token) is signal
+                    and self._release_failures.get(claim.token, 0) == 0
+                ):
+                    self._release_failures[claim.token] = 1
+                    signal.set()
+                    return False
+        signal.set()
+        self._forget_signal(claim, signal)
         return released
+
+    def _claim_is_still_current(self, claim: ContinuationClaimAuthority) -> bool:
+        """Retain only a retryable signal for this exact still-fenced task."""
+        task = AITaskRow.__table__
+        try:
+            with self.session_factory() as session:
+                row = session.execute(
+                    select(task).where(
+                        task.c.id == claim.owner_scope.task_id,
+                        task.c.user_id == claim.owner_scope.user_id,
+                        task.c.type == _TASK_TYPE,
+                        task.c.status.in_(("processing", "completed", "failed")),
+                        task.c.claimed_by == claim.worker_instance,
+                        task.c.claim_token == claim.token,
+                        task.c.execution_generation == claim.execution_generation,
+                        task.c.lease_until.is_not(None),
+                        task.c.user_cancelled_at.is_(None),
+                    )
+                ).mappings().one_or_none()
+            return row is not None
+        except Exception:
+            return False
+
+    def _forget_signal(self, claim: ContinuationClaimAuthority, signal: Event) -> None:
+        with self._signals_lock:
+            if self._signals.get(claim.token) is signal:
+                self._signals.pop(claim.token, None)
+                self._release_failures.pop(claim.token, None)
 
     def _confirm_release(
         self,

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from dataclasses import dataclass, field
 from threading import Event, Lock, RLock, Thread
 from time import monotonic
@@ -44,6 +44,7 @@ class _ActiveClaim:
     release_complete: Event | None = None
     release_succeeded: bool = False
     release_started: bool = False
+    release_attempts: int = 0
 
 
 @dataclass(slots=True)
@@ -208,22 +209,35 @@ class _ConfiguredRuntime:
         scan_due = getattr(recovery, "scan_due", None)
         if not callable(scan_due):
             return True
-        active = _ActiveRecovery(factory.task_type, Event(), Event())
+        completed, _result = self._run_tracked_recovery(
+            factory.task_type,
+            lambda stop_signal: scan_due(stop_signal=stop_signal),
+        )
+        return completed
+
+    def _run_tracked_recovery(
+        self,
+        task_type: str,
+        operation: Callable[[Event], object],
+    ) -> tuple[bool, object | None]:
+        active = _ActiveRecovery(task_type, Event(), Event())
         assert self._active_recoveries is not None and self._lock is not None
         with self._lock:
-            if self._closed or factory.task_type in self._active_recoveries:
-                return False
-            self._active_recoveries[factory.task_type] = active
+            if self._closed or task_type in self._active_recoveries:
+                return False, None
+            self._active_recoveries[task_type] = active
+        result: object | None = None
         try:
-            scan_due(stop_signal=active.stop_signal)
+            result = operation(active.stop_signal)
         except Exception:
             pass
         finally:
-            active.complete.set()
             with self._lock:
-                self._active_recoveries.pop(factory.task_type, None)
+                if self._active_recoveries.get(task_type) is active:
+                    self._active_recoveries.pop(task_type)
+                active.complete.set()
                 closed = self._closed
-        return not active.stop_signal.is_set() and not closed
+        return not active.stop_signal.is_set() and not closed, result
 
     def _recovery_for(self, factory: RegisteredExecutorFactory) -> object | None:
         if factory.recovery_factory is None:
@@ -254,8 +268,35 @@ class _ConfiguredRuntime:
     def consume_cancel_and_due(
         self, scope: OwnerTaskScope
     ) -> Literal["settled", "retained", "pending", "terminal_projection"]:
-        del scope
-        return "pending"
+        if type(scope) is not OwnerTaskScope or scope.operation != "frame.review":
+            return "pending"
+        factory = next(
+            (
+                candidate
+                for candidate in self._executor_factories
+                if isinstance(candidate, RegisteredExecutorFactory)
+                and candidate.task_type == "ai-review"
+            ),
+            None,
+        )
+        if factory is None:
+            return "pending"
+        recovery = self._recovery_for(factory)
+        consume_due = getattr(recovery, "consume_due", None)
+        if not callable(consume_due):
+            return "pending"
+        completed, result = self._run_tracked_recovery(
+            factory.task_type,
+            lambda stop_signal: consume_due(scope, stop_signal=stop_signal),
+        )
+        if not completed or result not in (
+            "settled",
+            "retained",
+            "pending",
+            "terminal_projection",
+        ):
+            return "pending"
+        return result
 
     def shutdown(self, reason: str) -> ShutdownReceipt:
         if not reason:
@@ -438,6 +479,13 @@ class _ConfiguredRuntime:
         if complete is None:
             return False
         complete.wait()
+        if (
+            not active.release_succeeded
+            and isinstance(active.claim, ContinuationClaimAuthority)
+            and active.release_attempts == 1
+        ):
+            self._start_release(active)
+            complete.wait()
         return active.release_succeeded
 
     @staticmethod
@@ -448,9 +496,16 @@ class _ConfiguredRuntime:
             _signal_active_lost(active)
             return
         with lock:
-            if complete.is_set() or active.release_started:
+            if (
+                active.release_succeeded
+                or active.release_started
+                or active.release_attempts >= 2
+            ):
                 return
             active.release_started = True
+            active.release_attempts += 1
+            if complete.is_set():
+                complete.clear()
 
         def release_claim() -> None:
             try:
@@ -473,7 +528,9 @@ class _ConfiguredRuntime:
             finally:
                 if not active.release_succeeded:
                     _signal_active_lost(active)
-                complete.set()
+                with lock:
+                    active.release_started = False
+                    complete.set()
 
         try:
             thread = Thread(

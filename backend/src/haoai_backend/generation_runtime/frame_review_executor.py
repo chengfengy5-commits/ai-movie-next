@@ -34,6 +34,12 @@ from haoai_backend.generation_core.frame_review_intents import (
 from haoai_backend.generation_core.frame_review_results import (
     SqlAlchemyFrameReviewResults,
 )
+from haoai_backend.generation_core.frame_review_recovery import (
+    SqlAlchemyFrameReviewRecovery,
+    _ProviderObservation,
+    _provider_observation,
+    _unknown_observation,
+)
 from haoai_backend.generation_credentials.application import RegistryCapabilities
 from haoai_backend.generation_credentials.domain import (
     CredentialCrypto,
@@ -54,6 +60,7 @@ class FrameReviewExecutor:
 
     configuration: GenerationRuntimeConfig
     registry_capabilities: RegistryCapabilities
+    recovery: SqlAlchemyFrameReviewRecovery | None = None
     _execution_port: object | None = None
 
     def bind_execution_port(self, port: object) -> None:
@@ -121,8 +128,16 @@ class FrameReviewExecutor:
         except _ExecutionAuthorityLost:
             return "ownership_lost"
         except Exception:
-            # The intent is already committed. A later claim must reconcile it.
-            return "pending" if guard.is_live_before_deadline() else "ownership_lost"
+            return self._record_observation(
+                claim,
+                intent,
+                verified,
+                guard,
+                _unknown_observation(
+                    request_started=guard.request_started,
+                    http_status=guard.http_status,
+                ),
+            )
 
         try:
             result = provider.optimize_frame(
@@ -131,11 +146,39 @@ class FrameReviewExecutor:
                 intent,
             )
         except Exception:
-            return "pending" if guard.is_claim_live() else "ownership_lost"
+            return self._record_observation(
+                claim,
+                intent,
+                verified,
+                guard,
+                _unknown_observation(
+                    request_started=guard.request_started,
+                    http_status=guard.http_status,
+                ),
+            )
         if isinstance(result, ProviderFailure):
-            return "pending" if guard.is_claim_live() else "ownership_lost"
+            return self._record_observation(
+                claim,
+                intent,
+                verified,
+                guard,
+                _provider_observation(
+                    result.code,
+                    request_started=guard.request_started,
+                    http_status=guard.http_status,
+                ),
+            )
         if not isinstance(result, TextResult):
-            return "pending" if guard.is_claim_live() else "ownership_lost"
+            return self._record_observation(
+                claim,
+                intent,
+                verified,
+                guard,
+                _unknown_observation(
+                    request_started=guard.request_started,
+                    http_status=guard.http_status,
+                ),
+            )
 
         results = SqlAlchemyFrameReviewResults(
             self.configuration.session_factory,
@@ -145,6 +188,20 @@ class FrameReviewExecutor:
             proof_authority,
         )
         return results.persist_success(claim, intent, verified, result)
+
+    def _record_observation(
+        self,
+        claim: ClaimAuthority,
+        intent: CommittedIntent,
+        verified: VerifiedFrameReviewExecutionInput,
+        guard: "_ReviewAuthorityGuard",
+        observation: _ProviderObservation,
+    ) -> str:
+        if not guard.is_claim_live():
+            return "ownership_lost"
+        if self.recovery is None:
+            return "pending"
+        return self.recovery.record_observation(claim, intent, verified, observation)
 
     def execute_continuation_claim(
         self,
@@ -187,6 +244,15 @@ class _ReviewAuthorityGuard:
         self._claim = claim
         self._intent = intent
         self._unit_id = unit_id
+        self.request_started = False
+        self.http_status: int | None = None
+
+    def mark_request_started(self) -> None:
+        self.require_live_before_deadline()
+        self.request_started = True
+
+    def record_http_status(self, status: object) -> None:
+        self.http_status = status if type(status) is int and 100 <= status <= 599 else None
 
     def is_claim_live(self) -> bool:
         return self._check_claim(require_before_deadline=False)
@@ -298,7 +364,10 @@ class _GatedHttpClient:
 
     async def request(self, *args: object, **kwargs: object):
         self._guard.require_live_before_deadline()
-        return await self._client.request(*args, **kwargs)
+        self._guard.mark_request_started()
+        response = await self._client.request(*args, **kwargs)
+        self._guard.record_http_status(getattr(response, "status_code", None))
+        return response
 
 
 class _GatedHttpContext:

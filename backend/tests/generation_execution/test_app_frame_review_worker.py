@@ -317,6 +317,16 @@ def test_http_admission_reaches_sql_result_and_task_observation_via_lifespan_wor
                     BillingUnitRow.__table__.c.task_id == task_id
                 )
             ).mappings().one()
+            step = connection.execute(
+                select(ExecutionStepRow.__table__).where(
+                    ExecutionStepRow.__table__.c.billing_unit_id == unit["id"]
+                )
+            ).mappings().one()
+            external = connection.execute(
+                select(ExternalSubmissionRow.__table__).where(
+                    ExternalSubmissionRow.__table__.c.step_id == step["id"]
+                )
+            ).mappings().one()
             receipts = connection.execute(
                 select(GenerationResultReceiptRow.__table__).where(
                     GenerationResultReceiptRow.__table__.c.task_id == task_id
@@ -380,10 +390,42 @@ def test_http_admission_reaches_sql_result_and_task_observation_via_lifespan_wor
             assert task["status"] == "queued"
             assert task["result"] is None
             assert work is None
-            assert unit["result_status"] == "pending"
+            assert unit["result_status"] == "unknown"
             assert unit["billing_status"] == "unbilled"
             assert unit["debited_amount"] == 0
-            assert len(receipts) == len(evidence) == 0
+            assert step["execution_status"] == "reconciling"
+            assert external["submission_status"] == "unknown"
+            assert receipts == []
+            observations = [
+                row
+                for row in evidence
+                if row["evidence_kind"] == "frame_review_observation_v1"
+            ]
+            assert len(observations) == 1
+            observation = observations[0]
+            assert observation["step_id"] == step["id"]
+            assert observation["submission_id"] == external["id"]
+            assert observation["validity"] == "unknown"
+            assert observation["result_digest"] is None
+            assert isinstance(observation["result_location"], str)
+            assert observation["result_location"].startswith(
+                "frame-review-observation-v1:"
+            )
+            observed_facts = json.loads(
+                observation["result_location"].removeprefix(
+                    "frame-review-observation-v1:"
+                )
+            )
+            assert observed_facts["kind"] == "outcome_unknown"
+            assert observed_facts["stage"] == "request"
+            assert observed_facts["request_started"] is True
+            assert observed_facts["http_status"] == 500
+            assert observed_facts["step_id"] == step["id"]
+            assert observed_facts["submission_id"] == external["id"]
+            assert observed_facts["request_digest"] == external["request_digest"]
+            assert "provider response must not be persisted" not in observation[
+                "result_location"
+            ]
             assert applications == [] and fees == [] and logs == []
             assert len(wallets) == 1 and wallets[0]["credits"] == 500
         assert runtime_session_calls > 0
