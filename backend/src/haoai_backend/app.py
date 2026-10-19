@@ -103,6 +103,10 @@ from .generation_runtime.assembly import (
     GenerationWorkerConfiguration,
     build_generation_worker_runtime,
 )
+from .generation_runtime.frame_review_assembly import (
+    FrameReviewWorkerConfiguration,
+    build_frame_review_worker_runtime,
+)
 from .generation_runtime.worker_service import GenerationWorkerService
 from .provider_status import ProviderStatusRuntime
 from .runtime_status.authentication import create_account_only_current_user_resolver
@@ -238,6 +242,7 @@ def create_app(
     chat_media_admission_configuration: ChatMediaAdmissionConfiguration | None = None,
     chat_text_generation_configuration: ChatTextGenerationConfiguration | None = None,
     generation_worker_configuration: GenerationWorkerConfiguration | None = None,
+    frame_review_worker_configuration: FrameReviewWorkerConfiguration | None = None,
 ) -> FastAPI:
     """Compose routes; explicitly configured generation workers start in lifespan."""
     generation_worker_runtime = (
@@ -245,10 +250,16 @@ def create_app(
         if generation_worker_configuration is not None
         else None
     )
+    frame_review_worker_runtime = (
+        build_frame_review_worker_runtime(frame_review_worker_configuration)
+        if frame_review_worker_configuration is not None
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         worker_service: GenerationWorkerService | None = None
+        frame_review_service: GenerationWorkerService | None = None
         try:
             if (
                 generation_worker_runtime is not None
@@ -264,8 +275,29 @@ def create_app(
                 )
                 application.state.generation_worker_service = worker_service
                 worker_service.start()
+            if (
+                frame_review_worker_runtime is not None
+                and frame_review_worker_configuration is not None
+            ):
+                frame_review_service = GenerationWorkerService(
+                    frame_review_worker_runtime,
+                    task_type="ai-review",
+                    poll_interval_seconds=_GENERATION_WORKER_POLL_INTERVAL_SECONDS,
+                    shutdown_timeout_seconds=(
+                        frame_review_worker_configuration.runtime.shutdown_timeout_seconds
+                    ),
+                )
+                application.state.frame_review_worker_service = frame_review_service
+                frame_review_service.start()
             yield
         finally:
+            if frame_review_service is not None:
+                receipt = await run_in_threadpool(
+                    frame_review_service.shutdown,
+                    "application lifespan shutdown",
+                )
+                application.state.frame_review_worker_shutdown = receipt
+                application.state.frame_review_worker_service = None
             if worker_service is not None:
                 receipt = await run_in_threadpool(
                     worker_service.shutdown,
@@ -282,6 +314,8 @@ def create_app(
     )
     app.state.generation_worker_runtime = generation_worker_runtime
     app.state.generation_worker_service = None
+    app.state.frame_review_worker_runtime = frame_review_worker_runtime
+    app.state.frame_review_worker_service = None
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
         def make_authentication_uow():

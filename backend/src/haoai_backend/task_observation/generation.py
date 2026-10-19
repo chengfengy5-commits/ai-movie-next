@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from threading import Event
 from typing import Literal, TypeAlias
 from uuid import NAMESPACE_URL, uuid5
 
@@ -238,6 +239,7 @@ def confirm_worker_fence_after_target_lock(
     *,
     receipt: GenerationResultReceipt | None = None,
     target: TargetSnapshot | None = None,
+    _local_stop_signal: Event | None = None,
 ) -> None:
     """Recheck the live worker fence and exact delivery state after target locks."""
     session = _require_session(shared_tx)
@@ -257,6 +259,8 @@ def confirm_worker_fence_after_target_lock(
         raise GenerationError("ownership_lost", "worker fence expired while waiting for the target lock")
     if isinstance(authority, ClaimAuthority) and authority.local_lost_signal.is_set():
         raise GenerationError("ownership_lost", "worker lost its local lease while waiting for the target lock")
+    if _local_stop_signal is not None and _local_stop_signal.is_set():
+        raise GenerationError("ownership_lost", "continuation worker was stopped while waiting for target locks")
     if work_id is None:
         return
     if not isinstance(authority, ContinuationClaimAuthority):
@@ -287,6 +291,7 @@ def confirm_worker_fence_after_target_lock(
 
     if receipt is None or target is None:
         if work_row.phase == "delivery_pending" and work_row.phase_version == version:
+            _confirm_fresh_worker_fence(session, authority, _local_stop_signal)
             return
         raise GenerationError("continuation_phase_or_fence_conflict", "committed continuation replay requires its original receipt and target")
     if (
@@ -330,6 +335,39 @@ def confirm_worker_fence_after_target_lock(
         or replay.application_ref != work_row.application_ref
     ):
         raise GenerationError("continuation_phase_or_fence_conflict", "continuation replay is not bound to its exact next phase and application")
+    _confirm_fresh_worker_fence(session, authority, _local_stop_signal)
+
+
+def _confirm_fresh_worker_fence(
+    session: Session,
+    authority: WorkerAuthority,
+    local_stop_signal: Event | None,
+) -> None:
+    """Recheck the task fence after continuation-specific locks and reads."""
+    scope, token, worker, generation, _, _ = _authority_facts(authority)
+    task = session.execute(
+        select(AITaskRow)
+        .where(AITaskRow.id == scope.task_id)
+        .with_for_update()
+        .execution_options(populate_existing=True)
+    ).scalar_one_or_none()
+    if (
+        task is None
+        or task.user_id != scope.user_id
+        or task.status != "processing"
+        or task.claimed_by != worker
+        or task.claim_token != token
+        or task.execution_generation != generation
+        or task.lease_until is None
+        or not _same_instant(task.lease_until, authority.lease_until)
+        or _as_utc(task.lease_until) <= _fresh_database_time(session)
+        or task.user_cancelled_at is not None
+    ):
+        raise GenerationError("ownership_lost", "worker fence expired before continuation delivery completed")
+    if isinstance(authority, ClaimAuthority) and authority.local_lost_signal.is_set():
+        raise GenerationError("ownership_lost", "worker lost its local lease before delivery completed")
+    if local_stop_signal is not None and local_stop_signal.is_set():
+        raise GenerationError("ownership_lost", "continuation worker was stopped before delivery completed")
 
 
 def find_application_record(

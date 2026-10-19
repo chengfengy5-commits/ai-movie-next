@@ -6,6 +6,7 @@ import hashlib
 import json
 from dataclasses import replace
 from datetime import datetime
+from threading import Event
 from typing import Any
 
 from sqlalchemy import func, select, update
@@ -48,6 +49,8 @@ def stage_frame_result(
     authority: WorkerAuthority,
     validated_result: ValidatedGenerationResult,
     target: TargetSnapshot,
+    *,
+    _local_stop_signal: Event | None = None,
 ) -> ApplicationOutcome:
     """Stage validated frame text, source description, notes and proof atomically."""
     if target.kind != "frame_text":
@@ -58,7 +61,15 @@ def stage_frame_result(
     content = validated_result.safe_output.text
     if hashlib.sha256(content.encode("utf-8")).hexdigest() != receipt.content_digest:
         return ApplicationOutcome("write_failed", receipt.result_ref, None, None, "validated text digest does not match the receipt")
-    return _stage_frame_mutation(shared_session, authority, receipt, target, content, work=work)
+    return _stage_frame_mutation(
+        shared_session,
+        authority,
+        receipt,
+        target,
+        content,
+        work=work,
+        local_stop_signal=_local_stop_signal,
+    )
 
 
 def stage_frame_preview(
@@ -90,6 +101,7 @@ def _stage_frame_mutation(
     *,
     work: LocalContinuationWork | None,
     preview: bool = False,
+    local_stop_signal: Event | None = None,
 ) -> ApplicationOutcome:
     if not isinstance(session, Session):
         raise TypeError("shared_session must be the caller-owned SQLAlchemy Session")
@@ -136,10 +148,24 @@ def _stage_frame_mutation(
             return ApplicationOutcome("target_deleted", receipt.result_ref, None, None, "storyboard asset was deleted")
 
     if isinstance(authority, (ClaimAuthority, ContinuationClaimAuthority)):
-        confirm_worker_fence_after_target_lock(session, authority, receipt=receipt, target=target)
+        confirm_worker_fence_after_target_lock(
+            session,
+            authority,
+            receipt=receipt,
+            target=target,
+            _local_stop_signal=local_stop_signal,
+        )
 
     replay = current_target_application(session, receipt, target, old_digest)
     if replay is not None:
+        if isinstance(authority, (ClaimAuthority, ContinuationClaimAuthority)):
+            confirm_worker_fence_after_target_lock(
+                session,
+                authority,
+                receipt=receipt,
+                target=target,
+                _local_stop_signal=local_stop_signal,
+            )
         return replay
 
     frame_index = _resolve_frame_index(frames, target)
@@ -156,6 +182,12 @@ def _stage_frame_mutation(
     if preview:
         current_frame["preview"] = replacement
     else:
+        if (
+            receipt.operation == "frame.review"
+            and not _has_valid_original_text(current_frame.get("original_text"))
+            and isinstance(current_frame.get("text"), str)
+        ):
+            current_frame["original_text"] = current_frame["text"]
         current_frame["text"] = replacement
     encoded = json.dumps(frames, ensure_ascii=False)
     updated = session.execute(update(chapters).where(
@@ -194,7 +226,19 @@ def _stage_frame_mutation(
     if work is not None:
         _mark_worker_result_applied(session, receipt)
         _advance_work(session, authority, work, record.application_ref)
+    if isinstance(authority, (ClaimAuthority, ContinuationClaimAuthority)):
+        confirm_worker_fence_after_target_lock(
+            session,
+            authority,
+            receipt=receipt,
+            target=target,
+            _local_stop_signal=local_stop_signal,
+        )
     return ApplicationOutcome("applied", receipt.result_ref, record.application_ref, after_digest)
+
+
+def _has_valid_original_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _load_canvas_receipt(session: Session, authority: CanvasApplyAuthority,

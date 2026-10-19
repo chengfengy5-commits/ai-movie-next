@@ -272,6 +272,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "chat_media_admission_configuration",
             "chat_text_generation_configuration",
             "generation_worker_configuration",
+            "frame_review_worker_configuration",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
         assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
@@ -283,6 +284,11 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
         assert inspect.signature(create_app).parameters["runtime_status_database_probe"].default is None
         assert inspect.signature(create_app).parameters["runtime_status_storage_probe"].default is None
         assert inspect.signature(create_app).parameters["chat_text_generation_configuration"].default is None
+        frame_review_worker_parameter = inspect.signature(create_app).parameters[
+            "frame_review_worker_configuration"
+        ]
+        assert frame_review_worker_parameter.default is None
+        assert frame_review_worker_parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
         methods = {
             (method, route.path)

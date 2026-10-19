@@ -15,6 +15,7 @@ from haoai_backend.generation_contracts.ports import (
 )
 from haoai_backend.generation_contracts.types import (
     ClaimAuthority,
+    ContinuationClaimAuthority,
     OwnerTaskScope,
     ShutdownReceipt,
     TextEvent,
@@ -32,8 +33,10 @@ from .configuration import (
 @dataclass(slots=True)
 class _ActiveClaim:
     port: object
-    claim: ClaimAuthority
+    claim: ClaimAuthority | ContinuationClaimAuthority
     heartbeat_stop: Event
+    local_lost_signal: Event = field(default_factory=Event)
+    authority_lock: Lock = field(default_factory=Lock)
     heartbeat: Thread | None = None
     heartbeat_start_complete: Event = field(default_factory=Event)
     heartbeat_started: bool = False
@@ -138,6 +141,14 @@ class _ConfiguredRuntime:
         try:
             port = factory.execution_port_factory()
             claim = port.claim_next(task_type, instance)
+            if claim is None:
+                claim_continuation = getattr(port, "claim_continuation", None)
+                if callable(claim_continuation):
+                    claim = claim_continuation(
+                        task_type,
+                        instance,
+                        getattr(port, "lease_seconds", 60),
+                    )
         except Exception:
             return "pending"
         if claim is None:
@@ -155,7 +166,7 @@ class _ConfiguredRuntime:
             if not rejected_after_claim:
                 self._active[claim.token] = active
         if rejected_after_claim:
-            _signal_lost(active.claim)
+            _signal_active_lost(active)
             self._release(active)
             return "ownership_lost"
         outcome: WorkerExecutionOutcome = "pending"
@@ -166,7 +177,20 @@ class _ConfiguredRuntime:
             bind_port = getattr(executor, "bind_execution_port", None)
             if callable(bind_port):
                 bind_port(port)
-            outcome = executor.execute_claim(claim)
+            if isinstance(active.claim, ContinuationClaimAuthority):
+                with active.authority_lock:
+                    execution_claim = active.claim
+                execute_continuation = getattr(
+                    executor, "execute_continuation_claim", None
+                )
+                if callable(execute_continuation):
+                    outcome = execute_continuation(
+                        execution_claim, active.local_lost_signal
+                    )
+                else:
+                    outcome = "ownership_lost"
+            else:
+                outcome = executor.execute_claim(active.claim)
         except Exception:
             # A durable intent, if already committed, prevents any later re-POST.
             outcome = "pending"
@@ -253,10 +277,10 @@ class _ConfiguredRuntime:
         revoked: list[str] = []
         for item in active:
             item.heartbeat_stop.set()
-            _signal_lost(item.claim)
+            _signal_active_lost(item)
             self._start_release(item)
             revoked.append(
-                f"{item.claim.scope.task_id}:{item.claim.execution_generation}"
+                f"{_claim_task_id(item.claim)}:{item.claim.execution_generation}"
             )
         for item in active:
             heartbeat = item.heartbeat
@@ -266,19 +290,19 @@ class _ConfiguredRuntime:
                 timeout=max(0.0, deadline - monotonic())
             ):
                 heartbeat_unreleased.append(
-                    f"heartbeat:{item.claim.scope.task_id}"
+                    f"heartbeat:{_claim_task_id(item.claim)}"
                 )
                 continue
             if item.heartbeat_started:
                 heartbeat.join(timeout=max(0.0, deadline - monotonic()))
                 if heartbeat.is_alive():
                     heartbeat_unreleased.append(
-                        f"heartbeat:{item.claim.scope.task_id}"
+                        f"heartbeat:{_claim_task_id(item.claim)}"
                     )
         for item in active:
             assert item.release_complete is not None
             item.release_complete.wait(timeout=max(0.0, deadline - monotonic()))
-            label = f"claim:{item.claim.scope.task_id}"
+            label = f"claim:{_claim_task_id(item.claim)}"
             if item.release_complete.is_set() and item.release_succeeded:
                 released.append(label)
             else:
@@ -297,7 +321,7 @@ class _ConfiguredRuntime:
             unreleased_resources=tuple(unreleased),
             revoked_claim_refs=tuple(revoked),
             recovery_plan_refs=(
-                *(f"task:{item.claim.scope.task_id}" for item in active),
+                *(f"task:{_claim_task_id(item.claim)}" for item in active),
                 *(f"recovery:{item.task_type}" for item in recoveries),
             ),
             timed_out=bool(heartbeat_unreleased or recovery_unreleased) or any(
@@ -321,11 +345,15 @@ class _ConfiguredRuntime:
     def _start_heartbeat(self, active: _ActiveClaim) -> bool:
         assert self._lock is not None
         with self._lock:
-            if self._closed or active.claim.local_lost_signal.is_set():
+            if self._closed or _active_claim_lost(active):
                 active.heartbeat_stop.set()
-                _signal_lost(active.claim)
+                _signal_active_lost(active)
                 return False
-            renew = getattr(active.port, "renew_or_revoke", None)
+            renew = (
+                getattr(active.port, "renew_continuation", None)
+                if isinstance(active.claim, ContinuationClaimAuthority)
+                else getattr(active.port, "renew_or_revoke", None)
+            )
             if not callable(renew):
                 return True
             lease_seconds = getattr(active.port, "lease_seconds", 60)
@@ -336,13 +364,32 @@ class _ConfiguredRuntime:
             interval = max(0.1, lease_seconds / 3)
             while not active.heartbeat_stop.wait(interval):
                 try:
-                    result = renew(active.claim)
+                    if isinstance(active.claim, ContinuationClaimAuthority):
+                        with active.authority_lock:
+                            claim = active.claim
+                        result = renew(claim)
+                        if isinstance(result, ContinuationClaimAuthority):
+                            with active.authority_lock:
+                                if active.claim == claim:
+                                    active.claim = result
+                                    result = "renewed"
+                                elif (
+                                    isinstance(active.claim, ContinuationClaimAuthority)
+                                    and _same_continuation_claim(active.claim, claim)
+                                    and active.claim.lease_until >= result.lease_until
+                                ):
+                                    result = "renewed"
+                                else:
+                                    result = "ownership_lost"
+                    else:
+                        with active.authority_lock:
+                            result = renew(active.claim)
                 except Exception:
                     result = "ownership_lost"
                 if result != "renewed":
-                    lost = getattr(active.claim.local_lost_signal, "set", None)
-                    if callable(lost):
-                        lost()
+                    _signal_active_lost(active)
+                    return
+                if active.local_lost_signal.is_set():
                     return
 
         heartbeat = Thread(
@@ -351,9 +398,9 @@ class _ConfiguredRuntime:
             daemon=True,
         )
         with self._lock:
-            if self._closed or active.claim.local_lost_signal.is_set():
+            if self._closed or _active_claim_lost(active):
                 active.heartbeat_stop.set()
-                _signal_lost(active.claim)
+                _signal_active_lost(active)
                 return False
             active.heartbeat = heartbeat
             active.heartbeat_start_complete.clear()
@@ -364,7 +411,7 @@ class _ConfiguredRuntime:
                 active.heartbeat = None
                 active.heartbeat_started = False
                 active.heartbeat_start_complete.set()
-            _signal_lost(active.claim)
+            _signal_active_lost(active)
             return False
         with self._lock:
             active.heartbeat_started = True
@@ -372,7 +419,7 @@ class _ConfiguredRuntime:
             closing = self._closed
         if closing:
             active.heartbeat_stop.set()
-            _signal_lost(active.claim)
+            _signal_active_lost(active)
         return not closing
 
     def _begin_execution(self, active: _ActiveClaim) -> bool:
@@ -380,8 +427,8 @@ class _ConfiguredRuntime:
 
         assert self._lock is not None
         with self._lock:
-            if self._closed or active.claim.local_lost_signal.is_set():
-                _signal_lost(active.claim)
+            if self._closed or _active_claim_lost(active):
+                _signal_active_lost(active)
                 return False
             return True
 
@@ -398,7 +445,7 @@ class _ConfiguredRuntime:
         lock = active.release_lock
         complete = active.release_complete
         if lock is None or complete is None:
-            _signal_lost(active.claim)
+            _signal_active_lost(active)
             return
         with lock:
             if complete.is_set() or active.release_started:
@@ -406,16 +453,26 @@ class _ConfiguredRuntime:
             active.release_started = True
 
         def release_claim() -> None:
-            release = getattr(active.port, "release_claim", None)
             try:
-                active.release_succeeded = bool(
-                    callable(release) and release(active.claim)
-                )
+                if isinstance(active.claim, ContinuationClaimAuthority):
+                    with active.authority_lock:
+                        claim = active.claim
+                    release = getattr(active.port, "release_continuation", None)
+                    active.release_succeeded = bool(
+                        callable(release) and release(claim)
+                    )
+                else:
+                    with active.authority_lock:
+                        claim = active.claim
+                        release = getattr(active.port, "release_claim", None)
+                        active.release_succeeded = bool(
+                            callable(release) and release(claim)
+                        )
             except Exception:
                 active.release_succeeded = False
             finally:
                 if not active.release_succeeded:
-                    _signal_lost(active.claim)
+                    _signal_active_lost(active)
                 complete.set()
 
         try:
@@ -426,17 +483,62 @@ class _ConfiguredRuntime:
             )
             thread.start()
         except Exception:
-            _signal_lost(active.claim)
+            _signal_active_lost(active)
             complete.set()
 
 
-def _signal_lost(claim: ClaimAuthority) -> None:
-    signal = getattr(claim.local_lost_signal, "set", None)
-    if callable(signal):
+def _claim_task_id(claim: ClaimAuthority | ContinuationClaimAuthority) -> str:
+    return (
+        claim.scope.task_id
+        if isinstance(claim, ClaimAuthority)
+        else claim.owner_scope.task_id
+    )
+
+
+def _same_continuation_claim(
+    left: ContinuationClaimAuthority, right: ContinuationClaimAuthority
+) -> bool:
+    return bool(
+        left.owner_scope == right.owner_scope
+        and left.unit_id == right.unit_id
+        and left.work_id == right.work_id
+        and left.result_ref == right.result_ref
+        and left.phase_version == right.phase_version
+        and left.worker_instance == right.worker_instance
+        and left.token == right.token
+        and left.execution_generation == right.execution_generation
+    )
+
+
+def _active_claim_lost(active: _ActiveClaim) -> bool:
+    if active.local_lost_signal.is_set():
+        return True
+    with active.authority_lock:
+        claim = active.claim
+    return _claim_signal_is_set(claim)
+
+
+def _claim_signal_is_set(claim: ClaimAuthority | ContinuationClaimAuthority) -> bool:
+    signal = getattr(claim, "local_lost_signal", None)
+    check = getattr(signal, "is_set", None)
+    return bool(callable(check) and check())
+
+
+def _signal_lost(claim: ClaimAuthority | ContinuationClaimAuthority) -> None:
+    signal = getattr(claim, "local_lost_signal", None)
+    setter = getattr(signal, "set", None)
+    if callable(setter):
         try:
-            signal()
+            setter()
         except Exception:
             pass
+
+
+def _signal_active_lost(active: _ActiveClaim) -> None:
+    active.local_lost_signal.set()
+    with active.authority_lock:
+        claim = active.claim
+    _signal_lost(claim)
 
 
 def build_runtime(
