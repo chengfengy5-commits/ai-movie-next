@@ -1448,9 +1448,27 @@ a:focus-visible {
 
 .series-card-actions {
   display: flex;
+  flex-wrap: wrap;
+  align-items: center;
   justify-content: flex-end;
   gap: 8px;
   margin-top: 8px;
+}
+
+.series-card-actions > button,
+.series-card-actions .series-export-control > button {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.series-card-actions > .series-export-control {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.series-card-actions .series-export-notice {
+  max-width: 100%;
+  overflow-wrap: anywhere;
 }
 
 .chapter-entry-button {
@@ -3656,10 +3674,6 @@ a:focus-visible {
 }
 
 @media (max-width: 650px) {
-  .series-card-actions {
-    flex-wrap: wrap;
-  }
-
   .asset-library-heading {
     align-items: stretch;
     flex-direction: column;
