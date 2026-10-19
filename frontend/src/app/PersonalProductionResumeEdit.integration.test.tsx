@@ -180,8 +180,9 @@ describe("personal production resume edits in Workspace", () => {
     renderWorkspace(services);
 
     const seriesList = await screen.findByRole("region", { name: "我的剧集" });
-    await user.click(within(seriesList).getByRole("button", { name: "团队剧集" }));
-    await user.click(within(seriesList).getByRole("button", { name: /全部剧集/ }));
+    const seriesFilters = within(seriesList).getByRole("group", { name: "剧集筛选" });
+    await user.click(within(seriesFilters).getByRole("button", { name: "团队剧集" }));
+    await user.click(within(seriesFilters).getByRole("button", { name: /全部剧集/ }));
     await user.click(within(seriesList).getByRole("button", { name: /加载更多/ }));
     expect(within(seriesList).getByText("显示 24 / 24 部")).toBeInTheDocument();
 

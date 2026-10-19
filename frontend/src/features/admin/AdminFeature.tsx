@@ -14,8 +14,21 @@ import { createAdminUsersApi } from "./usersApi";
 import { SystemModels } from "./SystemModels";
 import { RedemptionCodes } from "../admin-membership/RedemptionCodes";
 import { PurchasePackages } from "../admin-membership/PurchasePackages";
+import { AdminSystemConfig } from "../admin-system-config/AdminSystemConfig";
+import { createAdminSystemConfigApi } from "../admin-system-config/adminSystemConfigApi";
+import type { AdminSystemConfigApi, AdminSystemConfigExitSnapshot, PendingAdminSystemConfigExit } from "../admin-system-config/adminSystemConfigTypes";
 import { createAdminMembershipApi } from "../admin-membership/adminMembershipApi";
 import type { AdminMembershipApi, AdminMembershipExitSnapshot } from "../admin-membership/adminMembershipTypes";
+import { AdminSeries } from "../admin-series/AdminSeries";
+import { createAdminSeriesApi } from "../admin-series/adminSeriesApi";
+import { DEFAULT_ADMIN_SERIES_LIST_STATE } from "../admin-series/adminSeriesTypes";
+import type { AdminSeriesApi, AdminSeriesExitSnapshot, AdminSeriesListState, AdminSeriesRecord, PendingAdminSeriesExit } from "../admin-series/adminSeriesTypes";
+import { AdminTasks } from "../admin-tasks/AdminTasks";
+import { createAdminTasksApi } from "../admin-tasks/adminTasksApi";
+import { DEFAULT_ADMIN_TASK_LIST_STATE, type AdminTaskListState, type AdminTasksApi } from "../admin-tasks/adminTasksTypes";
+import { AdminSmtpAccounts } from "../admin-smtp-accounts/AdminSmtpAccounts";
+import { createAdminSmtpAccountsApi } from "../admin-smtp-accounts/adminSmtpAccountsApi";
+import type { AdminSmtpAccountExitSnapshot, AdminSmtpAccountMode, AdminSmtpAccountsApi, PendingAdminSmtpAccountExit } from "../admin-smtp-accounts/adminSmtpAccountsTypes";
 import "./Admin.css";
 
 const ADMIN_TOKEN_KEY = "admin_token";
@@ -47,7 +60,16 @@ type AdminView =
   | { kind: "redemption-create" }
   | { kind: "purchase-packages" }
   | { kind: "purchase-package-create" }
-  | { kind: "purchase-package-edit"; id: string };
+  | { kind: "purchase-package-edit"; id: string }
+  | { kind: "system-config" }
+  | { kind: "system-config-edit"; id: string }
+  | { kind: "series" }
+  | { kind: "series-create" }
+  | { kind: "series-edit"; id: string }
+  | { kind: "admin-tasks" }
+  | { kind: "smtp-accounts" }
+  | { kind: "smtp-account-create" }
+  | { kind: "smtp-account-edit"; id: string };
 
 interface AdminSession {
   token: string;
@@ -60,6 +82,30 @@ interface ActiveMembershipExit {
   viewIdentity: number;
   sessionGeneration: number;
   api: AdminMembershipApi;
+}
+
+interface ActiveSystemConfigExit {
+  snapshot: AdminSystemConfigExitSnapshot;
+  pending: NonNullable<AdminSystemConfigExitSnapshot["pending"]>;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AdminSystemConfigApi;
+}
+
+interface ActiveSeriesExit {
+  snapshot: AdminSeriesExitSnapshot;
+  pending: NonNullable<AdminSeriesExitSnapshot["pending"]>;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AdminSeriesApi;
+}
+
+interface ActiveSmtpAccountExit {
+  snapshot: AdminSmtpAccountExitSnapshot;
+  pending: NonNullable<AdminSmtpAccountExitSnapshot["pending"]>;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AdminSmtpAccountsApi;
 }
 
 interface AdminFeatureProps {
@@ -196,12 +242,25 @@ export function AdminFeature({
   const sessionGeneration = useRef(0);
   const membershipExit = useRef<ActiveMembershipExit | null>(null);
   const membershipApiRef = useRef<AdminMembershipApi | null>(null);
+  const systemConfigExit = useRef<ActiveSystemConfigExit | null>(null);
+  const systemConfigApiRef = useRef<AdminSystemConfigApi | null>(null);
+  const seriesExit = useRef<ActiveSeriesExit | null>(null);
+  const seriesApiRef = useRef<AdminSeriesApi | null>(null);
+  const tasksApiRef = useRef<AdminTasksApi | null>(null);
+  const smtpAccountsExit = useRef<ActiveSmtpAccountExit | null>(null);
+  const smtpAccountsApiRef = useRef<AdminSmtpAccountsApi | null>(null);
+  const [seriesListState, setSeriesListState] = useState<AdminSeriesListState>(DEFAULT_ADMIN_SERIES_LIST_STATE);
+  const [taskListState, setTaskListState] = useState<AdminTaskListState>(DEFAULT_ADMIN_TASK_LIST_STATE);
+  const [seriesListVersion, setSeriesListVersion] = useState(0);
+  const [seriesNotice, setSeriesNotice] = useState<string | null>(null);
   const [redemptionListVersion, setRedemptionListVersion] = useState(0);
   const [packageListVersion, setPackageListVersion] = useState(0);
   const [modelListVersion, setModelListVersion] = useState(0);
   const [promptListVersion, setPromptListVersion] = useState(0);
   const [userListVersion, setUserListVersion] = useState(0);
   const [creditListVersion, setCreditListVersion] = useState(0);
+  const [systemConfigListVersion, setSystemConfigListVersion] = useState(0);
+  const [smtpAccountsListVersion, setSmtpAccountsListVersion] = useState(0);
 
   const navigate = useCallback((nextView: AdminView, options?: { force?: boolean }) => {
     const pending = membershipExit.current;
@@ -217,7 +276,49 @@ export function AdminFeature({
           : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
       if (!window.confirm(question)) return false;
     }
+    const configPending = systemConfigExit.current;
+    if (!options?.force && configPending && configPending.viewIdentity === viewIdentity.current
+      && configPending.sessionGeneration === sessionGeneration.current
+      && configPending.api === systemConfigApiRef.current) {
+      const { kind, message } = configPending.pending;
+      const question = kind === "write-in-flight"
+        ? "系统配置保存请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : kind === "unknown-write"
+          ? message + "\n\n离开将放弃此意图的本地核对；之后重新提交会成为一项新操作。仍要离开吗？"
+          : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
+    const seriesPending = seriesExit.current;
+    if (!options?.force && seriesPending && seriesPending.viewIdentity === viewIdentity.current
+      && seriesPending.sessionGeneration === sessionGeneration.current && seriesPending.api === seriesApiRef.current) {
+      const { kind, operation, recordId, message } = seriesPending.pending;
+      const action = operation === "update" ? "更新" : "创建";
+      const target = recordId ? "记录 " + recordId : "当前表单";
+      const question = kind === "write-in-flight"
+        ? "正在" + action + target + "，请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : kind === "unknown-write"
+          ? message + "\n\n离开将放弃此意图的本地核对；之后重新提交会成为一项新操作。仍要离开吗？"
+          : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
+    const smtpPending = smtpAccountsExit.current;
+    if (!options?.force && smtpPending && smtpPending.viewIdentity === viewIdentity.current
+      && smtpPending.sessionGeneration === sessionGeneration.current
+      && smtpPending.api === smtpAccountsApiRef.current) {
+      const { kind, operation, recordId, message } = smtpPending.pending;
+      const action = operation === "delete" ? "删除" : operation === "update" ? "更新" : "创建";
+      const target = recordId ? "账号 " + recordId : "当前表单";
+      const question = kind === "write-in-flight"
+        ? "正在" + action + target + "，请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : kind === "unknown-write"
+          ? message + "\n\n离开将放弃此意图的本地核对；之后重新提交会成为一项新操作。仍要离开吗？"
+          : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
     membershipExit.current = null;
+    systemConfigExit.current = null;
+    seriesExit.current = null;
+    smtpAccountsExit.current = null;
     viewIdentity.current += 1;
     setView(nextView);
     return true;
@@ -243,11 +344,38 @@ export function AdminFeature({
     () => createAdminMembershipApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
+  const systemConfigApi = useMemo(
+    () => createAdminSystemConfigApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
+  const seriesApi = useMemo(
+    () => createAdminSeriesApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), () => session?.user.id ?? "", safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, session?.user.id, storage],
+  );
+  const tasksApi = useMemo(
+    () => createAdminTasksApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
+  const smtpAccountsApi = useMemo(
+    () => createAdminSmtpAccountsApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), () => session?.user.id ?? "", safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, session?.user.id, storage],
+  );
   membershipApiRef.current = membershipApi;
+  systemConfigApiRef.current = systemConfigApi;
+  seriesApiRef.current = seriesApi;
+  tasksApiRef.current = tasksApi;
+  smtpAccountsApiRef.current = smtpAccountsApi;
 
   const handleLogin = useCallback((nextSession: AdminSession) => {
     sessionGeneration.current += 1;
     membershipExit.current = null;
+    systemConfigExit.current = null;
+    seriesExit.current = null;
+    smtpAccountsExit.current = null;
+    setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
+    setSeriesNotice(null);
+    setSeriesListVersion(0);
     setSession(nextSession);
     navigate({ kind: "dashboard" }, { force: true });
   }, [navigate]);
@@ -255,6 +383,13 @@ export function AdminFeature({
   const handleUnauthorized = useCallback(() => {
     sessionGeneration.current += 1;
     membershipExit.current = null;
+    systemConfigExit.current = null;
+    seriesExit.current = null;
+    smtpAccountsExit.current = null;
+    setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
+    setSeriesNotice(null);
+    setSeriesListVersion(0);
     clearAdminSession(storage);
     setSession(null);
     navigate({ kind: "dashboard" }, { force: true });
@@ -264,6 +399,13 @@ export function AdminFeature({
     if (!navigate({ kind: "dashboard" })) return;
     sessionGeneration.current += 1;
     membershipExit.current = null;
+    systemConfigExit.current = null;
+    seriesExit.current = null;
+    smtpAccountsExit.current = null;
+    setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
+    setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
+    setSeriesNotice(null);
+    setSeriesListVersion(0);
     clearAdminSession(storage);
     setSession(null);
   }, [navigate, storage]);
@@ -276,6 +418,7 @@ export function AdminFeature({
   const activeViewIdentity = viewIdentity.current;
   const activeSessionGeneration = sessionGeneration.current;
   const activeMembershipApi = membershipApi;
+  const activeSystemConfigApi = systemConfigApi;
   const activeAdministratorId = session?.user.id ?? "";
   const membershipOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
   const membershipViewKey = view.kind === "redemption-codes" ? "redemption/list"
@@ -283,6 +426,22 @@ export function AdminFeature({
       : view.kind === "purchase-packages" ? "packages/list"
         : view.kind === "purchase-package-create" ? "packages/create"
           : view.kind === "purchase-package-edit" ? "packages/edit/" + view.id : "";
+  const systemConfigOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const systemConfigViewKey = view.kind === "system-config" ? "system-config/list"
+    : view.kind === "system-config-edit" ? "system-config/edit/" + view.id : "";
+  const seriesOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const seriesViewKey = view.kind === "series" ? "series/list"
+    : view.kind === "series-create" ? "series/create"
+      : view.kind === "series-edit" ? "series/edit/" + view.id : "";
+  const tasksOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const tasksViewKey = view.kind === "admin-tasks" ? "admin-tasks/list" : "";
+  const smtpAccountsOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
+  const smtpAccountsMode: AdminSmtpAccountMode = view.kind === "smtp-account-create" ? "create"
+    : view.kind === "smtp-account-edit" ? "edit" : "list";
+  const smtpAccountsRecordId = view.kind === "smtp-account-edit" ? view.id : "";
+  const smtpAccountsViewKey = view.kind === "smtp-accounts" ? "smtp-accounts/list"
+    : view.kind === "smtp-account-create" ? "smtp-accounts/create"
+      : view.kind === "smtp-account-edit" ? "smtp-accounts/edit/" + view.id : "";
   const handleMembershipExitState = useCallback((snapshot: AdminMembershipExitSnapshot) => {
     if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
       || membershipApiRef.current !== activeMembershipApi || snapshot.ownerScope !== membershipOwnerScope
@@ -308,6 +467,147 @@ export function AdminFeature({
     }
     navigate(nextView);
   }, [activeAdministratorId, activeMembershipApi, activeSessionGeneration, activeViewIdentity, membershipOwnerScope, membershipViewKey, navigate]);
+  const handleSystemConfigExitState = useCallback((snapshot: AdminSystemConfigExitSnapshot) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || systemConfigApiRef.current !== activeSystemConfigApi || snapshot.ownerScope !== systemConfigOwnerScope
+      || snapshot.viewKey !== systemConfigViewKey || snapshot.administratorId !== activeAdministratorId) return;
+    if (snapshot.pending) {
+      systemConfigExit.current = {
+        snapshot,
+        pending: snapshot.pending,
+        viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration,
+        api: activeSystemConfigApi,
+      };
+    } else if (systemConfigExit.current?.viewIdentity === activeViewIdentity
+      && systemConfigExit.current.sessionGeneration === activeSessionGeneration
+      && systemConfigExit.current.api === activeSystemConfigApi) {
+      systemConfigExit.current = null;
+    }
+  }, [activeAdministratorId, activeSessionGeneration, activeSystemConfigApi, activeViewIdentity, systemConfigOwnerScope, systemConfigViewKey]);
+  const systemConfigRecordId = view.kind === "system-config-edit" ? view.id : "";
+  const leaveSystemConfig = useCallback((nextView: AdminView, pending?: PendingAdminSystemConfigExit) => {
+    if (pending && pending.configId === systemConfigRecordId) {
+      const snapshot: AdminSystemConfigExitSnapshot = {
+        ownerScope: systemConfigOwnerScope,
+        viewKey: systemConfigViewKey,
+        administratorId: activeAdministratorId,
+        configId: pending.configId,
+        pending,
+      };
+      systemConfigExit.current = {
+        snapshot,
+        pending,
+        viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration,
+        api: activeSystemConfigApi,
+      };
+    }
+    navigate(nextView);
+  }, [activeAdministratorId, activeSessionGeneration, activeSystemConfigApi, activeViewIdentity, systemConfigOwnerScope, systemConfigRecordId, systemConfigViewKey, navigate]);
+  const handleSeriesExitState = useCallback((snapshot: AdminSeriesExitSnapshot) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || seriesApiRef.current !== seriesApi || snapshot.ownerScope !== seriesOwnerScope
+      || snapshot.viewKey !== seriesViewKey || snapshot.administratorId !== activeAdministratorId) return;
+    if (snapshot.pending) {
+      seriesExit.current = {
+        snapshot, pending: snapshot.pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: seriesApi,
+      };
+    } else if (seriesExit.current?.viewIdentity === activeViewIdentity
+      && seriesExit.current.sessionGeneration === activeSessionGeneration && seriesExit.current.api === seriesApi) {
+      seriesExit.current = null;
+    }
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, seriesApi, seriesOwnerScope, seriesViewKey]);
+  const leaveSeries = useCallback((nextView: AdminView, pending?: PendingAdminSeriesExit) => {
+    if (pending && !seriesExit.current) {
+      const snapshot: AdminSeriesExitSnapshot = { ownerScope: seriesOwnerScope, viewKey: seriesViewKey,
+        administratorId: activeAdministratorId, mode: view.kind === "series-create" ? "create" : "edit",
+        recordId: view.kind === "series-edit" ? view.id : "", pending };
+      seriesExit.current = { snapshot, pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: seriesApi };
+    }
+    navigate(nextView);
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, navigate, seriesApi, seriesOwnerScope, seriesViewKey, view]);
+  const handleSeriesUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && seriesApiRef.current === seriesApi) handleUnauthorized();
+  }, [activeSessionGeneration, activeViewIdentity, handleUnauthorized, seriesApi]);
+  const handleSeriesSaved = useCallback((record: AdminSeriesRecord, operation: "create" | "update") => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || seriesApiRef.current !== seriesApi) return;
+    setSeriesNotice(operation === "create"
+      ? `服务端已确认创建剧集 ${record.id}。`
+      : `服务端已确认更新剧集 ${record.id}。`);
+    setSeriesListVersion((value) => value + 1);
+    navigate({ kind: "series" });
+  }, [activeSessionGeneration, activeViewIdentity, navigate, seriesApi]);
+  const handleSeriesListStateChange = useCallback((state: AdminSeriesListState) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || seriesApiRef.current !== seriesApi) return;
+    setSeriesListState(state);
+  }, [activeSessionGeneration, activeViewIdentity, seriesApi]);
+  const handleTasksUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && tasksApiRef.current === tasksApi) handleUnauthorized();
+  }, [activeSessionGeneration, activeViewIdentity, handleUnauthorized, tasksApi]);
+  const handleTaskListStateChange = useCallback((state: AdminTaskListState) => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && tasksApiRef.current === tasksApi) setTaskListState(state);
+  }, [activeSessionGeneration, activeViewIdentity, tasksApi]);
+  const handleSmtpAccountsExitState = useCallback((snapshot: AdminSmtpAccountExitSnapshot) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || smtpAccountsApiRef.current !== smtpAccountsApi || snapshot.ownerScope !== smtpAccountsOwnerScope
+      || snapshot.viewKey !== smtpAccountsViewKey || snapshot.administratorId !== activeAdministratorId
+      || snapshot.mode !== smtpAccountsMode || snapshot.recordId !== smtpAccountsRecordId) return;
+    if (snapshot.pending) {
+      smtpAccountsExit.current = { snapshot, pending: snapshot.pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: smtpAccountsApi };
+    } else if (smtpAccountsExit.current?.viewIdentity === activeViewIdentity
+      && smtpAccountsExit.current.sessionGeneration === activeSessionGeneration
+      && smtpAccountsExit.current.api === smtpAccountsApi) {
+      smtpAccountsExit.current = null;
+    }
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, smtpAccountsApi,
+    smtpAccountsMode, smtpAccountsOwnerScope, smtpAccountsRecordId, smtpAccountsViewKey]);
+  const leaveSmtpAccounts = useCallback((nextView: AdminView, pending?: PendingAdminSmtpAccountExit) => {
+    if (pending) {
+      const snapshot: AdminSmtpAccountExitSnapshot = {
+        ownerScope: smtpAccountsOwnerScope,
+        viewKey: smtpAccountsViewKey,
+        administratorId: activeAdministratorId,
+        mode: smtpAccountsMode,
+        recordId: smtpAccountsRecordId,
+        pending,
+      };
+      smtpAccountsExit.current = { snapshot, pending, viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration, api: smtpAccountsApi };
+    }
+    navigate(nextView);
+  }, [activeAdministratorId, activeSessionGeneration, activeViewIdentity, navigate, smtpAccountsApi,
+    smtpAccountsMode, smtpAccountsOwnerScope, smtpAccountsRecordId, smtpAccountsViewKey]);
+  const handleSmtpAccountsUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && smtpAccountsApiRef.current === smtpAccountsApi) handleUnauthorized();
+  }, [activeSessionGeneration, activeViewIdentity, handleUnauthorized, smtpAccountsApi]);
+  const handleSmtpAccountsSaved = useCallback(() => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || smtpAccountsApiRef.current !== smtpAccountsApi) return;
+    setSmtpAccountsListVersion((value) => value + 1);
+  }, [activeSessionGeneration, activeViewIdentity, smtpAccountsApi]);
+  const openSeriesCreate = useCallback(() => {
+    setSeriesNotice(null);
+    navigate({ kind: "series-create" });
+  }, [navigate]);
+  const handleSystemConfigUnauthorized = useCallback(() => {
+    if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
+      && systemConfigApiRef.current === activeSystemConfigApi) handleUnauthorized();
+  }, [activeSystemConfigApi, activeSessionGeneration, activeViewIdentity, handleUnauthorized]);
+  const handleSystemConfigSaved = useCallback(() => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || systemConfigApiRef.current !== activeSystemConfigApi) return;
+    setSystemConfigListVersion((value) => value + 1);
+  }, [activeSystemConfigApi, activeSessionGeneration, activeViewIdentity]);
   const handleMembershipUnauthorized = useCallback(() => {
     if (viewIdentity.current === activeViewIdentity && sessionGeneration.current === activeSessionGeneration
       && membershipApiRef.current === activeMembershipApi) handleUnauthorized();
@@ -335,9 +635,23 @@ export function AdminFeature({
 
   useEffect(() => {
     const handleBeforeUnload = (event: BeforeUnloadEvent) => {
-      const pending = membershipExit.current;
-      if (!pending || pending.viewIdentity !== viewIdentity.current
-        || pending.sessionGeneration !== sessionGeneration.current || pending.api !== membershipApiRef.current) return;
+      const membershipPending = membershipExit.current;
+      const systemConfigPending = systemConfigExit.current;
+      const seriesPending = seriesExit.current;
+      const smtpAccountsPending = smtpAccountsExit.current;
+      const protectsExit = (membershipPending && membershipPending.viewIdentity === viewIdentity.current
+        && membershipPending.sessionGeneration === sessionGeneration.current
+        && membershipPending.api === membershipApiRef.current)
+        || (systemConfigPending && systemConfigPending.viewIdentity === viewIdentity.current
+          && systemConfigPending.sessionGeneration === sessionGeneration.current
+          && systemConfigPending.api === systemConfigApiRef.current)
+        || (seriesPending && seriesPending.viewIdentity === viewIdentity.current
+          && seriesPending.sessionGeneration === sessionGeneration.current
+          && seriesPending.api === seriesApiRef.current)
+        || (smtpAccountsPending && smtpAccountsPending.viewIdentity === viewIdentity.current
+          && smtpAccountsPending.sessionGeneration === sessionGeneration.current
+          && smtpAccountsPending.api === smtpAccountsApiRef.current);
+      if (!protectsExit) return;
       event.preventDefault();
       event.returnValue = "";
     };
@@ -367,6 +681,14 @@ export function AdminFeature({
             onClick={() => navigate({ kind: "dashboard" })}
           >
             <span aria-hidden="true">◫</span>运营概览
+          </button>
+          <button
+            className={view.kind === "system-config" || view.kind === "system-config-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button" aria-label="系统配置" title="系统配置"
+            aria-current={view.kind === "system-config" || view.kind === "system-config-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "system-config" })}
+          >
+            <span aria-hidden="true">⚙</span>系统配置
           </button>
           <button
             className={view.kind === "system-models" || view.kind === "model-create" || view.kind === "model-edit"
@@ -446,6 +768,36 @@ export function AdminFeature({
           >
             <span aria-hidden="true">↕</span>积分流水
           </button>
+          <button
+            className={view.kind === "series" || view.kind === "series-create" || view.kind === "series-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="剧集管理"
+            title="剧集管理"
+            aria-current={view.kind === "series" || view.kind === "series-create" || view.kind === "series-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "series" })}
+          >
+            <span aria-hidden="true">▣</span>剧集管理
+          </button>
+          <button
+            className={view.kind === "admin-tasks" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="全局任务"
+            title="全局任务"
+            aria-current={view.kind === "admin-tasks" ? "page" : undefined}
+            onClick={() => navigate({ kind: "admin-tasks" })}
+          >
+            <span aria-hidden="true">≡</span>全局任务
+          </button>
+          <button
+            className={view.kind === "smtp-accounts" || view.kind === "smtp-account-create" || view.kind === "smtp-account-edit" ? "admin-nav-item is-active" : "admin-nav-item"}
+            type="button"
+            aria-label="SMTP 账号"
+            title="SMTP 账号"
+            aria-current={view.kind === "smtp-accounts" || view.kind === "smtp-account-create" || view.kind === "smtp-account-edit" ? "page" : undefined}
+            onClick={() => navigate({ kind: "smtp-accounts" })}
+          >
+            <span aria-hidden="true">✉</span>SMTP 账号
+          </button>
         </nav>
         <div className="admin-sidebar-account">
           <span className="admin-sidebar-avatar" aria-hidden="true">
@@ -469,6 +821,22 @@ export function AdminFeature({
         <div className="admin-content">
           {view.kind === "dashboard" ? (
             <AdminDashboard api={api} onUnauthorized={handleUnauthorized} />
+          ) : view.kind === "system-config" || view.kind === "system-config-edit" ? (
+            <AdminSystemConfig
+              key={activeViewIdentity}
+              api={systemConfigApi}
+              mode={view.kind === "system-config" ? "list" : "edit"}
+              {...(view.kind === "system-config-edit" ? { configId: view.id } : {})}
+              ownerScope={systemConfigOwnerScope}
+              viewKey={systemConfigViewKey}
+              administratorId={activeAdministratorId}
+              listVersion={systemConfigListVersion}
+              onAuthenticationError={handleSystemConfigUnauthorized}
+              onEdit={(id) => navigate({ kind: "system-config-edit", id })}
+              onCancel={(pending) => leaveSystemConfig({ kind: "system-config" }, pending)}
+              onSaved={handleSystemConfigSaved}
+              onExitStateChange={handleSystemConfigExitState}
+            />
           ) : view.kind === "system-models" ? (
             <SystemModels
               api={api}
@@ -524,6 +892,55 @@ export function AdminFeature({
               key={activeViewIdentity}
               api={creditsApi}
               onAuthenticationError={handleResourceUnauthorized}
+            />
+          ) : view.kind === "series" || view.kind === "series-create" || view.kind === "series-edit" ? (
+            <AdminSeries
+              key={activeViewIdentity}
+              api={seriesApi}
+              mode={view.kind === "series" ? "list" : view.kind === "series-create" ? "create" : "edit"}
+              {...(view.kind === "series-edit" ? { recordId: view.id } : {})}
+              ownerScope={seriesOwnerScope}
+              viewKey={seriesViewKey}
+              administratorId={activeAdministratorId}
+              listVersion={seriesListVersion}
+              listState={seriesListState}
+              notice={view.kind === "series" ? seriesNotice : null}
+              onListStateChange={handleSeriesListStateChange}
+              onAuthenticationError={handleSeriesUnauthorized}
+              onCreate={openSeriesCreate}
+              onEdit={(id) => navigate({ kind: "series-edit", id })}
+              onCancel={(pending) => leaveSeries({ kind: "series" }, pending)}
+              onSaved={handleSeriesSaved}
+              onExitStateChange={handleSeriesExitState}
+            />
+          ) : view.kind === "admin-tasks" ? (
+            <AdminTasks
+              key={activeViewIdentity}
+              api={tasksApi}
+              ownerScope={tasksOwnerScope}
+              viewKey={tasksViewKey}
+              listState={taskListState}
+              onListStateChange={handleTaskListStateChange}
+              onAuthenticationError={handleTasksUnauthorized}
+            />
+          ) : view.kind === "smtp-accounts" || view.kind === "smtp-account-create" || view.kind === "smtp-account-edit" ? (
+            <AdminSmtpAccounts
+              key={activeViewIdentity}
+              api={smtpAccountsApi}
+              mode={smtpAccountsMode}
+              {...(smtpAccountsMode === "edit" ? { recordId: smtpAccountsRecordId } : {})}
+              ownerScope={smtpAccountsOwnerScope}
+              viewKey={smtpAccountsViewKey}
+              administratorId={activeAdministratorId}
+              listVersion={smtpAccountsListVersion}
+              onAuthenticationError={handleSmtpAccountsUnauthorized}
+              onCreate={() => navigate({ kind: "smtp-account-create" })}
+              onEdit={(id) => navigate({ kind: "smtp-account-edit", id })}
+              onCancel={(pending) => leaveSmtpAccounts(
+                smtpAccountsMode === "list" ? { kind: "dashboard" } : { kind: "smtp-accounts" }, pending,
+              )}
+              onSaved={handleSmtpAccountsSaved}
+              onExitStateChange={handleSmtpAccountsExitState}
             />
           ) : view.kind === "redemption-codes" || view.kind === "redemption-create" ? (
             <RedemptionCodes

@@ -23,6 +23,8 @@ import type { MyTeam } from "../shared/api/teams";
 import type { CreatorModel, CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 import type { AccountProfileServicePort } from "../shared/api/accountProfile";
 import type { AccountSecurityServicePort } from "../shared/api/accountSecurity";
+import type { TeamDetail, TeamManagementServicePort } from "../shared/api/teamManagement";
+import type { TeamSeriesPage, TeamSeriesRecord, TeamSeriesServicePort } from "../shared/api/teamSeries";
 
 type AssetLibraryCategory = "characters" | "scenes" | "props";
 
@@ -1107,33 +1109,36 @@ describe("read-only workspace", () => {
     await user.type(screen.getByLabelText("密码"), "demo123");
     await user.click(screen.getByRole("button", { name: "登录工作台" }));
 
-    await screen.findAllByRole("article");
-    const firstCard = screen.getAllByRole("article")[0]!;
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesFilters = within(seriesRegion).getByRole("group", { name: "剧集筛选" });
+    await within(seriesRegion).findAllByRole("article");
+    const firstCard = within(seriesRegion).getAllByRole("article")[0]!;
     expect(within(firstCard).getByRole("heading", { level: 3 })).toHaveTextContent("雾港来信");
-    expect(screen.getAllByRole("article")).toHaveLength(20);
-    expect(screen.getByRole("button", { name: /加载更多/ })).toBeInTheDocument();
-    expect(screen.getByText("当前账号受限")).toBeInTheDocument();
-    const restrictedCard = screen.getByText("当前账号受限").closest("article");
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(20);
+    expect(within(seriesRegion).getByRole("button", { name: /加载更多/ })).toBeInTheDocument();
+    expect(within(seriesRegion).getByText("当前账号受限")).toBeInTheDocument();
+    const restrictedCard = within(seriesRegion).getByText("当前账号受限").closest("article");
     expect(restrictedCard).not.toBeNull();
     expect(within(restrictedCard as HTMLElement).queryByRole("button", { name: /只读查看素材库/ }))
       .not.toBeInTheDocument();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(screen.getAllByText("林编剧").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("拾光工作室").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("我负责").length).toBeGreaterThan(0);
+    expect(within(seriesRegion).getAllByText("林编剧").length).toBeGreaterThan(0);
+    expect(within(seriesRegion).getAllByText("拾光工作室").length).toBeGreaterThan(0);
+    expect(within(seriesRegion).getAllByText("我负责").length).toBeGreaterThan(0);
 
-    await user.click(screen.getByRole("button", { name: /加载更多/ }));
-    expect(screen.getAllByRole("article")).toHaveLength(24);
+    await user.click(within(seriesRegion).getByRole("button", { name: /加载更多/ }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(24);
 
-    await user.click(screen.getByRole("button", { name: "我创建的" }));
-    expect(screen.getAllByRole("article")).toHaveLength(12);
-    expect(within(screen.getAllByRole("article")[0]!).getByRole("heading", { level: 3 }))
+    await user.click(within(seriesFilters).getByRole("button", { name: "我创建的" }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(12);
+    const firstCreatedCard = within(seriesRegion).getAllByRole("article")[0]!;
+    expect(within(firstCreatedCard).getByRole("heading", { level: 3 }))
       .toHaveTextContent("雾港来信");
 
-    await user.click(screen.getByRole("button", { name: "团队剧集" }));
-    expect(screen.getAllByRole("article")).toHaveLength(16);
-    await user.click(screen.getByRole("button", { name: "我认领的" }));
-    expect(screen.getAllByRole("article")).toHaveLength(4);
+    await user.click(within(seriesFilters).getByRole("button", { name: "团队剧集" }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(16);
+    await user.click(within(seriesFilters).getByRole("button", { name: "我认领的" }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(4);
 
     expect(window.localStorage.getItem(MOCK_SESSION_KEY)).toBe("demo-session");
     expect(window.localStorage.getItem(MOCK_USER_KEY)).not.toBeNull();
@@ -1150,34 +1155,43 @@ describe("read-only workspace", () => {
     await user.type(screen.getByLabelText("账号"), "demo");
     await user.type(screen.getByLabelText("密码"), "demo123");
     await user.click(screen.getByRole("button", { name: "登录工作台" }));
-    await screen.findAllByRole("article");
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesFilters = within(seriesRegion).getByRole("group", { name: "剧集筛选" });
+    await within(seriesRegion).findAllByRole("article");
 
-    await user.click(screen.getByRole("button", { name: "团队剧集" }));
-    await user.click(screen.getByRole("button", { name: /全部剧集/ }));
-    await user.click(screen.getByRole("button", { name: /加载更多/ }));
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
+    await user.click(within(seriesFilters).getByRole("button", { name: "团队剧集" }));
+    await user.click(within(seriesFilters).getByRole("button", { name: /全部剧集/ }));
+    await user.click(within(seriesRegion).getByRole("button", { name: /加载更多/ }));
+    expect(within(seriesRegion).getByText("显示 24 / 24 部")).toBeInTheDocument();
 
-    const entryCard = screen.getAllByRole("article")[0]!;
+    const entryCard = within(seriesRegion).getAllByRole("article")[0]!;
     await user.click(within(entryCard).getByRole("button", { name: /只读查看素材库/ }));
-    expect(await screen.findByRole("heading", { name: "雾港来信 · 素材库" })).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "林岚" })).toBeInTheDocument();
+    const assetLibrary = await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+    expect(await within(assetLibrary).findByRole("heading", { name: "雾港来信 · 素材库" }))
+      .toBeInTheDocument();
+    expect(await within(assetLibrary).findByRole("heading", { name: "林岚" })).toBeInTheDocument();
     expect(listChapters).not.toHaveBeenCalled();
     const hiddenList = container.querySelector(".series-list-view") as HTMLElement;
     expect(hiddenList.hidden).toBe(true);
     expect(hiddenList.hasAttribute("inert")).toBe(true);
     expect(screen.queryByRole("button", { name: "团队剧集" })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "场景" }));
-    expect(await screen.findByRole("heading", { name: "旧街清晨" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "道具" }));
-    expect(await screen.findByRole("heading", { name: "黄铜钥匙" })).toBeInTheDocument();
+    const assetCategories = within(assetLibrary).getByRole("group", { name: "素材分类" });
+    await user.click(within(assetCategories).getByRole("button", { name: "场景" }));
+    expect(await within(assetLibrary).findByRole("heading", { name: "旧街清晨" })).toBeInTheDocument();
+    await user.click(within(assetCategories).getByRole("button", { name: "道具" }));
+    expect(await within(assetLibrary).findByRole("heading", { name: "黄铜钥匙" })).toBeInTheDocument();
     expect(listChapters).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+    await user.click(within(assetLibrary).getByRole("button", { name: "返回剧集列表" }));
 
-    expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /全部剧集/ })).toHaveAttribute("aria-pressed", "true");
+    const returnedList = await screen.findByRole("region", { name: "我的剧集" });
+    expect(await within(returnedList).findByRole("heading", { name: "我的剧集" }))
+      .toBeInTheDocument();
+    expect(within(returnedList).getByText("显示 24 / 24 部")).toBeInTheDocument();
+    const returnedFilters = within(returnedList).getByRole("group", { name: "剧集筛选" });
+    expect(within(returnedFilters).getByRole("button", { name: /全部剧集/ }))
+      .toHaveAttribute("aria-pressed", "true");
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -2305,18 +2319,22 @@ describe("read-only workspace", () => {
     await user.type(screen.getByLabelText("账号"), "demo");
     await user.type(screen.getByLabelText("密码"), "demo123");
     await user.click(screen.getByRole("button", { name: "登录工作台" }));
-    await screen.findAllByRole("article");
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesFilters = within(seriesRegion).getByRole("group", { name: "剧集筛选" });
+    await within(seriesRegion).findAllByRole("article");
 
-    await user.click(screen.getByRole("button", { name: "团队剧集" }));
-    await user.click(screen.getByRole("button", { name: /全部剧集/ }));
-    await user.click(screen.getByRole("button", { name: /加载更多/ }));
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
+    await user.click(within(seriesFilters).getByRole("button", { name: "团队剧集" }));
+    await user.click(within(seriesFilters).getByRole("button", { name: /全部剧集/ }));
+    await user.click(within(seriesRegion).getByRole("button", { name: /加载更多/ }));
+    expect(within(seriesRegion).getByText("显示 24 / 24 部")).toBeInTheDocument();
 
-    const firstCard = screen.getAllByRole("article")[0]!;
+    const firstCard = within(seriesRegion).getAllByRole("article")[0]!;
     await user.click(within(firstCard).getByRole("button", { name: /只读查看章节/ }));
-    expect(await screen.findByRole("heading", { name: "第一章 · 雾起" })).toBeInTheDocument();
-    expect(screen.getByText(/当前由 周编剧 编辑/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重新读取章节" })).toBeInTheDocument();
+    const chapterRegion = await screen.findByRole("region", { name: "雾港来信" });
+    expect(await within(chapterRegion).findByRole("heading", { name: "第一章 · 雾起" }))
+      .toBeInTheDocument();
+    expect(within(chapterRegion).getByText(/当前由 周编剧 编辑/)).toBeInTheDocument();
+    expect(within(chapterRegion).getByRole("button", { name: "重新读取章节" })).toBeInTheDocument();
 
     const hiddenList = container.querySelector(".series-list-view") as HTMLElement;
     expect(hiddenList.hidden).toBe(true);
@@ -2324,13 +2342,18 @@ describe("read-only workspace", () => {
     expect(screen.queryByRole("button", { name: "团队剧集" })).not.toBeInTheDocument();
     // jsdom does not simulate native focus movement when a focused subtree becomes hidden; the browser check covers it.
 
-    await user.click(screen.getByRole("button", { name: /第二章/ }));
-    expect(await screen.findByText(/她拆开信封/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+    const chapterList = within(chapterRegion).getByRole("complementary", { name: "章节列表" });
+    await user.click(within(chapterList).getByRole("button", { name: /第二章/ }));
+    expect(await within(chapterRegion).findByText(/她拆开信封/)).toBeInTheDocument();
+    await user.click(within(chapterRegion).getByRole("button", { name: "返回剧集列表" }));
 
-    expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /全部剧集/ })).toHaveAttribute("aria-pressed", "true");
+    const returnedList = await screen.findByRole("region", { name: "我的剧集" });
+    expect(await within(returnedList).findByRole("heading", { name: "我的剧集" }))
+      .toBeInTheDocument();
+    expect(within(returnedList).getByText("显示 24 / 24 部")).toBeInTheDocument();
+    const returnedFilters = within(returnedList).getByRole("group", { name: "剧集筛选" });
+    expect(within(returnedFilters).getByRole("button", { name: /全部剧集/ }))
+      .toHaveAttribute("aria-pressed", "true");
   });
 
   it("ignores a late series response after logout", async () => {
@@ -5188,5 +5211,671 @@ describe("read-only workspace", () => {
 
     expect(await screen.findAllByRole("article")).toHaveLength(20);
     expect(window.localStorage.getItem("muse_series_list")).toBe("this is not valid JSON");
+  });
+
+  it("routes into team management and preserves its draft when a shared-sidebar exit is cancelled", async () => {
+    const user = userEvent.setup();
+    window.localStorage.setItem(API_TOKEN_KEY, "synthetic-team-session");
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const createdTeam = {
+      id: "team-created-through-api",
+      name: "真实API团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-05T10:00:00",
+    };
+    let teamCreated = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/teams/my" && init?.method === "GET") {
+        return jsonResponse(teamCreated ? [{ ...createdTeam, member_count: 1, my_role: "owner" }] : []);
+      }
+      if (url.pathname === "/api/teams" && init?.method === "POST") {
+        teamCreated = true;
+        return jsonResponse(createdTeam, 201);
+      }
+      if (url.pathname === `/api/teams/${createdTeam.id}` && init?.method === "GET") {
+        return jsonResponse({
+          ...createdTeam,
+          members: [{
+            user_id: "fixture-user",
+            username: "演示创作者",
+            avatar_url: null,
+            role: "owner",
+            permissions: [],
+            joined_at: "2026-10-05T10:00:00",
+          }],
+          my_role: "owner",
+          my_permissions: [],
+        });
+      }
+      throw new Error(`Unexpected team API request: ${init?.method ?? "GET"} ${url.pathname}`);
+    });
+    const base = createDemoServices(window.localStorage);
+    await base.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const apiServices = createApiServices(apiBaseUrl, {
+      storage: window.localStorage,
+      fetcher,
+    });
+    if (apiServices.teamManagement === undefined) {
+      throw new Error("API services did not expose the team management adapter.");
+    }
+    const services: WorkspaceServices = {
+      ...base,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      teamManagement: apiServices.teamManagement,
+    };
+    renderWorkspace(services);
+    await screen.findAllByRole("article");
+    const nav = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(nav).getByRole("button", { name: "我的团队" }));
+    await screen.findByRole("heading", { name: "团队管理" });
+    await screen.findByText("当前账号还没有加入团队。");
+    expect(fetcher).toHaveBeenCalled();
+    const nameInput = screen.getByLabelText("团队名称");
+    await user.type(nameInput, "保留这份草稿");
+    const blockedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(blockedUnload);
+    expect(blockedUnload.defaultPrevented).toBe(true);
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(within(nav).getByRole("button", { name: "我的任务" }));
+    expect(screen.getByRole("heading", { name: "团队管理" })).toBeInTheDocument();
+    expect(screen.getByLabelText("团队名称")).toHaveValue("保留这份草稿");
+    expect(fetcher.mock.calls.some(([, init]) => init?.method === "POST")).toBe(false);
+
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await user.click(within(nav).getByRole("button", { name: "我的任务" }));
+    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+    const allowedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(allowedUnload);
+    expect(allowedUnload.defaultPrevented).toBe(false);
+
+    await user.click(within(nav).getByRole("button", { name: "我的团队" }));
+    await screen.findByText("当前账号还没有加入团队。");
+    await user.type(screen.getByLabelText("团队名称"), " 真实API团队 ");
+    await user.click(screen.getByRole("button", { name: "创建团队" }));
+    expect(await screen.findByRole("heading", { name: "真实API团队" })).toBeInTheDocument();
+    expect(fetcher.mock.calls.map(([input]) => new URL(String(input)).pathname)).toEqual(
+      expect.arrayContaining([
+        "/api/teams/my",
+        "/api/teams",
+        `/api/teams/${createdTeam.id}`,
+      ]),
+    );
+    const createRequest = fetcher.mock.calls.find(([input, init]) =>
+      new URL(String(input)).pathname === "/api/teams" && init?.method === "POST",
+    );
+    expect(createRequest?.[1]?.method).toBe("POST");
+    expect(new Headers(createRequest?.[1]?.headers).get("authorization")).toBe("Bearer synthetic-team-session");
+    expect(JSON.parse(String(createRequest?.[1]?.body))).toEqual({ name: " 真实API团队 " });
+  });
+
+  it("protects the series-share selection across canceled navigation and restores its unload guard on return", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: "restricted-owned-series",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    let shareOutcomeUnknown = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/series/restricted-owned-series/share") {
+        if (shareOutcomeUnknown) return jsonResponse({ detail: "提交后服务暂时不可用" }, 503);
+        return jsonResponse({ message: "已分享到团队「当前团队」", team_id: "team-current", team_name: "当前团队" });
+      }
+      throw new Error(`Unexpected workspace API request: ${url.pathname}`);
+    });
+    window.localStorage.setItem(API_TOKEN_KEY, "series-share-workspace-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const base = createDemoServices(window.localStorage);
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher });
+    const services: WorkspaceServices = {
+      ...base,
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: async () => [series],
+      listMyTeams: async () => [teamDirectoryItem("team-current", "当前团队")],
+      listMyTasks: async () => myTaskPage([], 0),
+    };
+    renderWorkspace(services);
+
+    await screen.findAllByRole("article");
+    await user.click(screen.getByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "team-current");
+
+    const dirtyUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(dirtyUnload);
+    expect(dirtyUnload.defaultPrevented).toBe(true);
+
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的任务" }));
+    expect(screen.getByRole("dialog", { name: "分享到团队" })).toBeInTheDocument();
+    expect(screen.getByLabelText("分享给团队")).toHaveValue("team-current");
+    expect(fetcher).not.toHaveBeenCalled();
+
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await user.click(within(navigation).getByRole("button", { name: "我的任务" }));
+    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+    const allowedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(allowedUnload);
+    expect(allowedUnload.defaultPrevented).toBe(true);
+
+    await user.click(within(navigation).getByRole("button", { name: "我的剧集" }));
+    expect(await screen.findByRole("dialog", { name: "分享到团队" })).toBeInTheDocument();
+    const restoredUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(restoredUnload);
+    expect(restoredUnload.defaultPrevented).toBe(true);
+
+    shareOutcomeUnknown = true;
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    await user.click(within(navigation).getByRole("button", { name: "我的任务" }));
+    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+    const hiddenUnknownUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(hiddenUnknownUnload);
+    expect(hiddenUnknownUnload.defaultPrevented).toBe(true);
+
+    await user.click(within(navigation).getByRole("button", { name: "我的剧集" }));
+    expect(await screen.findByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "读取当前剧集事实" }));
+    expect(await screen.findByText("当前剧集列表显示：个人剧集。")).toBeInTheDocument();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "明确放弃本地状态" }));
+
+    const abandonedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(abandonedUnload);
+    expect(abandonedUnload.defaultPrevented).toBe(false);
+    await user.click(screen.getByRole("button", { name: "关闭团队共享" }));
+    expect(screen.queryByRole("dialog", { name: "分享到团队" })).not.toBeInTheDocument();
+    const cleanUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(cleanUnload);
+    expect(cleanUnload.defaultPrevented).toBe(false);
+  });
+
+  it("shares one pending and unknown write permit across the hidden series dialog and Teams workspace", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: "permit-owned-series",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    const createdTeam = {
+      id: "permit-created-team",
+      name: "许可团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-19T12:00:00",
+    };
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
+    const managementPort = apiServices.teamManagement as TeamManagementServicePort;
+    const createTeam = vi.spyOn(managementPort, "createTeam").mockResolvedValue(createdTeam);
+    vi.spyOn(managementPort, "listTeams").mockResolvedValue([]);
+    vi.spyOn(managementPort, "getTeam").mockResolvedValue({
+      ...createdTeam,
+      my_role: "owner",
+      my_permissions: [],
+      members: [],
+    });
+    const seriesPort = apiServices.teamSeries as TeamSeriesServicePort;
+    const share = deferred<Awaited<ReturnType<TeamSeriesServicePort["shareSeries"]>>>();
+    const shareSeries = vi.spyOn(seriesPort, "shareSeries").mockReturnValue(share.promise);
+
+    window.localStorage.setItem(API_TOKEN_KEY, "team-collaboration-permit-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: async () => [series],
+      listMyTeams: async () => [teamDirectoryItem("permit-target-team", "目标团队")],
+    };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderWorkspace(services);
+
+    await screen.findByRole("button", { name: "团队共享：雾港来信" });
+    await user.click(screen.getByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "permit-target-team");
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(shareSeries).toHaveBeenCalledTimes(1);
+
+    const pendingUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(pendingUnload);
+    expect(pendingUnload.defaultPrevented).toBe(true);
+
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    await screen.findByRole("heading", { name: "团队管理" });
+    expect(screen.getByLabelText("团队协作写入限制")).toHaveTextContent("仍在请求中");
+    await user.type(screen.getByLabelText("团队名称"), "放弃后新建");
+    await user.click(screen.getByRole("button", { name: "创建团队" }));
+    expect(createTeam).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("当前操作没有发送");
+
+    await act(async () => {
+      share.reject(new ApiError("http", "服务暂不可用", 503));
+      await Promise.resolve();
+    });
+    expect(await screen.findByLabelText("团队协作写入限制")).toHaveTextContent("结果待核对");
+    const unknownUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unknownUnload);
+    expect(unknownUnload.defaultPrevented).toBe(true);
+    await user.click(screen.getByRole("button", { name: "明确放弃本地状态" }));
+    await waitFor(() => expect(screen.queryByLabelText("团队协作写入限制")).not.toBeInTheDocument());
+    expect(shareSeries).toHaveBeenCalledTimes(1);
+
+    expect(screen.getByLabelText("团队名称")).toHaveValue("放弃后新建");
+    await user.click(screen.getByRole("button", { name: "创建团队" }));
+    await screen.findByRole("heading", { name: "许可团队" });
+    expect(createTeam).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves an unknown share on canceled close and releases only its lease on confirmed close", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: "close-unknown-share-series",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    let shareRequests = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/api/series/${series.id}/share` && init?.method === "POST") {
+        shareRequests += 1;
+        return shareRequests === 1
+          ? jsonResponse({ detail: "提交后服务暂时不可用" }, 503)
+          : jsonResponse({ message: "已分享到团队「关闭测试团队」", team_id: "close-target-team", team_name: "关闭测试团队" });
+      }
+      throw new Error(`Unexpected workspace API request: ${init?.method ?? "GET"} ${url.pathname}`);
+    });
+    window.localStorage.setItem(API_TOKEN_KEY, "close-unknown-share-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher });
+    const listSeries = vi.fn(async () => [series]);
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries,
+      listMyTeams: async () => [teamDirectoryItem("close-target-team", "关闭测试团队")],
+    };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderWorkspace(services);
+
+    await user.click(await screen.findByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "close-target-team");
+    await user.click(screen.getByLabelText("同时由我认领"));
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(shareRequests).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "读取当前剧集事实" }));
+    expect(await screen.findByText("当前剧集列表显示：个人剧集。")).toBeInTheDocument();
+    vi.mocked(window.confirm).mockReturnValue(false);
+    await user.click(screen.getByRole("button", { name: "关闭团队共享" }));
+    expect(screen.getByLabelText("分享给团队")).toHaveValue("close-target-team");
+    expect(screen.getByLabelText("同时由我认领")).toBeChecked();
+    expect(screen.getByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(screen.getByText("当前剧集列表显示：个人剧集。")).toBeInTheDocument();
+    const canceledCloseUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(canceledCloseUnload);
+    expect(canceledCloseUnload.defaultPrevented).toBe(true);
+    expect(shareRequests).toBe(1);
+
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "关闭团队共享" }));
+    expect(screen.queryByRole("dialog", { name: "分享到团队" })).not.toBeInTheDocument();
+    const confirmedCloseUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(confirmedCloseUnload);
+    expect(confirmedCloseUnload.defaultPrevented).toBe(false);
+    expect(shareRequests).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "close-target-team");
+    expect(screen.getByLabelText("同时由我认领")).not.toBeChecked();
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByText(/已分享到团队「关闭测试团队」/)).toBeInTheDocument();
+    expect(shareRequests).toBe(2);
+    expect(listSeries).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["success", "ack"] as const,
+    ["401", 401] as const,
+    ["403", 403] as const,
+  ])("retires a share guard when teamSeries is removed and ignores a late %s receipt", async (label, outcome) => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: `removed-port-${label}-series`,
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
+    if (apiServices.teamSeries === undefined) throw new Error("API services did not expose the team series port.");
+    const originalPort = apiServices.teamSeries;
+    const request = deferred<Awaited<ReturnType<TeamSeriesServicePort["shareSeries"]>>>();
+    vi.spyOn(originalPort, "shareSeries").mockReturnValue(request.promise);
+    const portRef: { current: TeamSeriesServicePort | undefined } = { current: originalPort };
+    const listSeries = vi.fn(async () => [series]);
+    const services = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api" as const,
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries,
+      listMyTeams: async () => [teamDirectoryItem("removed-port-team", "端口切换团队")],
+    } satisfies WorkspaceServices;
+    Object.defineProperty(services, "teamSeries", { enumerable: true, get: () => portRef.current });
+    window.localStorage.setItem(API_TOKEN_KEY, `removed-port-${label}-session`);
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const view = renderWorkspace(services);
+
+    await user.click(await screen.findByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "removed-port-team");
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByText("正在执行：分享剧集")).toBeInTheDocument();
+    const pendingUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(pendingUnload);
+    expect(pendingUnload.defaultPrevented).toBe(true);
+
+    portRef.current = undefined;
+    view.rerender(<AuthProvider services={services}><Workspace /></AuthProvider>);
+    expect(screen.queryByRole("dialog", { name: "分享到团队" })).not.toBeInTheDocument();
+    const retiredUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(retiredUnload);
+    expect(retiredUnload.defaultPrevented).toBe(false);
+
+    portRef.current = { ...originalPort, shareSeries: vi.fn(originalPort.shareSeries) };
+    view.rerender(<AuthProvider services={services}><Workspace /></AuthProvider>);
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "removed-port-team");
+    const newScopeUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(newScopeUnload);
+    expect(newScopeUnload.defaultPrevented).toBe(true);
+    const refreshCount = listSeries.mock.calls.length;
+
+    await act(async () => {
+      if (outcome === "ack") {
+        request.resolve({ message: "迟到的旧 ACK", team_id: "removed-port-team", team_name: "端口切换团队" });
+      } else {
+        request.reject(new ApiError("http", `late ${outcome}`, outcome));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByLabelText("分享给团队")).toHaveValue("removed-port-team");
+    expect(within(screen.getByRole("dialog", { name: "分享到团队" })).queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("迟到的旧 ACK")).not.toBeInTheDocument();
+    expect(originalPort.shareSeries).toHaveBeenCalledTimes(1);
+    expect(listSeries).toHaveBeenCalledTimes(refreshCount);
+    expect(screen.getByRole("button", { name: "退出" })).toBeInTheDocument();
+    expect(window.localStorage.getItem(API_TOKEN_KEY)).toBe(`removed-port-${label}-session`);
+    const newScopeStillDirty = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(newScopeStillDirty);
+    expect(newScopeStillDirty.defaultPrevented).toBe(true);
+  });
+
+  it("refreshes the visible team-series page after a hidden share ACK without accepting an old revision read", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const team = {
+      id: "revision-team",
+      name: "版本团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-19T12:00:00",
+    };
+    const teamDetail: TeamDetail = {
+      ...team,
+      my_role: "owner",
+      my_permissions: [],
+      members: [
+        { user_id: "fixture-user", username: "团队作者", avatar_url: null, role: "owner", permissions: [], joined_at: team.created_at },
+        { user_id: "revision-target", username: "目标成员", avatar_url: null, role: "member", permissions: [], joined_at: team.created_at },
+      ],
+    };
+    const makeRow = (id: string, name: string): TeamSeriesRecord => ({
+      id,
+      name,
+      description: null,
+      image_url: null,
+      user_id: "fixture-user",
+      owner_name: "团队作者",
+      owner_avatar_url: null,
+      claimed_by: null,
+      claimed_by_username: "",
+      claimed_by_avatar_url: null,
+      created_at: team.created_at,
+      updated_at: team.created_at,
+      chapter_count: 0,
+      asset_counts: { characters: 0, scenes: 0, props: 0, storyboard: 0 },
+    });
+    const page = (items: TeamSeriesRecord[], pageNumber: number, total: number): TeamSeriesPage => ({
+      items,
+      total,
+      page: pageNumber,
+      page_size: 10,
+      total_pages: 2,
+    });
+    const firstPage = page(Array.from({ length: 10 }, (_, index) => makeRow(`revision-${index + 1}`, `第${index + 1}部`)), 1, 11);
+    const oldPage = page([makeRow("revision-11", "刷新前剧集")], 2, 11);
+    const revisionPage = deferred<TeamSeriesPage>();
+    const stalePage = deferred<TeamSeriesPage>();
+    let listCall = 0;
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
+    const managementPort = apiServices.teamManagement as TeamManagementServicePort;
+    vi.spyOn(managementPort, "listTeams").mockResolvedValue([{
+      ...team,
+      member_count: 2,
+      my_role: "owner",
+    }]);
+    vi.spyOn(managementPort, "getTeam").mockResolvedValue(teamDetail);
+    const seriesPort = apiServices.teamSeries as TeamSeriesServicePort;
+    const listTeamSeries = vi.spyOn(seriesPort, "listTeamSeries").mockImplementation(() => {
+      listCall += 1;
+      if (listCall === 1) return Promise.resolve(firstPage);
+      if (listCall === 2) return Promise.resolve(oldPage);
+      if (listCall === 3) return stalePage.promise;
+      if (listCall === 4) return revisionPage.promise;
+      throw new Error(`Unexpected team-series read ${listCall}`);
+    });
+    const shareAck = deferred<Awaited<ReturnType<TeamSeriesServicePort["shareSeries"]>>>();
+    const shareSeries = vi.spyOn(seriesPort, "shareSeries").mockReturnValue(shareAck.promise);
+    const series = {
+      ...demoSeries[0]!,
+      id: "revision-owned-series",
+      name: "待共享剧集",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    window.localStorage.setItem(API_TOKEN_KEY, "team-series-revision-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: async () => [series],
+      listMyTeams: async () => [teamDirectoryItem(team.id, team.name)],
+      listSeriesStylePrompts: async () => [],
+    };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderWorkspace(services);
+
+    await screen.findByRole("button", { name: "团队共享：待共享剧集" });
+    await user.click(screen.getByRole("button", { name: "团队共享：待共享剧集" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), team.id);
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(shareSeries).toHaveBeenCalledTimes(1);
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    await screen.findByRole("heading", { name: "团队管理" });
+    await user.click(await screen.findByRole("button", { name: /版本团队/ }));
+    await screen.findByRole("heading", { name: "版本团队" });
+    await user.click(screen.getByRole("tab", { name: "团队剧集" }));
+    await screen.findByText("第 1 / 2 页 · 共 11 部");
+    expect(listTeamSeries).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByText("刷新前剧集");
+    expect(listTeamSeries).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getByRole("button", { name: "刷新列表" }));
+    await waitFor(() => expect(listTeamSeries).toHaveBeenCalledTimes(3));
+    expect(listTeamSeries.mock.calls[2]?.[1]).toBe(2);
+    await act(async () => {
+      shareAck.resolve({ message: "已分享到团队「版本团队」", team_id: team.id, team_name: team.name });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(listTeamSeries).toHaveBeenCalledTimes(4));
+    expect(listTeamSeries.mock.calls[3]?.[1]).toBe(2);
+
+    await user.type(screen.getByLabelText("名称"), "保留创建草稿");
+    await user.selectOptions(screen.getByLabelText("转交给成员"), "revision-target");
+    await act(async () => {
+      revisionPage.resolve(page([makeRow("revision-11", "分享后新剧集")], 2, 11));
+      await Promise.resolve();
+    });
+    await screen.findByText("分享后新剧集");
+    expect(screen.getByText("第 2 / 2 页 · 共 11 部")).toBeInTheDocument();
+    expect(screen.getByLabelText("名称")).toHaveValue("保留创建草稿");
+    expect(screen.getByLabelText("转交给成员")).toHaveValue("revision-target");
+
+    await act(async () => {
+      stalePage.resolve(page([makeRow("revision-11", "旧 revision 迟到结果")], 2, 11));
+      await Promise.resolve();
+    });
+    expect(screen.getByText("分享后新剧集")).toBeInTheDocument();
+    expect(screen.queryByText("旧 revision 迟到结果")).not.toBeInTheDocument();
+  });
+
+  it("ignores a late team-invite 401 after a view switch but logs out for the current invite view", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const team = {
+      id: "host-team",
+      name: "宿主团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-05T10:00:00",
+    };
+    const teamDetail = {
+      ...team,
+      members: [
+        {
+          user_id: "fixture-user",
+          username: "演示创作者",
+          avatar_url: null,
+          role: "owner",
+          permissions: [],
+          joined_at: "2026-10-05T10:00:00",
+        },
+        {
+          user_id: "member-1",
+          username: "合成成员",
+          avatar_url: null,
+          role: "member",
+          permissions: [],
+          joined_at: "2026-10-05T10:00:00",
+        },
+      ],
+      my_role: "owner",
+      my_permissions: [],
+    };
+    const firstInviteResponse = deferred<Response>();
+    let inviteReadCount = 0;
+    const inviteSignals: AbortSignal[] = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/teams/my" && init?.method === "GET") {
+        return jsonResponse([{ ...team, member_count: 2, my_role: "owner" }]);
+      }
+      if (url.pathname === `/api/teams/${team.id}` && init?.method === "GET") {
+        return jsonResponse(teamDetail);
+      }
+      if (url.pathname === `/api/teams/${team.id}/invites` && init?.method === "GET") {
+        inviteReadCount += 1;
+        if (inviteReadCount === 1) {
+          inviteSignals.push(init.signal as AbortSignal);
+          return firstInviteResponse.promise;
+        }
+        return jsonResponse({ detail: "合成401" }, 401);
+      }
+      throw new Error(`Unexpected team API request: ${init?.method ?? "GET"} ${url.pathname}`);
+    });
+    const base = createDemoServices(window.localStorage);
+    await base.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    window.localStorage.setItem(API_TOKEN_KEY, "synthetic-host-session");
+    const apiServices = createApiServices(apiBaseUrl, {
+      storage: window.localStorage,
+      fetcher,
+    });
+    const services: WorkspaceServices = {
+      ...base,
+      ...apiServices,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: base.listSeries,
+      listMyTeams: base.listMyTeams,
+      listMyTasks: base.listMyTasks,
+    };
+    renderWorkspace(services);
+    await screen.findAllByRole("article");
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    await user.click(await screen.findByRole("button", { name: /宿主团队/ }));
+    await screen.findByRole("heading", { name: "宿主团队" });
+    await user.click(screen.getByRole("tab", { name: "邀请码" }));
+    await user.click(screen.getByRole("button", { name: "读取邀请码" }));
+    await waitFor(() => expect(inviteReadCount).toBe(1));
+
+    await user.click(screen.getByRole("tab", { name: "成员与权限" }));
+    await user.selectOptions(screen.getByLabelText("角色"), "admin");
+    const dirtyUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(dirtyUnload);
+    expect(dirtyUnload.defaultPrevented).toBe(true);
+    expect(inviteSignals[0]?.aborted).toBe(true);
+
+    await act(async () => {
+      firstInviteResponse.resolve(jsonResponse({ detail: "old session" }, 401));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByRole("heading", { name: "团队管理" })).toBeInTheDocument();
+    expect(screen.getByLabelText("角色")).toHaveValue("admin");
+    expect(window.localStorage.getItem(API_TOKEN_KEY)).toBe("synthetic-host-session");
+
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    await user.click(screen.getByRole("tab", { name: "邀请码" }));
+    await user.click(screen.getByRole("button", { name: "读取邀请码" }));
+    expect(await screen.findByRole("button", { name: "登录工作台" })).toBeInTheDocument();
+    expect(window.localStorage.getItem(API_TOKEN_KEY)).toBeNull();
+    expect(inviteReadCount).toBe(2);
   });
 });

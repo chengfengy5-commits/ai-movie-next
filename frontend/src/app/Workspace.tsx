@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError } from "../shared/api/errors";
 import type { Series } from "../shared/api/contracts";
 import { useAuth } from "../features/auth/AuthProvider";
@@ -14,7 +14,13 @@ import { SeriesPage } from "../features/series/SeriesPage";
 import { MyTasksPage } from "../features/tasks/MyTasksPage";
 import { CreatorSettingsPage } from "../features/creator-settings/CreatorSettingsPage";
 import { AccountPage } from "../features/account/AccountPage";
+import { TeamsPage } from "../features/teams/TeamsPage";
 import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
+import {
+  createTeamCollaborationWriteScope,
+  sameTeamCollaborationWriteScope,
+  TeamCollaborationWritePermit,
+} from "./teamCollaborationWritePermit";
 
 function restoreErrorMessage(error: ApiError): string {
   if (error.status === 401) {
@@ -31,8 +37,29 @@ function restoreErrorMessage(error: ApiError): string {
 
 function Dashboard() {
   const { services, state, logout, refreshCurrentUser, sessionGeneration } = useAuth();
+  const collaborationActorId = state.status === "authenticated" ? state.user.id : null;
+  const collaborationWriteScope = useMemo(
+    () => createTeamCollaborationWriteScope(collaborationActorId, sessionGeneration, services),
+    [collaborationActorId, services, services.teamManagement, services.teamSeries, sessionGeneration],
+  );
+  const collaborationWritePermitRef = useRef<TeamCollaborationWritePermit | null>(null);
+  if (collaborationWritePermitRef.current === null) {
+    collaborationWritePermitRef.current = new TeamCollaborationWritePermit();
+  }
+  const collaborationWritePermit = collaborationWritePermitRef.current;
+  // Keep host guard ownership distinct when a port changes without replacing services.
+  const seriesShareGuardScopeRef = useRef(collaborationWriteScope);
+  const seriesShareGuardScopeRevisionRef = useRef(0);
+  if (!sameTeamCollaborationWriteScope(seriesShareGuardScopeRef.current, collaborationWriteScope)) {
+    seriesShareGuardScopeRef.current = collaborationWriteScope;
+    seriesShareGuardScopeRevisionRef.current += 1;
+  }
   const [selectedSeries, setSelectedSeries] = useState<Series | null>(null);
-  const [selectedView, setSelectedView] = useState<"series" | "chapters" | "assets" | "tasks" | "creator-settings" | "account">("series");
+  const [selectedView, setSelectedView] = useState<"series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "account">("series");
+  const [teamDirectoryRevision, setTeamDirectoryRevision] = useState(0);
+  const [seriesRevision, setSeriesRevision] = useState(0);
+  const [teamGuardVersion, setTeamGuardVersion] = useState(0);
+  const [seriesShareGuardVersion, setSeriesShareGuardVersion] = useState(0);
   const [chapterNavigationIntent, setChapterNavigationIntent] = useState<ChapterNavigationIntent | null>(null);
   const [assetNavigationIntent, setAssetNavigationIntent] = useState<AssetNavigationIntent | null>(null);
   const navigationIntentRef = useRef<ChapterNavigationIntent | null>(null);
@@ -47,11 +74,13 @@ function Dashboard() {
   const dashboardMounted = useRef(false);
   const creatorSettingsDirtyRef = useRef(false);
   const accountDirtyRef = useRef(false);
+  const teamGuardRef = useRef({ scopeKey: "", dirty: false, inFlight: false });
+  const seriesShareGuardRef = useRef({ scopeKey: "", dirty: false, inFlight: false });
   const currentNavigationContext = useRef<{
     userId: string;
     services: typeof services;
     selectedSeries: Series | null;
-    selectedView: "series" | "chapters" | "assets" | "tasks" | "creator-settings" | "account";
+    selectedView: "series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "account";
     scopeEpoch: number;
   } | null>(null);
 
@@ -62,6 +91,44 @@ function Dashboard() {
     };
   }, []);
 
+  useLayoutEffect(() => {
+    collaborationWritePermit.synchronizeScope(collaborationWriteScope);
+  }, [collaborationWritePermit, collaborationWriteScope]);
+
+  useEffect(() => {
+    const preventUnloadDuringWrite = (event: BeforeUnloadEvent) => {
+      if (!collaborationWritePermit.hasUnresolvedWrite()) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", preventUnloadDuringWrite);
+    return () => window.removeEventListener("beforeunload", preventUnloadDuringWrite);
+  }, [collaborationWritePermit]);
+
+  useEffect(() => {
+    if (selectedView !== "teams" || state.status !== "authenticated") return;
+    const scopeKey = `${state.user.id}:${sessionGeneration}:${dashboardScopeEpoch.current}`;
+    if (teamGuardRef.current.scopeKey !== scopeKey || !teamGuardRef.current.dirty) return;
+    const preventUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", preventUnload);
+    return () => window.removeEventListener("beforeunload", preventUnload);
+  }, [selectedView, sessionGeneration, state, teamGuardVersion]);
+
+  useLayoutEffect(() => {
+    if (state.status !== "authenticated") return;
+    const scopeKey = `${state.user.id}:${sessionGeneration}:${dashboardScopeEpoch.current}:series-share:${seriesShareGuardScopeRevisionRef.current}`;
+    if (seriesShareGuardRef.current.scopeKey !== scopeKey || !seriesShareGuardRef.current.dirty) return;
+    const preventUnload = (event: BeforeUnloadEvent) => {
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", preventUnload);
+    return () => window.removeEventListener("beforeunload", preventUnload);
+  }, [services, services.teamManagement, services.teamSeries, sessionGeneration, state, seriesShareGuardVersion]);
+
   if (state.status !== "authenticated") {
     return null;
   }
@@ -71,6 +138,7 @@ function Dashboard() {
     scopeChanged = true;
     dashboardScope.current = { userId: state.user.id, services };
     dashboardScopeEpoch.current += 1;
+    seriesShareGuardRef.current = { scopeKey: "", dirty: false, inFlight: false };
     navigationEpoch.current += 1;
     navigationIntentRef.current = null;
     assetNavigationIntentRef.current = null;
@@ -87,6 +155,14 @@ function Dashboard() {
     selectedView: scopeChanged ? "series" : selectedView,
     scopeEpoch: dashboardScopeEpoch.current,
   };
+  const teamGuardScopeKey = `${state.user.id}:${sessionGeneration}:${dashboardScopeEpoch.current}`;
+  if (teamGuardRef.current.scopeKey !== teamGuardScopeKey) {
+    teamGuardRef.current = { scopeKey: teamGuardScopeKey, dirty: false, inFlight: false };
+  }
+  const seriesShareGuardScopeKey = `${teamGuardScopeKey}:series-share:${seriesShareGuardScopeRevisionRef.current}`;
+  if (seriesShareGuardRef.current.scopeKey !== seriesShareGuardScopeKey) {
+    seriesShareGuardRef.current = { scopeKey: seriesShareGuardScopeKey, dirty: false, inFlight: false };
+  }
   currentNavigationContext.current = renderNavigationContext;
 
   function clearChapterNavigationIntent(expectedEpoch?: number) {
@@ -110,6 +186,10 @@ function Dashboard() {
   }
 
   function logoutFromWorkspace() {
+    teamGuardRef.current = { scopeKey: teamGuardScopeKey, dirty: false, inFlight: false };
+    seriesShareGuardRef.current = { scopeKey: seriesShareGuardScopeKey, dirty: false, inFlight: false };
+    setTeamGuardVersion((version) => version + 1);
+    setSeriesShareGuardVersion((version) => version + 1);
     clearChapterNavigationIntent();
     clearAssetNavigationIntent();
     setSelectedSeries(null);
@@ -118,6 +198,24 @@ function Dashboard() {
   }
 
   function confirmLeaveCurrentView(): boolean {
+    if (selectedView === "series"
+      && seriesShareGuardRef.current.scopeKey === seriesShareGuardScopeKey
+      && seriesShareGuardRef.current.dirty) {
+      const message = seriesShareGuardRef.current.inFlight
+        ? "团队共享写操作仍在请求中，离开不会撤销已发出的操作。页面会隐藏，回到我的剧集后仍可查看结果；仍要继续吗？"
+        : "当前有未提交的团队共享选择或待核对操作。页面会隐藏并保留当前状态；仍要继续吗？";
+      if (!window.confirm(message)) return false;
+    }
+    if (selectedView === "teams"
+      && teamGuardRef.current.scopeKey === teamGuardScopeKey
+      && teamGuardRef.current.dirty) {
+      const message = teamGuardRef.current.inFlight
+        ? "团队写操作仍在请求中，离开不能撤销已发出的操作。离开会丢弃本地草稿并停止当前页面核对，仍要继续吗？"
+        : "当前有未保存的团队草稿、待核对操作或尚未关闭的邀请码回执；离开会丢弃页面状态，但不会撤销服务器可能已完成的操作。继续吗？";
+      if (!window.confirm(message)) return false;
+      teamGuardRef.current = { scopeKey: teamGuardScopeKey, dirty: false, inFlight: false };
+      setTeamGuardVersion((version) => version + 1);
+    }
     if (selectedView === "creator-settings" && creatorSettingsDirtyRef.current) {
       return window.confirm("当前有未保存的创作者设置草稿或待核对操作，离开将丢弃页面状态。继续吗？");
     }
@@ -128,6 +226,38 @@ function Dashboard() {
     }
     if (selectedView === "account") accountDirtyRef.current = false;
     return true;
+  }
+
+  function updateTeamGuard(scopeKey: string, dirty: boolean, inFlight: boolean) {
+    if (scopeKey !== teamGuardScopeKey || selectedView !== "teams") return;
+    const current = teamGuardRef.current;
+    if (current.dirty === dirty && current.inFlight === inFlight && current.scopeKey === scopeKey) return;
+    teamGuardRef.current = { scopeKey, dirty, inFlight };
+    setTeamGuardVersion((version) => version + 1);
+  }
+
+  function updateSeriesShareGuard(scopeKey: string, dirty: boolean, inFlight: boolean) {
+    if (scopeKey !== seriesShareGuardScopeKey || seriesShareGuardRef.current.scopeKey !== scopeKey) return;
+    const current = seriesShareGuardRef.current;
+    if (current.dirty === dirty && current.inFlight === inFlight && current.scopeKey === scopeKey) return;
+    seriesShareGuardRef.current = { scopeKey, dirty, inFlight };
+    setSeriesShareGuardVersion((version) => version + 1);
+  }
+
+  function navigateToSeries() {
+    if ((selectedView === "series" && selectedSeries === null) || !confirmLeaveCurrentView()) return;
+    clearChapterNavigationIntent();
+    clearAssetNavigationIntent();
+    setSelectedSeries(null);
+    setSelectedView("series");
+  }
+
+  function navigateToTeams() {
+    if (selectedView === "teams" || !confirmLeaveCurrentView()) return;
+    clearChapterNavigationIntent();
+    clearAssetNavigationIntent();
+    setSelectedSeries(null);
+    setSelectedView("teams");
   }
 
   function navigateToCreatorSettings() {
@@ -147,7 +277,16 @@ function Dashboard() {
   }
 
   function leaveWorkspace() {
-    if (confirmLeaveCurrentView()) logoutFromWorkspace();
+    if (!confirmLeaveCurrentView()) return;
+    if (selectedView !== "series"
+      && seriesShareGuardRef.current.scopeKey === seriesShareGuardScopeKey
+      && seriesShareGuardRef.current.dirty) {
+      const message = seriesShareGuardRef.current.inFlight
+        ? "团队共享写操作仍在请求中。退出后无法撤销该请求；服务器结果仍可能需要核对。继续退出吗？"
+        : "仍有团队共享选择或待核对状态未清理。退出会结束本地核对，服务器可能已完成的操作不会撤销。继续退出吗？";
+      if (!window.confirm(message)) return;
+    }
+    logoutFromWorkspace();
   }
 
   function acceptAssetChapterTarget(target: AssetFrameUsageChapterTarget) {
@@ -283,10 +422,24 @@ function Dashboard() {
         </div>
         <nav aria-label="主要导航">
           <p className="nav-section-label">工作空间</p>
-          <div className={selectedView === "series" ? "nav-item active" : "nav-item"} aria-current={selectedView === "series" ? "page" : undefined}>
+          <button
+            className={selectedView === "series" ? "nav-item active" : "nav-item"}
+            aria-current={selectedView === "series" ? "page" : undefined}
+            onClick={navigateToSeries}
+            type="button"
+          >
             <span className="nav-icon" aria-hidden="true">▤</span>
             <span>我的剧集</span>
-          </div>
+          </button>
+          <button
+            aria-current={selectedView === "teams" ? "page" : undefined}
+            className={selectedView === "teams" ? "nav-item active" : "nav-item"}
+            onClick={navigateToTeams}
+            type="button"
+          >
+            <span className="nav-icon" aria-hidden="true">♧</span>
+            <span>我的团队</span>
+          </button>
           <button
             aria-current={selectedView === "tasks" ? "page" : undefined}
             className={selectedView === "tasks" ? "nav-item active" : "nav-item"}
@@ -365,6 +518,8 @@ function Dashboard() {
                 ? "我的账户"
                 : selectedView === "tasks"
                   ? "我的任务"
+                  : selectedView === "teams"
+                    ? "团队管理"
                   : selectedSeries === null
                     ? "我的剧集"
                     : selectedSeries.name}</strong>
@@ -383,6 +538,11 @@ function Dashboard() {
                 type="button"
               >
                 我的任务
+              </button>
+            )}
+            {selectedView !== "teams" && (
+              <button className="mobile-task-entry teams-mobile-entry" onClick={navigateToTeams} type="button">
+                我的团队
               </button>
             )}
             {selectedView !== "creator-settings" && (
@@ -434,6 +594,14 @@ function Dashboard() {
                 setSelectedView("assets");
               }}
               active={selectedSeries === null && selectedView === "series"}
+              collaborationWritePermit={collaborationWritePermit}
+              collaborationWriteScope={collaborationWriteScope}
+              teamDirectoryRevision={teamDirectoryRevision}
+              seriesRevision={seriesRevision}
+              sessionGeneration={sessionGeneration}
+              shareGuardScopeKey={seriesShareGuardScopeKey}
+              onShareGuardChange={updateSeriesShareGuard}
+              onSeriesChanged={() => setSeriesRevision((revision) => revision + 1)}
               services={services}
               userId={state.user.id}
               isSuperuser={state.user.is_superuser}
@@ -487,6 +655,30 @@ function Dashboard() {
               userId={state.user.id}
             />
           )}
+          {selectedView === "teams" && (
+            <TeamsPage
+              key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
+              services={services}
+              collaborationWritePermit={collaborationWritePermit}
+              collaborationWriteScope={collaborationWriteScope}
+              seriesRevision={seriesRevision}
+              userId={state.user.id}
+              sessionGeneration={sessionGeneration}
+              guardScopeKey={teamGuardScopeKey}
+              onUnauthorized={logoutFromWorkspace}
+              onBack={navigateToSeries}
+              onGuardChange={updateTeamGuard}
+              onDirectoryChanged={() => setTeamDirectoryRevision((revision) => revision + 1)}
+              onSeriesChanged={() => setSeriesRevision((revision) => revision + 1)}
+              onOpenSeries={(series, destination) => {
+                if (selectedView !== "teams" || !confirmLeaveCurrentView()) return;
+                clearChapterNavigationIntent();
+                clearAssetNavigationIntent();
+                setSelectedSeries(series);
+                setSelectedView(destination);
+              }}
+            />
+          )}
           {selectedView === "creator-settings" && (
             <CreatorSettingsPage
               key={state.user.id + ":" + dashboardScopeEpoch.current}
@@ -509,7 +701,7 @@ function Dashboard() {
               refreshCurrentUser={refreshCurrentUser}
               sessionGeneration={sessionGeneration}
               onUnauthorized={logoutFromWorkspace}
-              onLogout={logoutFromWorkspace}
+              onLogout={leaveWorkspace}
               onBack={() => {
                 if (!confirmLeaveCurrentView()) return;
                 setSelectedSeries(null);
@@ -528,6 +720,8 @@ function Dashboard() {
                 ? "本人资料、登录设备与密码"
               : selectedView === "tasks"
               ? "任务记录只读预览"
+              : selectedView === "teams"
+                ? "团队、成员与邀请码管理"
               : selectedSeries === null
                 ? "剧集管理"
                 : selectedView === "assets"

@@ -1,0 +1,137 @@
+.admin-tasks-page {
+  display: grid;
+  gap: 18px;
+}
+
+.admin-tasks-heading {
+  align-items: flex-end;
+}
+
+.admin-tasks-heading h1 {
+  margin: 0;
+}
+
+.admin-tasks-filters {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(145px, 1fr)) auto;
+  align-items: end;
+  gap: 12px;
+  padding: 16px;
+  border: 1px solid var(--admin-line, #2a2a30);
+  border-radius: 12px;
+  background: var(--admin-surface, #18181b);
+}
+
+.admin-tasks-filters label {
+  display: grid;
+  gap: 7px;
+  color: var(--admin-muted, #898992);
+  font-size: 12px;
+}
+
+.admin-tasks-filters input,
+.admin-tasks-filters select {
+  min-width: 0;
+  height: 38px;
+  padding: 0 10px;
+  border: 1px solid var(--admin-line, #2a2a30);
+  border-radius: 8px;
+  color: var(--admin-text, #e4e4e7);
+  background: var(--admin-surface-raised, #1e1e22);
+}
+
+.admin-tasks-filter-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.admin-tasks-error {
+  margin: 0;
+  color: var(--admin-danger, #f07178);
+}
+
+.admin-tasks-notice {
+  margin: 0;
+  color: #91d6af;
+}
+
+.admin-tasks-table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--admin-line, #2a2a30);
+  border-radius: 12px;
+  background: var(--admin-surface, #18181b);
+}
+
+.admin-tasks-table {
+  width: 100%;
+  border-collapse: collapse;
+  text-align: left;
+}
+
+.admin-tasks-table th,
+.admin-tasks-table td {
+  padding: 13px 15px;
+  border-bottom: 1px solid var(--admin-line, #2a2a30);
+  white-space: nowrap;
+}
+
+.admin-tasks-table th {
+  color: var(--admin-muted, #898992);
+  font-size: 11px;
+  font-weight: 650;
+}
+
+.admin-tasks-table th button {
+  padding: 0;
+  border: 0;
+  color: inherit;
+  background: transparent;
+  font: inherit;
+}
+
+.admin-tasks-table td {
+  color: var(--admin-text, #e4e4e7);
+  font-size: 12px;
+}
+
+.admin-tasks-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.admin-tasks-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  color: var(--admin-muted, #898992);
+  font-size: 12px;
+}
+
+.admin-tasks-pagination > span {
+  margin-right: auto;
+}
+
+@media (max-width: 900px) {
+  .admin-tasks-filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+@media (max-width: 540px) {
+  .admin-tasks-heading {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .admin-tasks-filters {
+    grid-template-columns: 1fr;
+  }
+
+  .admin-tasks-filter-actions .admin-button {
+    flex: 1;
+  }
+
+  .admin-tasks-pagination {
+    flex-wrap: wrap;
+  }
+}

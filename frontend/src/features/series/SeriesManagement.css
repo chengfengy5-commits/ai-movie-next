@@ -21,7 +21,8 @@
 }
 
 .series-card-actions .series-edit-action,
-.series-card-actions .series-delete-action {
+.series-card-actions .series-delete-action,
+.series-card-actions .series-share-action {
   min-height: 30px;
   padding: 0 10px;
   border: 1px solid #dce7e2;
@@ -33,7 +34,8 @@
 }
 
 .series-card-actions .series-edit-action:hover,
-.series-card-actions .series-delete-action:hover {
+.series-card-actions .series-delete-action:hover,
+.series-card-actions .series-share-action:hover {
   border-color: #a9d0c6;
   background: #f3f9f6;
 }
@@ -46,6 +48,16 @@
 .series-card-actions .series-delete-action:hover {
   border-color: #d8b0a8;
   background: #fff8f6;
+}
+
+.series-card-actions .series-share-action {
+  border-color: #d2def2;
+  color: #3d5c91;
+}
+
+.series-card-actions .series-share-action:hover {
+  border-color: #adc2e4;
+  background: #f4f7fc;
 }
 
 .series-empty-create {
@@ -355,4 +367,64 @@
   color: #526864;
   font-size: 10px;
   line-height: 1.6;
+}
+
+.series-share-dialog {
+  width: min(100%, 520px);
+}
+
+.series-share-form {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.series-share-form label {
+  color: #526864;
+  font-size: 12px;
+  font-weight: 650;
+}
+
+.series-share-form select {
+  width: 100%;
+  min-height: 38px;
+  padding: 0 10px;
+  border: 1px solid #d7e1dc;
+  border-radius: 8px;
+  color: #334b46;
+  background: #fff;
+  font: inherit;
+}
+
+.series-share-claim-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.series-share-claim-option input {
+  width: 15px;
+  height: 15px;
+  margin: 0;
+}
+
+.series-share-dialog .team-series-share-name {
+  margin: 0;
+  color: #334b46;
+  font-weight: 650;
+}
+
+.series-share-unknown {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid #e9c99b;
+  border-radius: 8px;
+  color: #73552e;
+  background: #fffaf1;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.series-share-unknown p {
+  margin: 0;
 }
