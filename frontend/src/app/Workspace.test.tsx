@@ -23,6 +23,8 @@ import type { MyTeam } from "../shared/api/teams";
 import type { CreatorModel, CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 import type { AccountProfileServicePort } from "../shared/api/accountProfile";
 import type { AccountSecurityServicePort } from "../shared/api/accountSecurity";
+import type { TeamDetail, TeamManagementServicePort } from "../shared/api/teamManagement";
+import type { TeamSeriesPage, TeamSeriesRecord, TeamSeriesServicePort } from "../shared/api/teamSeries";
 
 type AssetLibraryCategory = "characters" | "scenes" | "props";
 
@@ -5307,6 +5309,473 @@ describe("read-only workspace", () => {
     expect(createRequest?.[1]?.method).toBe("POST");
     expect(new Headers(createRequest?.[1]?.headers).get("authorization")).toBe("Bearer synthetic-team-session");
     expect(JSON.parse(String(createRequest?.[1]?.body))).toEqual({ name: " 真实API团队 " });
+  });
+
+  it("protects the series-share selection across canceled navigation and restores its unload guard on return", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: "restricted-owned-series",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    let shareOutcomeUnknown = false;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/series/restricted-owned-series/share") {
+        if (shareOutcomeUnknown) return jsonResponse({ detail: "提交后服务暂时不可用" }, 503);
+        return jsonResponse({ message: "已分享到团队「当前团队」", team_id: "team-current", team_name: "当前团队" });
+      }
+      throw new Error(`Unexpected workspace API request: ${url.pathname}`);
+    });
+    window.localStorage.setItem(API_TOKEN_KEY, "series-share-workspace-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const base = createDemoServices(window.localStorage);
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher });
+    const services: WorkspaceServices = {
+      ...base,
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: async () => [series],
+      listMyTeams: async () => [teamDirectoryItem("team-current", "当前团队")],
+      listMyTasks: async () => myTaskPage([], 0),
+    };
+    renderWorkspace(services);
+
+    await screen.findAllByRole("article");
+    await user.click(screen.getByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "team-current");
+
+    const dirtyUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(dirtyUnload);
+    expect(dirtyUnload.defaultPrevented).toBe(true);
+
+    vi.spyOn(window, "confirm").mockReturnValue(false);
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的任务" }));
+    expect(screen.getByRole("dialog", { name: "分享到团队" })).toBeInTheDocument();
+    expect(screen.getByLabelText("分享给团队")).toHaveValue("team-current");
+    expect(fetcher).not.toHaveBeenCalled();
+
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await user.click(within(navigation).getByRole("button", { name: "我的任务" }));
+    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+    const allowedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(allowedUnload);
+    expect(allowedUnload.defaultPrevented).toBe(true);
+
+    await user.click(within(navigation).getByRole("button", { name: "我的剧集" }));
+    expect(await screen.findByRole("dialog", { name: "分享到团队" })).toBeInTheDocument();
+    const restoredUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(restoredUnload);
+    expect(restoredUnload.defaultPrevented).toBe(true);
+
+    shareOutcomeUnknown = true;
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    await user.click(within(navigation).getByRole("button", { name: "我的任务" }));
+    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+    const hiddenUnknownUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(hiddenUnknownUnload);
+    expect(hiddenUnknownUnload.defaultPrevented).toBe(true);
+
+    await user.click(within(navigation).getByRole("button", { name: "我的剧集" }));
+    expect(await screen.findByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "读取当前剧集事实" }));
+    expect(await screen.findByText("当前剧集列表显示：个人剧集。")).toBeInTheDocument();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "明确放弃本地状态" }));
+
+    const abandonedUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(abandonedUnload);
+    expect(abandonedUnload.defaultPrevented).toBe(false);
+    await user.click(screen.getByRole("button", { name: "关闭团队共享" }));
+    expect(screen.queryByRole("dialog", { name: "分享到团队" })).not.toBeInTheDocument();
+    const cleanUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(cleanUnload);
+    expect(cleanUnload.defaultPrevented).toBe(false);
+  });
+
+  it("shares one pending and unknown write permit across the hidden series dialog and Teams workspace", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: "permit-owned-series",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    const createdTeam = {
+      id: "permit-created-team",
+      name: "许可团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-19T12:00:00",
+    };
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
+    const managementPort = apiServices.teamManagement as TeamManagementServicePort;
+    const createTeam = vi.spyOn(managementPort, "createTeam").mockResolvedValue(createdTeam);
+    vi.spyOn(managementPort, "listTeams").mockResolvedValue([]);
+    vi.spyOn(managementPort, "getTeam").mockResolvedValue({
+      ...createdTeam,
+      my_role: "owner",
+      my_permissions: [],
+      members: [],
+    });
+    const seriesPort = apiServices.teamSeries as TeamSeriesServicePort;
+    const share = deferred<Awaited<ReturnType<TeamSeriesServicePort["shareSeries"]>>>();
+    const shareSeries = vi.spyOn(seriesPort, "shareSeries").mockReturnValue(share.promise);
+
+    window.localStorage.setItem(API_TOKEN_KEY, "team-collaboration-permit-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: async () => [series],
+      listMyTeams: async () => [teamDirectoryItem("permit-target-team", "目标团队")],
+    };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderWorkspace(services);
+
+    await screen.findByRole("button", { name: "团队共享：雾港来信" });
+    await user.click(screen.getByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "permit-target-team");
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(shareSeries).toHaveBeenCalledTimes(1);
+
+    const pendingUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(pendingUnload);
+    expect(pendingUnload.defaultPrevented).toBe(true);
+
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    await screen.findByRole("heading", { name: "团队管理" });
+    expect(screen.getByLabelText("团队协作写入限制")).toHaveTextContent("仍在请求中");
+    await user.type(screen.getByLabelText("团队名称"), "放弃后新建");
+    await user.click(screen.getByRole("button", { name: "创建团队" }));
+    expect(createTeam).not.toHaveBeenCalled();
+    expect(screen.getByRole("alert")).toHaveTextContent("当前操作没有发送");
+
+    await act(async () => {
+      share.reject(new ApiError("http", "服务暂不可用", 503));
+      await Promise.resolve();
+    });
+    expect(await screen.findByLabelText("团队协作写入限制")).toHaveTextContent("结果待核对");
+    const unknownUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(unknownUnload);
+    expect(unknownUnload.defaultPrevented).toBe(true);
+    await user.click(screen.getByRole("button", { name: "明确放弃本地状态" }));
+    await waitFor(() => expect(screen.queryByLabelText("团队协作写入限制")).not.toBeInTheDocument());
+    expect(shareSeries).toHaveBeenCalledTimes(1);
+
+    expect(screen.getByLabelText("团队名称")).toHaveValue("放弃后新建");
+    await user.click(screen.getByRole("button", { name: "创建团队" }));
+    await screen.findByRole("heading", { name: "许可团队" });
+    expect(createTeam).toHaveBeenCalledTimes(1);
+  });
+
+  it("preserves an unknown share on canceled close and releases only its lease on confirmed close", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: "close-unknown-share-series",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    let shareRequests = 0;
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input));
+      if (url.pathname === `/api/series/${series.id}/share` && init?.method === "POST") {
+        shareRequests += 1;
+        return shareRequests === 1
+          ? jsonResponse({ detail: "提交后服务暂时不可用" }, 503)
+          : jsonResponse({ message: "已分享到团队「关闭测试团队」", team_id: "close-target-team", team_name: "关闭测试团队" });
+      }
+      throw new Error(`Unexpected workspace API request: ${init?.method ?? "GET"} ${url.pathname}`);
+    });
+    window.localStorage.setItem(API_TOKEN_KEY, "close-unknown-share-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher });
+    const listSeries = vi.fn(async () => [series]);
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries,
+      listMyTeams: async () => [teamDirectoryItem("close-target-team", "关闭测试团队")],
+    };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderWorkspace(services);
+
+    await user.click(await screen.findByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "close-target-team");
+    await user.click(screen.getByLabelText("同时由我认领"));
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(shareRequests).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "读取当前剧集事实" }));
+    expect(await screen.findByText("当前剧集列表显示：个人剧集。")).toBeInTheDocument();
+    vi.mocked(window.confirm).mockReturnValue(false);
+    await user.click(screen.getByRole("button", { name: "关闭团队共享" }));
+    expect(screen.getByLabelText("分享给团队")).toHaveValue("close-target-team");
+    expect(screen.getByLabelText("同时由我认领")).toBeChecked();
+    expect(screen.getByLabelText("待核对的团队共享操作")).toBeInTheDocument();
+    expect(screen.getByText("当前剧集列表显示：个人剧集。")).toBeInTheDocument();
+    const canceledCloseUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(canceledCloseUnload);
+    expect(canceledCloseUnload.defaultPrevented).toBe(true);
+    expect(shareRequests).toBe(1);
+
+    vi.mocked(window.confirm).mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "关闭团队共享" }));
+    expect(screen.queryByRole("dialog", { name: "分享到团队" })).not.toBeInTheDocument();
+    const confirmedCloseUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(confirmedCloseUnload);
+    expect(confirmedCloseUnload.defaultPrevented).toBe(false);
+    expect(shareRequests).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "close-target-team");
+    expect(screen.getByLabelText("同时由我认领")).not.toBeChecked();
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByText(/已分享到团队「关闭测试团队」/)).toBeInTheDocument();
+    expect(shareRequests).toBe(2);
+    expect(listSeries).toHaveBeenCalled();
+  });
+
+  it.each([
+    ["success", "ack"] as const,
+    ["401", 401] as const,
+    ["403", 403] as const,
+  ])("retires a share guard when teamSeries is removed and ignores a late %s receipt", async (label, outcome) => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const series = {
+      ...demoSeries[0]!,
+      id: `removed-port-${label}-series`,
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
+    if (apiServices.teamSeries === undefined) throw new Error("API services did not expose the team series port.");
+    const originalPort = apiServices.teamSeries;
+    const request = deferred<Awaited<ReturnType<TeamSeriesServicePort["shareSeries"]>>>();
+    vi.spyOn(originalPort, "shareSeries").mockReturnValue(request.promise);
+    const portRef: { current: TeamSeriesServicePort | undefined } = { current: originalPort };
+    const listSeries = vi.fn(async () => [series]);
+    const services = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api" as const,
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries,
+      listMyTeams: async () => [teamDirectoryItem("removed-port-team", "端口切换团队")],
+    } satisfies WorkspaceServices;
+    Object.defineProperty(services, "teamSeries", { enumerable: true, get: () => portRef.current });
+    window.localStorage.setItem(API_TOKEN_KEY, `removed-port-${label}-session`);
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const view = renderWorkspace(services);
+
+    await user.click(await screen.findByRole("button", { name: "团队共享：雾港来信" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "removed-port-team");
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(await screen.findByText("正在执行：分享剧集")).toBeInTheDocument();
+    const pendingUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(pendingUnload);
+    expect(pendingUnload.defaultPrevented).toBe(true);
+
+    portRef.current = undefined;
+    view.rerender(<AuthProvider services={services}><Workspace /></AuthProvider>);
+    expect(screen.queryByRole("dialog", { name: "分享到团队" })).not.toBeInTheDocument();
+    const retiredUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(retiredUnload);
+    expect(retiredUnload.defaultPrevented).toBe(false);
+
+    portRef.current = { ...originalPort, shareSeries: vi.fn(originalPort.shareSeries) };
+    view.rerender(<AuthProvider services={services}><Workspace /></AuthProvider>);
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), "removed-port-team");
+    const newScopeUnload = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(newScopeUnload);
+    expect(newScopeUnload.defaultPrevented).toBe(true);
+    const refreshCount = listSeries.mock.calls.length;
+
+    await act(async () => {
+      if (outcome === "ack") {
+        request.resolve({ message: "迟到的旧 ACK", team_id: "removed-port-team", team_name: "端口切换团队" });
+      } else {
+        request.reject(new ApiError("http", `late ${outcome}`, outcome));
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(screen.getByLabelText("分享给团队")).toHaveValue("removed-port-team");
+    expect(within(screen.getByRole("dialog", { name: "分享到团队" })).queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.queryByText("迟到的旧 ACK")).not.toBeInTheDocument();
+    expect(originalPort.shareSeries).toHaveBeenCalledTimes(1);
+    expect(listSeries).toHaveBeenCalledTimes(refreshCount);
+    expect(screen.getByRole("button", { name: "退出" })).toBeInTheDocument();
+    expect(window.localStorage.getItem(API_TOKEN_KEY)).toBe(`removed-port-${label}-session`);
+    const newScopeStillDirty = new Event("beforeunload", { cancelable: true });
+    window.dispatchEvent(newScopeStillDirty);
+    expect(newScopeStillDirty.defaultPrevented).toBe(true);
+  });
+
+  it("refreshes the visible team-series page after a hidden share ACK without accepting an old revision read", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const team = {
+      id: "revision-team",
+      name: "版本团队",
+      owner_id: "fixture-user",
+      created_at: "2026-10-19T12:00:00",
+    };
+    const teamDetail: TeamDetail = {
+      ...team,
+      my_role: "owner",
+      my_permissions: [],
+      members: [
+        { user_id: "fixture-user", username: "团队作者", avatar_url: null, role: "owner", permissions: [], joined_at: team.created_at },
+        { user_id: "revision-target", username: "目标成员", avatar_url: null, role: "member", permissions: [], joined_at: team.created_at },
+      ],
+    };
+    const makeRow = (id: string, name: string): TeamSeriesRecord => ({
+      id,
+      name,
+      description: null,
+      image_url: null,
+      user_id: "fixture-user",
+      owner_name: "团队作者",
+      owner_avatar_url: null,
+      claimed_by: null,
+      claimed_by_username: "",
+      claimed_by_avatar_url: null,
+      created_at: team.created_at,
+      updated_at: team.created_at,
+      chapter_count: 0,
+      asset_counts: { characters: 0, scenes: 0, props: 0, storyboard: 0 },
+    });
+    const page = (items: TeamSeriesRecord[], pageNumber: number, total: number): TeamSeriesPage => ({
+      items,
+      total,
+      page: pageNumber,
+      page_size: 10,
+      total_pages: 2,
+    });
+    const firstPage = page(Array.from({ length: 10 }, (_, index) => makeRow(`revision-${index + 1}`, `第${index + 1}部`)), 1, 11);
+    const oldPage = page([makeRow("revision-11", "刷新前剧集")], 2, 11);
+    const revisionPage = deferred<TeamSeriesPage>();
+    const stalePage = deferred<TeamSeriesPage>();
+    let listCall = 0;
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
+    const managementPort = apiServices.teamManagement as TeamManagementServicePort;
+    vi.spyOn(managementPort, "listTeams").mockResolvedValue([{
+      ...team,
+      member_count: 2,
+      my_role: "owner",
+    }]);
+    vi.spyOn(managementPort, "getTeam").mockResolvedValue(teamDetail);
+    const seriesPort = apiServices.teamSeries as TeamSeriesServicePort;
+    const listTeamSeries = vi.spyOn(seriesPort, "listTeamSeries").mockImplementation(() => {
+      listCall += 1;
+      if (listCall === 1) return Promise.resolve(firstPage);
+      if (listCall === 2) return Promise.resolve(oldPage);
+      if (listCall === 3) return stalePage.promise;
+      if (listCall === 4) return revisionPage.promise;
+      throw new Error(`Unexpected team-series read ${listCall}`);
+    });
+    const shareAck = deferred<Awaited<ReturnType<TeamSeriesServicePort["shareSeries"]>>>();
+    const shareSeries = vi.spyOn(seriesPort, "shareSeries").mockReturnValue(shareAck.promise);
+    const series = {
+      ...demoSeries[0]!,
+      id: "revision-owned-series",
+      name: "待共享剧集",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: false,
+    };
+    window.localStorage.setItem(API_TOKEN_KEY, "team-series-revision-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: async () => [series],
+      listMyTeams: async () => [teamDirectoryItem(team.id, team.name)],
+      listSeriesStylePrompts: async () => [],
+    };
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderWorkspace(services);
+
+    await screen.findByRole("button", { name: "团队共享：待共享剧集" });
+    await user.click(screen.getByRole("button", { name: "团队共享：待共享剧集" }));
+    await user.selectOptions(await screen.findByLabelText("分享给团队"), team.id);
+    await user.click(screen.getByRole("button", { name: "分享剧集" }));
+    expect(shareSeries).toHaveBeenCalledTimes(1);
+    const navigation = screen.getByRole("navigation", { name: "主要导航" });
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    await screen.findByRole("heading", { name: "团队管理" });
+    await user.click(await screen.findByRole("button", { name: /版本团队/ }));
+    await screen.findByRole("heading", { name: "版本团队" });
+    await user.click(screen.getByRole("tab", { name: "团队剧集" }));
+    await screen.findByText("第 1 / 2 页 · 共 11 部");
+    expect(listTeamSeries).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "下一页" }));
+    await screen.findByText("刷新前剧集");
+    expect(listTeamSeries).toHaveBeenCalledTimes(2);
+
+    await user.click(screen.getByRole("button", { name: "刷新列表" }));
+    await waitFor(() => expect(listTeamSeries).toHaveBeenCalledTimes(3));
+    expect(listTeamSeries.mock.calls[2]?.[1]).toBe(2);
+    await act(async () => {
+      shareAck.resolve({ message: "已分享到团队「版本团队」", team_id: team.id, team_name: team.name });
+      await Promise.resolve();
+    });
+    await waitFor(() => expect(listTeamSeries).toHaveBeenCalledTimes(4));
+    expect(listTeamSeries.mock.calls[3]?.[1]).toBe(2);
+
+    await user.type(screen.getByLabelText("名称"), "保留创建草稿");
+    await user.selectOptions(screen.getByLabelText("转交给成员"), "revision-target");
+    await act(async () => {
+      revisionPage.resolve(page([makeRow("revision-11", "分享后新剧集")], 2, 11));
+      await Promise.resolve();
+    });
+    await screen.findByText("分享后新剧集");
+    expect(screen.getByText("第 2 / 2 页 · 共 11 部")).toBeInTheDocument();
+    expect(screen.getByLabelText("名称")).toHaveValue("保留创建草稿");
+    expect(screen.getByLabelText("转交给成员")).toHaveValue("revision-target");
+
+    await act(async () => {
+      stalePage.resolve(page([makeRow("revision-11", "旧 revision 迟到结果")], 2, 11));
+      await Promise.resolve();
+    });
+    expect(screen.getByText("分享后新剧集")).toBeInTheDocument();
+    expect(screen.queryByText("旧 revision 迟到结果")).not.toBeInTheDocument();
   });
 
   it("ignores a late team-invite 401 after a view switch but logs out for the current invite view", async () => {

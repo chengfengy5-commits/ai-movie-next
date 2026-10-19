@@ -1,11 +1,13 @@
 import { TEAM_PERMISSION_KEYS, type TeamDetail, type TeamInvite, type TeamInviteReceipt, type TeamPermission } from "../../shared/api/teamManagement";
 
-export type TeamDetailTab = "members" | "invites" | "settings";
+export type TeamDetailTab = "members" | "invites" | "settings" | "series";
 
 interface TeamDetailPanelProps {
   team: TeamDetail;
   actorId: string;
   tab: TeamDetailTab;
+  detailLoading: boolean;
+  seriesAvailable: boolean;
   nameDraft: string;
   inviteCountDraft: string;
   roleDrafts: Record<string, string>;
@@ -50,6 +52,8 @@ export function TeamDetailPanel({
   team,
   actorId,
   tab,
+  detailLoading,
+  seriesAvailable,
   nameDraft,
   inviteCountDraft,
   roleDrafts,
@@ -95,6 +99,7 @@ export function TeamDetailPanel({
           <p className="team-muted">{team.members.length} 位成员 · 当前角色：{team.my_role}</p>
         </div>
       </div>
+      {detailLoading && <p className="team-muted" role="status">正在刷新团队资料…</p>}
 
       {notice !== null && <p className="team-success" role="status">{notice}</p>}
       {error !== null && <p className="team-error" role="alert">{error}</p>}
@@ -105,6 +110,7 @@ export function TeamDetailPanel({
         <button aria-selected={tab === "members"} className={tab === "members" ? "active" : ""} onClick={() => onTabChange("members")} role="tab" type="button">成员与权限</button>
         {canManageInvites && <button aria-selected={tab === "invites"} className={tab === "invites" ? "active" : ""} onClick={() => onTabChange("invites")} role="tab" type="button">邀请码</button>}
         <button aria-selected={tab === "settings"} className={tab === "settings" ? "active" : ""} onClick={() => onTabChange("settings")} role="tab" type="button">团队设置</button>
+        {seriesAvailable && <button aria-selected={tab === "series"} className={tab === "series" ? "active" : ""} onClick={() => onTabChange("series")} role="tab" type="button">团队剧集</button>}
       </div>
 
       {tab === "members" && (
@@ -245,6 +251,12 @@ export function TeamDetailPanel({
             {team.my_role !== "owner" && <button className="danger-button" disabled={locked} onClick={onLeave} type="button">退出团队</button>}
             {isOwner && <button className="danger-button" disabled={locked} onClick={onDelete} type="button">解散团队</button>}
           </div>
+        </div>
+      )}
+
+      {tab === "series" && seriesAvailable && (
+        <div aria-label="团队剧集" className="team-series-tab-anchor" role="tabpanel">
+          <p className="team-muted">创建团队剧集、管理制作认领，或查看当前团队的共享剧集。</p>
         </div>
       )}
     </section>

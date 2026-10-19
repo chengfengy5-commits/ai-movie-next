@@ -117,6 +117,8 @@ import {
 import { parseMyTeamList, type MyTeam } from "./teams";
 import { createTeamManagementHttpPort } from "./teamManagementHttp";
 import type { TeamManagementServicePort } from "./teamManagement";
+import { createTeamSeriesHttpPort } from "./teamSeriesHttp";
+import type { TeamSeriesServicePort } from "./teamSeries";
 import {
   parseStoryboardModels,
   parseStoryboardPrompts,
@@ -168,6 +170,7 @@ export interface WorkspaceServices {
   uploadSeriesCover?(file: File, signal: AbortSignal): Promise<string>;
   listMyTeams(signal: AbortSignal): Promise<MyTeam[]>;
   readonly teamManagement?: TeamManagementServicePort;
+  readonly teamSeries?: TeamSeriesServicePort;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
@@ -2663,6 +2666,12 @@ export function createApiServices(
     mode: "api",
     apiBaseUrl,
     teamManagement: createTeamManagementHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    teamSeries: createTeamSeriesHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,

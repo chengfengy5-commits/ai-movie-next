@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { ApiError } from "../../shared/api/errors";
 import type { TeamDetail, TeamInvite, TeamManagementServicePort, TeamPermission } from "../../shared/api/teamManagement";
+import type { TeamSeriesPage, TeamSeriesServicePort } from "../../shared/api/teamSeries";
 import { TeamsPage } from "./TeamsPage";
 
 const initialClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
@@ -30,6 +31,22 @@ const detail: TeamDetail = {
     user_id: "member-1", username: "Team member", avatar_url: null, role: "member", permissions: [], joined_at: now,
   }],
 };
+const seriesRow = {
+  id: "series-a",
+  name: "北境来信",
+  description: null,
+  image_url: null,
+  user_id: "creator-1",
+  owner_name: "Creator",
+  owner_avatar_url: null,
+  claimed_by: null,
+  claimed_by_username: "",
+  claimed_by_avatar_url: null,
+  created_at: now,
+  updated_at: now,
+  chapter_count: 0,
+  asset_counts: { characters: 0, scenes: 0, props: 0, storyboard: 0 },
+};
 
 function createPort(overrides: Partial<TeamManagementServicePort> = {}): TeamManagementServicePort {
   return {
@@ -50,6 +67,20 @@ function createPort(overrides: Partial<TeamManagementServicePort> = {}): TeamMan
   };
 }
 
+function createTeamSeriesPort(overrides: Partial<TeamSeriesServicePort> = {}): TeamSeriesServicePort {
+  const page: TeamSeriesPage = { items: [seriesRow], total: 1, page: 1, page_size: 10, total_pages: 1 };
+  return {
+    listTeamSeries: vi.fn(async () => page),
+    createTeamSeries: vi.fn(async () => ({ id: "created", name: "新剧集", team_id: team.id, user_id: "owner-1", style_prompt_id: null })),
+    shareSeries: vi.fn(async () => ({ message: "已分享到团队「协作组」", team_id: team.id, team_name: team.name })),
+    unshareSeries: vi.fn(async () => ({ message: "已移出团队，恢复为个人剧集" })),
+    claimTeamSeries: vi.fn(async () => ({ message: "认领成功", claimed_by: "owner-1", claimed_at: now })),
+    unclaimTeamSeries: vi.fn(async () => ({ message: "已取消认领" })),
+    transferTeamSeries: vi.fn(async (_teamId, _seriesId, userId) => ({ message: "已转交认领", claimed_by: userId })),
+    ...overrides,
+  };
+}
+
 function renderTeamsPage(
   port: TeamManagementServicePort,
   onGuardChange = vi.fn(),
@@ -66,6 +97,8 @@ function renderTeamsPage(
       onBack={vi.fn()}
       onGuardChange={onGuardChange}
       onDirectoryChanged={vi.fn()}
+      onSeriesChanged={vi.fn()}
+      onOpenSeries={vi.fn()}
     />,
   );
   return { ...result, services, onGuardChange, onUnauthorized };
@@ -150,6 +183,36 @@ describe("TeamsPage", () => {
     expect(onGuardChange).toHaveBeenLastCalledWith("owner-1:3:workspace-0", false, false);
     expect(port.createTeam).toHaveBeenCalledTimes(1);
   });
+
+  it.each(["401", "403", "unknown"] as const)(
+    "clears the host in-flight guard after a current %s write result",
+    async (outcome) => {
+      const user = userEvent.setup();
+      const onGuardChange = vi.fn();
+      const onUnauthorized = vi.fn();
+      const createTeam = vi.fn(async () => {
+        if (outcome === "401") throw new ApiError("http", "expired", 401);
+        if (outcome === "403") throw new ApiError("http", "forbidden", 403);
+        throw new ApiError("timeout", "pending");
+      });
+      const port = createPort({ createTeam });
+      renderTeamsPage(port, onGuardChange, onUnauthorized);
+      await screen.findByText("当前账号还没有加入团队。");
+      await user.type(screen.getByLabelText("团队名称"), "保留草稿");
+      await user.click(screen.getByRole("button", { name: "创建团队" }));
+
+      if (outcome === "401") {
+        await waitFor(() => expect(onUnauthorized).toHaveBeenCalledTimes(1));
+      } else if (outcome === "403") {
+        await waitFor(() => expect(screen.getByRole("button", { name: "创建团队" })).not.toBeDisabled());
+      } else {
+        expect(await screen.findByRole("region", { name: "待核对的团队操作" })).toBeInTheDocument();
+      }
+
+      expect(onGuardChange).toHaveBeenLastCalledWith("owner-1:3:workspace-0", true, false);
+      expect(createTeam).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("preserves dirty forms when the user cancels a team switch", async () => {
     const user = userEvent.setup();
@@ -466,6 +529,8 @@ describe("TeamsPage", () => {
         onBack={vi.fn()}
         onGuardChange={vi.fn()}
         onDirectoryChanged={vi.fn()}
+        onSeriesChanged={vi.fn()}
+        onOpenSeries={vi.fn()}
       />,
     );
     await user.click(await screen.findByRole("button", { name: /协作组/ }));
@@ -585,6 +650,8 @@ describe("TeamsPage", () => {
         onBack={vi.fn()}
         onGuardChange={onGuardChange}
         onDirectoryChanged={onDirectoryChanged}
+        onSeriesChanged={vi.fn()}
+        onOpenSeries={vi.fn()}
       />
     );
     const view = render(renderPage(oldServices, "owner-1", 3, "owner-1:3", oldGuard, oldDirectoryChanged));
@@ -607,6 +674,141 @@ describe("TeamsPage", () => {
     expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
+  it.each(["success", "401", "403"] as const)(
+    "retires the old management port attempt on a same-session replacement before late %s",
+    async (lateResult) => {
+      const oldResult = deferred<typeof team>();
+      const newResult = deferred<typeof team>();
+      const oldPort = createPort({ createTeam: vi.fn(() => oldResult.promise) });
+      const newTeam = { ...team, id: "new-team", name: "新端口团队" };
+      const newPort = createPort({
+        createTeam: vi.fn(() => newResult.promise),
+        getTeam: vi.fn(async () => ({ ...detail, ...newTeam })),
+      });
+      const services: WorkspaceServices = { ...createDemoServices(), teamManagement: oldPort };
+      const onUnauthorized = vi.fn();
+      const onDirectoryChanged = vi.fn();
+      const onGuardChange = vi.fn();
+      const props = {
+        services,
+        userId: "owner-1",
+        sessionGeneration: 3,
+        guardScopeKey: "owner-1:3:workspace-0",
+        onUnauthorized,
+        onBack: vi.fn(),
+        onGuardChange,
+        onDirectoryChanged,
+        onSeriesChanged: vi.fn(),
+        onOpenSeries: vi.fn(),
+      };
+      const view = render(<TeamsPage {...props} />);
+      const user = userEvent.setup();
+      await screen.findByText("当前账号还没有加入团队。");
+      await user.type(screen.getByLabelText("团队名称"), "旧端口草稿");
+      await user.click(screen.getByRole("button", { name: "创建团队" }));
+      expect(oldPort.createTeam).toHaveBeenCalledTimes(1);
+
+      Object.assign(services, { teamManagement: newPort });
+      view.rerender(<TeamsPage {...props} />);
+      await waitFor(() => expect(newPort.listTeams).toHaveBeenCalledTimes(1));
+      expect(screen.getByLabelText("团队名称")).toHaveValue("");
+      await user.type(screen.getByLabelText("团队名称"), "新端口团队");
+      await user.click(screen.getByRole("button", { name: "创建团队" }));
+      expect(newPort.createTeam).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        if (lateResult === "success") oldResult.resolve({ ...team, id: "old-team", name: "旧端口团队" });
+        else oldResult.reject(new ApiError("http", "旧端口拒绝", lateResult === "401" ? 401 : 403));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(onUnauthorized).not.toHaveBeenCalled();
+      expect(onDirectoryChanged).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "创建团队" })).toBeDisabled();
+      await user.click(screen.getByRole("button", { name: "创建团队" }));
+      expect(newPort.createTeam).toHaveBeenCalledTimes(1);
+
+      await act(async () => { newResult.resolve(newTeam); });
+      expect(await screen.findByRole("heading", { name: "新端口团队" })).toBeInTheDocument();
+      expect(onDirectoryChanged).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it.each(["success", "401", "403"] as const)(
+    "retires the old team-series port lease on a same-session replacement before late %s",
+    async (lateResult) => {
+      const user = userEvent.setup();
+      const oldResult = deferred<Awaited<ReturnType<TeamSeriesServicePort["claimTeamSeries"]>>>();
+      const newResult = deferred<Awaited<ReturnType<TeamSeriesServicePort["claimTeamSeries"]>>>();
+      let oldSignal: AbortSignal | undefined;
+      const oldSeriesPort = createTeamSeriesPort({
+        claimTeamSeries: vi.fn((_teamId, _seriesId, _actorId, signal) => {
+          oldSignal = signal;
+          return oldResult.promise;
+        }),
+      });
+      const newSeriesPort = createTeamSeriesPort({ claimTeamSeries: vi.fn(() => newResult.promise) });
+      const managementPort = createPort({
+        listTeams: vi.fn(async () => [{ ...team, member_count: 2, my_role: "owner" }]),
+      });
+      const services: WorkspaceServices = {
+        ...createDemoServices(),
+        listSeriesStylePrompts: vi.fn(async () => []),
+        teamManagement: managementPort,
+        teamSeries: oldSeriesPort,
+      };
+      const onUnauthorized = vi.fn();
+      const onSeriesChanged = vi.fn();
+      vi.spyOn(window, "confirm").mockReturnValue(true);
+      const props = {
+        services,
+        userId: "owner-1",
+        sessionGeneration: 3,
+        guardScopeKey: "owner-1:3:workspace-0",
+        onUnauthorized,
+        onBack: vi.fn(),
+        onGuardChange: vi.fn(),
+        onDirectoryChanged: vi.fn(),
+        onSeriesChanged,
+        onOpenSeries: vi.fn(),
+      };
+      const view = render(<TeamsPage {...props} />);
+      await user.click(await screen.findByRole("button", { name: /协作组/ }));
+      await screen.findByRole("heading", { name: "协作组" });
+      await user.click(screen.getByRole("tab", { name: "团队剧集" }));
+      await screen.findByRole("heading", { name: "北境来信" });
+      await user.click(screen.getByRole("button", { name: "认领剧集" }));
+      expect(oldSeriesPort.claimTeamSeries).toHaveBeenCalledTimes(1);
+
+      Object.assign(services, { teamSeries: newSeriesPort });
+      view.rerender(<TeamsPage {...props} />);
+      expect(oldSignal?.aborted).toBe(true);
+      await user.click(await screen.findByRole("button", { name: /协作组/ }));
+      await screen.findByRole("heading", { name: "协作组" });
+      await user.click(screen.getByRole("tab", { name: "团队剧集" }));
+      await screen.findByRole("heading", { name: "北境来信" });
+      await user.click(screen.getByRole("button", { name: "认领剧集" }));
+      expect(newSeriesPort.claimTeamSeries).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        if (lateResult === "success") oldResult.resolve({ message: "认领成功", claimed_by: "old-actor", claimed_at: now });
+        else oldResult.reject(new ApiError("http", "旧剧集端口拒绝", lateResult === "401" ? 401 : 403));
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+      expect(onUnauthorized).not.toHaveBeenCalled();
+      expect(onSeriesChanged).not.toHaveBeenCalled();
+      expect(screen.getByRole("button", { name: "认领剧集" })).toBeDisabled();
+      await user.click(screen.getByRole("button", { name: "认领剧集" }));
+      expect(newSeriesPort.claimTeamSeries).toHaveBeenCalledTimes(1);
+
+      await act(async () => { newResult.resolve({ message: "认领成功", claimed_by: "owner-1", claimed_at: now }); });
+      await waitFor(() => expect(onSeriesChanged).toHaveBeenCalledTimes(1));
+      expect(onUnauthorized).not.toHaveBeenCalled();
+    },
+  );
+
   it("ignores a late 401 from the old owner after the same page receives a new session", async () => {
     const stale = deferred<Array<{ id: string; name: string; owner_id: string; created_at: string; member_count: number; my_role: string }>>();
     const oldPort = createPort({ listTeams: vi.fn(() => stale.promise) });
@@ -626,6 +828,8 @@ describe("TeamsPage", () => {
         onBack={vi.fn()}
         onGuardChange={vi.fn()}
         onDirectoryChanged={vi.fn()}
+        onSeriesChanged={vi.fn()}
+        onOpenSeries={vi.fn()}
       />
     );
     const view = render(renderPage(oldServices, "old-owner", 1, "old-owner:1"));

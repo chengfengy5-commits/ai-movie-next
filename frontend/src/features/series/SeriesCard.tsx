@@ -12,6 +12,7 @@ interface SeriesCardProps {
   onViewAssets(series: Series): void;
   onEdit?(series: Series): void;
   onDelete?(series: Series): void;
+  onShare?(series: Series): void;
   exchangePort?: SeriesExchangePort;
 }
 
@@ -33,6 +34,7 @@ export function SeriesCard({
   onViewAssets,
   onEdit,
   onDelete,
+  onShare,
   exchangePort,
 }: SeriesCardProps) {
   const [imageFailed, setImageFailed] = useState(false);
@@ -97,7 +99,7 @@ export function SeriesCard({
             {series.can_enter ? "制作功能待开放" : "暂时不能进入"}
           </span>
         </div>
-        {(series.can_enter || onDelete !== undefined) && (
+        {(series.can_enter || onDelete !== undefined || onShare !== undefined) && (
           <div className="series-card-actions">
             {series.can_enter && (
               <>
@@ -144,6 +146,16 @@ export function SeriesCard({
                 type="button"
               >
                 删除
+              </button>
+            )}
+            {onShare !== undefined && series.user_id === currentUserId && (
+              <button
+                aria-label={`${series.team_id === null ? "团队共享" : "管理团队共享"}：${series.name}`}
+                className="series-share-action"
+                onClick={() => onShare(series)}
+                type="button"
+              >
+                {series.team_id === null ? "团队共享" : "管理团队共享"}
               </button>
             )}
           </div>

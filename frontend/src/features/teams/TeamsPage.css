@@ -485,3 +485,196 @@
     width: 100%;
   }
 }
+
+.team-series-create {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr);
+  align-items: center;
+  gap: 0.6rem 0.85rem;
+  padding: 1rem;
+  border: 1px solid #e4e9f1;
+  border-radius: 12px;
+  background: #fbfcfe;
+}
+
+.team-series-create h3,
+.team-series-create > p,
+.team-series-create .primary-button {
+  grid-column: 1 / -1;
+}
+
+.team-series-create h3 {
+  margin: 0;
+}
+
+.team-series-create label,
+.team-series-transfer-control label {
+  color: #526075;
+  font-size: 0.85rem;
+}
+
+.team-series-create input:not([type="checkbox"]),
+.team-series-create textarea,
+.team-series-create select,
+.team-series-transfer-control select {
+  width: 100%;
+  min-width: 0;
+  min-height: 38px;
+  padding: 0.45rem 0.65rem;
+  border: 1px solid #d5dce7;
+  border-radius: 8px;
+  color: #344156;
+  background: #fff;
+  font: inherit;
+}
+
+.team-series-create textarea {
+  min-height: 72px;
+  resize: vertical;
+}
+
+.team-series-create .team-series-claim-option {
+  display: flex;
+  grid-column: 1 / -1;
+  align-items: center;
+  gap: 0.55rem;
+}
+
+.team-series-create .team-series-claim-option input {
+  width: auto;
+  min-height: auto;
+}
+
+.team-series-list {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.team-series-card {
+  display: grid;
+  gap: 0.9rem;
+  padding: 1rem;
+  border: 1px solid #e4e9f1;
+  border-radius: 12px;
+  background: #fcfdff;
+}
+
+.team-series-card-heading {
+  display: flex;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.team-series-card-heading h3,
+.team-series-card-heading p {
+  margin: 0;
+}
+
+.team-series-card-heading p {
+  margin-top: 0.35rem;
+  color: #677386;
+  font-size: 0.85rem;
+}
+
+.team-series-card-heading dl {
+  display: grid;
+  gap: 0.35rem;
+  min-width: min(320px, 45%);
+  margin: 0;
+  color: #677386;
+  font-size: 0.75rem;
+}
+
+.team-series-card-heading dl > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.team-series-card-heading dt,
+.team-series-card-heading dd {
+  margin: 0;
+}
+
+.team-series-claim-controls,
+.team-series-open-actions,
+.team-series-pagination,
+.team-series-pagination > div {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.team-series-claim-state,
+.team-series-claim-hint {
+  color: #677386;
+  font-size: 0.8rem;
+}
+
+.team-series-transfer-control {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.team-series-transfer-control label {
+  margin-left: 0.35rem;
+}
+
+.team-series-transfer-control select {
+  width: auto;
+  min-width: 150px;
+}
+
+.team-series-pagination {
+  justify-content: space-between;
+  color: #677386;
+  font-size: 0.8rem;
+}
+
+.team-series-tab-anchor {
+  padding: 0.25rem 0;
+}
+
+.team-series-tab-anchor p {
+  margin: 0;
+}
+
+@media (max-width: 760px) {
+  .team-series-card-heading {
+    flex-direction: column;
+  }
+
+  .team-series-card-heading dl {
+    min-width: 0;
+  }
+}
+
+@media (max-width: 440px) {
+  .team-series-create {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .team-series-create label {
+    margin-top: 0.25rem;
+  }
+
+  .team-series-create input:not([type="checkbox"]),
+  .team-series-create textarea,
+  .team-series-create select,
+  .team-series-create .primary-button {
+    grid-column: 1;
+  }
+
+  .team-series-transfer-control {
+    align-items: stretch;
+    flex-direction: column;
+    width: 100%;
+  }
+
+  .team-series-transfer-control select {
+    width: 100%;
+  }
+}

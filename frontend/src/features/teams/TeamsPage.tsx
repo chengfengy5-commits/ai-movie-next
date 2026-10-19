@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import { ApiError } from "../../shared/api/errors";
+import type { Series } from "../../shared/api/contracts";
 import type { WorkspaceServices } from "../../shared/api/services";
 import {
   type TeamDetail,
@@ -12,36 +13,54 @@ import {
   type TeamRole,
   type TeamRoleReceipt,
 } from "../../shared/api/teamManagement";
+import type { TeamSeriesCreateDraft, TeamSeriesServicePort, TeamSeriesWriteIntent } from "../../shared/api/teamSeries";
+import {
+  createTeamCollaborationWriteScope,
+  sameTeamCollaborationWriteScope,
+  TeamCollaborationWritePermit,
+  type TeamCollaborationWriteLease,
+  type TeamCollaborationWriteScope,
+} from "../../app/teamCollaborationWritePermit";
 import { TeamDetailPanel, type TeamDetailTab } from "./TeamDetailPanel";
 import { TeamDirectoryPanel } from "./TeamDirectoryPanel";
+import { TeamSeriesPanel } from "./TeamSeriesPanel";
 import "./TeamsPage.css";
 
 interface TeamScope {
   userId: string;
   sessionGeneration: number;
   services: WorkspaceServices;
+  collaborationWriteScope: TeamCollaborationWriteScope;
   epoch: number;
 }
 
 interface TeamSnapshotSummary {
-  kind: "directory" | "team" | "invites";
+  kind: "directory" | "team" | "invites" | "team-series";
   teamName?: string;
   teamCount?: number;
   memberCount?: number;
   myRole?: string;
   inviteCount?: number;
   inviteStatuses?: string[];
+  seriesCount?: number;
+  seriesPage?: number;
+  seriesTotal?: number;
 }
 
 interface TeamsPageProps {
   services: WorkspaceServices;
   userId: string;
   sessionGeneration: number;
+  seriesRevision?: number;
+  collaborationWritePermit?: TeamCollaborationWritePermit;
+  collaborationWriteScope?: TeamCollaborationWriteScope;
   guardScopeKey: string;
   onUnauthorized(): void;
   onBack(): void;
   onGuardChange(scopeKey: string, dirty: boolean, inFlight: boolean): void;
   onDirectoryChanged(): void;
+  onSeriesChanged(teamId: string, seriesId: string): void;
+  onOpenSeries(series: Series, destination: "chapters" | "assets"): void;
 }
 
 interface Drafts {
@@ -51,16 +70,21 @@ interface Drafts {
   inviteCount: string;
   roleValues: Record<string, string>;
   permissionValues: Record<string, TeamPermission[]>;
+  seriesCreate: TeamSeriesCreateDraft;
+  seriesTransferTargets: Record<string, string>;
 }
 
-interface WriteOperation<T> {
+interface WriteMetadata<T> {
   label: string;
   teamId: string | null;
   targetId: string | null;
   submitted: unknown;
-  request(port: NonNullable<WorkspaceServices["teamManagement"]>, signal: AbortSignal): Promise<T>;
   applyAck?(ack: T): void;
   refresh?(): void;
+}
+
+interface WriteOperation<T> extends WriteMetadata<T> {
+  request(port: NonNullable<WorkspaceServices["teamManagement"]>, signal: AbortSignal): Promise<T>;
 }
 
 function initialDrafts(): Drafts {
@@ -71,6 +95,19 @@ function initialDrafts(): Drafts {
     inviteCount: "1",
     roleValues: {},
     permissionValues: {},
+    seriesCreate: { name: "", claim: false },
+    seriesTransferTargets: {},
+  };
+}
+
+function cloneDrafts(drafts: Drafts): Drafts {
+  return {
+    ...drafts,
+    roleValues: { ...drafts.roleValues },
+    permissionValues: Object.fromEntries(Object.entries(drafts.permissionValues)
+      .map(([memberId, permissions]) => [memberId, [...permissions]])),
+    seriesCreate: { ...drafts.seriesCreate },
+    seriesTransferTargets: { ...drafts.seriesTransferTargets },
   };
 }
 
@@ -80,6 +117,12 @@ function samePermissions(left: TeamPermission[], right: TeamPermission[]): boole
 
 function hasDrafts(drafts: Drafts, detail: TeamDetail | null): boolean {
   if (drafts.createName.length > 0 || drafts.joinCode.length > 0 || drafts.inviteCount !== "1") return true;
+  if (drafts.seriesCreate.name.length > 0
+    || drafts.seriesCreate.description !== undefined
+    || drafts.seriesCreate.image_url !== undefined
+    || drafts.seriesCreate.style_prompt_id !== undefined
+    || drafts.seriesCreate.claim
+    || Object.values(drafts.seriesTransferTargets).some((userId) => userId !== "")) return true;
   if (detail === null) return false;
   if (drafts.teamName !== detail.name) return true;
   for (const member of detail.members) {
@@ -105,6 +148,18 @@ function apiFailureMessage(error: unknown, writing: boolean): string {
   return writing ? "操作结果暂时无法确认，请只读核对。" : "读取团队信息失败，请重试。";
 }
 
+function teamSeriesFailureMessage(error: unknown): string {
+  if (!(error instanceof ApiError)) return "团队剧集操作未完成，请重试。";
+  if (error.detail !== null) return error.detail;
+  if (error.status === 401) return "当前登录状态已失效，正在返回登录页。";
+  if (error.status === 403) return "当前账号无权执行此操作；成员关系或权限可能已变化。";
+  if (error.status === 404) return "目标团队或剧集已不存在，请刷新后确认。";
+  if (error.status === 422) return "提交内容未通过服务端校验。";
+  if (error.status === 503) return "团队剧集服务当前未接线。";
+  if (error.status === 400) return "服务端拒绝了此认领变更。";
+  return "团队剧集操作未完成。";
+}
+
 function isUnknownWrite(error: unknown): boolean {
   if (!(error instanceof ApiError)) return true;
   if (error.kind === "network" || error.kind === "timeout" || error.kind === "invalid-response" || error.kind === "aborted") {
@@ -117,13 +172,32 @@ export function TeamsPage({
   services,
   userId,
   sessionGeneration,
+  seriesRevision = 0,
+  collaborationWritePermit: providedWritePermit,
+  collaborationWriteScope: providedWriteScope,
   guardScopeKey,
   onUnauthorized,
   onBack,
   onGuardChange,
   onDirectoryChanged,
+  onSeriesChanged,
+  onOpenSeries,
 }: TeamsPageProps) {
+  const localWritePermitRef = useRef<TeamCollaborationWritePermit | null>(null);
+  if (localWritePermitRef.current === null) localWritePermitRef.current = new TeamCollaborationWritePermit();
+  const collaborationWritePermit = providedWritePermit ?? localWritePermitRef.current;
+  const localWriteScope = useMemo(
+    () => createTeamCollaborationWriteScope(userId, sessionGeneration, services),
+    [services, services.teamManagement, services.teamSeries, sessionGeneration, userId],
+  );
+  const collaborationWriteScope = providedWriteScope ?? localWriteScope;
+  const permitSnapshot = useSyncExternalStore(
+    collaborationWritePermit.subscribe,
+    collaborationWritePermit.getSnapshot,
+    collaborationWritePermit.getSnapshot,
+  );
   const port = services.teamManagement;
+  const teamSeriesPort = services.teamSeries;
   const [teams, setTeams] = useState<TeamDirectoryEntry[]>([]);
   const [teamsLoading, setTeamsLoading] = useState(false);
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
@@ -146,7 +220,7 @@ export function TeamsPage({
 
   const mountedRef = useRef(false);
   const scopeEpochRef = useRef(0);
-  const scopeRef = useRef<TeamScope>({ userId, sessionGeneration, services, epoch: 0 });
+  const scopeRef = useRef<TeamScope>({ userId, sessionGeneration, services, collaborationWriteScope, epoch: 0 });
   const draftsRef = useRef(drafts);
   const detailRef = useRef(detail);
   const dirtyRef = useRef(false);
@@ -155,6 +229,7 @@ export function TeamsPage({
     attempt: number;
     epoch: number;
     controller: AbortController;
+    lease: TeamCollaborationWriteLease;
     label: string;
     teamId: string | null;
     targetId: string | null;
@@ -168,6 +243,7 @@ export function TeamsPage({
     targetId: string | null;
     submitted: unknown;
     draft: Drafts;
+    owner: "management" | "team-series";
   } | null>(null);
   const snapshotAttemptRef = useRef(0);
   const snapshotControllerRef = useRef<AbortController | null>(null);
@@ -180,21 +256,30 @@ export function TeamsPage({
   const onBackRef = useRef(onBack);
   const onGuardChangeRef = useRef(onGuardChange);
   const onDirectoryChangedRef = useRef(onDirectoryChanged);
+  const onSeriesChangedRef = useRef(onSeriesChanged);
+  const onOpenSeriesRef = useRef(onOpenSeries);
   onUnauthorizedRef.current = onUnauthorized;
   onBackRef.current = onBack;
   onGuardChangeRef.current = onGuardChange;
   onDirectoryChangedRef.current = onDirectoryChanged;
+  onSeriesChangedRef.current = onSeriesChanged;
+  onOpenSeriesRef.current = onOpenSeries;
   draftsRef.current = drafts;
   detailRef.current = detail;
 
   const priorScope = scopeRef.current;
   const identityChanged = priorScope.userId !== userId
     || priorScope.sessionGeneration !== sessionGeneration
-    || priorScope.services !== services;
+    || priorScope.services !== services
+    || !sameTeamCollaborationWriteScope(priorScope.collaborationWriteScope, collaborationWriteScope);
   if (identityChanged) {
     const nextEpoch = ++scopeEpochRef.current;
-    scopeRef.current = { userId, sessionGeneration, services, epoch: nextEpoch };
+    scopeRef.current = { userId, sessionGeneration, services, collaborationWriteScope, epoch: nextEpoch };
   }
+
+  useLayoutEffect(() => {
+    collaborationWritePermit.synchronizeScope(collaborationWriteScope);
+  }, [collaborationWritePermit, collaborationWriteScope]);
 
   const currentScope = scopeRef.current;
   const isCurrent = useCallback((epoch: number) => mountedRef.current && scopeRef.current.epoch === epoch,
@@ -431,32 +516,63 @@ export function TeamsPage({
     syncGuard();
   }, [detail, drafts, guardScopeKey, inviteReceipt, sessionGeneration, unknownLabel]);
 
-  async function runWrite<T>(operation: WriteOperation<T>): Promise<void> {
+  async function runSharedWrite<T>(
+    operation: WriteMetadata<T>,
+    ownerKind: "management" | "team-series",
+    request: (signal: AbortSignal) => Promise<T>,
+  ): Promise<void> {
     const owner = scopeRef.current;
-    const ownerPort = owner.services.teamManagement;
-    if (ownerPort === undefined || writeRef.current !== null || unknownRef.current !== null) return;
+    if (writeRef.current !== null || unknownRef.current !== null) return;
+    const lease = collaborationWritePermit.acquire(owner.collaborationWriteScope, {
+      kind: ownerKind === "management" ? "team-management" : "team-series",
+      label: operation.label,
+    });
+    if (lease === null) {
+      if (mountedRef.current) {
+        const message = permitSnapshot.phase === "unknown"
+          ? "另一项团队协作写操作仍待明确放弃；当前操作没有发送。"
+          : "另一项团队协作写操作正在进行；当前操作没有发送。";
+        if (selectedTeamId === null) setDirectoryError(message);
+        else setDetailError(message);
+      }
+      return;
+    }
     const attempt = ++attemptRef.current;
     const controller = new AbortController();
     writeRef.current = {
       attempt,
       epoch: owner.epoch,
       controller,
+      lease,
       label: operation.label,
       teamId: operation.teamId,
       targetId: operation.targetId,
       submitted: operation.submitted,
     };
-    setPendingLabel(operation.label);
-    setDetailError(null);
-    setDirectoryError(null);
-    setRefreshWarning(null);
-    publishGuard(true, owner.epoch, true);
+    if (mountedRef.current) {
+      setPendingLabel(operation.label);
+      setDetailError(null);
+      setDirectoryError(null);
+      setRefreshWarning(null);
+      publishGuard(true, owner.epoch, true);
+    }
+    const isCurrentAttempt = () => scopeRef.current.epoch === owner.epoch
+      && sameTeamCollaborationWriteScope(scopeRef.current.collaborationWriteScope, owner.collaborationWriteScope)
+      && writeRef.current?.attempt === attempt
+      && writeRef.current.lease.id === lease.id
+      && collaborationWritePermit.isLeaseCurrent(lease);
     try {
-      const request = operation.request(ownerPort, controller.signal);
-      const ack = await request;
-      if (!isCurrent(owner.epoch) || writeRef.current?.attempt !== attempt) return;
+      const ack = await request(controller.signal);
+      if (!isCurrentAttempt()) return;
+      collaborationWritePermit.complete(lease);
       writeRef.current = null;
-      setPendingLabel(null);
+      if (mountedRef.current) setPendingLabel(null);
+      else if (ownerKind === "team-series") {
+        onSeriesChangedRef.current(operation.teamId ?? "", operation.targetId ?? "");
+      } else {
+        onDirectoryChangedRef.current();
+      }
+      if (!mountedRef.current) return;
       setUnknownLabel(null);
       unknownRef.current = null;
       setNotice(`${operation.label}已确认。`);
@@ -464,14 +580,18 @@ export function TeamsPage({
       operation.refresh?.();
       publishGuard(hasPageGuard(), owner.epoch);
     } catch (error) {
-      if (!isCurrent(owner.epoch) || writeRef.current?.attempt !== attempt) return;
+      if (!isCurrentAttempt()) return;
+      writeRef.current = null;
+      if (mountedRef.current) setPendingLabel(null);
       if (error instanceof ApiError && error.status === 401) {
-        writeRef.current = null;
-        setPendingLabel(null);
+        collaborationWritePermit.complete(lease);
+        if (mountedRef.current) publishGuard(hasPageGuard(), owner.epoch, false);
         onUnauthorizedRef.current();
         return;
       }
       if (isUnknownWrite(error)) {
+        collaborationWritePermit.markUnknown(lease);
+        if (!mountedRef.current) return;
         unknownRef.current = {
           attempt,
           epoch: owner.epoch,
@@ -479,28 +599,40 @@ export function TeamsPage({
           teamId: operation.teamId,
           targetId: operation.targetId,
           submitted: operation.submitted,
-          draft: {
-            ...draftsRef.current,
-            roleValues: { ...draftsRef.current.roleValues },
-            permissionValues: Object.fromEntries(Object.entries(draftsRef.current.permissionValues)
-              .map(([memberId, permissions]) => [memberId, [...permissions]])),
-          },
+          draft: cloneDrafts(draftsRef.current),
+          owner: ownerKind,
         };
         setUnknownLabel(operation.label);
         setDetailError("这次写操作的结果无法确认。请先进行只读核对；系统不会自动重试。放弃本地状态也不会撤销服务器可能已完成的操作。");
+        publishGuard(hasPageGuard(), owner.epoch, false);
       } else {
-        setDetailError(apiFailureMessage(error, true));
+        collaborationWritePermit.complete(lease);
+        if (!mountedRef.current) return;
+        setDetailError(ownerKind === "team-series" ? teamSeriesFailureMessage(error) : apiFailureMessage(error, true));
+        publishGuard(hasPageGuard(), owner.epoch, false);
       }
     } finally {
-      if (isCurrent(owner.epoch) && writeRef.current?.attempt === attempt) {
+      if (isCurrentAttempt()) {
+        collaborationWritePermit.complete(lease);
         writeRef.current = null;
-        setPendingLabel(null);
-        publishGuard(
-          hasPageGuard(),
-          owner.epoch,
-        );
+        if (mountedRef.current) {
+          setPendingLabel(null);
+          publishGuard(hasPageGuard(), owner.epoch);
+        }
       }
     }
+  }
+
+  async function runWrite<T>(operation: WriteOperation<T>): Promise<void> {
+    const ownerPort = scopeRef.current.services.teamManagement;
+    if (ownerPort === undefined) return;
+    return runSharedWrite(operation, "management", (signal) => operation.request(ownerPort, signal));
+  }
+
+  function runTeamSeriesWrite<T>(operation: TeamSeriesWriteIntent<T>): void {
+    const ownerPort: TeamSeriesServicePort | undefined = scopeRef.current.services.teamSeries;
+    if (ownerPort === undefined) return;
+    void runSharedWrite(operation, "team-series", (signal) => operation.request(ownerPort, signal));
   }
 
   function resetDrafts(): void {
@@ -528,6 +660,7 @@ export function TeamsPage({
         ? "当前有尚未关闭的邀请码回执或未保存的团队草稿。离开会丢弃页面状态，但已生成的邀请码不会撤销。继续吗？"
         : "当前有未保存的团队草稿，离开会丢弃这些页面状态。继续吗？";
     if (!window.confirm(message)) return false;
+    if (unknownRef.current !== null && !collaborationWritePermit.abandonUnknown(collaborationWriteScope)) return false;
     unknownRef.current = null;
     setUnknownLabel(null);
     resetDrafts();
@@ -825,8 +958,7 @@ export function TeamsPage({
 
   async function readOnlyCheck(): Promise<void> {
     const owner = scopeRef.current;
-    const ownerPort = owner.services.teamManagement;
-    if (ownerPort === undefined || unknownRef.current === null) return;
+    if (unknownRef.current === null) return;
     const frozenAttempt = unknownRef.current;
     const attempt = ++snapshotAttemptRef.current;
     snapshotControllerRef.current?.abort();
@@ -835,18 +967,28 @@ export function TeamsPage({
     const teamId = frozenAttempt.teamId;
     const currentTab = tab;
     try {
-      if (teamId !== null && currentTab === "invites") {
-        const list = await ownerPort.listInvites(teamId, controller.signal);
+      if (frozenAttempt.owner === "team-series" && teamId !== null) {
+        const seriesPort = owner.services.teamSeries;
+        if (seriesPort === undefined) return;
+        const current = await seriesPort.listTeamSeries(teamId, 1, 10, controller.signal);
         if (!isCurrent(owner.epoch) || unknownRef.current !== frozenAttempt || snapshotAttemptRef.current !== attempt) return;
-        setSnapshot({ kind: "invites", inviteCount: list.length, inviteStatuses: list.map(({ status }) => status) });
-      } else if (teamId !== null) {
-        const current = await ownerPort.getTeam(teamId, controller.signal);
-        if (!isCurrent(owner.epoch) || unknownRef.current !== frozenAttempt || snapshotAttemptRef.current !== attempt) return;
-        setSnapshot({ kind: "team", teamName: current.name, memberCount: current.members.length, myRole: current.my_role });
+        setSnapshot({ kind: "team-series", seriesCount: current.items.length, seriesPage: current.page, seriesTotal: current.total });
       } else {
-        const current = await ownerPort.listTeams(controller.signal);
-        if (!isCurrent(owner.epoch) || unknownRef.current !== frozenAttempt || snapshotAttemptRef.current !== attempt) return;
-        setSnapshot({ kind: "directory", teamCount: current.length });
+        const ownerPort = owner.services.teamManagement;
+        if (ownerPort === undefined) return;
+        if (teamId !== null && currentTab === "invites") {
+          const list = await ownerPort.listInvites(teamId, controller.signal);
+          if (!isCurrent(owner.epoch) || unknownRef.current !== frozenAttempt || snapshotAttemptRef.current !== attempt) return;
+          setSnapshot({ kind: "invites", inviteCount: list.length, inviteStatuses: list.map(({ status }) => status) });
+        } else if (teamId !== null) {
+          const current = await ownerPort.getTeam(teamId, controller.signal);
+          if (!isCurrent(owner.epoch) || unknownRef.current !== frozenAttempt || snapshotAttemptRef.current !== attempt) return;
+          setSnapshot({ kind: "team", teamName: current.name, memberCount: current.members.length, myRole: current.my_role });
+        } else {
+          const current = await ownerPort.listTeams(controller.signal);
+          if (!isCurrent(owner.epoch) || unknownRef.current !== frozenAttempt || snapshotAttemptRef.current !== attempt) return;
+          setSnapshot({ kind: "directory", teamCount: current.length });
+        }
       }
     } catch (error) {
       if (!isCurrent(owner.epoch) || unknownRef.current !== frozenAttempt || snapshotAttemptRef.current !== attempt) return;
@@ -860,6 +1002,7 @@ export function TeamsPage({
   function abandonUnknown(): void {
     if (unknownRef.current === null || writeRef.current !== null) return;
     if (!window.confirm("放弃本地核对状态并允许新的独立操作？这不会撤销服务器可能已完成的操作。")) return;
+    if (!collaborationWritePermit.abandonUnknown(collaborationWriteScope)) return;
     unknownRef.current = null;
     setUnknownLabel(null);
     setSnapshot(null);
@@ -867,7 +1010,15 @@ export function TeamsPage({
     publishGuard(hasPageGuard());
   }
 
-  const locked = pendingLabel !== null || unknownLabel !== null;
+  function abandonSharedUnknown(): void {
+    if (permitSnapshot.phase !== "unknown") return;
+    if (!window.confirm("明确放弃这项团队协作操作的本地核对状态？这不会撤销服务器可能已完成的操作。")) return;
+    if (!collaborationWritePermit.abandonUnknown(collaborationWriteScope)) return;
+    setNotice("已明确放弃本地核对状态；服务器可能已完成的操作不会撤销。");
+  }
+
+  const locked = pendingLabel !== null || unknownLabel !== null || permitSnapshot.phase !== "idle";
+  const externalWriteLock = writeRef.current === null && unknownRef.current === null && permitSnapshot.phase !== "idle";
   const selectedTeam = detail !== null && detail.id === selectedTeamId ? detail : null;
   const selectedSummary = teams.find((item) => item.id === selectedTeamId);
 
@@ -904,21 +1055,42 @@ export function TeamsPage({
             </section>
           )}
 
+          {externalWriteLock && (
+            <section aria-label="团队协作写入限制" className="team-unknown-banner" role="status">
+              <div>
+                <strong>{permitSnapshot.phase === "unknown"
+                  ? `“${permitSnapshot.owner?.label ?? "团队协作操作"}”结果待核对`
+                  : `“${permitSnapshot.owner?.label ?? "团队协作操作"}”仍在请求中`}</strong>
+                <p>
+                  {permitSnapshot.phase === "unknown"
+                    ? "系统不会自动重发。请明确放弃本地核对状态后，才能开始另一项团队写操作。"
+                    : "团队管理与剧集分享共用写入许可；当前请求结束前，其他团队写操作不会发送。"}
+                </p>
+              </div>
+              {permitSnapshot.phase === "unknown" && (
+                <div className="team-unknown-actions">
+                  <button className="danger-button" onClick={abandonSharedUnknown} type="button">明确放弃本地状态</button>
+                </div>
+              )}
+            </section>
+          )}
+
           {snapshot !== null && unknownLabel !== null && (
             <section className="team-snapshot" aria-label="只读核对快照" role="status">
               <strong>只读快照 · 未确认原操作</strong>
               {snapshot.kind === "directory" && <span>当前团队数量：{snapshot.teamCount}</span>}
               {snapshot.kind === "team" && <span>{snapshot.teamName || "未命名团队"} · {snapshot.memberCount} 位成员 · 当前角色 {snapshot.myRole}</span>}
               {snapshot.kind === "invites" && <span>{snapshot.inviteCount} 个邀请码：{snapshot.inviteStatuses?.join("、") || "无"}</span>}
+              {snapshot.kind === "team-series" && <span>当前共有 {snapshot.seriesTotal} 部；第 {snapshot.seriesPage} 页读取到 {snapshot.seriesCount} 部。</span>}
             </section>
           )}
 
-          {selectedTeam === null ? (
+          {selectedTeam === null && selectedTeamId === null ? (
             <TeamDirectoryPanel
               teams={teams}
               selectedTeamId={selectedTeamId}
               loading={teamsLoading}
-              disabled={locked}
+              disabled={pendingLabel !== null || unknownLabel !== null}
               error={directoryError}
               createName={drafts.createName}
               joinCode={drafts.joinCode}
@@ -929,13 +1101,15 @@ export function TeamsPage({
               onJoin={joinTeam}
               onSelect={selectTeam}
             />
-          ) : detailLoading ? (
+          ) : selectedTeam === null && detailLoading ? (
             <section aria-label="团队详情加载中" className="team-panel"><p className="team-empty">正在读取团队详情…</p></section>
-          ) : (
+          ) : selectedTeam !== null ? (
             <TeamDetailPanel
               team={selectedTeam}
               actorId={userId}
               tab={tab}
+              detailLoading={detailLoading}
+              seriesAvailable={teamSeriesPort !== undefined}
               nameDraft={drafts.teamName}
               inviteCountDraft={drafts.inviteCount}
               roleDrafts={drafts.roleValues}
@@ -972,6 +1146,34 @@ export function TeamsPage({
               onDelete={deleteTeam}
               onDismissInviteReceipt={() => changeInviteReceipt(null)}
               onCopyInviteCode={(code) => { void copyInviteCode(code); }}
+            />
+          ) : null}
+          {selectedTeamId !== null && (
+            <TeamSeriesPanel
+              active={tab === "series" && selectedTeam !== null}
+              actorId={userId}
+              createDraft={drafts.seriesCreate}
+              locked={locked}
+              onCreateDraftChange={(seriesCreate) => updateDrafts((current) => ({ ...current, seriesCreate }))}
+              onOpenSeries={(series, destination) => onOpenSeriesRef.current(series, destination)}
+              onSeriesChanged={(teamId, seriesId) => onSeriesChangedRef.current(teamId, seriesId)}
+              onTransferTargetChange={(seriesId, recipientId) => updateDrafts((current) => {
+                const seriesTransferTargets = { ...current.seriesTransferTargets };
+                if (recipientId === "") delete seriesTransferTargets[seriesId];
+                else seriesTransferTargets[seriesId] = recipientId;
+                return { ...current, seriesTransferTargets };
+              })}
+              onUnauthorized={() => onUnauthorizedRef.current()}
+              onWrite={runTeamSeriesWrite}
+              pendingLabel={pendingLabel}
+              port={teamSeriesPort}
+              services={services}
+              sessionGeneration={sessionGeneration}
+              seriesRevision={seriesRevision}
+              team={selectedTeam}
+              teamId={selectedTeamId}
+              transferTargets={drafts.seriesTransferTargets}
+              unknownLabel={unknownLabel}
             />
           )}
           {detailError !== null && selectedTeam === null && selectedTeamId !== null && (

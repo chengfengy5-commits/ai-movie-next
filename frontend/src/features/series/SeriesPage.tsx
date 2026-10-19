@@ -4,10 +4,16 @@ import type { Series, SeriesFilter } from "../../shared/api/contracts";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import type { SeriesExchangePort } from "../../shared/api/seriesExchange";
 import type { MyTeam } from "../../shared/api/teams";
+import {
+  createTeamCollaborationWriteScope,
+  TeamCollaborationWritePermit,
+  type TeamCollaborationWriteScope,
+} from "../../app/teamCollaborationWritePermit";
 import { filterSeries, SERIES_PAGE_SIZE, seriesFilters } from "./seriesFilters";
 import { SeriesCard } from "./SeriesCard";
 import { SeriesDeleteDialog } from "./SeriesDeleteDialog";
 import { SeriesEditorDialog } from "./SeriesEditorDialog";
+import { SeriesShareDialog } from "./SeriesShareDialog";
 import { SeriesExchangeDialog } from "../series-exchange/SeriesExchangeDialog";
 import "./SeriesManagement.css";
 
@@ -19,7 +25,14 @@ interface SeriesPageProps {
   onViewChapters(series: Series): void;
   onViewAssets(series: Series): void;
   isSuperuser?: boolean;
+  sessionGeneration?: number;
   teamDirectoryRevision?: number;
+  seriesRevision?: number;
+  collaborationWritePermit?: TeamCollaborationWritePermit;
+  collaborationWriteScope?: TeamCollaborationWriteScope;
+  shareGuardScopeKey?: string;
+  onShareGuardChange?(scopeKey: string, dirty: boolean, inFlight: boolean): void;
+  onSeriesChanged?(teamId: string, seriesId: string): void;
   onImported?(result: { seriesId: string; name: string; chapterIds: string[]; kind: "json" | "markdown" }): void;
 }
 
@@ -123,13 +136,34 @@ export function SeriesPage({
   onViewChapters,
   onViewAssets,
   isSuperuser = false,
+  sessionGeneration = 0,
   teamDirectoryRevision = 0,
+  seriesRevision = 0,
+  collaborationWritePermit: providedWritePermit,
+  collaborationWriteScope: providedWriteScope,
+  shareGuardScopeKey = `${userId}:${sessionGeneration}:series-share`,
+  onShareGuardChange = () => undefined,
+  onSeriesChanged = () => undefined,
   onImported,
 }: SeriesPageProps) {
+  const localWritePermitRef = useRef<TeamCollaborationWritePermit | null>(null);
+  if (localWritePermitRef.current === null) localWritePermitRef.current = new TeamCollaborationWritePermit();
+  const collaborationWritePermit = providedWritePermit ?? localWritePermitRef.current;
+  const localWriteScope = useMemo(
+    () => createTeamCollaborationWriteScope(userId, sessionGeneration, services),
+    [services, services.teamManagement, services.teamSeries, sessionGeneration, userId],
+  );
+  const collaborationWriteScope = providedWriteScope ?? localWriteScope;
+
+  useLayoutEffect(() => {
+    collaborationWritePermit.synchronizeScope(collaborationWriteScope);
+  }, [collaborationWritePermit, collaborationWriteScope]);
+
   const [series, setSeries] = useState<Awaited<ReturnType<WorkspaceServices["listSeries"]>>>([]);
-  const [seriesScope, setSeriesScope] = useState({ userId, services });
+  const [seriesScope, setSeriesScope] = useState({ userId, sessionGeneration, services });
   const [loadedSeriesScope, setLoadedSeriesScope] = useState<{
     userId: string;
+    sessionGeneration: number;
     services: WorkspaceServices;
   } | null>(null);
   const [loading, setLoading] = useState(true);
@@ -147,6 +181,7 @@ export function SeriesPage({
   const [deleteTarget, setDeleteTarget] = useState<Series | null>(null);
   const [mutationNotice, setMutationNotice] = useState<string | null>(null);
   const [exchangeDialogOpen, setExchangeDialogOpen] = useState(false);
+  const [shareTarget, setShareTarget] = useState<Series | null>(null);
 
   const exchangeServiceMethods = services as WorkspaceServices & Partial<SeriesExchangePort>;
   const exchangePort = useMemo<SeriesExchangePort | undefined>(() => {
@@ -160,14 +195,19 @@ export function SeriesPage({
     };
   }, [exchangeServiceMethods]);
 
-  const identityRef = useRef({ userId, services });
+  const identityRef = useRef({ userId, sessionGeneration, services });
+  const shareRefreshMessageRef = useRef<string | null>(null);
   const requestGeneration = useRef(0);
   const teamRequestController = useRef<AbortController | null>(null);
   const contextRef = useRef<TeamRequestContext>({ userId, services, active, filter });
   contextRef.current = { userId, services, active, filter };
 
-  const seriesMatchesScope = seriesScope.userId === userId && seriesScope.services === services;
-  const hasLoadedCurrentSeries = loadedSeriesScope?.userId === userId && loadedSeriesScope.services === services;
+  const seriesMatchesScope = seriesScope.userId === userId
+    && seriesScope.sessionGeneration === sessionGeneration
+    && seriesScope.services === services;
+  const hasLoadedCurrentSeries = loadedSeriesScope?.userId === userId
+    && loadedSeriesScope.sessionGeneration === sessionGeneration
+    && loadedSeriesScope.services === services;
   const visibleSeries = seriesMatchesScope ? series : [];
   const visibleLoading = !seriesMatchesScope || (loading && !hasLoadedCurrentSeries);
   const visibleError = seriesMatchesScope ? error : null;
@@ -273,19 +313,22 @@ export function SeriesPage({
 
   useLayoutEffect(() => {
     const identityChanged = identityRef.current.userId !== userId
+      || identityRef.current.sessionGeneration !== sessionGeneration
       || identityRef.current.services !== services;
-    identityRef.current = { userId, services };
+    identityRef.current = { userId, sessionGeneration, services };
     if (!active || identityChanged) {
       setEditor(null);
       setDeleteTarget(null);
+      if (identityChanged) setShareTarget(null);
       if (identityChanged) {
         setExchangeDialogOpen(false);
       }
     }
     if (identityChanged) {
       setMutationNotice(null);
+      shareRefreshMessageRef.current = null;
     }
-  }, [active, services, userId]);
+  }, [active, services, sessionGeneration, userId]);
 
   useLayoutEffect(() => {
     if (teamDirectoryRevisionRef.current === teamDirectoryRevision) {
@@ -355,9 +398,13 @@ export function SeriesPage({
     void services.listSeries(controller.signal).then((result) => {
       if (current && !controller.signal.aborted) {
         setSeries(result);
-        setSeriesScope({ userId, services });
-        setLoadedSeriesScope({ userId, services });
+        setSeriesScope({ userId, sessionGeneration, services });
+        setLoadedSeriesScope({ userId, sessionGeneration, services });
         setLoading(false);
+        if (shareRefreshMessageRef.current !== null) {
+          setMutationNotice(`${shareRefreshMessageRef.current}列表已刷新。`);
+          shareRefreshMessageRef.current = null;
+        }
       }
     }).catch((cause: unknown) => {
       if (!current || controller.signal.aborted) {
@@ -371,16 +418,20 @@ export function SeriesPage({
       if (!seriesMatchesScope) {
         setSeries([]);
       }
-      setSeriesScope({ userId, services });
+      setSeriesScope({ userId, sessionGeneration, services });
       setError(nextError);
       setLoading(false);
+      if (shareRefreshMessageRef.current !== null) {
+        setMutationNotice(`${shareRefreshMessageRef.current}已确认，但列表刷新失败：${nextError.detail ?? nextError.message}`);
+        shareRefreshMessageRef.current = null;
+      }
     });
 
     return () => {
       current = false;
       controller.abort();
     };
-  }, [active, onUnauthorized, reloadKey, services, userId]);
+  }, [active, onUnauthorized, reloadKey, seriesRevision, sessionGeneration, services, teamDirectoryRevision, userId]);
 
   useLayoutEffect(() => () => cancelTeamRequest(), [cancelTeamRequest]);
 
@@ -617,6 +668,12 @@ export function SeriesPage({
                   setDeleteTarget(selected);
                 }
                 : undefined;
+              const onShare = services.teamSeries !== undefined && item.user_id === userId
+                ? (selected: Series) => {
+                  setMutationNotice(null);
+                  setShareTarget(selected);
+                }
+                : undefined;
 
               return (
                 <SeriesCard
@@ -628,6 +685,7 @@ export function SeriesPage({
                   {...(exchangePort === undefined ? {} : { exchangePort })}
                   {...(onEdit === undefined ? {} : { onEdit })}
                   {...(onDelete === undefined ? {} : { onDelete })}
+                  {...(onShare === undefined ? {} : { onShare })}
                   series={item}
                 />
               );
@@ -704,6 +762,29 @@ export function SeriesPage({
           series={seriesMatchesScope ? visibleSeries : []}
           services={services}
           userId={userId}
+        />
+      )}
+      {shareTarget !== null && services.teamSeries !== undefined && (
+        <SeriesShareDialog
+          active={active}
+          actorId={userId}
+          key={shareTarget.id}
+          onClose={() => setShareTarget(null)}
+          onConfirmed={(message) => {
+            shareRefreshMessageRef.current = message;
+            setMutationNotice(`${message}正在刷新剧集列表。`);
+            setShareTarget(null);
+            setReloadKey((key) => key + 1);
+          }}
+          onGuardChange={onShareGuardChange}
+          onSeriesChanged={onSeriesChanged}
+          onUnauthorized={onUnauthorized}
+          collaborationWritePermit={collaborationWritePermit}
+          collaborationWriteScope={collaborationWriteScope}
+          scopeKey={shareGuardScopeKey}
+          series={shareTarget}
+          services={services}
+          sessionGeneration={sessionGeneration}
         />
       )}
     </section>
