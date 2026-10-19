@@ -1,16 +1,16 @@
 # HaoAI-next 完整剩余工作清单与排期
 
-更新日期：2026-10-17（北京时间）
+更新日期：2026-10-19（北京时间）
 
-本文以 2026-10-17 的仓库与已接受收据校准完整剩余范围。它是唯一的迁移清单，不是新的架构设计，也不代表整站功能已验收。
+本文以 2026-10-19 的主线源码与已接受收据校准完整剩余范围。它是唯一的迁移清单，不是新的架构设计，也不代表整站功能已验收。
 
 ## 当前基线与计数口径
 
-本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；本批后台会员证据在末尾增补。149 收据确认会员管理前端已提交并推送至 main@eca1978bd2453ca1e4cb486804c904a6aa89b1ba。单图原 intent 到期 recovery/due 消费者随后提交并推送至 main@1e07f90bb203b8ff6e7b534eb0e8b22a12f5ddfc；E166 收据确认 remoteExact=true。该1e07提交是当前后端源码回归基线，不改变 102 的 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78 历史分析归属。系统配置 list/edit 前端已由本批提交并推送至 main@32b3f721a8436a270b58b73c2a2c138ca8dc6b5a；196 为前端门禁，201 为真实 HTTP/owned SQL，209 为局部 GUI 与独立 SQL，生命周期结果另列。后台剧集与移动样式修复、全局任务列表、SMTP 账户管理已分别并入 main；TaskList 提交 3e8c525b41f064b0feecc60fe74005f6931c579f、SMTP 提交 78a4d9f877eaf8c964a4f7c69a656b5b9bd5f5a5 均由 Root 确认 push exit 0 且外部 ls-remote 精确一致，本轮已核实的最新实现提交为 78a4d9f877eaf8c964a4f7c69a656b5b9bd5f5a5。后续文档或实现提交不改变既有证据归属；102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
+本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；会员、系统配置、后台和早期全量检查等历史收据仍按各自源码时点解释。最新主线整合提交为 `e094224e7751ba92c25d22fe17d51e89bb15a264`；Root 收据395确认 main 与 AI 分支远端均精确指向该提交。e094整合团队管理13个方法、团队剧集协作7个方法及 frame.review 后端链。本文后附的最新记录区分这些新增源码、分层验证与尚未完成范围；102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
 
-固定旧源共有 248 个显式 method/path 声明，当前运行时登记 250 个方法，其中包括两个新增两步分镜接口；248 个旧声明均已登记、差集为 0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
+固定旧源共有 248 个显式 method/path 声明；backend385 收据中的 create_app registry 为 250 个方法、36 个参数项，旧声明已登记差集为0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
 
-清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。当前 U12.5 与 U12.7 又各完成一行开发和接线，故为 27、24、51：开发 33−U11.2−U12.8−U12.9−U12.6−U12.5−U12.7=27，接线 28−U12.8−U12.9−U12.5−U12.7=24，验证/接受仍为 51。U12.6 的运行时消费者接线仍待完成。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
+清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。U12.5 与 U12.7 又各完成一行开发和接线后为27、24、51。e094将 U03.1、U03.2、U03.3 各一行的开发与接线义务并入主线，当前为24、21、51：开发 `27−3=24`，接线 `24−3=21`，验证/接受仍为51。U12.6 的运行时消费者接线仍待完成。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
 
 状态简写：C＝已实现或已接入；P＝部分；M＝缺失；I＝进行中；U＝当前没有足够验证；E＝依赖外部授权或外部环境。验证和接受状态分别以 V/A 标明。实现、接线状态为 C 的行只在相应列记为完成；局部测试、历史浏览器和当前完整接受不可互相替代。
 
@@ -37,9 +37,9 @@
 
 | ID | 交付内容 | 实现 | 接入 | 验证/验收 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| U03.1 | 团队创建/编辑/删除、详情、成员及角色权限 | P | M | V=P / A=U；团队/剧集/reporting 后端共 25 个旧接口已装配，前端仅有筛选用团队目录 | 新建团队中心和独立 API；经受信 actor 接入，最后由单一集成作者写共享 Workspace/services；覆盖 owner/admin/member/非成员。 |
-| U03.2 | 邀请生成、列表、撤销、加入、离开与配额 | P | M | V=P / A=U；管理端邀请/加入/离开和 JoinQuota 已有 | 补邀请、加入/离开、过期撤销及人数配额 UI 和多用户 API 验收；授权必须由后端决定。 |
-| U03.3 | 团队剧集共享/撤回、认领/取消、创建和转移 | P | M | V=P / A=U；团队剧集 7 接口和访问策略已有 | 接入共享、认领、释放、转移与确认回读；验证转移中的生成/编辑/认可权限及归属保全。 |
+| U03.1 | 团队创建/编辑/删除、详情、成员及角色权限 | C | C | V=P / A=U；13个团队管理/邀请方法对应UI与HTTP源码已整合到e094，并有真实HTTP与局部GUI证据；解散确认结果仍未知 | 补团队解散确认与完整跨会话/失败分支验收；覆盖 owner/admin/member/非成员，不把已接源码扩大为整行接受。 |
+| U03.2 | 邀请生成、列表、撤销、加入、离开与配额 | C | C | V=P / A=P；邀请、加入/离开及配额对应UI与HTTP源码已整合，真实HTTP和浏览器正向闭环有局部证据 | 补完整邀请/配额负例、unknown/in-flight/cross-session浏览器分支；授权仍由后端决定。 |
+| U03.3 | 团队剧集共享/撤回、认领/取消、创建和转移 | C | C | V=P / A=U；7个团队剧集方法及对应UI/HTTP源码已整合到e094，整行多用户GUI接受仍不足 | 补未覆盖确认/未知/跨页/跨会话、多用户权限及生成/编辑/认可交叉验收。 |
 | U03.4 | 成员任务、团队/剧集/模型用量与导出 | P | M | V=P / A=U；reporting 5 接口已装配 | 先稳定共同 reporting 契约，再各自实现用量/导出 UI 与任务 UI；分别验证跨团队隔离、金额和导出一致性。 |
 
 ### U04 分镜编辑、AI 复核优化与结果应用
@@ -47,8 +47,8 @@
 | ID | 交付内容 | 实现 | 接入 | 验证/验收 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
 | U04.1 | 分镜浏览、文字/结构编辑及素材引用导航 | C | C | V=P / A=P；编辑器、引用面板及历史正文/排序主链已证 | 补结构插入/删除、引用清理、未知写入和团队权限的当前真实后端浏览器分支。 |
-| U04.2 | AI 复核/批量优化、上下文、部分成功与统计 | P | P | V=P / A=U；API 准入和状态读取存在，当前仅排队，未装配实际 review/optimize worker | 完成真实 frame.review/frame.optimize producer、Work、费用及恢复，再接 React 操作、统计、来源和错误展示。 |
-| U04.3 | 生成结果应用、媒体版本与认可失效 | P | M | V=P / A=U；owned result facade、SQL CAS 和协调器已有，真实消费者未接 | 将完成结果验证与 generation_application 接入 HTTP/Worker/UI；验证稳定 ID、no-ID、重复、迟到和回执未知，不重写已有 CAS。 |
+| U04.2 | AI 复核/批量优化、上下文、部分成功与统计 | P | P | V=P / A=U；frame.review 后端链已接，frame.optimize、React AI入口和统计整体仍待 | 补 frame.optimize 与其它 family producer/consumer，连接 React 状态、来源和错误展示；保持 review 子范围证据与整体未完状态分开。 |
+| U04.3 | 生成结果应用、媒体版本与认可失效 | P | P | V=P / A=U；frame.review 的 P5 apply/fee consumer 已接；其它 family、媒体版本和完整 UI 仍待 | 补剩余结果家族、媒体版本/认可失效与 UI 流程；验证稳定 ID、no-ID、重复、迟到和回执未知，不重写已有 CAS。 |
 
 ### U05 素材浏览管理、维护、融合、替换和上传
 
@@ -68,7 +68,7 @@
 | U06.2 | 两步分镜生成、报价、SSE 预览和确认保存 | C | C | V=P / A=P；真实 JWT/Target API/owned SQLite + FakeRuntime 主链已通过 | 保留主链收据，补受影响的失败、断流、原 key 恢复和权限分支；FakeRuntime 不代表真实 provider。 |
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
 | U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；路由、解析和保存已有，提取 runtime 仍需注入 | 装配 StoryboardAssetRuntime，接提取结果编辑/确认和批量保存；验证失败不覆盖源内容及未知回读。 |
-| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；8 项 canonical records、P1–P6 合同、单图 claim/intent/result、P5 bridge 和 stream 金融已有；GEN-W01 recovery/due 消费者已实现；仅 1/5 worker 类型有 executor factory 登记 | image.single 到期恢复已通过有界 owned PostgreSQL 合成验证（E179/E181 固定 177，E185 固定 183，均对应同一 916 项 1e07 源清单）。E181 F 仅证明两个不同 worker PID 读取同一持久 PG 图，不等于 PG/完整服务重启或任意 crash 恢复。P6 HTTP/control cancel、poll、可验证原输出恢复、其他四类 worker consumer、六项附加义务和完整 A01–A39 验收仍待；U06.5 宽范围仍为 P/P、V=P/A=U。 |
+| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single 原链与 frame.review 独立注入后端链各有局部实现；总体多 family、React 控制与完整恢复接受仍待 | image.single 到期恢复的有界PG证据见E179/E181/E185；frame.review 的 I06 recovery、C01 shutdown、I07 cancel另有e094/PG392范围证据。它们不证明完整服务重启或任意crash恢复。其它family consumer、React控制、可验证原输出恢复、六项附加义务和完整A01–A39验收仍待；U06.5宽范围仍为P/P、V=P/A=U。 |
 | U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
 
 ### U07 多节点创作画布和结果回填
@@ -137,17 +137,17 @@
 | B-ASSETS | 基础素材 SQL、维护/替换模块已存在 | 接入 media upload application 与 fused runtime/storage，完成高级素材 UI 和存储链。 |
 | B-PRODUCTION | 便签、粗剪和媒体协调器已有 | 新写入者消费协调器；补真实媒体预览、字节导出/输出及多用户证据。 |
 | B-ACCOUNT | 账户、偏好、模型、提示词和兑换逻辑已有；会员批已并入 | 真实 SMTP sender 仍缺；各账户/运营工作流仍按 U01/U11/U12 补验证和 UI。 |
-| B-TEAMS | 管理、剧集协作和 reporting 后端共 25 旧接口已装配 | 完整团队前端及多用户权限接受，不用目录存在代替授权。 |
-| B-TASKS | 旧任务 read/status/cancel、通用/后台任务和 provider status 已有；只读全局 TaskList 页面已接入 | image.single 原 intent recovery/due 消费已实现；E179/E181/E185 的有界 owned PG 合成回归覆盖已声明的到期锁、双消费者、退款回滚/ACK确认和 cooperative shutdown 范围。TaskList 真实 HTTP/浏览器验收仍待；P2/P6 可靠取消、poll/control、详情 UI 状态和可验证原输出恢复仍缺；其他任务家族继续按各自消费者边界完成。 |
+| B-TEAMS | 团队管理/邀请13方法与团队剧集协作7方法已随e094进入主线；reporting仍未接入对应UI/消费者 | 补多用户权限与团队剧集的完整接受；完成U03.4 reporting，不用目录或源码接入代替授权。 |
+| B-TASKS | 旧任务 read/status/cancel、通用/后台任务和 provider status 已有；只读全局 TaskList 页面已接入 | image.single 原 intent recovery/due 消费及 frame.review 独立后端链已实现。E179/E181/E185覆盖所列 image.single 有界范围；PG392覆盖 frame.review 的真实owned取消/重放五类场景（late正价与0价）。TaskList HTTP/浏览器、完整服务重启、其它任务家族和UI仍待；不将两个局部PG范围提升为完整任务工作流接受。 |
 | B-ADMIN | 后台 API 家族已有，React 登录、仪表盘和 23/23 个旧资源视图均已实现并接入源码 | 完成全面浏览器、真实 HTTP/SQL 与跨会话/未知结果验收；剧集已有局部验收，TaskList 与 SMTP 真实 HTTP/浏览器仍待。3 个积分扩展视图独立。 |
-| B-GENERATION | 六入口准入、合同、凭据、图/计费；单图受限 runtime 与原 intent recovery/due consumer、文本 SSE 有实现，两步分镜有局部浏览器证据 | worker registry 五类中仅 image-single factory 有 executor 注册；另外四类需实际 executor。metadata/准入/claim 不是可执行证明。 |
+| B-GENERATION | 六入口准入、合同、凭据、图/计费；image.single受限runtime与recovery/due、文本SSE、两步分镜局部浏览器证据，以及frame.review后端链均已接 | frame.optimize、其它family worker和React AI入口仍需完成；metadata/准入/claim不能替代真实producer、consumer或完整工作流证据。 |
 | B-INTEGRATIONS | DB/provider/storage/quota/download/SMTP ports 与部分 adapter 已存在 | 补本地组合根和真实 caller；逐项区分 owned fake/loopback 与外部账号验收。 |
 | B-ARCH | 扫描 106 个 domain/application 文件；多数模块使用 port/UoW 边界 | 收口 aistarslab application 直连 persistence/provider、generation_credentials application 直连 SQLAlchemy/concrete repository 的边界，同时保留现有同事务/主体约束。 |
 
 | 集成 | 当前证据 | 后续工作/边界 |
 | --- | --- | --- |
-| INT-LOCAL-COMPOSITION | create_app 显式配置，lifespan 可拥有 image-single service；没有全特性 launcher 证据 | 建可复现本地组合根，明确 DB/auth/providers/media ports、readiness 和 shutdown；不依赖旧 app/env 自动发现或隐式建表。 |
-| INT-DB | SQLAlchemy UoW、generation migration/readiness、credential migration 和 scoped owned PG 收据存在 | image.single 到期 recovery/due 的 owned PG 锁/双消费者、实际退款应用后回滚及 commit 后 ACK 未知确认已在 E181/E185 合成验证。继续核 continuation/cancel 受影响事务；这些收据不覆盖 PG 重启或真实数据库，不连接或写真实数据库。 |
+| INT-LOCAL-COMPOSITION | create_app 显式配置，lifespan 可拥有 image-single service；frame.review各边界也采用显式依赖注入；没有全特性 launcher 证据 | 建可复现的全特性本地组合根，明确 DB/auth/providers/media ports、readiness 和 shutdown；不依赖旧 app/env 自动发现或隐式建表。 |
+| INT-DB | SQLAlchemy UoW、generation migration/readiness、credential migration 和 scoped owned PG 收据存在 | image.single 到期 recovery/due 的owned PG范围见E181/E185；frame.review I07的五类owned PG范围由PG392确认通过并清理。两者不覆盖完整服务/PG重启或真实数据库，不连接或写真实数据库。 |
 | INT-PROVIDERS | 部分真实 transport adapter 和显式 ports 已有 | 完成剩余 adapter、loopback/fake 协议、原 credential principal/snapshot 绑定及配置消费者；实际账号/付费调用另授权。 |
 | INT-STORAGE | media storage typed ports、OwnedMediaRuntime、R2 upload storage 和本地读取器存在 | 接入四类能力、upload application/fused storage/MediaStore；本地验证权限、大小/MIME、DNS、重定向、内容绑定和清理；R2 账号另授权。 |
 | INT-SMTP | sender callbacks、加密 SMTP 账户配置/每日重置及后台账户管理页面已有并接入 | 先完成账户管理真实 HTTP/owned SQL 与浏览器验收；开发 sender 并用 owned SMTP sink 验输送语义。真实邮箱交付需后续适用授权，本轮不索要密钥。 |
@@ -197,11 +197,11 @@ A39 指定的 GPT-5.6 Sol/xhigh Grillme 外审仍为 OFFLINE_PENDING，尚未使
 | --- | --- | --- | --- |
 | GEN-W01 | image.single 原 intent 的独立 recovery/due 消费者 | 16–32 小时；低信心（原工作包估算，不是当前剩余工时或整体 ETA） | 已实现并提交推送 1e07f90bb203b8ff6e7b534eb0e8b22a12f5ddfc，E166 remoteExact=true。E160 三参数 SQL 边界 RED 为 2 failed/1 passed；加入 queued 恢复后 E163 为 3 passed/277 deselected。E165 全后端回归为 2434 passed、558 warnings、267 subtests passed（actualWaitExit=0、timeout=false、916 输入前后 exact、进程组及 TMP 清理）；create_app registry 的 250 methods/35 parameters 与 E88 一致。owned PG 合成批次 E179（foundation/A/G/H，4/4）与 E181（foundation/B/C/D/E/F-A/F-B，7/7）固定 cases-177；E185（foundation/B/C/E，4/4）固定 cases-183。三份收据均对应 1e07 源、同一 916 项 manifest，前后源码 exact 且 worker、PG 和临时目录清理通过。E181 F 是两个不同 worker PID 从同一持久 PG 图恢复；时钟由受控 SQL UTC 值推进，不是墙钟等待两小时，也不证明 PG/完整服务重启或任意 crash 恢复。仍待 P6 cancel control、poll、可验证原输出恢复、其他四类 worker consumer 和完整 A01–A39 验收。本工作包 16–32 小时仍是原始估算，不代表当前剩余工时或整体 ETA；本地回归不等于浏览器或真实 Provider 验收。 |
 | 后台兑换码/套餐 | U12.8 与 U12.9，合计 5 个旧视图 | 8–16 小时原始估算；中低信心 | 已完成并由149收据确认提交推送 eca1978；源码复核见129-02/03、148。143是基于142冻结的前端门禁（87 files/1297 tests、TSC/build 均实际 exit 0）；137为独立真实 HTTP/owned SQL 验收，144为独立桌面浏览器验收。最新全前端门禁284另行覆盖当前 main。剩余证据缺口见末尾；8–16小时保留为原估算，不作为剩余工时或ETA；不包含真实支付。 |
-| 团队管理/邀请 | U03.1 与 U03.2 首批 | 16–32 小时；低信心（原估算） | main 尚待接入；隔离团队分支已开发13方法并完成前端完整检查及本地真实HTTP/SQL，浏览器仍有待验收项，详见下方10月19日记录。团队剧集、reporting另列。 |
+| 团队管理/邀请 | U03.1–U03.3 | 16–32 小时；低信心（原估算） | 13个管理/邀请方法与7个团队剧集方法已在e094整合到main；GUI376历史收据仍为PARTIAL。GUI399已通过团队卡片桌面/移动V01视觉检查；移动工作空间导航V02仍有文字挤压，解散确认对话框、跨页正向及跨会话场景未验。U03.4 reporting仍待。该估算是原工作包估算，不表示当前剩余工时或整体ETA。 |
 
 其余 family、画布、媒体导出、真实 provider/SMTP/R2 和完整 A01–A39 接受未逐项深审，因此整体剩余工时和 ETA 保持未知，不复用 10 月 9 日的周数或日期，也不按 routes/files 数量线性外推。
 
-共享 writer 协作仍按北京时间每日 12:00–14:00、20:00–次日 09:00 的窗口；窗口外在安全边界串行收口，不新建自动化。U03.4 与 U10.3 先依赖共同稳定的 reporting 契约，再各自建设消费者，避免相互依赖循环。GEN-W01 的 image.single 原 intent recovery/due 消费已落地；随后继续扩展 review/optimize 的真实 Work 和 continuation。结果应用、媒体、画布、缺项工作流按真实消费者边界衔接。
+共享 writer 协作仍按北京时间每日 12:00–14:00、20:00–次日 09:00 的窗口；窗口外在安全边界串行收口，不新建自动化。U03.4 与 U10.3 先依赖共同稳定的 reporting 契约，再各自建设消费者，避免相互依赖循环。GEN-W01 的 image.single 原 intent recovery/due 消费已落地；frame.review 后端链亦已接入，后续继续完成 frame.optimize、React AI入口及其它 family。结果应用、媒体、画布、缺项工作流按真实消费者边界衔接。
 
 ## 特殊证据边界与最终阶段
 
@@ -213,13 +213,13 @@ U11.2 的最新证据来自 9df：MEMBERSHIP97-I01 已由 97-02 finding 闭合�
 
 后台会员管理批次的验收层彼此独立：136 是基于前端冻结135的门禁（87 files/1295 tests，TSC、Vitest、build 实际 exit 0）；137 是基于同一前端冻结与 backend 5ca522c 的真实路由/owned SQL 检查，15 组、32 个真实 HTTP 请求通过，后台9种操作成功响应 exact 200，鉴权覆盖401/403，套餐/兑换码字段覆盖 0、null、false 和空字符串，used/expired/unused 码删除均通过；删除后两账户积分13/4、账本0、会员free不变。143 是更新的前端冻结142门禁（87 files/1297 tests，TSC、Vitest、build 实际 exit 0）；147 仅将11个新目录文件各去掉一个EOF LF，148证明可逆，因此143未在格式收尾后的字节上重跑。144 是独立桌面浏览器正向验收：套餐 list/create/edit、兑换码 list/create，0/null/false 保存回读和确认后离开；最终 SQL 为套餐5、兑换码6，两账户积分13/4、账本0、会员free不变，并留有桌面截图。144因硬TTL以exit 1结束，但进程组、端口、临时目录和凭据已清理，不把整个run记为PASS。CSV下载工具等待超时未验，移动端、unknown/in-flight/cross-session浏览器负例、GUI删除及生成码到用户兑换闭环仍待；137的API删除不能替代GUI删除。
 
-系统配置 list/edit 批次已提交推送至 main@32b3f721a8436a270b58b73c2a2c138ca8dc6b5a。194 为源码复核；196 基于 233 项前端输入，90 files/1324 tests、TSC/build 均 actual exit 0，输入前后 exact、进程组和 TMP 清理通过。201 为真实 loopback HTTP/owned SQLite，21 请求/11 检查通过，19 字段转换、隐藏/非目标配置及 wallet/ledger 保全分层核对；统计经既有 BalanceReader fake 隔绝默认 127.0.0.1:8765，不代表真实余额上游。209 在同一 233 前端/916 后端冻结上完成 nonce/PID 和 HTML 探针，Root 实际 GUI 已验管理员登录、dashboard、19 字段装载、5 字段保存确认及保存后 disabled；独立 SQL 仅这 5 字段改变，其它目标字段、非目标行、users/wallet/ledger 不变，0 存储与回包默认 3 差异已证。桌面及 390px JPG 已留，client/scroll/body 宽均 390、无横向溢出；209 当时所见 68px 共享侧栏拥挤后已由移动 CSS 源码修复，仍待新 GUI 复验。dirty 确认弹窗已见，dismiss 工具超时，未证取消保稿；in-flight/unknown/cross-session GUI、服务端 logout 撤销仍待。两个 owned tab 均已关闭并核 absent、viewport 已 reset。209 supervisor 实际 exit 0 且 lifecycle-stopped，233/916 source/snapshot/Git/保护尾 exact，groups/ports/TMP 及凭据清理通过；Root UI receipt 明确 partial，生命周期成功不等于全部 UI 接受，更不等于部署。历史204 phase A 未并入 main；当前 backend AIreview 279 仍在隔离分支修复，尚未合并，main executor factory 仍为 1/5，A01–A39 完整矩阵接受数仍为 0。
+系统配置 list/edit 批次已提交推送至 main@32b3f721a8436a270b58b73c2a2c138ca8dc6b5a。194 为源码复核；196 基于 233 项前端输入，90 files/1324 tests、TSC/build 均 actual exit 0，输入前后 exact、进程组和 TMP 清理通过。201 为真实 loopback HTTP/owned SQLite，21 请求/11 检查通过，19 字段转换、隐藏/非目标配置及 wallet/ledger 保全分层核对；统计经既有 BalanceReader fake 隔绝默认 127.0.0.1:8765，不代表真实余额上游。209 在同一 233 前端/916 后端冻结上完成 nonce/PID 和 HTML 探针，Root 实际 GUI 已验管理员登录、dashboard、19 字段装载、5 字段保存确认及保存后 disabled；独立 SQL 仅这 5 字段改变，其它目标字段、非目标行、users/wallet/ledger 不变，0 存储与回包默认 3 差异已证。桌面及 390px JPG 已留，client/scroll/body 宽均 390、无横向溢出；209 当时所见 68px 共享侧栏拥挤后已由移动 CSS 源码修复，仍待新 GUI 复验。dirty 确认弹窗已见，dismiss 工具超时，未证取消保稿；in-flight/unknown/cross-session GUI、服务端 logout 撤销仍待。两个 owned tab 均已关闭并核 absent、viewport 已 reset。209 supervisor 实际 exit 0 且 lifecycle-stopped，233/916 source/snapshot/Git/保护尾 exact，groups/ports/TMP 及凭据清理通过；Root UI receipt 明确 partial，生命周期成功不等于全部 UI 接受，更不等于部署。历史204 phase A与 backend AIreview 279 在当时尚未并入 main；后续 frame.review 合入情况见本节后附的最新整合记录。A01–A39 完整矩阵接受数仍为 0。
 
 后台剧集、全局任务和 SMTP 账户页已接入当前 main：剧集为后台 3 视图，另有 232/233 局部 HTTP/GUI 收据；c8f 修复移动导航与剧集表格可读性，尚待 GUI 复验。全局 TaskList 于 3e8c525b41f064b0feecc60fe74005f6931c579f、SMTP 账户管理于 78a4d9f877eaf8c964a4f7c69a656b5b9bd5f5a5 合入并推送；TaskList 与 SMTP 的真实 HTTP/owned SQL 和浏览器验收仍待，SMTP 真实发送不在此证据内。由此 23/23 旧后台资源视图源码已接入，不等于浏览器全面验收。
 
 前端284全量门禁收据 haoai-next-root-admin-final-full-frontend-284.json（SHA-256 a7531451de9d20d3e517c6b934bd037d02346e079bc557f22ab98fb64e10d747）显示 263 项输入前后 exact；TSC、Vitest 102 files/1404 tests、build 均 actual exit 0，进程组清空且临时目录移除。历史274全量门禁为 1403 passed，唯一失败是同一 Workspace 用例在默认 5000ms 下以 5493ms 超时；282 使用临时隔离配置重跑单例与 Workspace 75 项，未复现，但不是根因定位。284 使用原配置与默认 5000ms 全量通过；根因仍未证，不能称已定位修复。
 
-生成原规范另有 5 种 source worker type；当前默认 factory 只有 image-single 实际登记 executor，其他四类只有准入/策略/元数据不等于可执行。BATCH/优化/视频/提取等完整 consumer 和原始 A01–A39 矩阵仍待完成。image.single 的真实 ASGI auth→fake Provider 500→reconciling→原 deadline 后 failed/refund 路径已由本地合成 SQLite/fake 用例覆盖；非空 unknown 前后保留原 first/deadline、及时成功 retained、BYOK zero 不建 wallet、唯一退款后合法消费的 replay、commit-ACK/rollback 和 cooperative shutdown 也有合成用例。这不是浏览器或真实 Provider 证据。PG owned 合成收据 E179/E181（cases-177）与 E185（cases-183）在同一 916 项 1e07 源清单上通过各自选定范围，覆盖具体到期锁/双消费者、退款回滚与 ACK 确认及 shutdown gate。E181 F 是两个不同 worker PID 读取同一持久 PG 图，不代表 PG 或完整服务重启、任意 crash；受控 SQL UTC 时钟不是墙钟两小时等待。P6 cancel HTTP/control、poll、可验证原输出恢复及其余四类 worker 仍待完成。
+生成系统的多个 source worker type仍未全部接通；image-single与frame.review分别有已验证的局部后端链，frame.optimize、批量/视频/提取等其它 family consumer 与React AI入口仍待。准入、策略、metadata或claim不能替代真实producer和consumer，也不能替代完整A01–A39矩阵。image.single 的真实 ASGI auth→fake Provider 500→reconciling→原 deadline 后 failed/refund 路径已由本地合成 SQLite/fake 用例覆盖；非空 unknown 前后保留原 first/deadline、及时成功 retained、BYOK zero 不建 wallet、唯一退款后合法消费的 replay、commit-ACK/rollback 和 cooperative shutdown 也有合成用例。这不是浏览器或真实 Provider 证据。PG owned 合成收据 E179/E181（cases-177）与 E185（cases-183）在同一 916 项 1e07 源清单上通过各自选定范围，覆盖具体到期锁/双消费者、退款回滚与 ACK 确认及 shutdown gate。E181 F 是两个不同 worker PID 读取同一持久 PG 图，不代表 PG 或完整服务重启、任意 crash；受控 SQL UTC 时钟不是墙钟两小时等待。frame.review I07 PG392的局部结果见最新整合记录；其它任务 family 的 cancel/control、poll、可验证原输出恢复仍待按各自范围完成。
 
 全部 backend 与 12 类 React 工作流、跨用户/权限/故障恢复及适用 owned 验收完成后，最后才做后端语言评估。真实数据库写入、资金操作、Provider/付费调用、SMTP 真实发送、R2 账号/存储及生产部署仍是各自独立授权的验收层；本清单的局部源码、测试、HTTP/SQL 或浏览器证据均不扩大这些授权。
 
@@ -239,7 +239,7 @@ Root完整前端检查309固定271项输入，TypeScript通过，Vitest为1267�
 
 冻结271项输入后的完整前端检查 `haoai-next-team-resume-20261019-query-full.json` 实际通过：104个测试文件、1429个用例，TypeScript与生产构建均exit 0。使用原配置、单worker和默认单条5000ms超时；900秒外层进程期限未触发。源码前后精确一致，自有进程、依赖链接目录、构建输出和临时目录均已清理。独立复核318通过；仍保留既有act和构建chunk警告。本次只修改测试查询与异步断言，不改变产品行为。
 
-下一步是这13个团队管理/邀请方法的真实Target HTTP、owned SQL、多账号权限/会员/JoinQuota及桌面、移动浏览器验收。团队分支尚未合入main，主分支清单数量保持原口径；本次前端通过不代表整个项目、浏览器或发布验收完成。
+截至该阶段，下一步是这13个团队管理/邀请方法的真实Target HTTP、owned SQL、多账号权限/会员/JoinQuota及桌面、移动浏览器验收；当时团队分支尚未合入main，主分支计数因此保持原口径。该状态随后由e094合入更新，见下方最新主线记录。本次前端通过不代表整个项目、浏览器或发布验收完成。
 
 ### 团队真实HTTP与浏览器验收进展（2026-10-19）
 
@@ -251,4 +251,14 @@ Root收据 `haoai-next-root-team-http-321.json` 对应该提交、271项前端�
 
 解散确认的控制结果仍未知：323尝试取消时控制调用超时，恢复后团队确已解散；保护用户/钱包/账本行哈希前后相同，但不能把这次取消或有意确认记为通过。独立诊断324未发现确定的产品源码缺陷。全新夹具325分步复验读取到confirm，随后dismiss返回对话框已失效，AX读取又超时；独立SQL确认当时团队/成员/邀请及保护行与操作前精确一致，但未取得取消完成回执，仍不能记为通过。没有为自动化修改产品确认逻辑。
 
-323与325的前后端进程组、端口、私有凭据和临时目录已实际清理；323标签已关闭、视口已恢复。325自有标签4关闭调用超时，最终列表仍可见该失去服务的标签，标签清理单列待处理。浏览器完整在途/未知写/跨会话负例，以及解散取消和明确确认的独立复验仍待。团队分支保持隔离，尚未合入main；全目标继续开发，主分支清单数量不提前扣减，未部署。
+323与325的前后端进程组、端口、私有凭据和临时目录已实际清理；323标签已关闭、视口已恢复。325自有标签4关闭调用超时，最终列表仍可见该失去服务的标签，标签清理单列待处理。浏览器完整在途/未知写/跨会话负例，以及解散取消和明确确认的独立复验仍待。该段记录e094合入前的隔离状态，后续主线状态见下节；未部署。
+
+### 主线整合与 frame.review 后端链（2026-10-19）
+
+Root 收据395确认中文整合提交 `e094224e7751ba92c25d22fe17d51e89bb15a264` 在 main 与 AI 分支远端均精确一致。团队管理/邀请13方法及团队剧集协作7方法对应的UI与HTTP源码现已接入主线；U03.1、U03.2、U03.3 的实现与接线状态均为 C/C。它们的验证与接受状态仍按各自证据边界保留在表中：HTTP与GUI有局部正向证据，解散确认、跨会话/unknown 分支及完整团队剧集多用户接受仍有缺口；U03.4 reporting仍待。
+
+同一整合提交包含显式依赖注入的 frame.review 后端路径：真实准入→claim/intent/result→P5应用与费用→I06 recovery/C01 shutdown→I07用户取消。Root385验证的944项后端源与整合后后端逐项exact；394确认可复用该源对应的2568 tests、267 subtests及registry250/36结果，未在e094重新执行。Root392的五类真实 owned PostgreSQL I07 场景通过，late case覆盖正价与0价，且资源清理通过。这些结果只覆盖该后端子路径；frame.optimize、React AI入口、其它 worker family和完整 A01–A39 接受仍未完成。
+
+前端371门禁为109个文件、1474项通过，TypeScript与生产构建均exit 0。GUI376历史收据仍为 PARTIAL；Root399已通过团队卡片V01视觉检查：1265px桌面六类操作自然换行，390px移动视口内六类操作可见且无横向溢出，导出长提示可折行。该结果仅证明卡片视觉；移动工作空间导航V02仍有文字挤压待后续CSS批次处理，导出下载文件字节、团队解散确认对话框及跨页正向场景仍未验证，不把局部视觉结果提升为整体GUI PASS。
+
+全量矩阵边界保持不变：A01–A39完整矩阵接受数为0，A39指定的 GPT-5.6 Sol/xhigh Grillme 外审仍为 OFFLINE_PENDING。上述源码接入、局部后端/前端检查及 owned PG 证据均不提升整站完成度，也不产生新的整体 ETA。
