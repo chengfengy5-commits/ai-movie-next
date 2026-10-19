@@ -6,7 +6,7 @@
 
 ## 当前基线与计数口径
 
-本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；会员、系统配置、后台和早期全量检查等历史收据仍按各自源码时点解释。最新主线整合提交为 `e094224e7751ba92c25d22fe17d51e89bb15a264`；Root 收据395确认 main 与 AI 分支远端均精确指向该提交。e094整合团队管理13个方法、团队剧集协作7个方法及 frame.review 后端链。本文后附的最新记录区分这些新增源码、分层验证与尚未完成范围；102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
+本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；会员、系统配置、后台和早期全量检查等历史收据仍按各自源码时点解释。功能整合基线为 `e094224e7751ba92c25d22fe17d51e89bb15a264`；Root收据395确认该批整合后 main 与 AI 分支远端均精确指向该提交。e094整合团队管理13个方法、团队剧集协作7个方法及 frame.review 后端链。前一桌面卡片CSS与清单回写已由Root400确认推送至 main@`d91d98a46ea117fcbea3cd0d8a0c4fb5a5e7688e`；本批V02移动topbar CSS尚待中文提交。本文后附的最新记录区分这些新增源码、分层验证与尚未完成范围；102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
 
 固定旧源共有 248 个显式 method/path 声明；backend385 收据中的 create_app registry 为 250 个方法、36 个参数项，旧声明已登记差集为0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
 
@@ -197,7 +197,7 @@ A39 指定的 GPT-5.6 Sol/xhigh Grillme 外审仍为 OFFLINE_PENDING，尚未使
 | --- | --- | --- | --- |
 | GEN-W01 | image.single 原 intent 的独立 recovery/due 消费者 | 16–32 小时；低信心（原工作包估算，不是当前剩余工时或整体 ETA） | 已实现并提交推送 1e07f90bb203b8ff6e7b534eb0e8b22a12f5ddfc，E166 remoteExact=true。E160 三参数 SQL 边界 RED 为 2 failed/1 passed；加入 queued 恢复后 E163 为 3 passed/277 deselected。E165 全后端回归为 2434 passed、558 warnings、267 subtests passed（actualWaitExit=0、timeout=false、916 输入前后 exact、进程组及 TMP 清理）；create_app registry 的 250 methods/35 parameters 与 E88 一致。owned PG 合成批次 E179（foundation/A/G/H，4/4）与 E181（foundation/B/C/D/E/F-A/F-B，7/7）固定 cases-177；E185（foundation/B/C/E，4/4）固定 cases-183。三份收据均对应 1e07 源、同一 916 项 manifest，前后源码 exact 且 worker、PG 和临时目录清理通过。E181 F 是两个不同 worker PID 从同一持久 PG 图恢复；时钟由受控 SQL UTC 值推进，不是墙钟等待两小时，也不证明 PG/完整服务重启或任意 crash 恢复。仍待 P6 cancel control、poll、可验证原输出恢复、其他四类 worker consumer 和完整 A01–A39 验收。本工作包 16–32 小时仍是原始估算，不代表当前剩余工时或整体 ETA；本地回归不等于浏览器或真实 Provider 验收。 |
 | 后台兑换码/套餐 | U12.8 与 U12.9，合计 5 个旧视图 | 8–16 小时原始估算；中低信心 | 已完成并由149收据确认提交推送 eca1978；源码复核见129-02/03、148。143是基于142冻结的前端门禁（87 files/1297 tests、TSC/build 均实际 exit 0）；137为独立真实 HTTP/owned SQL 验收，144为独立桌面浏览器验收。最新全前端门禁284另行覆盖当前 main。剩余证据缺口见末尾；8–16小时保留为原估算，不作为剩余工时或ETA；不包含真实支付。 |
-| 团队管理/邀请 | U03.1–U03.3 | 16–32 小时；低信心（原估算） | 13个管理/邀请方法与7个团队剧集方法已在e094整合到main；GUI376历史收据仍为PARTIAL。GUI399已通过团队卡片桌面/移动V01视觉检查；移动工作空间导航V02仍有文字挤压，解散确认对话框、跨页正向及跨会话场景未验。U03.4 reporting仍待。该估算是原工作包估算，不表示当前剩余工时或整体ETA。 |
+| 团队管理/邀请 | U03.1–U03.3 | 16–32 小时；低信心（原估算） | 13个管理/邀请方法与7个团队剧集方法已在e094整合到main；GUI376历史收据仍为PARTIAL。GUI399已通过卡片V01视觉检查，GUI405已通过移动topbar V02窄视觉检查；解散确认对话框、跨页正向及完整跨会话场景未验。U03.4 reporting仍待。该估算是原工作包估算，不表示当前剩余工时或整体ETA。 |
 
 其余 family、画布、媒体导出、真实 provider/SMTP/R2 和完整 A01–A39 接受未逐项深审，因此整体剩余工时和 ETA 保持未知，不复用 10 月 9 日的周数或日期，也不按 routes/files 数量线性外推。
 
@@ -259,6 +259,6 @@ Root 收据395确认中文整合提交 `e094224e7751ba92c25d22fe17d51e89bb15a264
 
 同一整合提交包含显式依赖注入的 frame.review 后端路径：真实准入→claim/intent/result→P5应用与费用→I06 recovery/C01 shutdown→I07用户取消。Root385验证的944项后端源与整合后后端逐项exact；394确认可复用该源对应的2568 tests、267 subtests及registry250/36结果，未在e094重新执行。Root392的五类真实 owned PostgreSQL I07 场景通过，late case覆盖正价与0价，且资源清理通过。这些结果只覆盖该后端子路径；frame.optimize、React AI入口、其它 worker family和完整 A01–A39 接受仍未完成。
 
-前端371门禁为109个文件、1474项通过，TypeScript与生产构建均exit 0。GUI376历史收据仍为 PARTIAL；Root399已通过团队卡片V01视觉检查：1265px桌面六类操作自然换行，390px移动视口内六类操作可见且无横向溢出，导出长提示可折行。该结果仅证明卡片视觉；移动工作空间导航V02仍有文字挤压待后续CSS批次处理，导出下载文件字节、团队解散确认对话框及跨页正向场景仍未验证，不把局部视觉结果提升为整体GUI PASS。
+前端371门禁为109个文件、1474项通过，TypeScript与生产构建均exit 0。GUI376历史收据仍为 PARTIAL；Root399已通过团队卡片V01视觉检查：1265px桌面六类操作自然换行，390px移动视口内六类操作可见且无横向溢出，导出长提示可折行。Root405报告 `PASS_V02_CSS_VISUAL_ONLY`：390px下六个导航控制完整横排；320px下合法20字中文剧集名面包屑自然换行且无页面横向溢出；1265px桌面header保持row布局、移动按钮隐藏、六类卡片操作保持正常。405使用已审363/334与旧916 backend fixture，不是main 944整站验收。两批仅证明限定视觉；导出下载文件字节、团队解散确认对话框、跨页正向及完整跨会话场景仍未验证，不把局部视觉结果提升为整体GUI PASS。
 
 全量矩阵边界保持不变：A01–A39完整矩阵接受数为0，A39指定的 GPT-5.6 Sol/xhigh Grillme 外审仍为 OFFLINE_PENDING。上述源码接入、局部后端/前端检查及 owned PG 证据均不提升整站完成度，也不产生新的整体 ETA。
