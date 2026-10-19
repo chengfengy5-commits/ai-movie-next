@@ -36,6 +36,10 @@ from haoai_backend.generation_core.schema import (
     PolicyStopEventRow,
     UnitFeeDecisionRow,
 )
+from haoai_backend.generation_core.frame_review_cancellation import (
+    CancelOutcome,
+    SqlAlchemyFrameReviewCancellation,
+)
 from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 from haoai_backend.generation_credentials.frame_review_snapshot_reader import (
     PersistedFrameReviewExecutionBinding,
@@ -126,6 +130,7 @@ class SqlAlchemyFrameReviewRecovery:
     id_factory: IdFactory
     crypto: CredentialCrypto
     proof_authority: HmacProofAuthority
+    cancellation: SqlAlchemyFrameReviewCancellation | None = None
     page_size: int = _MAX_PAGE_SIZE
     _cursor: tuple[datetime, str] | None = None
     _scan_lock: RLock = field(default_factory=RLock, init=False, repr=False)
@@ -141,6 +146,16 @@ class SqlAlchemyFrameReviewRecovery:
             or not 1 <= self.page_size <= _MAX_PAGE_SIZE
         ):
             raise ValueError("frame.review recovery dependencies must be explicit")
+        if self.cancellation is None:
+            self.cancellation = SqlAlchemyFrameReviewCancellation(
+                self.session_factory,
+                self.db_clock,
+                self.id_factory,
+                self.crypto,
+                self.proof_authority,
+            )
+        elif not isinstance(self.cancellation, SqlAlchemyFrameReviewCancellation):
+            raise ValueError("frame.review cancellation adapter must be explicit")
 
     def record_observation(
         self,
@@ -176,7 +191,7 @@ class SqlAlchemyFrameReviewRecovery:
 
     def scan_due(
         self, *, stop_signal: Event | None = None
-    ) -> tuple[Literal["settled", "retained", "pending"], ...]:
+    ) -> tuple[Literal["settled", "retained", "pending", "terminal_projection"], ...]:
         """Inspect at most 32 registered due candidates and check stop between writes."""
 
         if _is_stopping(stop_signal):
@@ -189,7 +204,7 @@ class SqlAlchemyFrameReviewRecovery:
                 candidates = self._next_page(now)
             except Exception:
                 return ("pending",)
-            outcomes: list[Literal["settled", "retained", "pending"]] = []
+            outcomes: list[Literal["settled", "retained", "pending", "terminal_projection"]] = []
             for candidate in candidates:
                 if _is_stopping(stop_signal):
                     break
@@ -198,8 +213,31 @@ class SqlAlchemyFrameReviewRecovery:
                     task_id=candidate.task_id,
                     operation=_OPERATION,
                 )
-                outcomes.append(self.consume_due(scope, stop_signal=stop_signal))
+                outcomes.append(self.consume_cancel_and_due(scope, stop_signal=stop_signal))
             return tuple(outcomes)
+
+    def consume_cancel_and_due(
+        self,
+        scope: OwnerTaskScope,
+        *,
+        stop_signal: Event | None = None,
+    ) -> CancelOutcome:
+        """Settle a persisted cancellation first, then preserve the original due path."""
+
+        if type(scope) is not OwnerTaskScope or scope.operation != _OPERATION:
+            return "pending"
+        if _is_stopping(stop_signal) or self.cancellation is None:
+            return "pending"
+        cancellation = self.cancellation.consume_persisted(
+            scope, stop_signal=stop_signal
+        )
+        if cancellation != "not_selected":
+            return (
+                cancellation
+                if cancellation in {"settled", "retained", "pending", "terminal_projection"}
+                else "pending"
+            )
+        return self.consume_due(scope, stop_signal=stop_signal)
 
     def consume_due(
         self,
@@ -601,11 +639,23 @@ class SqlAlchemyFrameReviewRecovery:
                 unit.c.deadline_at <= _database_datetime(now),
             )
         )
+        persisted_cancel = exists(
+            select(unit.c.id).where(
+                unit.c.task_id == task.c.id,
+                unit.c.operation == _OPERATION,
+                unit.c.step_graph_version == _GRAPH_VERSION,
+            )
+        )
         conditions = [
             task.c.type == _TASK_TYPE,
-            task.c.status.in_(_ACTIVE_TASK_STATUSES),
-            task.c.user_cancelled_at.is_(None),
-            due,
+            or_(
+                and_(
+                    task.c.status.in_(_ACTIVE_TASK_STATUSES),
+                    task.c.user_cancelled_at.is_(None),
+                    due,
+                ),
+                and_(task.c.status == "cancelling", persisted_cancel),
+            ),
         ]
         if cursor is not None:
             created_at, task_id = cursor

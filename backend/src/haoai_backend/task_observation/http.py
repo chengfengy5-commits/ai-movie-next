@@ -15,6 +15,7 @@ from . import application
 from .errors import TaskObservationUnavailable
 from .ports import (
     CancellationSignalRegistry,
+    FrameReviewCancellationPort,
     TaskCancellationWriter,
     UnitOfWorkFactory,
 )
@@ -37,6 +38,7 @@ def build_task_observation_router(
     resolve_active_actor: ActorResolver | None,
     cancellation_signals: CancellationSignalRegistry | None = None,
     cancellation_writer: TaskCancellationWriter | None = None,
+    frame_review_cancellation: FrameReviewCancellationPort | None = None,
 ) -> APIRouter:
     """Build the nine routes from explicitly supplied read/auth/cancel adapters."""
     router = APIRouter(prefix="/api/chat", tags=["task-observation"])
@@ -140,6 +142,7 @@ def build_task_observation_router(
             task_id,
             cancellation_signals,
             cancellation_writer,
+            frame_review_cancellation,
         )
 
     return router

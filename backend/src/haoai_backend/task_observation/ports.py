@@ -9,6 +9,7 @@ from typing import Any, Literal, Protocol, TypeAlias
 from haoai_backend.generation_contracts.ports import CallerTransaction
 from haoai_backend.generation_contracts.records import ApplicationRecord, GenerationResultReceipt
 from haoai_backend.generation_contracts.types import GenerationActor, OwnerTaskScope
+from haoai_backend.shared.identity import TrustedActor
 
 from .domain import BillingUnitRecord, TaskRecord, TaskSubmissionRecord, TeamMembershipRecord
 
@@ -100,6 +101,12 @@ class TaskCancellationWriter(Protocol):
     """Write only the source-compatible status transition in an independent unit."""
 
     def request_cancel(self, task_id: str) -> bool: ...
+
+
+class FrameReviewCancellationPort(Protocol):
+    """Settle a registered review after trusted active-user authentication."""
+
+    def cancel_owned(self, actor: TrustedActor, task_id: str) -> str: ...
 
 
 CancellationConnectionFactory: TypeAlias = Callable[

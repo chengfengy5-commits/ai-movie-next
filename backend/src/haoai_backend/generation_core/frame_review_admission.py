@@ -389,7 +389,7 @@ def _safe_request_data(
             "source_message_id": str(request.get("message_id") or ""),
             "model_source": model.source.value,
             "model_id": model.catalog_id,
-            "model_owner_id": "system" if model.source.value == "system" else model.owner_id,
+            "model_owner_id": snapshot.payload.scope.owner_or_system,
             "model_display_name": model.display_name,
             "cost_per_call": snapshot.snapshot.server_quote,
             "enable_thinking": request.get("enable_thinking") is True,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
@@ -27,6 +28,7 @@ from .payload import (
 )
 from .ports import (
     CancellationSignalRegistry,
+    FrameReviewCancellationPort,
     TaskCancellationWriter,
     TaskObservationUnitOfWork,
     TaskRow,
@@ -251,24 +253,98 @@ def request_batch_optimize_cancel(
     task_id: str,
     signal_registry: CancellationSignalRegistry | None,
     cancellation_writer: TaskCancellationWriter | None,
+    frame_review_cancellation: FrameReviewCancellationPort | None = None,
 ) -> dict[str, Any]:
-    """Signal the local worker before requesting the independent status write."""
+    """Route registered reviews through their own transaction, preserving legacy order."""
     if factory is None:
         raise TaskObservationUnavailable()
-    if cancellation_writer is None:
+    if cancellation_writer is None and frame_review_cancellation is None:
         raise TaskObservationUnavailable("任务取消服务尚未接线")
 
-    def operation(uow: TaskObservationUnitOfWork) -> dict[str, Any]:
+    def operation(uow: TaskObservationUnitOfWork) -> tuple[str, dict[str, Any]]:
         task = uow.load_owned_task(actor.user_id, task_id)
         if task is None:
             raise TaskObservationNotFound("任务不存在")
 
+        task_type = _value(task, "type")
+        request_data = _object_mapping(_value(task, "request_data"))
+        selected = _registered_frame_review_candidate(task_type, request_data)
+        if task_type == "ai-review" and not selected:
+            try:
+                unit = uow.unique_billing_unit(task_id)
+            except Exception:
+                # An ambiguous unit graph cannot safely fall through to the legacy writer.
+                selected = True
+            else:
+                selected = unit is not None and (
+                    _value(unit, "operation") == "frame.review"
+                    or _value(unit, "step_graph_version") == "frame-review-v1"
+                )
+
+        task_snapshot = {
+            "task_id": _value(task, "id"),
+            "status": _value(task, "status"),
+            "type": task_type,
+        }
+        if task_type == "ai-review" and selected:
+            return "registered", task_snapshot
+
+        if cancellation_writer is None:
+            raise TaskObservationUnavailable("任务取消服务尚未接线")
         if _value(task, "status") in ("queued", "processing"):
             signal = signal_registry.get(task_id) if signal_registry is not None else None
             if signal:
                 signal.set()
             cancellation_writer.request_cancel(task_id)
 
-        return {"task_id": _value(task, "id"), "status": "cancelling"}
+        return "legacy", {"task_id": _value(task, "id"), "status": "cancelling"}
 
-    return _run_read_only(factory, operation)
+    route, value = _run_read_only(factory, operation)
+    if route == "legacy":
+        return value
+    if frame_review_cancellation is None:
+        raise TaskObservationUnavailable("注册分镜复核取消服务尚未接线")
+
+    outcome = frame_review_cancellation.cancel_owned(actor, value["task_id"])
+    if outcome == "not_found":
+        raise TaskObservationNotFound("任务不存在")
+    if outcome == "settled":
+        signal = signal_registry.get(value["task_id"]) if signal_registry is not None else None
+        if signal:
+            signal.set()
+    elif outcome not in {"retained", "terminal_projection"}:
+        raise TaskObservationUnavailable("任务取消状态暂时无法安全确认")
+    return {"task_id": value["task_id"], "status": "cancelling"}
+
+
+def _registered_frame_review_candidate(
+    task_type: object, request_data: Mapping[str, Any] | None
+) -> bool:
+    if task_type != "ai-review" or request_data is None:
+        return False
+    return any(
+        request_data.get(name) is not None
+        for name in (
+            "via",
+            "mode",
+            "operation",
+            "graph_version",
+            "step_graph_version",
+            "submission_id",
+            "billing_unit_id",
+            "prepared_payload_id",
+            "protected_ref",
+        )
+    )
+
+
+def _object_mapping(value: object) -> Mapping[str, Any] | None:
+    if isinstance(value, Mapping):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+        return parsed if isinstance(parsed, Mapping) else None
+    return None

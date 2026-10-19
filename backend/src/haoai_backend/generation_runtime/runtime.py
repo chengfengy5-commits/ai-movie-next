@@ -282,12 +282,14 @@ class _ConfiguredRuntime:
         if factory is None:
             return "pending"
         recovery = self._recovery_for(factory)
-        consume_due = getattr(recovery, "consume_due", None)
-        if not callable(consume_due):
+        consume = getattr(recovery, "consume_cancel_and_due", None)
+        if not callable(consume):
+            consume = getattr(recovery, "consume_due", None)
+        if not callable(consume):
             return "pending"
         completed, result = self._run_tracked_recovery(
             factory.task_type,
-            lambda stop_signal: consume_due(scope, stop_signal=stop_signal),
+            lambda stop_signal: consume(scope, stop_signal=stop_signal),
         )
         if not completed or result not in (
             "settled",

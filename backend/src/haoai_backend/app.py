@@ -152,6 +152,9 @@ from .task_observation.authentication import (
     resolve_active_actor as resolve_task_active_actor,
 )
 from .task_observation.cancellation import SqlTaskCancellationWriter
+from .task_observation.frame_review_cancellation import (
+    build_frame_review_cancellation_facade,
+)
 from .task_observation.http import build_task_observation_router
 from .task_observation.persistence import task_observation_unit_of_work_factory
 from .task_observation.ports import CancellationConnectionFactory, CancellationSignalRegistry
@@ -674,6 +677,32 @@ def create_app(
         if task_cancellation_connection_factory is not None
         else None
     )
+    frame_review_cancellation = None
+    if frame_review_worker_configuration is not None:
+        runtime_configuration = frame_review_worker_configuration.runtime
+        registry_capabilities = frame_review_worker_configuration.registry_capabilities
+        if (
+            effective_session_factory is not None
+            and runtime_configuration.session_factory is effective_session_factory
+        ):
+            frame_review_cancellation = build_frame_review_cancellation_facade(
+                session_factory=runtime_configuration.session_factory,
+                registry_capabilities=registry_capabilities,
+                db_clock=runtime_configuration.db_clock,
+                id_factory=runtime_configuration.id_factory,
+            )
+    elif (
+        chat_text_generation_configuration is not None
+        and chat_text_generation_configuration.frame_review_admission is not None
+    ):
+        registry_capabilities = (
+            chat_text_generation_configuration.frame_review_admission.registry_capabilities
+        )
+        if effective_session_factory is not None:
+            frame_review_cancellation = build_frame_review_cancellation_facade(
+                session_factory=effective_session_factory,
+                registry_capabilities=registry_capabilities,
+            )
     app.include_router(
         build_task_observation_router(
             uow_factory=task_uow_factory,
@@ -681,6 +710,7 @@ def create_app(
             resolve_active_actor=active_actor_resolver,
             cancellation_signals=task_cancellation_signals,
             cancellation_writer=task_cancellation_writer,
+            frame_review_cancellation=frame_review_cancellation,
         )
     )
 
