@@ -292,7 +292,7 @@ describe("personal rough-cut editing through Workspace", () => {
     const panel = await within(chapterRegion).findByRole("region", { name: "我的粗剪草稿" });
     expect(await within(panel).findByText("未保存的初始投影")).toBeInTheDocument();
     expect(getRoughCut).toHaveBeenCalledTimes(1);
-    expect(getRoughCut.mock.results[0]?.value).resolves.toMatchObject({
+    await expect(getRoughCut.mock.results[0]?.value).resolves.toMatchObject({
       revision: 0,
       saved: false,
       frames: [{ included: true, pending: false }],

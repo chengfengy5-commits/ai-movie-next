@@ -1107,33 +1107,36 @@ describe("read-only workspace", () => {
     await user.type(screen.getByLabelText("密码"), "demo123");
     await user.click(screen.getByRole("button", { name: "登录工作台" }));
 
-    await screen.findAllByRole("article");
-    const firstCard = screen.getAllByRole("article")[0]!;
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesFilters = within(seriesRegion).getByRole("group", { name: "剧集筛选" });
+    await within(seriesRegion).findAllByRole("article");
+    const firstCard = within(seriesRegion).getAllByRole("article")[0]!;
     expect(within(firstCard).getByRole("heading", { level: 3 })).toHaveTextContent("雾港来信");
-    expect(screen.getAllByRole("article")).toHaveLength(20);
-    expect(screen.getByRole("button", { name: /加载更多/ })).toBeInTheDocument();
-    expect(screen.getByText("当前账号受限")).toBeInTheDocument();
-    const restrictedCard = screen.getByText("当前账号受限").closest("article");
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(20);
+    expect(within(seriesRegion).getByRole("button", { name: /加载更多/ })).toBeInTheDocument();
+    expect(within(seriesRegion).getByText("当前账号受限")).toBeInTheDocument();
+    const restrictedCard = within(seriesRegion).getByText("当前账号受限").closest("article");
     expect(restrictedCard).not.toBeNull();
     expect(within(restrictedCard as HTMLElement).queryByRole("button", { name: /只读查看素材库/ }))
       .not.toBeInTheDocument();
     expect(screen.queryByRole("link")).not.toBeInTheDocument();
-    expect(screen.getAllByText("林编剧").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("拾光工作室").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("我负责").length).toBeGreaterThan(0);
+    expect(within(seriesRegion).getAllByText("林编剧").length).toBeGreaterThan(0);
+    expect(within(seriesRegion).getAllByText("拾光工作室").length).toBeGreaterThan(0);
+    expect(within(seriesRegion).getAllByText("我负责").length).toBeGreaterThan(0);
 
-    await user.click(screen.getByRole("button", { name: /加载更多/ }));
-    expect(screen.getAllByRole("article")).toHaveLength(24);
+    await user.click(within(seriesRegion).getByRole("button", { name: /加载更多/ }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(24);
 
-    await user.click(screen.getByRole("button", { name: "我创建的" }));
-    expect(screen.getAllByRole("article")).toHaveLength(12);
-    expect(within(screen.getAllByRole("article")[0]!).getByRole("heading", { level: 3 }))
+    await user.click(within(seriesFilters).getByRole("button", { name: "我创建的" }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(12);
+    const firstCreatedCard = within(seriesRegion).getAllByRole("article")[0]!;
+    expect(within(firstCreatedCard).getByRole("heading", { level: 3 }))
       .toHaveTextContent("雾港来信");
 
-    await user.click(screen.getByRole("button", { name: "团队剧集" }));
-    expect(screen.getAllByRole("article")).toHaveLength(16);
-    await user.click(screen.getByRole("button", { name: "我认领的" }));
-    expect(screen.getAllByRole("article")).toHaveLength(4);
+    await user.click(within(seriesFilters).getByRole("button", { name: "团队剧集" }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(16);
+    await user.click(within(seriesFilters).getByRole("button", { name: "我认领的" }));
+    expect(within(seriesRegion).getAllByRole("article")).toHaveLength(4);
 
     expect(window.localStorage.getItem(MOCK_SESSION_KEY)).toBe("demo-session");
     expect(window.localStorage.getItem(MOCK_USER_KEY)).not.toBeNull();
@@ -1150,34 +1153,43 @@ describe("read-only workspace", () => {
     await user.type(screen.getByLabelText("账号"), "demo");
     await user.type(screen.getByLabelText("密码"), "demo123");
     await user.click(screen.getByRole("button", { name: "登录工作台" }));
-    await screen.findAllByRole("article");
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesFilters = within(seriesRegion).getByRole("group", { name: "剧集筛选" });
+    await within(seriesRegion).findAllByRole("article");
 
-    await user.click(screen.getByRole("button", { name: "团队剧集" }));
-    await user.click(screen.getByRole("button", { name: /全部剧集/ }));
-    await user.click(screen.getByRole("button", { name: /加载更多/ }));
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
+    await user.click(within(seriesFilters).getByRole("button", { name: "团队剧集" }));
+    await user.click(within(seriesFilters).getByRole("button", { name: /全部剧集/ }));
+    await user.click(within(seriesRegion).getByRole("button", { name: /加载更多/ }));
+    expect(within(seriesRegion).getByText("显示 24 / 24 部")).toBeInTheDocument();
 
-    const entryCard = screen.getAllByRole("article")[0]!;
+    const entryCard = within(seriesRegion).getAllByRole("article")[0]!;
     await user.click(within(entryCard).getByRole("button", { name: /只读查看素材库/ }));
-    expect(await screen.findByRole("heading", { name: "雾港来信 · 素材库" })).toBeInTheDocument();
-    expect(await screen.findByRole("heading", { name: "林岚" })).toBeInTheDocument();
+    const assetLibrary = await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+    expect(await within(assetLibrary).findByRole("heading", { name: "雾港来信 · 素材库" }))
+      .toBeInTheDocument();
+    expect(await within(assetLibrary).findByRole("heading", { name: "林岚" })).toBeInTheDocument();
     expect(listChapters).not.toHaveBeenCalled();
     const hiddenList = container.querySelector(".series-list-view") as HTMLElement;
     expect(hiddenList.hidden).toBe(true);
     expect(hiddenList.hasAttribute("inert")).toBe(true);
     expect(screen.queryByRole("button", { name: "团队剧集" })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "场景" }));
-    expect(await screen.findByRole("heading", { name: "旧街清晨" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "道具" }));
-    expect(await screen.findByRole("heading", { name: "黄铜钥匙" })).toBeInTheDocument();
+    const assetCategories = within(assetLibrary).getByRole("group", { name: "素材分类" });
+    await user.click(within(assetCategories).getByRole("button", { name: "场景" }));
+    expect(await within(assetLibrary).findByRole("heading", { name: "旧街清晨" })).toBeInTheDocument();
+    await user.click(within(assetCategories).getByRole("button", { name: "道具" }));
+    expect(await within(assetLibrary).findByRole("heading", { name: "黄铜钥匙" })).toBeInTheDocument();
     expect(listChapters).not.toHaveBeenCalled();
 
-    await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+    await user.click(within(assetLibrary).getByRole("button", { name: "返回剧集列表" }));
 
-    expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /全部剧集/ })).toHaveAttribute("aria-pressed", "true");
+    const returnedList = await screen.findByRole("region", { name: "我的剧集" });
+    expect(await within(returnedList).findByRole("heading", { name: "我的剧集" }))
+      .toBeInTheDocument();
+    expect(within(returnedList).getByText("显示 24 / 24 部")).toBeInTheDocument();
+    const returnedFilters = within(returnedList).getByRole("group", { name: "剧集筛选" });
+    expect(within(returnedFilters).getByRole("button", { name: /全部剧集/ }))
+      .toHaveAttribute("aria-pressed", "true");
     expect(fetch).not.toHaveBeenCalled();
   });
 
@@ -2305,18 +2317,22 @@ describe("read-only workspace", () => {
     await user.type(screen.getByLabelText("账号"), "demo");
     await user.type(screen.getByLabelText("密码"), "demo123");
     await user.click(screen.getByRole("button", { name: "登录工作台" }));
-    await screen.findAllByRole("article");
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesFilters = within(seriesRegion).getByRole("group", { name: "剧集筛选" });
+    await within(seriesRegion).findAllByRole("article");
 
-    await user.click(screen.getByRole("button", { name: "团队剧集" }));
-    await user.click(screen.getByRole("button", { name: /全部剧集/ }));
-    await user.click(screen.getByRole("button", { name: /加载更多/ }));
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
+    await user.click(within(seriesFilters).getByRole("button", { name: "团队剧集" }));
+    await user.click(within(seriesFilters).getByRole("button", { name: /全部剧集/ }));
+    await user.click(within(seriesRegion).getByRole("button", { name: /加载更多/ }));
+    expect(within(seriesRegion).getByText("显示 24 / 24 部")).toBeInTheDocument();
 
-    const firstCard = screen.getAllByRole("article")[0]!;
+    const firstCard = within(seriesRegion).getAllByRole("article")[0]!;
     await user.click(within(firstCard).getByRole("button", { name: /只读查看章节/ }));
-    expect(await screen.findByRole("heading", { name: "第一章 · 雾起" })).toBeInTheDocument();
-    expect(screen.getByText(/当前由 周编剧 编辑/)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "重新读取章节" })).toBeInTheDocument();
+    const chapterRegion = await screen.findByRole("region", { name: "雾港来信" });
+    expect(await within(chapterRegion).findByRole("heading", { name: "第一章 · 雾起" }))
+      .toBeInTheDocument();
+    expect(within(chapterRegion).getByText(/当前由 周编剧 编辑/)).toBeInTheDocument();
+    expect(within(chapterRegion).getByRole("button", { name: "重新读取章节" })).toBeInTheDocument();
 
     const hiddenList = container.querySelector(".series-list-view") as HTMLElement;
     expect(hiddenList.hidden).toBe(true);
@@ -2324,13 +2340,18 @@ describe("read-only workspace", () => {
     expect(screen.queryByRole("button", { name: "团队剧集" })).not.toBeInTheDocument();
     // jsdom does not simulate native focus movement when a focused subtree becomes hidden; the browser check covers it.
 
-    await user.click(screen.getByRole("button", { name: /第二章/ }));
-    expect(await screen.findByText(/她拆开信封/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+    const chapterList = within(chapterRegion).getByRole("complementary", { name: "章节列表" });
+    await user.click(within(chapterList).getByRole("button", { name: /第二章/ }));
+    expect(await within(chapterRegion).findByText(/她拆开信封/)).toBeInTheDocument();
+    await user.click(within(chapterRegion).getByRole("button", { name: "返回剧集列表" }));
 
-    expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
-    expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: /全部剧集/ })).toHaveAttribute("aria-pressed", "true");
+    const returnedList = await screen.findByRole("region", { name: "我的剧集" });
+    expect(await within(returnedList).findByRole("heading", { name: "我的剧集" }))
+      .toBeInTheDocument();
+    expect(within(returnedList).getByText("显示 24 / 24 部")).toBeInTheDocument();
+    const returnedFilters = within(returnedList).getByRole("group", { name: "剧集筛选" });
+    expect(within(returnedFilters).getByRole("button", { name: /全部剧集/ }))
+      .toHaveAttribute("aria-pressed", "true");
   });
 
   it("ignores a late series response after logout", async () => {
