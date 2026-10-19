@@ -1320,8 +1320,23 @@ a:focus-visible {
   }
 
   .topbar {
+    align-items: stretch;
+    flex-direction: column;
+    gap: 8px;
+    justify-content: flex-start;
     min-height: 53px;
-    padding: 0 17px;
+    padding: 10px 17px;
+  }
+
+  .breadcrumb {
+    min-width: 0;
+    flex-wrap: wrap;
+    overflow-wrap: anywhere;
+  }
+
+  .breadcrumb strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   .workspace-content {
@@ -4037,7 +4052,18 @@ a:focus-visible {
   }
 
   .topbar-actions {
+    width: 100%;
+    min-width: 0;
+    flex-wrap: wrap;
+    justify-content: flex-start;
     gap: 8px;
+  }
+
+  .topbar-actions > .mobile-task-entry,
+  .topbar-actions > .mode-chip,
+  .topbar-actions > .text-button {
+    flex: 0 0 auto;
+    white-space: nowrap;
   }
 
   .topbar-actions .mode-chip {
