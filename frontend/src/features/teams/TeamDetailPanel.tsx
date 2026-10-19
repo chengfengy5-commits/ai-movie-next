@@ -1,6 +1,6 @@
 import { TEAM_PERMISSION_KEYS, type TeamDetail, type TeamInvite, type TeamInviteReceipt, type TeamPermission } from "../../shared/api/teamManagement";
 
-export type TeamDetailTab = "members" | "invites" | "settings" | "series";
+export type TeamDetailTab = "members" | "invites" | "settings" | "series" | "reporting";
 
 interface TeamDetailPanelProps {
   team: TeamDetail;
@@ -111,6 +111,7 @@ export function TeamDetailPanel({
         {canManageInvites && <button aria-selected={tab === "invites"} className={tab === "invites" ? "active" : ""} onClick={() => onTabChange("invites")} role="tab" type="button">邀请码</button>}
         <button aria-selected={tab === "settings"} className={tab === "settings" ? "active" : ""} onClick={() => onTabChange("settings")} role="tab" type="button">团队设置</button>
         {seriesAvailable && <button aria-selected={tab === "series"} className={tab === "series" ? "active" : ""} onClick={() => onTabChange("series")} role="tab" type="button">团队剧集</button>}
+        <button aria-selected={tab === "reporting"} className={tab === "reporting" ? "active" : ""} onClick={() => onTabChange("reporting")} role="tab" type="button">用量与任务</button>
       </div>
 
       {tab === "members" && (

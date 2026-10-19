@@ -122,6 +122,17 @@ async function startFixture(overrides: Record<string, string> = {}): Promise<Fix
 describe("API services", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("wires read-only team reporting only in API mode", () => {
+    const storage = new MemoryStorage();
+    const fetcher = vi.fn(async () => jsonResponse({})) as typeof fetch;
+    const apiServices = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const demoServices = createDemoServices(storage);
+
+    expect(apiServices.teamReporting).toBeDefined();
+    expect(demoServices.teamReporting).toBeUndefined();
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
   it("does not claim a releasable lease when POST may have renewed another window's lock", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "fixture-demo-token");

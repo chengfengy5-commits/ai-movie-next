@@ -24,6 +24,7 @@ import {
 import { TeamDetailPanel, type TeamDetailTab } from "./TeamDetailPanel";
 import { TeamDirectoryPanel } from "./TeamDirectoryPanel";
 import { TeamSeriesPanel } from "./TeamSeriesPanel";
+import { TeamReportingPanel } from "./TeamReportingPanel";
 import "./TeamsPage.css";
 
 interface TeamScope {
@@ -198,6 +199,7 @@ export function TeamsPage({
   );
   const port = services.teamManagement;
   const teamSeriesPort = services.teamSeries;
+  const teamReportingPort = services.teamReporting;
   const [teams, setTeams] = useState<TeamDirectoryEntry[]>([]);
   const [teamsLoading, setTeamsLoading] = useState(false);
   const [selectedTeamId, setSelectedTeamId] = useState<string | null>(null);
@@ -1174,6 +1176,18 @@ export function TeamsPage({
               teamId={selectedTeamId}
               transferTargets={drafts.seriesTransferTargets}
               unknownLabel={unknownLabel}
+            />
+          )}
+          {selectedTeam !== null && (
+            <TeamReportingPanel
+              active={tab === "reporting"}
+              actorId={userId}
+              onRefreshTeam={() => { void loadDetail(selectedTeam.id); }}
+              onUnauthorized={() => onUnauthorizedRef.current()}
+              port={teamReportingPort}
+              services={services}
+              sessionGeneration={sessionGeneration}
+              team={selectedTeam}
             />
           )}
           {detailError !== null && selectedTeam === null && selectedTeamId !== null && (

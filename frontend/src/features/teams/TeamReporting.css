@@ -1,0 +1,205 @@
+.team-reporting-panel {
+  display: grid;
+  gap: 1rem;
+}
+
+.team-reporting-panel[hidden] {
+  display: none;
+}
+
+.team-reporting-switch,
+.team-reporting-toolbar,
+.team-reporting-date-filter,
+.team-reporting-pagination {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.65rem;
+}
+
+.team-reporting-switch button,
+.team-reporting-back,
+.team-reporting-inline-button {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0.45rem 0.65rem;
+}
+
+.team-reporting-switch button.active {
+  border-bottom: 2px solid currentColor;
+  font-weight: 700;
+}
+
+.team-reporting-toolbar select,
+.team-reporting-date-filter input {
+  border: 1px solid #c9ccd1;
+  border-radius: 0.35rem;
+  font: inherit;
+  min-height: 2.35rem;
+  padding: 0.35rem 0.55rem;
+}
+
+.team-reporting-content {
+  display: grid;
+  gap: 0.8rem;
+  min-width: 0;
+}
+
+.team-reporting-task-summary,
+.team-reporting-metrics {
+  align-items: stretch;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+
+.team-reporting-task-summary span,
+.team-reporting-metrics > div {
+  background: #f5f6f8;
+  border-radius: 0.4rem;
+  padding: 0.65rem 0.8rem;
+}
+
+.team-reporting-metrics {
+  margin: 0;
+}
+
+.team-reporting-metrics > div {
+  display: grid;
+  gap: 0.25rem;
+  min-width: 8rem;
+}
+
+.team-reporting-metrics dt,
+.team-reporting-task small {
+  color: #626973;
+  font-size: 0.82rem;
+}
+
+.team-reporting-metrics dd {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin: 0;
+}
+
+.team-reporting-task-list {
+  display: grid;
+  gap: 0.65rem;
+}
+
+.team-reporting-task {
+  border: 1px solid #e1e4e8;
+  border-radius: 0.45rem;
+  display: grid;
+  gap: 0.35rem;
+  padding: 0.8rem;
+}
+
+.team-reporting-task-heading {
+  align-items: baseline;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  justify-content: space-between;
+}
+
+.team-reporting-task p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.team-reporting-task small + small {
+  margin-top: -0.25rem;
+}
+
+.team-reporting-pagination {
+  justify-content: flex-end;
+}
+
+.team-reporting-table-wrap {
+  max-width: 100%;
+  overflow-x: auto;
+}
+
+.team-reporting-table {
+  border-collapse: collapse;
+  min-width: 38rem;
+  width: 100%;
+}
+
+.team-reporting-table th,
+.team-reporting-table td {
+  border-bottom: 1px solid #e1e4e8;
+  padding: 0.6rem 0.7rem;
+  text-align: left;
+  vertical-align: top;
+}
+
+.team-reporting-table thead th {
+  background: #f5f6f8;
+  font-weight: 600;
+}
+
+.team-reporting-link {
+  background: transparent;
+  border: 0;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+  text-align: left;
+  text-decoration: underline;
+  text-underline-offset: 0.15em;
+}
+
+.team-reporting-model-chip {
+  background: #f5f6f8;
+  border: 1px solid #e1e4e8;
+  border-radius: 999px;
+  cursor: pointer;
+  font: inherit;
+  justify-self: start;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  padding: 0.4rem 0.75rem;
+}
+
+.team-reporting-member-list {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding-left: 1.2rem;
+}
+
+.team-reporting-back {
+  justify-self: start;
+  padding-left: 0;
+}
+
+.team-reporting-inline-button {
+  text-decoration: underline;
+}
+
+@media (max-width: 640px) {
+  .team-reporting-date-filter {
+    align-items: stretch;
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .team-reporting-date-filter input,
+  .team-reporting-date-filter button {
+    width: 100%;
+  }
+
+  .team-reporting-toolbar select {
+    flex: 1 1 100%;
+  }
+
+  .team-reporting-metrics > div {
+    flex: 1 1 8rem;
+  }
+}
