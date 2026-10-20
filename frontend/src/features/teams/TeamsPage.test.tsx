@@ -3,6 +3,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-libra
 import userEvent from "@testing-library/user-event";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { ApiError } from "../../shared/api/errors";
+import type { TeamReportingServicePort } from "../../shared/api/teamReporting";
 import type { TeamDetail, TeamInvite, TeamManagementServicePort, TeamPermission } from "../../shared/api/teamManagement";
 import type { TeamSeriesPage, TeamSeriesServicePort } from "../../shared/api/teamSeries";
 import { TeamsPage } from "./TeamsPage";
@@ -85,8 +86,13 @@ function renderTeamsPage(
   port: TeamManagementServicePort,
   onGuardChange = vi.fn(),
   onUnauthorized = vi.fn(),
+  reportingPort?: TeamReportingServicePort,
 ) {
-  const services: WorkspaceServices = { ...createDemoServices(), teamManagement: port };
+  const services: WorkspaceServices = {
+    ...createDemoServices(),
+    teamManagement: port,
+    ...(reportingPort === undefined ? {} : { teamReporting: reportingPort }),
+  };
   const result = render(
     <TeamsPage
       services={services}
@@ -115,6 +121,38 @@ function deferred<T>() {
 }
 
 describe("TeamsPage", () => {
+  it("keeps the existing draft confirmation when opening the reporting tab", async () => {
+    const user = userEvent.setup();
+    const reportingPort: TeamReportingServicePort = {
+      listMemberTasks: vi.fn(async (_teamId, _userId, page, pageSize) => ({ total: 0, tasks: [], page, page_size: pageSize, credits: 12 })),
+      getTeamUsage: vi.fn(async () => ({ items: [], total_calls: 0, total_credits: 0, total_failed: 0 })),
+      getSeriesUsage: vi.fn(async () => { throw new Error("unexpected series usage read"); }),
+      getModelUsage: vi.fn(async () => { throw new Error("unexpected model usage read"); }),
+      exportTeamUsage: vi.fn(async () => { throw new Error("unexpected usage export"); }),
+    };
+    const managementPort = createPort({
+      listTeams: vi.fn(async () => [{ ...team, member_count: detail.members.length, my_role: "owner" }]),
+      getTeam: vi.fn(async () => detail),
+    });
+    renderTeamsPage(managementPort, vi.fn(), vi.fn(), reportingPort);
+    await user.click(await screen.findByRole("button", { name: /协作组/ }));
+    await screen.findByRole("heading", { name: "协作组" });
+    await user.click(screen.getByRole("tab", { name: "团队设置" }));
+    await user.clear(screen.getByLabelText("团队名称"));
+    await user.type(screen.getByLabelText("团队名称"), "草稿名称");
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(screen.getByRole("tab", { name: "用量与任务" }));
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("tab", { name: "团队设置" })).toHaveAttribute("aria-selected", "true");
+    expect(reportingPort.listMemberTasks).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("tab", { name: "用量与任务" }));
+    await screen.findByText("该成员当前没有任务记录。");
+    expect(reportingPort.listMemberTasks).toHaveBeenCalledWith("team-a", "owner-1", 1, 10, expect.any(AbortSignal));
+  });
+
   it("keeps a confirmed generated-code receipt visible when the follow-up invite read fails", async () => {
     const user = userEvent.setup();
     const listInvites = vi.fn(async (): Promise<TeamInvite[]> => { throw new ApiError("network", "offline"); });
