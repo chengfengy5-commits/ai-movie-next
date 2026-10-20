@@ -114,6 +114,13 @@ import {
   type CreatorPromptUpdateInput,
   type CreatorSettingsServicePort,
 } from "./creatorSettings";
+import type { FrameReviewServicePort } from "./frameReview";
+import {
+  parseFrameReviewCancelReceipt,
+  parseFrameReviewCapabilities,
+  parseFrameReviewReceipt,
+  parseFrameReviewTask,
+} from "./frameReviewHttp";
 import { parseMyTeamList, type MyTeam } from "./teams";
 import { createTeamManagementHttpPort } from "./teamManagementHttp";
 import type { TeamManagementServicePort } from "./teamManagement";
@@ -239,6 +246,7 @@ export interface WorkspaceServices {
   getTaskReceipt?(taskId: string, signal: AbortSignal): Promise<TaskReceipt>;
   getTaskRequest?(taskId: string, signal: AbortSignal): Promise<TaskRequestRecord>;
   readonly storyboardGeneration?: StoryboardGenerationServicePort;
+  readonly frameReview?: FrameReviewServicePort;
   readonly creatorSettings?: CreatorSettingsServicePort;
   exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
   importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
@@ -1913,6 +1921,10 @@ type ApiEndpoint =
   | "streamTwoPassStoryboard"
   | "twoPassSubmission"
   | "twoPassTask"
+  | "frameReviewCapabilities"
+  | "frameReviewSubmit"
+  | "frameReviewTask"
+  | "frameReviewCancel"
   | "exportSeries"
   | "importSeries"
   | "uploadSeriesCover"
@@ -2062,6 +2074,20 @@ function apiRequestDefinition(
   if (endpoint === "twoPassTask") {
     const query = new URLSearchParams({ task_id: identifiers?.taskId ?? "" });
     return { path: "/chat/tasks?" + query.toString(), method: "GET" };
+  }
+  if (endpoint === "frameReviewCapabilities") {
+    return { path: "/chat/frame-review/capabilities", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "frameReviewSubmit") {
+    return { path: "/chat/frame-review", method: "POST", expectedStatus: 200 };
+  }
+  if (endpoint === "frameReviewTask") {
+    const taskId = encodeApiPathId(identifiers?.taskId, "任务");
+    return { path: "/chat/ai-review/" + taskId, method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "frameReviewCancel") {
+    const taskId = encodeApiPathId(identifiers?.taskId, "任务");
+    return { path: "/chat/batch-optimize/" + taskId + "/cancel", method: "POST", expectedStatus: 200 };
   }
   if (endpoint === "taskRequest") {
     const taskId = encodeApiPathId(identifiers?.taskId, "任务");
@@ -2616,6 +2642,43 @@ export function createApiServices(
     },
   };
 
+  const frameReview: FrameReviewServicePort = {
+    async getCapabilities(signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameReviewCapabilities(
+        await requestForCurrentApiSession("frameReviewCapabilities", token, signal),
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async submit(input, signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameReviewReceipt(
+        await requestForCurrentApiSession("frameReviewSubmit", token, signal, input),
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async getTask(taskId, signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameReviewTask(
+        await requestForCurrentApiSession("frameReviewTask", token, signal, undefined, { taskId }),
+        taskId,
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async cancel(taskId, signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameReviewCancelReceipt(
+        await requestForCurrentApiSession("frameReviewCancel", token, signal, undefined, { taskId }),
+        taskId,
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+  };
+
   const accountProfile: AccountProfileServicePort = {
     async getCredits(signal) {
       const token = requireApiToken(storage);
@@ -2687,6 +2750,7 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     creatorSettings,
+    frameReview,
     accountProfile,
     accountMembership,
     accountSecurity,

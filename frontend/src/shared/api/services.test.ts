@@ -1550,4 +1550,88 @@ describe("API services", () => {
     expect(fetcher).not.toHaveBeenCalled();
   });
 
+  it("uses the registered frame review routes for capability, submit, observation, and cancellation", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "creative-token");
+    const taskId = "review/task-1";
+    const calls: Array<{ url: URL; init: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        operation: "frame.review",
+        enabled: true,
+        reason: null,
+        supported_providers: ["openai", "deepseek", "custom"],
+      }),
+      jsonResponse({ task_id: taskId, model_name: "Review model", is_system: false, credit_cost: 3 }),
+      jsonResponse({
+        id: taskId,
+        type: "ai-review",
+        status: "queued",
+        progress: 0,
+        progress_message: null,
+        result: null,
+        credit_cost: 0,
+        model_name: "Review model",
+      }),
+      jsonResponse({ task_id: taskId, status: "cancelling" }),
+    ];
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      calls.push({ url, init });
+      const next = responses.shift();
+      if (next === undefined) throw new Error("Unexpected extra frame review request.");
+      return next;
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const port = services.frameReview;
+    if (port === undefined) throw new Error("Frame review API is unavailable.");
+    const signal = new AbortController().signal;
+    await expect(port.getCapabilities(signal)).resolves.toMatchObject({ enabled: true });
+    await expect(port.submit({
+      chapter_id: "chapter-1",
+      frame_index: 2,
+      prompt_id: "prompt-1",
+      model_id: "model-1",
+      message_id: "",
+      error_reason: "检查动作方向",
+      asset_context: "",
+      prev_context: "",
+      enable_thinking: false,
+    }, signal)).resolves.toMatchObject({ task_id: taskId, credit_cost: 3 });
+    await expect(port.getTask(taskId, signal)).resolves.toMatchObject({ id: taskId, status: "queued" });
+    await expect(port.cancel(taskId, signal)).resolves.toEqual({ task_id: taskId, status: "cancelling" });
+
+    expect(calls.map(({ url, init }) => [init.method, url.pathname])).toEqual([
+      ["GET", "/api/chat/frame-review/capabilities"],
+      ["POST", "/api/chat/frame-review"],
+      ["GET", "/api/chat/ai-review/review%2Ftask-1"],
+      ["POST", "/api/chat/batch-optimize/review%2Ftask-1/cancel"],
+    ]);
+    expect(calls.every(({ init }) => new Headers(init.headers).get("Authorization") === "Bearer creative-token"))
+      .toBe(true);
+    expect(JSON.parse(String(calls[1]?.init.body))).toMatchObject({
+      chapter_id: "chapter-1",
+      frame_index: 2,
+      model_id: "model-1",
+      prompt_id: "prompt-1",
+    });
+  });
+
+  it("ignores a late 401 from an old token while reading frame review capabilities", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "old-token");
+    let resolveFetch!: (response: Response) => void;
+    const fetcher = vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const port = services.frameReview;
+    if (port === undefined) throw new Error("Frame review API is unavailable.");
+
+    const pending = port.getCapabilities(new AbortController().signal);
+    storage.setItem(API_TOKEN_KEY, "new-token");
+    resolveFetch(jsonResponse({ detail: "old session expired" }, 401));
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("new-token");
+  });
+
 });

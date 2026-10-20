@@ -1,0 +1,72 @@
+.frame-review-dialog {
+  display: grid;
+  gap: 1rem;
+  max-height: min(90vh, 880px);
+  overflow-y: auto;
+}
+
+.frame-review-source-label,
+.frame-review-label {
+  display: grid;
+  gap: 0.4rem;
+  color: var(--ink-700, #384250);
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.frame-review-source,
+.frame-review-result > div {
+  border: 1px solid var(--line, #d8dee8);
+  border-radius: 0.75rem;
+  background: var(--surface-subtle, #f6f8fb);
+  color: var(--ink-900, #17202d);
+  line-height: 1.6;
+  padding: 0.8rem 0.9rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.frame-review-label textarea,
+.frame-review-label select {
+  border: 1px solid var(--line-strong, #c5ceda);
+  border-radius: 0.65rem;
+  background: var(--surface, #fff);
+  color: inherit;
+  font: inherit;
+  padding: 0.65rem 0.75rem;
+  resize: vertical;
+}
+
+.frame-review-thinking {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--ink-700, #384250);
+}
+
+.frame-review-task,
+.frame-review-result {
+  display: grid;
+  gap: 0.55rem;
+  border-top: 1px solid var(--line, #d8dee8);
+  padding-top: 0.9rem;
+}
+
+.frame-review-task-id {
+  overflow-wrap: anywhere;
+  color: var(--ink-700, #384250);
+  font-size: 0.85rem;
+}
+
+.frame-review-unknown {
+  border-left: 3px solid var(--warning, #b86b16);
+  background: var(--warning-surface, #fff7e9);
+  padding: 0.65rem 0.8rem;
+}
+
+.frame-review-actions {
+  position: sticky;
+  bottom: -1.25rem;
+  background: var(--surface, #fff);
+  padding-block: 0.8rem 0.25rem;
+}

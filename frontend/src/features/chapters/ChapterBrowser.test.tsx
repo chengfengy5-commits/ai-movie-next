@@ -11,6 +11,8 @@ import {
   type PersonalProductionSnapshot,
 } from "../../shared/api/personalProductionNotes";
 import type { WorkspaceServices } from "../../shared/api/services";
+import type { CreatorModel, CreatorPrompt } from "../../shared/api/creatorSettings";
+import type { FrameReviewCapabilities, FrameReviewServicePort, FrameReviewTask } from "../../shared/api/frameReview";
 import type { StoryboardGenerationServicePort } from "../storyboard-generation/contracts";
 import { digestPersonalProductionMediaIdentity } from "./personal-production/mediaIdentity";
 import { demoSeries } from "../series/demoSeries";
@@ -463,6 +465,172 @@ describe("read-only chapter browser", () => {
     roughCutPanelBridge.lastTarget = null;
     roughCutPanelBridge.onFrameNavigationInvalidated = null;
     roughCutPanelBridge.lastInvalidation = null;
+  });
+
+  it("confirms repeated frame reviews using each admission source while preserving historic original text", async () => {
+    const user = userEvent.setup();
+    const original = chapter("chapter-frame-review", "复核章节", [
+      { text: "原始镜头文字", original_text: "更早的历史原文", storyboard: ["review-storyboard-1"] },
+    ]);
+    const base = makeServices([original], {
+      [original.id]: [{ ...asset("review-storyboard-1", original.id), frame_index: 0 }],
+    }, false, true);
+    const reviewModel: CreatorModel = {
+      id: "review-model",
+      category: "text",
+      name: "复核模型",
+      provider: "openai",
+      params: null,
+      sort_order: 1,
+      is_system: false,
+      user_id: "demo-user",
+    };
+    const reviewPrompt: CreatorPrompt = {
+      id: "review-prompt",
+      category: "ai-review",
+      name: "复核提示词",
+      is_system: false,
+      sort_order: 1,
+      user_id: "demo-user",
+    };
+    const enabledCapabilities: FrameReviewCapabilities = {
+      operation: "frame.review",
+      enabled: true,
+      reason: null,
+      supported_providers: ["openai", "deepseek", "custom"],
+    };
+    const tasks = new Map<string, FrameReviewTask>();
+    const frameReview: FrameReviewServicePort = {
+      getCapabilities: vi.fn(async () => ({
+        ...enabledCapabilities,
+      })),
+      submit: vi.fn(async () => ({
+        task_id: "pending-frame-review-task",
+        model_name: "复核模型",
+        is_system: false,
+        credit_cost: 3,
+      })),
+      getTask: vi.fn(async (taskId: string) => tasks.get(taskId)!),
+      cancel: vi.fn(async (taskId: string) => ({ task_id: taskId, status: "cancelling" as const })),
+    };
+    const creatorSettings = {
+      listModels: vi.fn(async () => [reviewModel]),
+      listPrompts: vi.fn(async () => [reviewPrompt]),
+    };
+    const services: WorkspaceServices = {
+      ...base.services,
+      creatorSettings: creatorSettings as unknown as NonNullable<WorkspaceServices["creatorSettings"]>,
+      frameReview,
+    };
+    base.setCurrentChapters([original]);
+    let reviewNumber = 0;
+    frameReview.submit = vi.fn(async () => {
+      reviewNumber += 1;
+      const current = base.getCurrentChapters()[0]!;
+      const sourceText = current.content![0]!.text as string;
+      const optimizedText = reviewNumber === 1 ? "第一次复核后的文字" : "第二次复核后的文字";
+      const taskId = `frame-review-task-${reviewNumber}`;
+      const result = {
+        chapter_id: original.id,
+        frame_index: 0,
+        prompt_id: reviewPrompt.id,
+        optimized_text: optimizedText,
+        original_text: sourceText,
+      };
+      tasks.set(taskId, {
+        id: taskId,
+        type: "ai-review",
+        status: "completed",
+        progress: 100,
+        progress_message: null,
+        result: JSON.stringify(result),
+        credit_cost: 3,
+        model_name: "复核模型",
+      });
+      base.setCurrentChapters([{
+        ...current,
+        updated_at: `2026-10-20T00:3${reviewNumber}:00`,
+        content: [{ ...current.content![0]!, text: optimizedText }],
+      }]);
+      return { task_id: taskId, model_name: "复核模型", is_system: false, credit_cost: 3 };
+    });
+
+    renderBrowser(services);
+
+    async function reviewCurrentFrame(expectedSource: string, expectedResult: string): Promise<void> {
+      const frame = await screen.findByRole("article", { name: "复核章节 · 镜头 1" });
+      const reviewButton = await within(frame).findByRole("button", { name: "AI 复核" });
+      expect(reviewButton).toBeEnabled();
+      await user.click(reviewButton);
+      const dialog = within(await screen.findByRole("dialog", { name: "AI 分镜复核" }));
+      expect(dialog.getByText(expectedSource)).toBeInTheDocument();
+      await user.type(dialog.getByRole("textbox", { name: "希望核对的问题" }), "检查镜头连续性");
+      await user.click(dialog.getByRole("button", { name: "提交复核" }));
+
+      expect(await screen.findByText("服务器已回写镜头；章节源数据已重新读取并核对。")).toBeInTheDocument();
+      expect(await screen.findByRole("heading", { name: "服务器回写后的镜头文字" })).toBeInTheDocument();
+      expect(dialog.getByText(expectedResult)).toBeInTheDocument();
+      await waitFor(() => expect(base.listChapters).toHaveBeenCalledTimes(reviewNumber + 1));
+      expect(frameReview.submit).toHaveBeenCalledTimes(reviewNumber);
+      await user.click(dialog.getByRole("button", { name: "关闭" }));
+      await waitFor(() => expect(screen.queryByRole("dialog", { name: "AI 分镜复核" })).not.toBeInTheDocument());
+    }
+
+    await reviewCurrentFrame("原始镜头文字", "第一次复核后的文字");
+    await reviewCurrentFrame("第一次复核后的文字", "第二次复核后的文字");
+    expect(base.getCurrentChapters()[0]!.content![0]!.original_text).toBe("更早的历史原文");
+    expect(base.listStoryboardAssets).toHaveBeenCalledTimes(3);
+    expect(frameReview.getTask).toHaveBeenNthCalledWith(1, "frame-review-task-1", expect.any(AbortSignal));
+    expect(frameReview.getTask).toHaveBeenNthCalledWith(2, "frame-review-task-2", expect.any(AbortSignal));
+    expect(base.updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("keeps a text-editor draft open and disables frame review until the editor closes", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-review-draft", "草稿章节", [
+      { text: "当前镜头文字", storyboard: ["review-draft-storyboard"] },
+    ]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("review-draft-storyboard", current.id), frame_index: 0 }],
+    }, false, true);
+    const enabledCapabilities: FrameReviewCapabilities = {
+      operation: "frame.review",
+      enabled: true,
+      reason: null,
+      supported_providers: ["openai", "deepseek", "custom"],
+    };
+    const services: WorkspaceServices = {
+      ...base.services,
+      frameReview: {
+        getCapabilities: vi.fn(async () => ({
+          ...enabledCapabilities,
+        })),
+        submit: vi.fn(async () => ({ task_id: "task", model_name: "复核模型", is_system: false, credit_cost: 1 })),
+        getTask: vi.fn(async () => ({
+          id: "task", type: "ai-review", status: "queued", progress: 0,
+          progress_message: null, result: null, credit_cost: 1, model_name: "复核模型",
+        })),
+        cancel: vi.fn(async () => ({ task_id: "task", status: "cancelling" as const })),
+      },
+      creatorSettings: {
+        listModels: vi.fn(async () => []),
+        listPrompts: vi.fn(async () => []),
+      } as unknown as NonNullable<WorkspaceServices["creatorSettings"]>,
+    };
+
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "草稿章节 · 镜头 1" });
+    await within(frame).findByRole("button", { name: "AI 复核" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const draft = editor.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(draft);
+    await user.type(draft, "仍在编辑中的草稿");
+
+    expect(within(frame).getByRole("button", { name: "AI 复核" })).toBeDisabled();
+    expect(draft).toHaveValue("仍在编辑中的草稿");
+    expect(screen.queryByRole("dialog", { name: "AI 分镜复核" })).not.toBeInTheDocument();
   });
 
   it("selects the exact non-first target by raw chapter ID and loads only its assets", async () => {
