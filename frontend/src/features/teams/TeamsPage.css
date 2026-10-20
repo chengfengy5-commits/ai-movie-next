@@ -46,6 +46,10 @@
   padding: clamp(1rem, 2.5vw, 1.75rem);
 }
 
+.team-panel[hidden] {
+  display: none;
+}
+
 .team-muted {
   color: #677386;
   font-size: 0.875rem;
