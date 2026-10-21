@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Prop, Scene } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { AssetMaintenanceServicePort, AssetOrphanCheckInput } from "../../shared/api/assetMaintenance";
+import { AssetReplacementError, type AssetReplacementPort } from "../../shared/api/assetReplacement";
 import type { WorkspaceServices } from "../../shared/api/services";
 import { demoSeries } from "../series/demoSeries";
 import * as usagePanelModule from "./AssetFrameUsagePanel";
@@ -268,6 +269,166 @@ describe("asset library", () => {
     expect(container.querySelector("audio, audio source, script")).toBeNull();
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(serviceSet.listChapters).not.toHaveBeenCalled();
+  });
+
+  it("opens replacement from the unique same-series asset card and keeps the demo entry disabled", async () => {
+    const user = userEvent.setup();
+    const demo = renderLibrary(makeServices({ mode: "demo" }));
+    const demoCard = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    expect(within(demoCard).getByRole("button", { name: "替换章节引用" })).toBeDisabled();
+    expect(within(demoCard).getByText("演示模式暂未接入素材替换服务。")).toBeInTheDocument();
+    demo.unmount();
+
+    const port: AssetReplacementPort = {
+      beginRun: () => ({ isCurrent: () => true, replaceChapter: vi.fn(async () => ({ message: "已替换" })) }),
+    };
+    const services = makeServices({
+      assetReplacement: port,
+      listCharacters: vi.fn(async () => [character(), character({ id: "new-character-id", name: "新角色" })]),
+      listChapters: vi.fn(async () => [chapter("chapter-real-id", "第一章引用")]),
+    });
+    renderLibrary(services);
+    const oldCard = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    await user.click(within(oldCard).getByRole("button", { name: "替换章节引用" }));
+
+    expect(await screen.findByRole("dialog", { name: /替换章节引用：顾行舟/ })).toBeInTheDocument();
+    const selector = await screen.findByRole("combobox", { name: "新角色" });
+    await waitFor(() => expect(selector).toBeEnabled());
+    await user.selectOptions(selector, "new-character-id");
+    expect(await screen.findByText("章节 ID：chapter-real-id")).toBeInTheDocument();
+  });
+
+  it("uses each fresh old-asset name for its preview and keeps that name on its own history entry", async () => {
+    const user = userEvent.setup();
+    const oldCardAsset = character({ id: "old-id", name: "卡片旧名A" });
+    const firstPreviewAsset = character({ id: "old-id", name: "目录快照旧名B" });
+    const nextPreviewAsset = character({ id: "old-id", name: "下一预览旧名C" });
+    const newAsset = character({ id: "new-id", name: "新角色" });
+    let directoryReads = 0;
+    let chapterContent = chapter("chapter-real-id", "原章节内容", oldCardAsset.id).content;
+    const replaceChapter = vi.fn(async () => {
+      chapterContent = chapter("chapter-real-id", "原章节内容", newAsset.id).content;
+      return { message: "已替换" };
+    });
+    const services = makeServices({
+      assetReplacement: { beginRun: () => ({ isCurrent: () => true, replaceChapter }) },
+      listCharacters: vi.fn(async () => {
+        directoryReads += 1;
+        const oldAsset = directoryReads === 1
+          ? oldCardAsset
+          : directoryReads >= 5 ? nextPreviewAsset : firstPreviewAsset;
+        return [oldAsset, newAsset];
+      }),
+      listChapters: vi.fn(async () => [{ ...chapter("chapter-real-id", "原章节内容", oldCardAsset.id), content: chapterContent }]),
+    });
+    renderLibrary(services);
+
+    const oldCard = await screen.findByRole("article", { name: "卡片旧名A素材卡片" });
+    await user.click(within(oldCard).getByRole("button", { name: "替换章节引用" }));
+    const selector = await screen.findByRole("combobox", { name: "新角色" });
+    await waitFor(() => expect(selector).toBeEnabled());
+    expect(await screen.findByRole("heading", { name: "替换章节引用：目录快照旧名B" })).toBeInTheDocument();
+    await user.selectOptions(selector, newAsset.id);
+
+    const preview = await screen.findByRole("region", { name: "逐章替换预览" });
+    expect(preview).toHaveTextContent("角色「目录快照旧名B」 → 角色「新角色」");
+    await user.click(await screen.findByRole("checkbox", { name: /^选择章节 / }));
+    await user.click(screen.getByRole("checkbox", { name: /我已核对所选章节/ }));
+    await user.click(screen.getByRole("button", { name: /确认并逐章替换/ }));
+
+    const results = await screen.findByRole("region", { name: "逐章提交结果" });
+    expect(within(results).getByRole("heading", { level: 3 })).toHaveTextContent("角色「目录快照旧名B」 → 新角色");
+    await waitFor(() => expect(within(results).getByRole("listitem", { name: /chapter-real-id提交结果/ })).toHaveTextContent("引用已核对"));
+    expect(replaceChapter).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "新建替换预览" }));
+    const history = await screen.findByRole("region", { name: "先前替换记录" });
+    expect(history).toHaveTextContent("角色「目录快照旧名B」 → 新角色");
+
+    const nextSelector = await screen.findByRole("combobox", { name: "新角色" });
+    await waitFor(() => expect(nextSelector).toBeEnabled());
+    await user.selectOptions(nextSelector, newAsset.id);
+    const nextPreview = await screen.findByRole("region", { name: "逐章替换预览" });
+    expect(nextPreview).toHaveTextContent("角色「下一预览旧名C」 → 角色「新角色」");
+    expect(history).toHaveTextContent("角色「目录快照旧名B」 → 新角色");
+    expect(replaceChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    { scenario: "正常成功回读", unknown: false, finalStatus: "引用已核对" },
+    { scenario: "500 后只读回读符合预期", unknown: true, finalStatus: "结果未知" },
+  ])("keeps an old-asset receipt reachable after cleanup and reopening ($scenario)", async ({ unknown, finalStatus }) => {
+    const user = userEvent.setup();
+    let committed = false;
+    const oldAsset = character();
+    const newAsset = character({ id: "new-character-id", name: "新角色" });
+    const replaceChapter = vi.fn(async () => {
+      committed = true;
+      if (unknown) throw new AssetReplacementError("unknown", "服务器返回 500，结果未知。", 500);
+      return { message: "已替换" };
+    });
+    const services = makeServices({
+      assetReplacement: { beginRun: () => ({ isCurrent: () => true, replaceChapter }) },
+      listCharacters: vi.fn(async () => committed ? [newAsset] : [oldAsset, newAsset]),
+      listChapters: vi.fn(async () => [chapter(
+        "chapter-real-id",
+        "第一章引用",
+        committed ? newAsset.id : oldAsset.id,
+      )]),
+    });
+    renderLibrary(services);
+    const oldCard = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    await user.click(within(oldCard).getByRole("button", { name: "替换章节引用" }));
+    await user.selectOptions(await screen.findByRole("combobox", { name: "新角色" }), newAsset.id);
+    await user.click(await screen.findByRole("checkbox", { name: /^选择章节 / }));
+    await user.click(screen.getByRole("checkbox", { name: /我已核对所选章节/ }));
+    await user.click(screen.getByRole("button", { name: /确认并逐章替换/ }));
+
+    if (unknown) {
+      await waitFor(() => expect(screen.getByRole("listitem", { name: /chapter-real-id提交结果/ })).toHaveTextContent("结果未知"));
+      await user.click(screen.getByRole("button", { name: "重新核对（只读，不重发）" }));
+      await screen.findByText(/当前引用符合预览预期；未知请求仍未获得服务器最终确认/);
+    } else {
+      await waitFor(() => expect(screen.getByRole("listitem", { name: /chapter-real-id提交结果/ })).toHaveTextContent("引用已核对"));
+    }
+    await waitFor(() => expect(screen.queryByRole("article", { name: "顾行舟素材卡片" })).not.toBeInTheDocument());
+    expect(await screen.findByRole("article", { name: "新角色素材卡片" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "关闭并保留本次记录" }));
+
+    await user.click(await screen.findByRole("button", { name: /替换记录/ }));
+    await screen.findByRole("dialog");
+    await waitFor(() => expect(screen.getByRole("listitem", { name: /chapter-real-id提交结果/ })).toHaveTextContent(finalStatus));
+    expect(replaceChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("prevents a competing asset management dialog while a replacement POST is in flight", async () => {
+    const user = userEvent.setup();
+    let finishWrite!: (receipt: { message: string }) => void;
+    const replaceChapter = vi.fn(() => new Promise<{ message: string }>((resolve) => {
+      finishWrite = resolve;
+    }));
+    const port: AssetReplacementPort = {
+      beginRun: () => ({ isCurrent: () => true, replaceChapter }),
+    };
+    const services = makeServices({
+      assetReplacement: port,
+      listCharacters: vi.fn(async () => [character(), character({ id: "new-character-id", name: "新角色" })]),
+      listChapters: vi.fn(async () => [chapter("chapter-real-id", "第一章引用")]),
+    });
+    renderLibrary(services);
+    const oldCard = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    await user.click(within(oldCard).getByRole("button", { name: "替换章节引用" }));
+    await user.selectOptions(await screen.findByRole("combobox", { name: "新角色" }), "new-character-id");
+    await user.click(await screen.findByRole("checkbox", { name: /^选择章节 / }));
+    await user.click(screen.getByRole("checkbox", { name: /我已核对所选章节/ }));
+    await user.click(screen.getByRole("button", { name: /确认并逐章替换/ }));
+
+    await waitFor(() => expect(replaceChapter).toHaveBeenCalledTimes(1));
+    await user.click(within(oldCard).getByRole("button", { name: "编辑" }));
+    expect(screen.getAllByRole("dialog")).toHaveLength(1);
+
+    finishWrite?.({ message: "已替换" });
+    await screen.findByText(/服务已确认，但回读内容与预览不符/);
   });
 
   it("keeps maintenance unconnected without a port and bridges confirmed orphans to the existing delete preview", async () => {

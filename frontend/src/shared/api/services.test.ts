@@ -130,8 +130,10 @@ describe("API services", () => {
 
     expect(apiServices.teamReporting).toBeDefined();
     expect(apiServices.assetMaintenance).toBeDefined();
+    expect(apiServices.assetReplacement).toBeDefined();
     expect(demoServices.teamReporting).toBeUndefined();
     expect(demoServices.assetMaintenance).toBeUndefined();
+    expect(demoServices.assetReplacement).toBeUndefined();
     expect(fetcher).not.toHaveBeenCalled();
   });
 
