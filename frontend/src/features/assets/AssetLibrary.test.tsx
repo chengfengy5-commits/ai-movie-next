@@ -4,6 +4,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Prop, Scene } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
+import type { AssetMaintenanceServicePort, AssetOrphanCheckInput } from "../../shared/api/assetMaintenance";
 import type { WorkspaceServices } from "../../shared/api/services";
 import { demoSeries } from "../series/demoSeries";
 import * as usagePanelModule from "./AssetFrameUsagePanel";
@@ -13,6 +14,11 @@ import { AssetLibrary, type AssetNavigationIntent } from "./AssetLibrary";
 const assetSearchRuntime = vi.hoisted(() => ({
   inputs: [] as Array<{ accessibleName: string; onChange: (event: unknown) => void }>,
   clearButtons: [] as Array<{ onClick: (event: unknown) => void }>,
+  maintenanceBridges: [] as Array<{
+    directoryEpoch: number;
+    onLocateAsset: (item: unknown, directoryEpoch: number) => void;
+    onOpenDelete: (item: unknown, directoryEpoch: number) => void;
+  }>,
 }));
 
 vi.mock("react/jsx-runtime", async (importOriginal) => {
@@ -22,6 +28,15 @@ vi.mock("react/jsx-runtime", async (importOriginal) => {
       return;
     }
     const record = props as Record<string, unknown>;
+    if (typeof type === "function" && type.name === "AssetMaintenanceDialog"
+      && typeof record.directoryEpoch === "number"
+      && typeof record.onLocateAsset === "function" && typeof record.onOpenDelete === "function") {
+      assetSearchRuntime.maintenanceBridges.push({
+        directoryEpoch: record.directoryEpoch,
+        onLocateAsset: record.onLocateAsset as (item: unknown, directoryEpoch: number) => void,
+        onOpenDelete: record.onOpenDelete as (item: unknown, directoryEpoch: number) => void,
+      });
+    }
     if (type === "input" && record.type === "search" && typeof record.onChange === "function") {
       assetSearchRuntime.inputs.push({
         accessibleName: String(record["aria-label"] ?? ""),
@@ -50,6 +65,15 @@ vi.mock("react/jsx-dev-runtime", async (importOriginal) => {
     const props = args[1];
     if (typeof props === "object" && props !== null) {
       const record = props as Record<string, unknown>;
+      if (typeof type === "function" && type.name === "AssetMaintenanceDialog"
+        && typeof record.directoryEpoch === "number"
+        && typeof record.onLocateAsset === "function" && typeof record.onOpenDelete === "function") {
+        assetSearchRuntime.maintenanceBridges.push({
+          directoryEpoch: record.directoryEpoch,
+          onLocateAsset: record.onLocateAsset as (item: unknown, directoryEpoch: number) => void,
+          onOpenDelete: record.onOpenDelete as (item: unknown, directoryEpoch: number) => void,
+        });
+      }
       if (type === "input" && record.type === "search" && typeof record.onChange === "function") {
         assetSearchRuntime.inputs.push({
           accessibleName: String(record["aria-label"] ?? ""),
@@ -79,6 +103,14 @@ function latestCapturedSearchClear() {
     throw new Error("No captured asset search clear handler.");
   }
   return clear.onClick;
+}
+
+function latestCapturedMaintenanceBridge() {
+  const bridge = assetSearchRuntime.maintenanceBridges.at(-1);
+  if (bridge === undefined) {
+    throw new Error("No captured asset maintenance bridge handlers.");
+  }
+  return bridge;
 }
 
 const series = demoSeries[0]!;
@@ -211,6 +243,7 @@ describe("asset library", () => {
     cleanup();
     assetSearchRuntime.inputs = [];
     assetSearchRuntime.clearButtons = [];
+    assetSearchRuntime.maintenanceBridges = [];
     vi.restoreAllMocks();
     vi.unstubAllGlobals();
   });
@@ -236,6 +269,400 @@ describe("asset library", () => {
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(serviceSet.listChapters).not.toHaveBeenCalled();
   });
+
+  it("keeps maintenance unconnected without a port and bridges confirmed orphans to the existing delete preview", async () => {
+    const user = userEvent.setup();
+    const withoutPort = makeServices({ mode: "demo" });
+    const unavailable = renderLibrary(withoutPort);
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "整理素材" })).toBeDisabled();
+    expect(screen.getByText("演示模式暂未接入素材维护服务。")).toBeInTheDocument();
+    unavailable.unmount();
+
+    const port: AssetMaintenanceServicePort = {
+      checkOrphans: vi.fn(async () => ({ orphans: [{ type: "character" as const, id: "shared-asset-id" }] })),
+      listDuplicates: vi.fn(async () => ({ type: "character" as const, total: 1, ignored_total: 0, groups: [] })),
+      setDuplicateIgnored: vi.fn(async () => ({ ignored: true as const, pairs_added: 1, pairs_total: 1 })),
+      listIgnoredDuplicates: vi.fn(async () => ({ type: "character" as const, total: 0, items: [] })),
+      mergeAssets: vi.fn(async () => ({
+        message: "合并完成",
+        keep_id: "shared-asset-id",
+        merged_count: 1,
+        redirected_frames: 0,
+        fused_updated: 0,
+        aliases_added: 0,
+        dropped_images: [],
+        aliases: [],
+      })),
+    };
+    const services = makeServices({
+      assetMaintenance: port,
+      listChapters: vi.fn(async () => [chapter("第一章", "删除预览引用")]),
+    });
+    renderLibrary(services);
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "整理素材" }));
+    expect(await screen.findByRole("dialog", { name: "整理素材" })).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "孤立项" }));
+    await user.click(screen.getByRole("button", { name: "检查孤立项" }));
+    await user.click(await screen.findByRole("button", { name: "打开删除确认" }));
+
+    expect(await screen.findByRole("dialog", { name: "删除角色" })).toBeInTheDocument();
+    const deleteDialog = screen.getByRole("dialog", { name: "删除角色" });
+    expect(await within(deleteDialog).findByText(/已读取 1 章；发现 1 章、1 个镜头、1 次可确认引用。/)).toBeInTheDocument();
+    expect(port.checkOrphans).toHaveBeenCalledExactlyOnceWith(series.id, {
+      items: [{ type: "character", id: "shared-asset-id" }],
+    }, expect.any(AbortSignal));
+  });
+
+  it("freezes orphan navigation and deletion bridges until an unknown merge is explicitly abandoned", async () => {
+    const user = userEvent.setup();
+    const port: AssetMaintenanceServicePort = {
+      checkOrphans: vi.fn(async () => ({ orphans: [{ type: "character" as const, id: "shared-asset-id" }] })),
+      listDuplicates: vi.fn(async () => ({
+        type: "character" as const,
+        total: 1,
+        ignored_total: 0,
+        groups: [{
+          index: 0,
+          items: [
+            { id: "shared-asset-id", name: "顾行舟", description: "档案管理员", image_url: null, ref_count: 1, aliases: [], canonical_key: null },
+            { id: "other-asset-id", name: "顾行舟旧稿", description: "旧档案", image_url: null, ref_count: 1, aliases: [], canonical_key: null },
+          ],
+        }],
+      })),
+      setDuplicateIgnored: vi.fn(async () => ({ ignored: true as const, pairs_added: 1, pairs_total: 1 })),
+      listIgnoredDuplicates: vi.fn(async () => ({ type: "character" as const, total: 0, items: [] })),
+      mergeAssets: vi.fn(async () => { throw new ApiError("network", "connection lost"); }),
+    };
+    const services = makeServices({
+      assetMaintenance: port,
+      listCharacters: vi.fn(async () => [character(), character({ id: "other-asset-id", name: "顾行舟旧稿" })]),
+    });
+    renderLibrary(services);
+    await screen.findByRole("heading", { name: "顾行舟" });
+    await user.click(screen.getByRole("button", { name: "整理素材" }));
+    await screen.findByRole("dialog", { name: "整理素材" });
+    await user.click(screen.getByRole("tab", { name: "孤立项" }));
+    await user.click(screen.getByRole("button", { name: "检查孤立项" }));
+    expect(await screen.findByText(/已确认 1 项当前目录素材/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "疑似重复" }));
+    const choices = screen.getAllByLabelText("纳入本次操作");
+    await user.click(choices[0]!);
+    await user.click(choices[1]!);
+    await user.click(screen.getAllByRole("radio", { name: "保留此项" })[0]!);
+    await user.click(screen.getByRole("button", { name: "合并所选素材" }));
+    await user.click(screen.getByRole("button", { name: "确认合并这些素材" }));
+    expect(await screen.findByText(/合并请求结果未知/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "孤立项" }));
+    expect(screen.getByRole("button", { name: "查看卡片" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "打开删除确认" })).toBeDisabled();
+    const bridge = latestCapturedMaintenanceBridge();
+    act(() => {
+      bridge.onLocateAsset(character(), bridge.directoryEpoch);
+      bridge.onOpenDelete(character(), bridge.directoryEpoch);
+    });
+    expect(screen.getByRole("dialog", { name: "整理素材" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "删除角色" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "放弃本地核对" }));
+    expect(screen.getByRole("button", { name: "查看卡片" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "打开删除确认" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "打开删除确认" }));
+    expect(await screen.findByRole("dialog", { name: "删除角色" })).toBeInTheDocument();
+  });
+
+  it("checks the refreshed full directory after a committed merge and reuses it for locate and delete", async () => {
+    const user = userEvent.setup();
+    const initialDirectory = [
+      character(),
+      character({ id: "other-asset-id", name: "顾行舟旧稿" }),
+      character({ id: "old-orphan-id", name: "旧孤立角色" }),
+    ];
+    const refreshedDirectory = [
+      character({ id: "kept-asset-id", name: "保留角色" }),
+      character({ id: "fresh-orphan-one", name: "新角色一" }),
+      character({ id: "fresh-orphan-two", name: "新角色二" }),
+    ];
+    const directRead = deferred<Character[]>();
+    const parentReload = deferred<Character[]>();
+    let directoryReadCount = 0;
+    const listCharacters = vi.fn(async () => {
+      directoryReadCount += 1;
+      if (directoryReadCount === 1) return initialDirectory;
+      if (directoryReadCount === 2) return directRead.promise;
+      if (directoryReadCount === 3) return parentReload.promise;
+      return refreshedDirectory;
+    });
+    const port: AssetMaintenanceServicePort = {
+      checkOrphans: vi.fn(async (_seriesId: string, request: AssetOrphanCheckInput) => ({
+        orphans: request.items.filter((item) => item.id.startsWith("fresh-orphan")),
+      })),
+      listDuplicates: vi.fn()
+        .mockResolvedValueOnce({
+          type: "character" as const,
+          total: 1,
+          ignored_total: 0,
+          groups: [{
+            index: 0,
+            items: [
+              { id: "shared-asset-id", name: "顾行舟", description: "档案管理员", image_url: null, ref_count: 0, aliases: [], canonical_key: null },
+              { id: "other-asset-id", name: "顾行舟旧稿", description: "旧档案", image_url: null, ref_count: 0, aliases: [], canonical_key: null },
+            ],
+          }],
+        })
+        .mockResolvedValue({ type: "character" as const, total: 0, ignored_total: 0, groups: [] }),
+      setDuplicateIgnored: vi.fn(async () => ({ ignored: true as const, pairs_added: 1, pairs_total: 1 })),
+      listIgnoredDuplicates: vi.fn(async () => ({ type: "character" as const, total: 0, items: [] })),
+      mergeAssets: vi.fn(async () => ({
+        message: "合并完成",
+        keep_id: "kept-asset-id",
+        merged_count: 1,
+        redirected_frames: 0,
+        fused_updated: 0,
+        aliases_added: 0,
+        dropped_images: [],
+        aliases: [],
+      })),
+    };
+    const services = makeServices({
+      assetMaintenance: port,
+      listCharacters,
+      listChapters: vi.fn(async () => []),
+    });
+    renderLibrary(services);
+    await screen.findByRole("heading", { name: "顾行舟" });
+    await user.click(screen.getByRole("button", { name: "整理素材" }));
+    await screen.findByRole("dialog", { name: "整理素材" });
+
+    const choices = screen.getAllByLabelText("纳入本次操作");
+    await user.click(choices[0]!);
+    await user.click(choices[1]!);
+    await user.click(screen.getAllByRole("radio", { name: "保留此项" })[0]!);
+    await user.click(screen.getByRole("button", { name: "合并所选素材" }));
+    await user.click(screen.getByRole("button", { name: "确认合并这些素材" }));
+    await waitFor(() => expect(listCharacters).toHaveBeenCalledTimes(3));
+    await act(async () => {
+      directRead.resolve(refreshedDirectory);
+      await directRead.promise;
+    });
+    expect(await screen.findByText(/合并已提交，素材目录和维护结果已重新读取/)).toBeInTheDocument();
+    await act(async () => {
+      parentReload.resolve(initialDirectory);
+      await parentReload.promise;
+    });
+    expect(screen.getByRole("heading", { name: "新角色一" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "旧孤立角色" })).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "孤立项" }));
+    await user.click(screen.getByRole("button", { name: "检查孤立项" }));
+    expect(await screen.findByText(/已确认 2 项当前目录素材/)).toBeInTheDocument();
+    expect(port.checkOrphans).toHaveBeenNthCalledWith(1, series.id, {
+      items: [
+        { type: "character", id: "kept-asset-id" },
+        { type: "character", id: "fresh-orphan-one" },
+        { type: "character", id: "fresh-orphan-two" },
+      ],
+    }, expect.any(AbortSignal));
+
+    await user.click(screen.getAllByRole("button", { name: "查看卡片" })[0]!);
+    expect(await screen.findByRole("heading", { name: "新角色一" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "整理素材" }));
+    await screen.findByRole("dialog", { name: "整理素材" });
+    await user.click(screen.getByRole("tab", { name: "孤立项" }));
+    await user.click(screen.getByRole("button", { name: "检查孤立项" }));
+    expect(await screen.findByText(/已确认 2 项当前目录素材/)).toBeInTheDocument();
+    expect(port.checkOrphans).toHaveBeenNthCalledWith(2, series.id, {
+      items: [
+        { type: "character", id: "kept-asset-id" },
+        { type: "character", id: "fresh-orphan-one" },
+        { type: "character", id: "fresh-orphan-two" },
+      ],
+    }, expect.any(AbortSignal));
+    const maintenanceDialog = screen.getByRole("dialog", { name: "整理素材" });
+    const secondOrphan = within(maintenanceDialog).getByText("新角色二").closest("li");
+    expect(secondOrphan).not.toBeNull();
+    await user.click(within(secondOrphan!).getByRole("button", { name: "打开删除确认" }));
+    expect(await screen.findByRole("dialog", { name: "删除角色" })).toBeInTheDocument();
+    expect(port.mergeAssets).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps an unknown merge frozen through directory reread, then checks and bridges only the refreshed directory", async () => {
+    const user = userEvent.setup();
+    const initialDirectory = [
+      character(),
+      character({ id: "other-asset-id", name: "顾行舟旧稿" }),
+      character({ id: "old-orphan-id", name: "旧孤立角色" }),
+    ];
+    const refreshedDirectory = [
+      character({ id: "kept-asset-id", name: "保留角色" }),
+      character({ id: "fresh-orphan-one", name: "新角色一" }),
+      character({ id: "fresh-orphan-two", name: "新角色二" }),
+    ];
+    let directoryReadCount = 0;
+    const listCharacters = vi.fn(async () => {
+      directoryReadCount += 1;
+      return directoryReadCount === 1 ? initialDirectory : refreshedDirectory;
+    });
+    const port: AssetMaintenanceServicePort = {
+      checkOrphans: vi.fn()
+        .mockResolvedValueOnce({ orphans: [{ type: "character" as const, id: "old-orphan-id" }] })
+        .mockImplementation(async (_seriesId: string, request: AssetOrphanCheckInput) => ({
+          orphans: request.items.filter((item) => item.id.startsWith("fresh-orphan")),
+        })),
+      listDuplicates: vi.fn().mockResolvedValue({
+        type: "character" as const,
+        total: 1,
+        ignored_total: 0,
+        groups: [{
+          index: 0,
+          items: [
+            { id: "shared-asset-id", name: "顾行舟", description: "档案管理员", image_url: null, ref_count: 0, aliases: [], canonical_key: null },
+            { id: "other-asset-id", name: "顾行舟旧稿", description: "旧档案", image_url: null, ref_count: 0, aliases: [], canonical_key: null },
+          ],
+        }],
+      }),
+      setDuplicateIgnored: vi.fn(async () => ({ ignored: true as const, pairs_added: 1, pairs_total: 1 })),
+      listIgnoredDuplicates: vi.fn(async () => ({ type: "character" as const, total: 0, items: [] })),
+      mergeAssets: vi.fn(async () => { throw new ApiError("network", "connection lost"); }),
+    };
+    const services = makeServices({
+      assetMaintenance: port,
+      listCharacters,
+      listChapters: vi.fn(async () => []),
+    });
+    renderLibrary(services);
+    await screen.findByRole("heading", { name: "顾行舟" });
+    await user.click(screen.getByRole("button", { name: "整理素材" }));
+    await screen.findByRole("dialog", { name: "整理素材" });
+    await user.click(screen.getByRole("tab", { name: "孤立项" }));
+    await user.click(screen.getByRole("button", { name: "检查孤立项" }));
+    expect(await within(screen.getByRole("dialog", { name: "整理素材" })).findByText("旧孤立角色")).toBeInTheDocument();
+
+    const staleBridge = latestCapturedMaintenanceBridge();
+    await user.click(screen.getByRole("tab", { name: "疑似重复" }));
+    const choices = screen.getAllByLabelText("纳入本次操作");
+    await user.click(choices[0]!);
+    await user.click(choices[1]!);
+    await user.click(screen.getAllByRole("radio", { name: "保留此项" })[0]!);
+    await user.click(screen.getByRole("button", { name: "合并所选素材" }));
+    await user.click(screen.getByRole("button", { name: "确认合并这些素材" }));
+    expect(await screen.findByText(/合并请求结果未知/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "仅重新读取核对" }));
+    expect(await screen.findByText(/数据已重新读取，但无法证明先前请求的写入结果/)).toBeInTheDocument();
+    await waitFor(() => expect(listCharacters).toHaveBeenCalledTimes(3));
+    await user.click(screen.getByRole("tab", { name: "孤立项" }));
+
+    expect(screen.queryByText("旧孤立角色")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "查看卡片" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "检查孤立项" })).toBeDisabled();
+    expect(port.mergeAssets).toHaveBeenCalledTimes(1);
+    await user.click(screen.getByRole("button", { name: "放弃本地核对" }));
+    expect(screen.getByRole("button", { name: "检查孤立项" })).toBeEnabled();
+
+    act(() => {
+      const staleItem = character({ id: "old-orphan-id", name: "旧孤立角色" });
+      staleBridge.onLocateAsset(staleItem, staleBridge.directoryEpoch);
+      staleBridge.onOpenDelete(staleItem, staleBridge.directoryEpoch);
+    });
+    expect(screen.getByRole("dialog", { name: "整理素材" })).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "删除角色" })).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "检查孤立项" }));
+    expect(await screen.findByText(/已确认 2 项当前目录素材/)).toBeInTheDocument();
+    expect(port.checkOrphans).toHaveBeenNthCalledWith(2, series.id, {
+      items: [
+        { type: "character", id: "kept-asset-id" },
+        { type: "character", id: "fresh-orphan-one" },
+        { type: "character", id: "fresh-orphan-two" },
+      ],
+    }, expect.any(AbortSignal));
+    await user.click(screen.getAllByRole("button", { name: "查看卡片" })[0]!);
+    expect(await screen.findByRole("heading", { name: "新角色一" })).toBeInTheDocument();
+    expect(port.mergeAssets).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(["success", "unauthorized"] as const)(
+    "ignores an old %s merge result after the actor changes and the dialog unmounts",
+    async (settlement) => {
+      const user = userEvent.setup();
+      const pending = deferred<Awaited<ReturnType<AssetMaintenanceServicePort["mergeAssets"]>>>();
+      const port: AssetMaintenanceServicePort = {
+        checkOrphans: vi.fn(async () => ({ orphans: [] })),
+        listDuplicates: vi.fn(async () => ({
+          type: "character" as const,
+          total: 1,
+          ignored_total: 0,
+          groups: [{
+            index: 0,
+            items: [
+              { id: "shared-asset-id", name: "顾行舟", description: "档案管理员", image_url: null, ref_count: 1, aliases: [], canonical_key: null },
+              { id: "other-asset-id", name: "顾行舟旧稿", description: "旧档案", image_url: null, ref_count: 1, aliases: [], canonical_key: null },
+            ],
+          }],
+        })),
+        setDuplicateIgnored: vi.fn(async () => ({ ignored: true as const, pairs_added: 1, pairs_total: 1 })),
+        listIgnoredDuplicates: vi.fn(async () => ({ type: "character" as const, total: 0, items: [] })),
+        mergeAssets: vi.fn(() => pending.promise),
+      };
+      const services = makeServices({
+        assetMaintenance: port,
+        listCharacters: vi.fn(async () => [character(), character({ id: "other-asset-id", name: "顾行舟旧稿" })]),
+      });
+      const onUnauthorized = vi.fn();
+      const view = renderLibrary(services, onUnauthorized, series, "actor-a");
+      await screen.findByRole("heading", { name: "顾行舟" });
+      await user.click(screen.getByRole("button", { name: "整理素材" }));
+      await screen.findByRole("dialog", { name: "整理素材" });
+      const choices = screen.getAllByLabelText("纳入本次操作");
+      await user.click(choices[0]!);
+      await user.click(choices[1]!);
+      await user.click(screen.getAllByRole("radio", { name: "保留此项" })[0]!);
+      await user.click(screen.getByRole("button", { name: "合并所选素材" }));
+      await user.click(screen.getByRole("button", { name: "确认合并这些素材" }));
+      expect(port.mergeAssets).toHaveBeenCalledExactlyOnceWith(series.id, {
+        type: "character",
+        keep_id: "shared-asset-id",
+        merge_ids: ["other-asset-id"],
+      }, expect.any(AbortSignal));
+
+      view.rerender(
+        <AssetLibrary
+          onBack={vi.fn()}
+          onUnauthorized={onUnauthorized}
+          series={series}
+          services={services}
+          userId="actor-b"
+        />,
+      );
+      expect(screen.queryByRole("dialog", { name: "整理素材" })).not.toBeInTheDocument();
+      await screen.findByRole("heading", { name: "顾行舟" });
+      await act(async () => {
+        if (settlement === "success") {
+          pending.resolve({
+            message: "合并完成",
+            keep_id: "shared-asset-id",
+            merged_count: 1,
+            redirected_frames: 3,
+            fused_updated: 2,
+            aliases_added: 0,
+            dropped_images: [],
+            aliases: [],
+          });
+        } else {
+          pending.reject(new ApiError("http", "unauthorized", 401));
+        }
+        await pending.promise.catch(() => undefined);
+      });
+
+      expect(onUnauthorized).not.toHaveBeenCalled();
+      expect(screen.queryByRole("dialog", { name: "整理素材" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("dialog", { name: "删除角色" })).not.toBeInTheDocument();
+      expect(screen.queryByText(/合并已提交|合并请求结果未知|登录状态已变化/)).not.toBeInTheDocument();
+      expect(port.listDuplicates).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it("opens a new snapshot for the selected card and ignores a late response from the previous asset", async () => {
     const user = userEvent.setup();

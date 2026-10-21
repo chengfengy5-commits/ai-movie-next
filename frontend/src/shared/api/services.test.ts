@@ -129,7 +129,9 @@ describe("API services", () => {
     const demoServices = createDemoServices(storage);
 
     expect(apiServices.teamReporting).toBeDefined();
+    expect(apiServices.assetMaintenance).toBeDefined();
     expect(demoServices.teamReporting).toBeUndefined();
+    expect(demoServices.assetMaintenance).toBeUndefined();
     expect(fetcher).not.toHaveBeenCalled();
   });
 
