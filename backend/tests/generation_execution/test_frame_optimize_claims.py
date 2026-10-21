@@ -16,6 +16,10 @@ from generation_execution.frame_optimize_execution_helpers import (
     assert_only_original_graph,
     claim_adapter,
     claim_one,
+    fee_adapter,
+    intent_adapter,
+    persist_result,
+    prepare_item,
     rows_for,
 )
 
@@ -177,5 +181,38 @@ def test_release_and_renew_never_clear_a_cancellation_status(tmp_path):
         assert after["claim_token"] == before["claim_token"]
         assert after["execution_generation"] == before["execution_generation"]
         assert_only_original_graph(case, external_count=0)
+    finally:
+        case.engine.dispose()
+
+
+def test_generation_heartbeat_accepts_its_charged_unit_progress(tmp_path):
+    case = admit_batch(tmp_path, frame_count=3, request_indexes=(2, 0))
+    try:
+        claims = claim_adapter(case, token="opt-claim-before-fee-heartbeat")
+        claim = claims.claim_next("batch-optimize", "optimize-worker")
+        assert claim is not None
+        intents = intent_adapter(case, prefix="heartbeat-after-fee-intent")
+        item, prepared = prepare_item(case, claim, order=0, intents=intents)
+        receipt = persist_result(case, claim, prepared, text="first frame charged")
+        assert not isinstance(receipt, str)
+        work = next(row for row in rows_for(case)["work"] if row.unit_id == item.unit_id)
+        charged = fee_adapter(case, prefix="heartbeat-after-fee").resolve_current_fee(
+            claim, work.work_id
+        )
+        assert charged.disposition == "charged"
+
+        before = rows_for(case)["task"]
+        case.clock[0] += timedelta(seconds=1)
+        assert claims.renew_or_revoke(claim) == "renewed"
+        after = rows_for(case)["task"]
+        assert not claim.local_lost_signal.is_set()
+        assert after["status"] == "processing"
+        assert after["claim_token"] == claim.token
+        assert after["execution_generation"] == claim.execution_generation
+        assert after["lease_until"] == (_G2_JOINT_NOW + timedelta(seconds=61)).replace(tzinfo=None)
+        assert after["lease_until"] > before["lease_until"]
+        assert after["credit_cost"] == 3
+        assert after["billing_status"] == "charged"
+        assert len(rows_for(case)["fees"]) == len(rows_for(case)["creditLogs"]) == 1
     finally:
         case.engine.dispose()

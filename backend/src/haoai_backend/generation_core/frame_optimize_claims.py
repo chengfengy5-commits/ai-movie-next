@@ -19,6 +19,7 @@ from haoai_backend.generation_core.frame_optimize_execution import (
     lock_frame_optimize_batch,
     valid_intent_projection,
 )
+from haoai_backend.generation_core.frame_optimize_progress import lock_frame_optimize_progress
 from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 
 _OPERATION = "frame.optimize"
@@ -203,8 +204,14 @@ class SqlAlchemyFrameOptimizeClaims:
                     proof_authority=self.proof_authority,
                 )
                 now = self._server_now()
+                progress = (
+                    lock_frame_optimize_progress(session, graph)
+                    if graph is not None
+                    else None
+                )
                 if (
                     graph is None
+                    or progress is None
                     or not _lease_available(graph.task, now)
                     or not initial_generation_candidate(graph)
                     or not valid_intent_projection(graph)
@@ -353,6 +360,7 @@ class SqlAlchemyFrameOptimizeClaims:
                         or not _same_time(graph.task.get("lease_until"), write.lease_until)
                         or graph.task.get("request_data") != write.request_data
                         or not _claim_live(graph.task, write.authority(signal), now)
+                        or lock_frame_optimize_progress(session, graph) is None
                         or not initial_generation_candidate(graph)
                         or not valid_intent_projection(graph)
                     ):
@@ -425,6 +433,16 @@ def _lock_current_graph(session: Session, claim: ClaimAuthority, adapter):
         or claim.local_lost_signal.is_set()
     ):
         return None
+    # Lease transitions must wait behind a fee/result transaction. The batch
+    # loader uses SKIP LOCKED for worker discovery, which would otherwise turn
+    # ordinary contention into a false ownership loss and stop sibling work.
+    user_id = session.execute(
+        select(UserRow.id)
+        .where(UserRow.id == claim.scope.user_id)
+        .with_for_update()
+    ).scalar_one_or_none()
+    if user_id is None:
+        return None
     graph = lock_frame_optimize_batch(
         session,
         claim.scope.user_id,
@@ -432,7 +450,11 @@ def _lock_current_graph(session: Session, claim: ClaimAuthority, adapter):
         crypto=adapter.crypto,
         proof_authority=adapter.proof_authority,
     )
-    if graph is None or not valid_intent_projection(graph):
+    if (
+        graph is None
+        or not valid_intent_projection(graph)
+        or lock_frame_optimize_progress(session, graph) is None
+    ):
         return None
     return graph
 

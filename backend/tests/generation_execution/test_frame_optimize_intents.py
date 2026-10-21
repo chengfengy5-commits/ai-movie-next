@@ -27,6 +27,7 @@ from haoai_backend.generation_core.frame_optimize_intents import (
 from haoai_backend.generation_core.frame_optimize_execution import (
     valid_intent_projection,
 )
+from haoai_backend.generation_core.schema import LocalContinuationWorkRow
 from haoai_backend.task_observation.cancellation import SqlTaskCancellationWriter
 from generation_core.test_admission_staging import _G2_JOINT_NOW, ModelSource
 from generation_execution.frame_optimize_execution_helpers import (
@@ -34,8 +35,12 @@ from generation_execution.frame_optimize_execution_helpers import (
     assert_only_original_graph,
     claim_adapter,
     claim_one,
+    fee_adapter,
     intent_adapter,
     locked_batch,
+    persist_result,
+    persist_result_and_fee,
+    prepare_item,
     rows_for,
 )
 
@@ -526,5 +531,111 @@ def test_byok_zero_quote_without_prompt_can_create_intent_without_wallet(tmp_pat
         assert state["wallet"] == []
         assert state["units"][0]["quoted_amount"] == 0
         assert state["units"][0]["debited_amount"] == 0
+    finally:
+        case.engine.dispose()
+
+
+def test_charged_result_does_not_block_the_next_original_sibling_intent(tmp_path):
+    case = admit_batch(tmp_path, request_indexes=(2, 0, 1))
+    try:
+        claim = claim_one(case)
+        intents = intent_adapter(case, prefix="post-fee-sibling-intent")
+        first, first_intent = prepare_item(case, claim, order=0, intents=intents)
+        assert first.frame_index == 2
+        receipt = persist_result(case, claim, first_intent, text="first result")
+        assert not isinstance(receipt, str)
+        work = next(row for row in rows_for(case)["work"] if row.unit_id == first.unit_id)
+        fee = fee_adapter(case, prefix="post-fee-sibling").resolve_current_fee(
+            claim, work.work_id
+        )
+        assert fee.disposition == "charged"
+
+        second, second_intent = prepare_item(case, claim, order=1, intents=intents)
+        assert second.frame_index == 0
+        assert second.unit_id != first.unit_id
+        assert second_intent.disposition == "committed"
+        assert second_intent.intent is not None
+        assert second_intent.intent.provider_idempotency_key is None
+
+        rows = rows_for(case)
+        first_unit = next(row for row in rows["units"] if row["id"] == first.unit_id)
+        second_unit = next(row for row in rows["units"] if row["id"] == second.unit_id)
+        assert rows["task"]["status"] == "processing"
+        assert rows["task"]["claim_token"] == claim.token
+        assert rows["task"]["execution_generation"] == claim.execution_generation
+        assert rows["task"]["credit_cost"] == 3
+        assert rows["task"]["billing_status"] == "charged"
+        assert first_unit["billing_status"] == "charged"
+        assert second_unit["billing_status"] == "unbilled"
+        assert len(rows["external"]) == 2
+        assert {row["submission_status"] for row in rows["external"]} == {"completed", "submitting"}
+        assert len(rows["receipts"]) == len(rows["fees"]) == len(rows["creditLogs"]) == 1
+        assert len(rows["work"]) == 1
+        assert rows["work"][0].phase == "delivery_pending"
+        assert rows["applications"] == []
+        assert rows["wallet"][0]["credits"] == 497
+    finally:
+        case.engine.dispose()
+
+
+@pytest.mark.parametrize("broken_link", ["missing", "sibling"])
+def test_progress_rejects_delivery_work_without_its_own_fee_reference(tmp_path, broken_link):
+    case = admit_batch(tmp_path, request_indexes=(2, 0, 1))
+    try:
+        claim = claim_one(case, token=f"fee-link-{broken_link}")
+        intents = intent_adapter(case, prefix=f"fee-link-intent-{broken_link}")
+        fees = fee_adapter(case, prefix=f"fee-link-fee-{broken_link}")
+        unit_ids = _ordered_units(case)
+        charged_count = 1 if broken_link == "missing" else 2
+
+        for order in range(charged_count):
+            item, prepared = prepare_item(case, claim, order, intents=intents)
+            receipt, fee = persist_result_and_fee(
+                case, claim, prepared, fees, text=f"charged unit {order}"
+            )
+            assert receipt.unit_id == unit_ids[order]
+            assert fee.disposition == "charged"
+
+        invalid_reference = None if broken_link == "missing" else unit_ids[1]
+        with case.engine.begin() as connection:
+            changed = connection.execute(
+                update(LocalContinuationWorkRow.__table__)
+                .where(
+                    LocalContinuationWorkRow.__table__.c.task_id == case.task_id,
+                    LocalContinuationWorkRow.__table__.c.unit_id == unit_ids[0],
+                )
+                .values(fee_decision_ref=invalid_reference)
+            )
+        assert changed.rowcount == 1
+
+        before = rows_for(case)
+        before_fee_facts = sorted(
+            (fee.unit_id, fee.resolution, fee.ledger_ref, fee.generation_result_ref)
+            for fee in before["fees"]
+        )
+        before_ledger_facts = sorted(
+            (log.id, log.user_id, log.billing_unit_id, log.amount, log.business_key)
+            for log in before["creditLogs"]
+        )
+        outcome = intents.prepare(claim, unit_ids[2])
+        assert outcome.disposition == "unresolved"
+        assert outcome.intent is None
+
+        after = rows_for(case)
+        assert len(after["external"]) == charged_count
+        assert len(after["receipts"]) == len(after["evidence"]) == len(after["work"]) == charged_count
+        assert len(after["fees"]) == len(after["creditLogs"]) == charged_count
+        assert after["wallet"][0]["credits"] == 500 - 3 * charged_count
+        assert after["applications"] == []
+        assert after["task"]["credit_cost"] == 3 * charged_count
+        assert after["external"] == before["external"]
+        assert sorted(
+            (fee.unit_id, fee.resolution, fee.ledger_ref, fee.generation_result_ref)
+            for fee in after["fees"]
+        ) == before_fee_facts
+        assert sorted(
+            (log.id, log.user_id, log.billing_unit_id, log.amount, log.business_key)
+            for log in after["creditLogs"]
+        ) == before_ledger_facts
     finally:
         case.engine.dispose()

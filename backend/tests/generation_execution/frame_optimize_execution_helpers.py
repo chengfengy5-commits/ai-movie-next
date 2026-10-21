@@ -18,6 +18,7 @@ from haoai_backend.generation_core.base_schema import (
     CreditLogRow,
     ExecutionStepRow,
     ExternalSubmissionRow,
+    ResultEvidenceRow,
     TaskSubmissionRow,
     UserCreditRow,
 )
@@ -25,6 +26,12 @@ from haoai_backend.generation_core.frame_optimize_admission import admit_frame_o
 from haoai_backend.generation_core.frame_optimize_claims import SqlAlchemyFrameOptimizeClaims
 from haoai_backend.generation_core.frame_optimize_execution import lock_frame_optimize_batch
 from haoai_backend.generation_core.frame_optimize_intents import SqlAlchemyFrameOptimizeIntents
+from haoai_backend.generation_core.frame_optimize_results import SqlAlchemyFrameOptimizeResults
+from haoai_backend.generation_core.frame_optimize_continuation_claims import (
+    SqlAlchemyFrameOptimizeContinuationClaims,
+)
+from haoai_backend.generation_core.frame_optimize_fees import SqlAlchemyFrameOptimizeFees
+from haoai_backend.generation_contracts.types import TextResult
 from haoai_backend.generation_core.schema import (
     ApplicationRecordRow,
     GenerationResultReceiptRow,
@@ -71,6 +78,9 @@ class FrameOptimizeCase:
     task_id: str
     request_indexes: tuple[int, ...]
     clock: list[datetime]
+    intent_adapter_count: int = 0
+    result_adapter_count: int = 0
+    fee_adapter_count: int = 0
 
     @property
     def actor_id(self) -> str:
@@ -80,6 +90,7 @@ class FrameOptimizeCase:
 def admit_batch(
     tmp_path: Path,
     *,
+    frame_count: int | None = None,
     request_indexes: tuple[int, ...] = (2, 0, 1),
     model_source: ModelSource = ModelSource.SYSTEM,
     prompt_source: ModelSource | None = ModelSource.SYSTEM,
@@ -88,7 +99,7 @@ def admit_batch(
 ) -> FrameOptimizeCase:
     engine, sessions, capabilities, crypto_state, ids, request = _build_optimize_case(
         tmp_path,
-        frame_count=len(request_indexes),
+        frame_count=frame_count or len(request_indexes),
         request_indexes=request_indexes,
         model_source=model_source,
         prompt_source=prompt_source,
@@ -125,13 +136,96 @@ def claim_adapter(
 
 
 def intent_adapter(case: FrameOptimizeCase, *, prefix: str = "opt-intent"):
+    sequence = case.intent_adapter_count
+    case.intent_adapter_count += 1
     return SqlAlchemyFrameOptimizeIntents(
         session_factory=case.sessions,
         db_clock=lambda: case.clock[0],
         crypto=case.capabilities.crypto,
         proof_authority=case.capabilities.proof_authority,
+        id_factory=IdSequence(f"{prefix}:{sequence}"),
+    )
+
+
+def result_adapter(case: FrameOptimizeCase, *, prefix: str = "opt-result"):
+    sequence = case.result_adapter_count
+    case.result_adapter_count += 1
+    return SqlAlchemyFrameOptimizeResults(
+        session_factory=case.sessions,
+        db_clock=lambda: case.clock[0],
+        crypto=case.capabilities.crypto,
+        proof_authority=case.capabilities.proof_authority,
+        id_factory=IdSequence(f"{prefix}:{sequence}"),
+    )
+
+
+def continuation_claim_adapter(
+    case: FrameOptimizeCase,
+    *,
+    token: str = "opt-continuation-token",
+    lease_seconds: int = 60,
+):
+    return SqlAlchemyFrameOptimizeContinuationClaims(
+        session_factory=case.sessions,
+        db_clock=lambda: case.clock[0],
+        crypto=case.capabilities.crypto,
+        proof_authority=case.capabilities.proof_authority,
+        id_factory=lambda: token,
+        lease_seconds=lease_seconds,
+    )
+
+
+def fee_adapter(case: FrameOptimizeCase, *, prefix: str = "opt-fee"):
+    sequence = case.fee_adapter_count
+    case.fee_adapter_count += 1
+    prefix = f"{prefix}:{sequence}"
+    claims = continuation_claim_adapter(case, token=f"{prefix}-claim")
+    return SqlAlchemyFrameOptimizeFees(
+        session_factory=case.sessions,
+        db_clock=lambda: case.clock[0],
+        crypto=case.capabilities.crypto,
+        proof_authority=case.capabilities.proof_authority,
+        continuation_claims=claims,
         id_factory=IdSequence(prefix),
     )
+
+
+def persist_result(case, claim, prepared, *, text: str = "optimized frame"):
+    assert prepared.disposition == "committed"
+    assert prepared.intent is not None
+    assert prepared.verified_batch is not None
+    assert prepared.verified_item is not None
+    return result_adapter(case).persist_success(
+        claim,
+        prepared.intent,
+        prepared.verified_batch,
+        prepared.verified_item,
+        TextResult(text),
+    )
+
+
+def prepare_item(
+    case: FrameOptimizeCase,
+    claim: ClaimAuthority,
+    order: int = 0,
+    *,
+    intents=None,
+):
+    graph = locked_batch(case)
+    assert graph is not None
+    assert 0 <= order < len(graph.verified.items)
+    item = graph.verified.items[order]
+    prepared = (intents or intent_adapter(case)).prepare(claim, item.unit_id)
+    return item, prepared
+
+
+def persist_result_and_fee(case, claim, prepared, fees, *, text: str = "optimized frame"):
+    receipt = persist_result(case, claim, prepared, text=text)
+    assert not isinstance(receipt, str)
+    state = rows_for(case)
+    work = next(row for row in state["work"] if row.unit_id == prepared.verified_item.unit_id)
+    fee = fees.resolve_current_fee(claim, work.work_id)
+    return receipt, fee
 
 
 def claim_one(case: FrameOptimizeCase, *, token: str = "frame-optimize-claim-token") -> ClaimAuthority:
@@ -223,6 +317,14 @@ def rows_for(case: FrameOptimizeCase) -> dict[str, object]:
             "payloads": [dict(row) for row in payloads],
             "wallet": [dict(row) for row in wallet],
             "creditLogs": session.execute(select(CreditLogRow)).scalars().all(),
+            "evidence": [
+                dict(row)
+                for row in session.execute(
+                    select(ResultEvidenceRow.__table__).where(
+                        ResultEvidenceRow.submission_id.in_([row["id"] for row in external])
+                    )
+                ).mappings().all()
+            ],
             "fees": session.execute(select(UnitFeeDecisionRow)).scalars().all(),
             "receipts": session.execute(select(GenerationResultReceiptRow)).scalars().all(),
             "applications": session.execute(select(ApplicationRecordRow)).scalars().all(),
@@ -263,8 +365,14 @@ __all__ = [
     "assert_only_original_graph",
     "claim_adapter",
     "claim_one",
+    "continuation_claim_adapter",
+    "fee_adapter",
     "intent_adapter",
     "locked_batch",
+    "prepare_item",
+    "persist_result_and_fee",
+    "persist_result",
+    "result_adapter",
     "reopen_batch",
     "rows_for",
 ]

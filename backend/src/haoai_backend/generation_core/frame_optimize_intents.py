@@ -26,6 +26,7 @@ from haoai_backend.generation_core.frame_optimize_execution import (
     lock_frame_optimize_batch,
     valid_intent_projection,
 )
+from haoai_backend.generation_core.frame_optimize_progress import lock_frame_optimize_progress
 from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 from haoai_backend.generation_credentials.frame_optimize_snapshot_reader import (
     VerifiedFrameOptimizeExecutionBatch,
@@ -111,6 +112,11 @@ class SqlAlchemyFrameOptimizeIntents:
                 now = self._server_now()
                 if graph is None or not valid_intent_projection(graph):
                     return None, "unresolved"
+                progress = lock_frame_optimize_progress(session, graph)
+                if progress is None:
+                    return None, "unresolved"
+                if progress.stopped_insufficient:
+                    return None, "ownership_lost"
 
                 unit = graph.units_by_id.get(unit_id)
                 step = graph.steps_by_unit.get(unit_id)
@@ -233,6 +239,9 @@ class SqlAlchemyFrameOptimizeIntents:
                     now = self._server_now()
                     if graph is None or not valid_intent_projection(graph):
                         return FrameOptimizeIntentPreparation("unresolved")
+                    progress = lock_frame_optimize_progress(session, graph)
+                    if progress is None:
+                        return FrameOptimizeIntentPreparation("unresolved")
                     unit = graph.units_by_id.get(unit_id)
                     step = graph.steps_by_unit.get(unit_id)
                     item = graph.items_by_unit.get(unit_id)
@@ -252,6 +261,8 @@ class SqlAlchemyFrameOptimizeIntents:
                     ):
                         return FrameOptimizeIntentPreparation("unresolved")
                     if not _claim_is_current(graph.task, claim, now):
+                        return FrameOptimizeIntentPreparation("existing")
+                    if progress.stopped_insufficient:
                         return FrameOptimizeIntentPreparation("existing")
                     if not _first_send_is_current(
                         task=graph.task,
@@ -315,9 +326,7 @@ def _unit_is_unprepared(unit, step) -> bool:
 def _first_send_is_current(*, task, unit, step, external, now: datetime) -> bool:
     deadline = unit.get("deadline_at")
     return bool(
-        task.get("billing_status") == "unbilled"
-        and task.get("result") is None
-        and task.get("credit_cost") == 0
+        task.get("result") is None
         and unit.get("billing_status") == "unbilled"
         and unit.get("result_status") == "pending"
         and unit.get("debited_amount") == 0
