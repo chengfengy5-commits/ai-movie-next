@@ -9,6 +9,7 @@ import type {
 } from "../../shared/api/contracts";
 import type { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import { AssetMaintenanceDialog } from "./maintenance/AssetMaintenanceDialog";
 import {
   AssetManagementDialog,
   type AssetDirectory,
@@ -89,6 +90,19 @@ interface AssetManagementRequest {
   category: AssetLibraryType;
   mode: AssetManagementMode;
   item: AssetRecord | null;
+}
+
+interface AssetMaintenanceRequest {
+  id: number;
+  scope: LibraryScope;
+  category: AssetLibraryType;
+  directoryResult: ScopedAssetResult;
+  directoryItems: AssetRecord[];
+  directoryRefreshEpoch: number;
+  pendingDirectoryReloadVersion: number | null;
+  acceptedDirectoryReloadVersion: number | null;
+  port: NonNullable<WorkspaceServices["assetMaintenance"]>;
+  orphanActionsLocked: boolean;
 }
 
 const assetTypes: Array<{ id: AssetLibraryType; label: string }> = [
@@ -370,6 +384,7 @@ export function AssetLibrary({
     () => navigationIntent?.category ?? "characters",
   );
   const [reloadVersion, setReloadVersion] = useState(0);
+  const reloadVersionRef = useRef(0);
   const [result, setResult] = useState<ScopedAssetResult | null>(null);
   const resultRef = useRef(result);
   resultRef.current = result;
@@ -384,6 +399,15 @@ export function AssetLibrary({
   managementRequestRef.current = managementRequest;
   const managementRequestIdRef = useRef(0);
   const invalidatedManagementRequestRef = useRef<AssetManagementRequest | null>(null);
+  const [maintenanceRequest, setMaintenanceRequest] = useState<AssetMaintenanceRequest | null>(null);
+  const maintenanceRequestRef = useRef(maintenanceRequest);
+  maintenanceRequestRef.current = maintenanceRequest;
+  const maintenanceRequestIdRef = useRef(0);
+  const [pendingLocateAsset, setPendingLocateAsset] = useState<{
+    assetId: string;
+    scope: LibraryScope;
+    category: AssetLibraryType;
+  } | null>(null);
   const [navigationIssue, setNavigationIssue] = useState<{ epoch: number; message: string } | null>(null);
   const [navigationFeedback, setNavigationFeedback] = useState<AssetNavigationFeedback | null>(null);
   const cache = useRef(new Map<AssetLibraryType, AssetReadyResult>());
@@ -460,12 +484,20 @@ export function AssetLibrary({
     setUsageOwner(null);
     managementRequestRef.current = null;
     setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
     setNavigationIssue(null);
     setNavigationFeedback(null);
     setSelectedType(effectiveNavigationIntent.category);
   }
 
   useEffect(() => {
+    const currentMaintenanceRequest = maintenanceRequestRef.current;
+    if (currentMaintenanceRequest !== null
+      && currentMaintenanceRequest.scope === libraryScope
+      && currentMaintenanceRequest.acceptedDirectoryReloadVersion === reloadVersion) {
+      return undefined;
+    }
     const requestGeneration = ++directoryRequestGenerationRef.current;
     const intent = effectiveNavigationIntent;
     const forcedFreshRead = intent !== null
@@ -614,6 +646,8 @@ export function AssetLibrary({
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
     setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
     setNavigationFeedback(null);
   }
 
@@ -652,6 +686,8 @@ export function AssetLibrary({
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
     setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
     resetAssetSearch();
     if (navigationIntentRef.current?.category !== type) {
       abandonNavigationIntent();
@@ -736,8 +772,138 @@ export function AssetLibrary({
       mode,
       item,
     };
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
     managementRequestRef.current = request;
     setManagementRequest(request);
+  }
+
+  function openMaintenance(): void {
+    const activeResult = resultRef.current;
+    const port = services.assetMaintenance;
+    if (
+      port === undefined
+      || activeResult === null
+      || activeResult.scope !== libraryScope
+      || activeResult.result.status !== "ready"
+      || activeResult.result.type !== selectedType
+      || libraryScopeRef.current !== libraryScope
+    ) {
+      return;
+    }
+    const request: AssetMaintenanceRequest = {
+      id: ++maintenanceRequestIdRef.current,
+      scope: libraryScope,
+      category: selectedType,
+      directoryResult: activeResult,
+      directoryItems: activeResult.result.items,
+      directoryRefreshEpoch: 0,
+      pendingDirectoryReloadVersion: null,
+      acceptedDirectoryReloadVersion: null,
+      port,
+      orphanActionsLocked: true,
+    };
+    maintenanceRequestRef.current = request;
+    setMaintenanceRequest(request);
+    invalidateUsage();
+    managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
+    setManagementRequest(null);
+  }
+
+  function isCurrentMaintenance(request: AssetMaintenanceRequest): boolean {
+    return maintenanceRequestRef.current === request
+      && libraryScopeRef.current === request.scope
+      && request.scope.userId === userId
+      && request.scope.services === services
+      && request.scope.seriesId === series.id
+      && selectedTypeRef.current === request.category
+      && services.assetMaintenance === request.port;
+  }
+
+  function isCurrentMaintenanceDirectory(request: AssetMaintenanceRequest, directoryEpoch: number): boolean {
+    const activeResult = resultRef.current;
+    return isCurrentMaintenance(request)
+      && directoryEpoch === request.directoryResult.requestGeneration
+      && activeResult === request.directoryResult
+      && activeResult.result.status === "ready"
+      && activeResult.result.type === request.category
+      && activeResult.result.items === request.directoryItems
+      && directoryRequestGenerationRef.current === request.directoryResult.requestGeneration;
+  }
+
+  function closeMaintenance(request: AssetMaintenanceRequest): void {
+    if (request.orphanActionsLocked || !isCurrentMaintenance(request)) return;
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+  }
+
+  function invalidateMaintenanceDirectory(request: AssetMaintenanceRequest): number | null {
+    if (!isCurrentMaintenance(request)) return null;
+    request.directoryRefreshEpoch += 1;
+    request.acceptedDirectoryReloadVersion = null;
+    cache.current.delete(request.category);
+    request.pendingDirectoryReloadVersion = reloadCurrentType();
+    return request.directoryRefreshEpoch;
+  }
+
+  function acceptMaintenanceDirectory(
+    request: AssetMaintenanceRequest,
+    directory: AssetDirectory,
+    refreshEpoch: number,
+  ): void {
+    if (!isCurrentMaintenance(request)
+      || request.directoryRefreshEpoch !== refreshEpoch
+      || directory.category !== request.category) return;
+    const requestGeneration = ++directoryRequestGenerationRef.current;
+    let ready: AssetReadyResult;
+    switch (directory.category) {
+      case "characters":
+        ready = { type: "characters", status: "ready", items: directory.items };
+        break;
+      case "scenes":
+        ready = { type: "scenes", status: "ready", items: directory.items };
+        break;
+      case "props":
+        ready = { type: "props", status: "ready", items: directory.items };
+        break;
+    }
+    cache.current.set(directory.category, ready);
+    resetAssetSearch();
+    invalidateUsage();
+    setNavigationFeedback(null);
+    const nextResult: ScopedAssetResult = {
+      scope: request.scope,
+      requestGeneration,
+      navigationEpoch: null,
+      result: ready,
+    };
+    request.directoryResult = nextResult;
+    request.directoryItems = directory.items;
+    request.acceptedDirectoryReloadVersion = request.pendingDirectoryReloadVersion;
+    request.pendingDirectoryReloadVersion = null;
+    resultRef.current = nextResult;
+    setResult(nextResult);
+  }
+
+  function locateMaintenanceAsset(request: AssetMaintenanceRequest, item: AssetRecord, directoryEpoch: number): void {
+    if (request.orphanActionsLocked
+      || !isCurrentMaintenanceDirectory(request, directoryEpoch)
+      || !hasUniqueUsageIdentity(request.directoryItems, item, series.id)) return;
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+    resetAssetSearch();
+    setPendingLocateAsset({ assetId: item.id, scope: request.scope, category: request.category });
+  }
+
+  function openOrphanDelete(request: AssetMaintenanceRequest, item: AssetRecord, directoryEpoch: number): void {
+    if (request.orphanActionsLocked
+      || !isCurrentMaintenanceDirectory(request, directoryEpoch)
+      || !hasUniqueUsageIdentity(request.directoryItems, item, series.id)) return;
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+    resetAssetSearch();
+    openManagement("delete", request.category, item, request.directoryItems);
   }
 
   function isCurrentManagement(request: AssetManagementRequest): boolean {
@@ -806,7 +972,9 @@ export function AssetLibrary({
     setResult(nextResult);
   }
 
-  function reloadCurrentType() {
+  function reloadCurrentType(): number {
+    const nextReloadVersion = reloadVersionRef.current + 1;
+    reloadVersionRef.current = nextReloadVersion;
     directoryRequestGenerationRef.current += 1;
     resetAssetSearch();
     invalidateUsage();
@@ -830,7 +998,8 @@ export function AssetLibrary({
       }
       return next;
     });
-    setReloadVersion((version) => version + 1);
+    setReloadVersion(nextReloadVersion);
+    return nextReloadVersion;
   }
 
   function goBack() {
@@ -839,6 +1008,8 @@ export function AssetLibrary({
     invalidatedManagementRequestRef.current = null;
     managementRequestRef.current = null;
     setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
     onBack();
   }
 
@@ -1078,6 +1249,24 @@ export function AssetLibrary({
     ? navigationIssue.message
     : null;
 
+  useLayoutEffect(() => {
+    if (pendingLocateAsset === null) return;
+    if (pendingLocateAsset.scope !== libraryScope || pendingLocateAsset.category !== selectedType) {
+      setPendingLocateAsset(null);
+      return;
+    }
+    if (currentResult === null || currentResult.status !== "ready" || currentResult.type !== pendingLocateAsset.category) {
+      return;
+    }
+    const matches = currentResult.items.filter((item) => item.id === pendingLocateAsset.assetId);
+    const element = assetCardElementsRef.current.get(pendingLocateAsset.assetId);
+    if (matches.length === 1 && element !== undefined && element.isConnected && element.closest("[hidden], [inert]") === null) {
+      element.focus({ preventScroll: true });
+      element.scrollIntoView?.({ behavior: "auto", block: "center" });
+    }
+    setPendingLocateAsset(null);
+  }, [currentResult, libraryScope, pendingLocateAsset, selectedType]);
+
   return (
     <section className="asset-library" aria-labelledby="asset-library-heading" ref={libraryElementRef}>
       <div className="asset-library-heading">
@@ -1087,6 +1276,14 @@ export function AssetLibrary({
           <p>查看并维护剧集已有的角色、场景与道具文字资料。</p>
         </div>
         <div className="asset-library-actions">
+          <button
+            className="secondary-button"
+            disabled={currentResult?.status !== "ready" || services.assetMaintenance === undefined}
+            onClick={openMaintenance}
+            type="button"
+          >
+            整理素材
+          </button>
           <button
             className="primary-button"
             disabled={currentResult?.status !== "ready"}
@@ -1107,6 +1304,11 @@ export function AssetLibrary({
           </button>
         </div>
       </div>
+      {services.assetMaintenance === undefined && currentResult?.status === "ready" && (
+        <p className="asset-maintenance-unavailable" role="note">
+          {services.mode === "demo" ? "演示模式暂未接入素材维护服务。" : "当前服务暂未接入素材维护接口。"}
+        </p>
+      )}
 
       <div className="asset-library-toolbar">
         <div className="asset-type-tabs" role="group" aria-label="素材分类">
@@ -1255,6 +1457,39 @@ export function AssetLibrary({
             seriesId={series.id}
             seriesName={series.name}
             services={services}
+          />
+        )}
+      {maintenanceRequest !== null
+        && maintenanceRequest.scope === libraryScope
+        && maintenanceRequest.category === selectedType
+        && services.assetMaintenance === maintenanceRequest.port && (
+          <AssetMaintenanceDialog
+            apiBaseUrl={services.apiBaseUrl}
+            category={maintenanceRequest.category}
+            directoryItems={maintenanceRequest.directoryItems}
+            directoryEpoch={maintenanceRequest.directoryResult.requestGeneration}
+            isCurrent={() => isCurrentMaintenance(maintenanceRequest)}
+            isDirectoryCurrent={(items, directoryEpoch) => isCurrentMaintenanceDirectory(maintenanceRequest, directoryEpoch)
+              && items === maintenanceRequest.directoryItems}
+            key={maintenanceRequest.id}
+            onClose={() => closeMaintenance(maintenanceRequest)}
+            onDirectoryNeedsRefresh={() => invalidateMaintenanceDirectory(maintenanceRequest)}
+            onDirectoryUpdated={(directory, refreshEpoch) => acceptMaintenanceDirectory(maintenanceRequest, directory, refreshEpoch)}
+            onOrphanActionsLockedChange={(locked) => {
+              if (maintenanceRequestRef.current === maintenanceRequest) {
+                maintenanceRequest.orphanActionsLocked = locked;
+              }
+            }}
+            onLocateAsset={(item, directoryEpoch) => locateMaintenanceAsset(maintenanceRequest, item, directoryEpoch)}
+            onOpenDelete={(item, directoryEpoch) => openOrphanDelete(maintenanceRequest, item, directoryEpoch)}
+            onUnauthorized={() => {
+              if (isCurrentMaintenance(maintenanceRequest)) unauthorizedHandlerRef.current();
+            }}
+            port={maintenanceRequest.port}
+            seriesId={series.id}
+            seriesName={series.name}
+            services={services}
+            userId={userId}
           />
         )}
     </section>

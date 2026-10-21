@@ -128,6 +128,8 @@ import { createTeamSeriesHttpPort } from "./teamSeriesHttp";
 import type { TeamSeriesServicePort } from "./teamSeries";
 import { createTeamReportingHttpPort } from "./teamReportingHttp";
 import type { TeamReportingServicePort } from "./teamReporting";
+import { createAssetMaintenanceHttpPort } from "./assetMaintenanceHttp";
+import type { AssetMaintenanceServicePort } from "./assetMaintenance";
 import {
   parseStoryboardModels,
   parseStoryboardPrompts,
@@ -181,6 +183,7 @@ export interface WorkspaceServices {
   readonly teamManagement?: TeamManagementServicePort;
   readonly teamSeries?: TeamSeriesServicePort;
   readonly teamReporting?: TeamReportingServicePort;
+  readonly assetMaintenance?: AssetMaintenanceServicePort;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
@@ -2744,6 +2747,12 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     teamReporting: createTeamReportingHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    assetMaintenance: createAssetMaintenanceHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,
