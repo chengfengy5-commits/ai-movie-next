@@ -52,10 +52,13 @@ def test_worker_service_is_explicit_and_stops_polling_on_shutdown() -> None:
     service = _service(runtime)
 
     assert runtime.calls == []
+    assert service.is_running is False
     service.start()
     assert runtime.started.wait(timeout=1.0)
+    assert service.is_running is True
 
     receipt = service.shutdown("test shutdown")
+    assert service.is_running is False
 
     call_count = len(runtime.calls)
     assert call_count >= 1

@@ -191,7 +191,7 @@ def build_system(path: Path):
     def token_for(user_id: str, *, jti: str | None = None) -> str:
         claims: dict[str, object] = {
             "sub": user_id,
-            "exp": NOW + timedelta(minutes=5),
+            "exp": datetime.now(timezone.utc) + timedelta(minutes=5),
         }
         if jti is not None:
             claims["jti"] = jti
@@ -457,5 +457,29 @@ def test_missing_credentials_keep_authentication_response_shape(tmp_path: Path) 
         assert response.json() == {"detail": "Not authenticated"}
         assert response.headers["www-authenticate"] == "Bearer"
         assert business_sessions == []
+    finally:
+        engine.dispose()
+
+
+def test_profile_card_uses_fresh_token_expiry_with_historic_business_clock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    historic_now = (
+        datetime.now(timezone.utc) - timedelta(minutes=10)
+    ).replace(microsecond=0, tzinfo=None)
+    monkeypatch.setitem(globals(), "NOW", historic_now)
+    engine, app, _events, _auth_sessions, _business_sessions, token_for = build_system(
+        tmp_path / "profiles-historic-business-clock.sqlite"
+    )
+    try:
+        response = request(
+            app,
+            "GET",
+            "/api/users/target/card",
+            headers={"Authorization": f"Bearer {token_for('viewer', jti='viewer-jti')}"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["id"] == "target"
     finally:
         engine.dispose()

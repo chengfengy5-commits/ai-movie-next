@@ -41,6 +41,8 @@ import { resolveProductionNoteFrameTarget } from "./productionNoteFrameNavigatio
 import { ChapterManagementDialog, type ChapterManagementAction } from "./ChapterManagementDialog";
 import { ChapterOrderDialog } from "./ChapterOrderDialog";
 import { FrameTextEditor, type FrameTextSaveResult } from "./FrameTextEditor";
+import { FrameReviewDialog, type FrameReviewSourceCheck } from "./FrameReviewDialog";
+import type { FrameReviewResult } from "../../shared/api/frameReview";
 import {
   FrameStructureEditor,
   type FrameStructureMode,
@@ -139,6 +141,17 @@ interface ChapterEditLockOwner {
 interface FrameTextEditorContext extends ChapterEditLockOwner {
   position: number;
   initialText: string;
+}
+
+interface FrameReviewDialogOwner {
+  scope: ChapterBrowserScope;
+  chapter: Chapter;
+  position: number;
+  frameIndex: number;
+  storyboardAssetId: string;
+  sourceText: string;
+  sourceVersion: string;
+  requestGeneration: number;
 }
 
 interface FrameStructureEditorContext extends ChapterEditLockOwner {
@@ -431,6 +444,16 @@ function readEditableFrameText(chapter: Chapter, position: number): string | nul
   return value === undefined || value === null || typeof value === "string" ? value ?? "" : null;
 }
 
+function storyboardFrameId(frame: StoryboardFrame | undefined): string | null {
+  if (frame === undefined || !Array.isArray(frame.storyboard)) return null;
+  const first = frame.storyboard[0];
+  return typeof first === "string" && first.trim() !== "" ? first : null;
+}
+
+function frameSourceVersion(chapter: Chapter, frame: StoryboardFrame): string {
+  return `${chapter.updated_at}:${JSON.stringify(frame)}`;
+}
+
 function errorPresentation(error: ApiError): ErrorPresentation {
   if (error.status === 403) {
     const detail = error.detail?.toLowerCase() ?? "";
@@ -557,6 +580,10 @@ export function ChapterBrowser({
   const [frameTextEditor, setFrameTextEditor] = useState<FrameTextEditorContext | null>(null);
   const frameTextEditorRef = useRef<FrameTextEditorContext | null>(null);
   frameTextEditorRef.current = frameTextEditor;
+  const [frameReviewDialog, setFrameReviewDialog] = useState<FrameReviewDialogOwner | null>(null);
+  const frameReviewDialogRef = useRef<FrameReviewDialogOwner | null>(null);
+  frameReviewDialogRef.current = frameReviewDialog;
+  const frameReviewVerifiedSourceRef = useRef<FrameReviewDialogOwner | null>(null);
   const [frameStructureEditor, setFrameStructureEditor] = useState<FrameStructureEditorContext | null>(null);
   const frameStructureEditorRef = useRef<FrameStructureEditorContext | null>(null);
   frameStructureEditorRef.current = frameStructureEditor;
@@ -647,6 +674,9 @@ export function ChapterBrowser({
     setChaptersError(null);
     setChapterManagement(null);
     setStoryboardGenerationDialog(null);
+    frameReviewDialogRef.current = null;
+    frameReviewVerifiedSourceRef.current = null;
+    setFrameReviewDialog(null);
     chapterOrderEditorRef.current = null;
     setChapterOrderEditor(null);
     invalidateFrameEditingWorkflow({ deferLockRelease: true });
@@ -859,6 +889,12 @@ export function ChapterBrowser({
     () => chapters?.find((chapter) => chapter.id === selectedChapterId) ?? null,
     [chapters, selectedChapterId],
   );
+  useEffect(() => {
+    const owner = frameReviewDialogRef.current;
+    if (owner !== null && !isFrameReviewOwnerCurrent(owner)) {
+      closeFrameReviewDialog(owner);
+    }
+  }, [selectedChapter, selectedChapterId, series.id, services, userId]);
   const currentAssetResult = selectedChapter !== null && assetResult?.chapterId === selectedChapter.id
     ? assetResult
     : null;
@@ -1480,6 +1516,7 @@ export function ChapterBrowser({
     closePersonalNotes();
     closeFrameAssetReferences();
     closePersonalRoughCut();
+    closeFrameReviewDialog();
     assetCache.current.clear();
     setChapters(null);
     setSelectedChapterId(null);
@@ -1706,6 +1743,7 @@ export function ChapterBrowser({
     closePersonalNotes();
     closeFrameAssetReferences();
     closePersonalRoughCut();
+    closeFrameReviewDialog();
     onBack();
   }
 
@@ -2812,7 +2850,7 @@ export function ChapterBrowser({
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
   const chapterManagementBlocked = chapterPanelsOpen
     || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null || frameEditOpening
-    || storyboardGenerationDialog !== null;
+    || storyboardGenerationDialog !== null || frameReviewDialog !== null;
   const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
   const canEditFrameStructure = series.can_enter
     && services.updateChapter !== undefined
@@ -2822,6 +2860,144 @@ export function ChapterBrowser({
     && services.createChapter !== undefined
     && services.updateChapter !== undefined
     && services.deleteChapter !== undefined;
+
+  function closeFrameReviewDialog(expected?: FrameReviewDialogOwner): void {
+    const owner = frameReviewDialogRef.current;
+    if (expected !== undefined && owner !== expected) return;
+    frameReviewDialogRef.current = null;
+    frameReviewVerifiedSourceRef.current = null;
+    setFrameReviewDialog(null);
+  }
+
+  function isFrameReviewOwnerCurrent(owner: FrameReviewDialogOwner): boolean {
+    const directory = chapterDirectoryRef.current;
+    const chaptersForTarget = directory.chapters?.filter((chapter) => chapter.id === owner.chapter.id) ?? [];
+    const chapter = chaptersForTarget[0];
+    if (
+      frameReviewDialogRef.current !== owner
+      || !sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+      || owner.requestGeneration !== chapterRequestGeneration.current
+      || selectedChapterIdRef.current !== owner.chapter.id
+      || !sameChapterBrowserScope(directory.scope, owner.scope)
+      || directory.requestGeneration !== owner.requestGeneration
+      || chaptersForTarget.length !== 1
+      || chapter?.series_id !== owner.scope.seriesId
+    ) {
+      return false;
+    }
+    if (frameReviewVerifiedSourceRef.current === owner) return true;
+    const currentFrame = chapter.content?.[owner.frameIndex];
+    return currentFrame !== undefined
+      && storyboardFrameId(currentFrame) === owner.storyboardAssetId
+      && frameSourceVersion(chapter, currentFrame) === owner.sourceVersion
+      && readEditableFrameText(chapter, owner.position) === owner.sourceText;
+  }
+
+  async function openFrameReview(
+    sourceFrame: StoryboardFrame,
+    position: number,
+    storyboardAssetId: string,
+  ): Promise<void> {
+    const directory = chapterDirectoryRef.current;
+    const assets = currentAssetResult?.status === "ready" ? currentAssetResult.assets : null;
+    const matchingAssets = assets?.filter((asset) => (
+      asset.id === storyboardAssetId
+      && asset.series_id === series.id
+      && asset.chapter_id === selectedChapter?.id
+      && asset.frame_index === position - 1
+    )) ?? [];
+    if (
+      !canEditStoryboard
+      || services.frameReview === undefined
+      || chapterManagement !== null
+      || chapterManagementBlocked
+      || frameReviewDialogRef.current !== null
+      || chaptersLoading
+      || chaptersError !== null
+      || chapters === null
+      || selectedChapter === null
+      || assets === null
+      || matchingAssets.length !== 1
+      || frames[position - 1] !== sourceFrame
+      || !sameChapterBrowserScope(directory.scope, currentScope)
+      || directory.requestGeneration !== chapterRequestGeneration.current
+      || directory.chapters !== chapters
+      || !isChapterSelectableFromDirectory(directory.chapters, selectedChapter.id, series.id)
+    ) {
+      return;
+    }
+    const sourceText = readEditableFrameText(selectedChapter, position);
+    if (sourceText === null) return;
+    const owner: FrameReviewDialogOwner = {
+      scope: currentScope,
+      chapter: selectedChapter,
+      position,
+      frameIndex: position - 1,
+      storyboardAssetId,
+      sourceText,
+      sourceVersion: frameSourceVersion(selectedChapter, sourceFrame),
+      requestGeneration: directory.requestGeneration,
+    };
+    frameReviewVerifiedSourceRef.current = null;
+    frameReviewDialogRef.current = owner;
+    setFrameReviewDialog(owner);
+  }
+
+  async function refreshFrameReviewSource(
+    owner: FrameReviewDialogOwner,
+    result: FrameReviewResult,
+  ): Promise<FrameReviewSourceCheck> {
+    if (!isFrameReviewOwnerCurrent(owner)) {
+      return { status: "unconfirmed", message: "当前章节或登录范围已变化，未将迟到结果标记为完成。" };
+    }
+    const directoryAtRead = chapterDirectoryRef.current;
+    const requestGeneration = chapterRequestGeneration.current;
+    let nextChapters: Chapter[];
+    let nextAssets: StoryboardAsset[];
+    try {
+      [nextChapters, nextAssets] = await Promise.all([
+        owner.scope.services.listChapters(owner.scope.seriesId, new AbortController().signal),
+        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, new AbortController().signal),
+      ]);
+    } catch (cause) {
+      if (normalizeApiError(cause).status === 401 && isFrameReviewOwnerCurrent(owner)) {
+        unauthorizedHandlerRef.current();
+      }
+      return { status: "unconfirmed", message: "任务已返回结果，但章节或素材真源读取失败；请重新读取后核对。" };
+    }
+    if (
+      !isFrameReviewOwnerCurrent(owner)
+      || chapterRequestGeneration.current !== requestGeneration
+      || chapterDirectoryRef.current !== directoryAtRead
+    ) {
+      return { status: "unconfirmed", message: "章节读取期间页面范围发生变化，结果尚未核对。" };
+    }
+    const matchingChapters = nextChapters.filter((chapter) => chapter.id === owner.chapter.id);
+    const latestChapter = matchingChapters[0];
+    if (matchingChapters.length !== 1 || latestChapter?.series_id !== owner.scope.seriesId) {
+      return { status: "unconfirmed", message: "章节源数据无法唯一确认，结果没有标记为已应用。" };
+    }
+    const latestFrame = latestChapter.content?.[owner.frameIndex];
+    const latestFrameText = readEditableFrameText(latestChapter, owner.position);
+    const matchingAssets = nextAssets.filter((asset) => (
+      asset.id === owner.storyboardAssetId
+      && asset.series_id === owner.scope.seriesId
+      && asset.chapter_id === owner.chapter.id
+      && asset.frame_index === owner.frameIndex
+    ));
+    const applied = latestFrame !== undefined
+      && storyboardFrameId(latestFrame) === owner.storyboardAssetId
+      && matchingAssets.length === 1
+      && result.original_text === owner.sourceText
+      && latestFrameText === result.optimized_text;
+
+    frameReviewVerifiedSourceRef.current = owner;
+    applyFreshChapterDirectory(nextChapters, owner.scope);
+    refreshAssetsAfterFrameRead(owner.chapter.id, nextAssets);
+    return applied
+      ? { status: "applied" }
+      : { status: "unconfirmed", message: "已重新读取章节与素材，但镜头文字或来源版本与任务结果不一致；请核对当前真源。" };
+  }
 
   function openStoryboardGeneration(): void {
     if (!canManageChapters || services.storyboardGeneration === undefined
@@ -3412,6 +3588,21 @@ export function ChapterBrowser({
                     )}
                     {frameViews.map((frame) => {
                       const sourceFrame = frames[frame.position - 1];
+                      const storyboardAssetId = storyboardFrameId(sourceFrame);
+                      const reviewAssets = storyboardAssetId !== null && currentAssetResult?.status === "ready"
+                        ? currentAssetResult.assets.filter((asset) => (
+                          asset.id === storyboardAssetId
+                          && asset.series_id === series.id
+                          && asset.chapter_id === selectedChapter?.id
+                          && asset.frame_index === frame.position - 1
+                        ))
+                        : [];
+                      const canReviewFrame = canEditStoryboard
+                        && services.frameReview !== undefined
+                        && sourceFrame !== undefined
+                        && storyboardAssetId !== null
+                        && reviewAssets.length === 1
+                        && frame.text.kind !== "invalid";
                       const imageAvailable = frame.imageUrl !== null && !failedImagePositions.has(frame.position);
                       const text = textContents(frame.text, "尚未填写镜头文字。", "这条镜头文字暂时无法识别。");
                       const isResumeTarget = currentResumeLocation?.target.position === frame.position;
@@ -3477,6 +3668,15 @@ export function ChapterBrowser({
                                   title={chapterPanelsOpen ? "请先关闭当前制作记录或原图引用面板" : undefined}
                                   type="button"
                                 >{frameEditOpening ? "正在核对…" : "编辑文字"}</button>
+                              )}
+                              {canReviewFrame && sourceFrame !== undefined && storyboardAssetId !== null && (
+                                <button
+                                  className="text-button frame-review-open-button"
+                                  disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                                  onClick={() => void openFrameReview(sourceFrame, frame.position, storyboardAssetId)}
+                                  title={chapterPanelsOpen ? "请先关闭当前制作记录或原图引用面板" : undefined}
+                                  type="button"
+                                >AI 复核</button>
                               )}
                               <button
                                 className="text-button frame-copy-text-button"
@@ -3626,6 +3826,28 @@ export function ChapterBrowser({
           seriesId={chapterOrderEditor.scope.seriesId}
         />
       )}
+      {frameReviewDialog !== null
+        && sameChapterBrowserScope(frameReviewDialog.scope, currentScope)
+        && selectedChapterId === frameReviewDialog.chapter.id && (
+          <FrameReviewDialog
+            key={`${frameReviewDialog.scope.userId}:${frameReviewDialog.scope.seriesId}:${frameReviewDialog.chapter.id}:${frameReviewDialog.storyboardAssetId}:${frameReviewDialog.frameIndex}:${frameReviewDialog.requestGeneration}`}
+            chapterId={frameReviewDialog.chapter.id}
+            chapterTitle={frameReviewDialog.chapter.title}
+            frameIndex={frameReviewDialog.frameIndex}
+            isCurrent={() => isFrameReviewOwnerCurrent(frameReviewDialog)}
+            onClose={() => closeFrameReviewDialog(frameReviewDialog)}
+            onSourceApplied={(result) => refreshFrameReviewSource(frameReviewDialog, result)}
+            onUnauthorized={() => {
+              if (isFrameReviewOwnerCurrent(frameReviewDialog)) unauthorizedHandlerRef.current();
+            }}
+            services={frameReviewDialog.scope.services}
+            sourceText={frameReviewDialog.sourceText}
+            sourceVersion={frameReviewDialog.sourceVersion}
+            storyboardAssetId={frameReviewDialog.storyboardAssetId}
+            seriesId={frameReviewDialog.scope.seriesId}
+            userId={frameReviewDialog.scope.userId}
+          />
+        )}
       {frameTextEditor !== null && sameChapterBrowserScope(frameTextEditor.scope, currentScope) && (
         <FrameTextEditor
           key={`${frameTextEditor.scope.userId}:${frameTextEditor.scope.seriesId}:${frameTextEditor.chapter.id}:${frameTextEditor.position}:${frameTextEditor.requestGeneration}`}

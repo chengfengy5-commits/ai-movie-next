@@ -46,6 +46,18 @@ class GenerationWorkerService:
         self._thread: Thread | None = None
         self._shutdown_receipt: ShutdownReceipt | None = None
 
+    @property
+    def is_running(self) -> bool:
+        """Report whether the polling thread is alive and has not been shut down."""
+
+        with self._lock:
+            return (
+                self._thread is not None
+                and self._thread.is_alive()
+                and not self._stop.is_set()
+                and self._shutdown_receipt is None
+            )
+
     def start(self) -> None:
         """Start the explicitly configured polling thread exactly once."""
 
