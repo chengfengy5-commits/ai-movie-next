@@ -29,6 +29,13 @@ interface FrameReviewDialogProps {
 const pollIntervalMs = 1200;
 const activeTaskStatuses = new Set(["queued", "pending", "processing", "running", "cancelling", "reconciling"]);
 
+function frameReviewProgressMessage(progressMessage: string | null): string | null {
+  if (progressMessage === "frame_review_target_delivery_failed") {
+    return "复核结果未能写入当前镜头，请刷新章节并核对内容。";
+  }
+  return progressMessage;
+}
+
 function capabilityMessage(capabilities: FrameReviewCapabilities): string | null {
   if (capabilities.enabled) return null;
   switch (capabilities.reason) {
@@ -218,7 +225,7 @@ export function FrameReviewDialog({
           invalidateCancelResponse();
           setTerminal("failed");
           transitionPhase("finished");
-          setMessage(nextTask.progress_message ?? "服务器报告此任务失败。");
+          setMessage(frameReviewProgressMessage(nextTask.progress_message) ?? "服务器报告此任务失败。");
           return;
         }
         if (nextTask.status === "cancelled" || nextTask.status === "canceled") {
@@ -411,7 +418,7 @@ export function FrameReviewDialog({
           <section aria-label="分镜复核任务状态" className="frame-review-task" role="status">
             <p>{taskStatusText}</p>
             {task?.progress !== null && task?.progress !== undefined && <progress max={100} value={task.progress} />}
-            {task?.progress_message && <p>{task.progress_message}</p>}
+            {task?.progress_message && <p>{frameReviewProgressMessage(task.progress_message)}</p>}
             {message !== null && <p className="frame-review-request-state">{message}</p>}
             {receipt !== null && (
               <p>模型：{receipt.modelName}（{receipt.isSystem ? "系统" : "我的"}）；服务器报价：{receipt.creditCost}</p>

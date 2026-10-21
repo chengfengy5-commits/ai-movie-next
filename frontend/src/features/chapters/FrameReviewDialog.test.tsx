@@ -282,6 +282,27 @@ describe("FrameReviewDialog", () => {
     expect(screen.queryByText("取消请求未被接受")).not.toBeInTheDocument();
   });
 
+  it("maps the target delivery failure code to a clear Chinese explanation", async () => {
+    const user = userEvent.setup();
+    const machineCode = "frame_review_target_delivery_failed";
+    const { services } = makeDialogServices({
+      getTask: vi.fn(async () => ({
+        ...completedTask,
+        status: "failed",
+        progress_message: machineCode,
+      })),
+    });
+    renderDialog(services);
+
+    const dialog = within(await screen.findByRole("dialog", { name: "AI 分镜复核" }));
+    await user.type(await dialog.findByRole("textbox", { name: "希望核对的问题" }), "核对动作");
+    await user.click(dialog.getByRole("button", { name: "提交复核" }));
+
+    expect(await screen.findByText("复核结果未能写入当前镜头，请刷新章节并核对内容。"))
+      .toBeInTheDocument();
+    expect(screen.queryByText(machineCode)).not.toBeInTheDocument();
+  });
+
   it("ignores a late cancel 401 after task state becomes unconfirmed", async () => {
     const user = userEvent.setup();
     const taskResponse = deferred<FrameReviewTask>();
