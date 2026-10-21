@@ -20,6 +20,12 @@ from haoai_backend.generation_core.base_schema import (
     ResultEvidenceRow,
 )
 from haoai_backend.generation_core.frame_optimize_execution import LockedFrameOptimizeBatch
+from haoai_backend.generation_core.frame_optimize_application_facts import (
+    AppliedFrameOptimizeFact,
+    application_fact,
+    parse_partial_results,
+    reconstruct_expected_chapter,
+)
 from haoai_backend.generation_core.schema import (
     ApplicationRecordRow,
     GenerationResultReceiptRow,
@@ -43,6 +49,9 @@ class FrameOptimizeProgress:
     works_by_unit: Mapping[str, Mapping[str, object]]
     fees_by_unit: Mapping[str, Mapping[str, object]]
     ledgers_by_unit: Mapping[str, Mapping[str, object]]
+    applications_by_unit: Mapping[str, Mapping[str, object]]
+    applied_by_unit: Mapping[str, AppliedFrameOptimizeFact]
+    partial_results: tuple[tuple[int, str], ...]
     stopped_insufficient: bool
 
 
@@ -94,33 +103,36 @@ def lock_frame_optimize_progress(
         .order_by(CreditLogRow.billing_unit_id, CreditLogRow.id)
         .with_for_update()
     ).mappings().all()
-    applications = session.execute(
-        select(ApplicationRecordRow.application_ref)
+    application_rows = session.execute(
+        select(ApplicationRecordRow.__table__)
         .where(ApplicationRecordRow.task_id == task_id)
-        .limit(1)
-    ).first()
+        .order_by(ApplicationRecordRow.unit_id, ApplicationRecordRow.application_ref)
+        .with_for_update()
+    ).mappings().all()
 
     receipts = _unique_by_unit(receipt_rows, "unit_id")
     works = _unique_by_unit(work_rows, "unit_id")
     fees = _unique_by_unit(fee_rows, "unit_id")
     evidence_by_id = _unique_by_id(evidence_rows, "id")
     ledgers = _unique_by_unit(ledger_rows, "billing_unit_id")
-    if any(value is None for value in (receipts, works, fees, evidence_by_id, ledgers)):
+    applications = _unique_by_unit(application_rows, "unit_id")
+    if any(value is None for value in (receipts, works, fees, evidence_by_id, ledgers, applications)):
         return None
     assert receipts is not None and works is not None and fees is not None
-    assert evidence_by_id is not None and ledgers is not None
+    assert evidence_by_id is not None and ledgers is not None and applications is not None
 
     if (
         set(receipts) - set(unit_ids)
         or set(works) - set(unit_ids)
         or set(fees) - set(unit_ids)
         or set(ledgers) - set(unit_ids)
-        or applications is not None
+        or set(applications) - set(unit_ids)
         or len(evidence_by_id) != len(receipt_rows)
     ):
         return None
 
     evidence_by_unit: dict[str, Mapping[str, object]] = {}
+    applied_by_unit: dict[str, AppliedFrameOptimizeFact] = {}
     units = graph.units_by_id
     steps = graph.steps_by_unit
     external = graph.external_by_step
@@ -136,6 +148,7 @@ def lock_frame_optimize_progress(
         work = works.get(unit_id)
         fee = fees.get(unit_id)
         ledger = ledgers.get(unit_id)
+        application = applications.get(unit_id)
         amount = unit.get("quoted_amount")
         if (
             step is None
@@ -151,6 +164,7 @@ def lock_frame_optimize_progress(
                 work is not None
                 or fee is not None
                 or ledger is not None
+                or application is not None
                 or unit.get("result_status") != "pending"
                 or unit.get("billing_status") != "unbilled"
                 or unit.get("debited_amount") != 0
@@ -193,7 +207,6 @@ def lock_frame_optimize_progress(
             or not _same_time(receipt.get("validated_at"), fulfilled)
             or not _same_time(unit.get("success_confirmed_at"), fulfilled)
             or unit.get("result_status") != "succeeded"
-            or step.get("execution_status") != "result_observed"
             or external_row.get("submission_status") != "completed"
             or external_row.get("submitted_at") is None
             or work.get("owner_id") != owner_id
@@ -208,14 +221,71 @@ def lock_frame_optimize_progress(
             or not _same_time(work.get("original_deadline_at"), deadline)
             or work.get("phase_order") != _PHASE_ORDER
             or type(work.get("phase_version")) is not int
-            or work.get("application_ref") is not None
         ):
-            return None
-        if not _evidence_matches(evidence, receipt, external_row, step, decoded):
             return None
 
         phase = work.get("phase")
         resolution = fee.get("resolution") if fee else None
+        if phase == "finalize_pending":
+            if (
+                work.get("phase_version") != 2
+                or work.get("fee_decision_ref") != unit_id
+                or fee is None
+                or application is None
+                or work.get("application_ref") != application.get("application_ref")
+                or work.get("terminal_reason") is not None
+                or step.get("execution_status") != "applied"
+                or evidence.get("application_status") != "applied"
+                or evidence.get("applied_at") is None
+                or not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount)
+            ):
+                return None
+            fact = application_fact(
+                application,
+                item,
+                owner_id=owner_id,
+                task_id=task_id,
+                result_ref=str(receipt.get("result_ref")),
+                result_digest=str(receipt.get("content_digest")),
+                optimized_text=decoded,
+            )
+            if fact is None:
+                return None
+            applied_by_unit[unit_id] = fact
+        elif phase == "stopped_delivery_failed":
+            if (
+                work.get("phase_version") != 2
+                or work.get("fee_decision_ref") != unit_id
+                or fee is None
+                or application is not None
+                or work.get("application_ref") is not None
+                or work.get("terminal_reason") not in {
+                    "frame_optimize_target_conflict",
+                    "frame_optimize_target_deleted",
+                }
+                or step.get("execution_status") != "result_observed"
+                or evidence.get("application_status") != "pending"
+                or evidence.get("applied_at") is not None
+                or not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount)
+            ):
+                return None
+        elif application is not None or work.get("application_ref") is not None:
+            return None
+        if phase not in {"finalize_pending", "stopped_delivery_failed"} and (
+            step.get("execution_status") != "result_observed"
+            or evidence.get("application_status") != "pending"
+            or evidence.get("applied_at") is not None
+        ):
+            return None
+        if not _evidence_matches(
+            evidence,
+            receipt,
+            external_row,
+            step,
+            decoded,
+            applied=phase == "finalize_pending",
+        ):
+            return None
         if phase == "fee_pending":
             if (
                 work.get("phase_version") != 0
@@ -243,6 +313,13 @@ def lock_frame_optimize_progress(
                 pass
             else:
                 return None
+        elif phase in {"finalize_pending", "stopped_delivery_failed"}:
+            if not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount):
+                return None
+            if resolution == "charged":
+                total_debited += amount
+            elif resolution != "no_charge":
+                return None
         elif phase in {"stopped_insufficient", "stopped_late_generation"}:
             expected_resolution = phase
             if (
@@ -262,7 +339,20 @@ def lock_frame_optimize_progress(
         else:
             return None
 
-    if graph.task.get("result") is not None:
+    items_by_index = {item.frame_index: item for item in graph.verified.items}
+    partial_results = parse_partial_results(graph.task.get("result"), items_by_index)
+    if partial_results is None:
+        return None
+    expected_results = {
+        fact.item.frame_index: fact.optimized_text for fact in applied_by_unit.values()
+    }
+    if (
+        len(expected_results) != len(applied_by_unit)
+        or len(partial_results) != len(expected_results)
+        or {index: text for index, text in partial_results} != expected_results
+        or set(applications) != set(applied_by_unit)
+        or reconstruct_expected_chapter(graph.verified, expected_results) is None
+    ):
         return None
     if graph.task.get("credit_cost") != total_debited:
         return None
@@ -286,6 +376,9 @@ def lock_frame_optimize_progress(
         works_by_unit=works,
         fees_by_unit=fees,
         ledgers_by_unit=ledgers,
+        applications_by_unit=applications,
+        applied_by_unit=applied_by_unit,
+        partial_results=partial_results,
         stopped_insufficient=saw_insufficient,
     )
 
@@ -321,7 +414,7 @@ def encode_optimize_text(value: str) -> tuple[str, str] | None:
     return digest, _INLINE_PREFIX + base64.urlsafe_b64encode(raw).decode("ascii")
 
 
-def _evidence_matches(evidence, receipt, submission, step, output: str) -> bool:
+def _evidence_matches(evidence, receipt, submission, step, output: str, *, applied: bool) -> bool:
     digest = str(receipt.get("content_digest"))
     return all(
         (
@@ -333,7 +426,7 @@ def _evidence_matches(evidence, receipt, submission, step, output: str) -> bool:
             evidence.get("payload_digest") == digest,
             evidence.get("result_digest") == digest,
             evidence.get("validity") == "valid",
-            evidence.get("application_status") == "pending",
+            evidence.get("application_status") == ("applied" if applied else "pending"),
             decode_optimize_text(evidence.get("result_location"), digest) == output,
         )
     )

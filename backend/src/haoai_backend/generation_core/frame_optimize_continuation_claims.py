@@ -16,7 +16,7 @@ from haoai_backend.generation_contracts.types import (
     ContinuationClaimAuthority,
     OwnerTaskScope,
 )
-from haoai_backend.generation_core.base_schema import AITaskRow, UserRow
+from haoai_backend.generation_core.base_schema import AITaskRow, BillingUnitRow, UserRow
 from haoai_backend.generation_core.frame_optimize_execution import (
     LockedFrameOptimizeBatch,
     lock_frame_optimize_batch,
@@ -111,6 +111,54 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
             self._signals.setdefault(generation_claim.token, signal)
         return _authority(graph.task, work, unit_id, generation_claim)
 
+    def bind_current_delivery(
+        self,
+        session: Session,
+        generation_claim: ClaimAuthority,
+        work_id: str,
+    ) -> ContinuationClaimAuthority | None:
+        """Bind the live generation lease to one already-paid delivery Unit."""
+        if (
+            not isinstance(session, Session)
+            or not isinstance(generation_claim, ClaimAuthority)
+            or generation_claim.scope.operation != _OPERATION
+            or generation_claim.local_lost_signal.is_set()
+            or not isinstance(work_id, str)
+            or not work_id
+        ):
+            return None
+        graph = self._lock_batch(session, generation_claim.scope.user_id, generation_claim.scope.task_id)
+        now = self._now()
+        if (
+            graph is None
+            or now is None
+            or not _generation_claim_live(graph.task, generation_claim, now)
+            or _has_unit_cancel_marker(graph)
+        ):
+            return None
+        progress = lock_frame_optimize_progress(session, graph)
+        if progress is None:
+            return None
+        match = next(
+            (
+                (unit_id, work)
+                for unit_id, work in progress.works_by_unit.items()
+                if work.get("work_id") == work_id
+                and work.get("phase") == "delivery_pending"
+                and work.get("phase_version") == 1
+                and work.get("fee_decision_ref") == unit_id
+                and progress.fees_by_unit.get(unit_id, {}).get("resolution") in {"charged", "no_charge"}
+            ),
+            None,
+        )
+        if match is None:
+            return None
+        unit_id, work = match
+        signal = generation_claim.local_lost_signal
+        with self._signals_lock:
+            self._signals.setdefault(generation_claim.token, signal)
+        return _authority(graph.task, work, unit_id, generation_claim)
+
     def claim_continuation(
         self, task_type: str, instance: str, lease_seconds: int | None = None
     ) -> ContinuationClaimAuthority | None:
@@ -160,7 +208,9 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
         try:
             with self.session_factory() as session:
                 with session.begin():
-                    graph = self._lock_authority_graph(session, claim, self._now())
+                    graph = self._lock_authority_graph(
+                        session, claim, self._now(), allow_advanced_phase=True, allow_stopped=True
+                    )
                     now = self._now()
                     if graph is None or now is None:
                         return None
@@ -255,6 +305,85 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
             return None
         return graph
 
+    def lock_current_delivery_claim(
+        self,
+        session: Session,
+        claim: ContinuationClaimAuthority,
+        now: datetime | None = None,
+    ) -> LockedFrameOptimizeContinuation | None:
+        if not isinstance(session, Session) or not isinstance(claim, ContinuationClaimAuthority):
+            return None
+        signal = self._signal_for(claim)
+        if signal is None or signal.is_set():
+            return None
+        locked = self._lock_authority_graph(
+            session,
+            claim,
+            now or self._now(),
+            allow_advanced_phase=True,
+            allow_stopped=True,
+        )
+        if locked is None:
+            return None
+        if locked.work.get("phase") == "delivery_pending":
+            if (
+                _has_unit_cancel_marker(locked.graph)
+                or locked.work.get("phase_version") != claim.phase_version
+                or locked.work.get("fee_decision_ref") != claim.unit_id
+                or locked.fee is None
+                or locked.fee.get("resolution") not in {"charged", "no_charge"}
+                or not locked.receipt.get("automatic_application_allowed")
+            ):
+                return None
+            return locked
+        if locked.work.get("phase") == "finalize_pending":
+            if (
+                locked.work.get("phase_version") != claim.phase_version + 1
+                or locked.work.get("application_ref") is None
+            ):
+                return None
+            return locked
+        return None
+
+    def confirm_live_delivery_fence(
+        self, session: Session, claim: ContinuationClaimAuthority
+    ) -> bool:
+        """Recheck the parent lease after source locks and before final CAS writes."""
+        if not isinstance(session, Session) or not isinstance(claim, ContinuationClaimAuthority):
+            return False
+        signal = self._signal_for(claim)
+        now = self._now()
+        task = session.execute(
+            select(AITaskRow.__table__)
+            .where(
+                AITaskRow.__table__.c.id == claim.owner_scope.task_id,
+                AITaskRow.__table__.c.user_id == claim.owner_scope.user_id,
+                AITaskRow.__table__.c.type == _TASK_TYPE,
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if task is None or now is None or signal is None or signal.is_set():
+            return False
+        lease = _utc(task.get("lease_until"))
+        units = session.execute(
+            select(BillingUnitRow.__table__)
+            .where(BillingUnitRow.__table__.c.task_id == claim.owner_scope.task_id)
+            .order_by(BillingUnitRow.__table__.c.id)
+            .with_for_update()
+        ).mappings().all()
+        return bool(
+            task.get("status") == "processing"
+            and task.get("claimed_by") == claim.worker_instance
+            and task.get("claim_token") == claim.token
+            and task.get("execution_generation") == claim.execution_generation
+            and task.get("user_cancelled_at") is None
+            and bool(units)
+            and all(row.get("user_cancelled_at") is None for row in units)
+            and lease is not None
+            and lease > now
+            and _same_time(lease, claim.lease_until)
+        )
+
     def _claim_candidate(self, owner_id, task_id, work_id, instance, token, seconds, staged):
         signal = threading.Event()
         with self.session_factory() as session:
@@ -280,15 +409,34 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
                 if graph is None or now is None:
                     return None
                 progress = lock_frame_optimize_progress(session, graph)
-                work = progress.works_by_unit.get(self._unit_for_work(progress, work_id)) if progress else None
+                unit_id = self._unit_for_work(progress, work_id) if progress else None
+                work = progress.works_by_unit.get(unit_id) if progress and unit_id else None
+                fee = progress.fees_by_unit.get(unit_id) if progress and unit_id else None
+                may_drain_paid_delivery = bool(
+                    work is not None
+                    and work.get("phase") == "delivery_pending"
+                    and fee is not None
+                    and fee.get("resolution") in {"charged", "no_charge"}
+                )
+                delivery_blocked_by_unit_cancel = bool(
+                    may_drain_paid_delivery and _has_unit_cancel_marker(graph)
+                )
                 if (
                     progress is None
-                    or progress.stopped_insufficient
+                    or unit_id is None
                     or work is None
                     or work.get("work_id") != work_id
-                    or work.get("phase") != "fee_pending"
+                    or work.get("phase") not in {"fee_pending", "delivery_pending"}
+                    or delivery_blocked_by_unit_cancel
+                    or (
+                        progress.stopped_insufficient
+                        and not may_drain_paid_delivery
+                    )
                     or not _lease_available(graph.task, now)
-                    or graph.task.get("recovery_status") == "stopped_insufficient"
+                    or (
+                        graph.task.get("recovery_status") == "stopped_insufficient"
+                        and not may_drain_paid_delivery
+                    )
                 ):
                     return None
                 if session.execute(
@@ -323,7 +471,6 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
                 )
                 if changed.rowcount != 1:
                     return None
-                unit_id = next(uid for uid, row in progress.works_by_unit.items() if row.get("work_id") == work_id)
                 authority = ContinuationClaimAuthority(
                     owner_scope=OwnerTaskScope(owner_id, task_id, _OPERATION),
                     unit_id=unit_id,
@@ -357,7 +504,7 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
         if graph is None or locked_now is None:
             return None
         progress = lock_frame_optimize_progress(session, graph)
-        if progress is None or (progress.stopped_insufficient and not allow_stopped):
+        if progress is None:
             return None
         task = graph.task
         lease = _utc(task.get("lease_until"))
@@ -380,9 +527,9 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
         work = progress.works_by_unit.get(claim.unit_id)
         fee = progress.fees_by_unit.get(claim.unit_id)
         ledger = progress.ledgers_by_unit.get(claim.unit_id)
-        allowed_advanced_phases = {"fee_pending", "delivery_pending"}
+        allowed_advanced_phases = {"fee_pending", "delivery_pending", "finalize_pending"}
         if allow_stopped:
-            allowed_advanced_phases.add("stopped_insufficient")
+            allowed_advanced_phases.update({"stopped_insufficient", "stopped_delivery_failed"})
         if (
             unit is None
             or receipt is None
@@ -397,12 +544,18 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
             )
             or (
                 not allow_advanced_phase
-                and work.get("phase") != "fee_pending"
+                and work.get("phase") not in {"fee_pending", "delivery_pending"}
             )
             or (
                 allow_advanced_phase
                 and work.get("phase") not in allowed_advanced_phases
             )
+        ):
+            return None
+        if progress.stopped_insufficient and not allow_stopped and not (
+            work.get("phase") == "delivery_pending"
+            and fee is not None
+            and fee.get("resolution") in {"charged", "no_charge"}
         ):
             return None
         return LockedFrameOptimizeContinuation(
@@ -427,14 +580,13 @@ class SqlAlchemyFrameOptimizeContinuationClaims:
                     task.c.type == _TASK_TYPE,
                     task.c.status.in_(_ACTIVE),
                     task.c.user_cancelled_at.is_(None),
-                    task.c.recovery_status != "stopped_insufficient",
                     or_(
                         and_(task.c.status.in_(("queued", "reconciling")), task.c.lease_until.is_(None)),
                         and_(task.c.status == "processing", task.c.lease_until <= _db_time(now)),
                     ),
                     work.c.operation == _OPERATION,
                     work.c.policy_version == "frame_optimize_pre_apply_v1",
-                    work.c.phase == "fee_pending",
+                    work.c.phase.in_(("fee_pending", "delivery_pending")),
                 )
                 .order_by(task.c.created_at, task.c.id, work.c.work_id)
                 .limit(128)
@@ -560,6 +712,10 @@ def _generation_claim_live(task, claim, now):
         and _utc(task.get("lease_until")) > now
         and not claim.local_lost_signal.is_set()
     )
+
+
+def _has_unit_cancel_marker(graph: LockedFrameOptimizeBatch) -> bool:
+    return any(unit.get("user_cancelled_at") is not None for unit in graph.units)
 
 
 def _lease_available(task, now):

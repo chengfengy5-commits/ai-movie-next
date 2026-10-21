@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import select, text, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -31,7 +32,11 @@ from haoai_backend.generation_core.frame_optimize_continuation_claims import (
     SqlAlchemyFrameOptimizeContinuationClaims,
 )
 from haoai_backend.generation_core.frame_optimize_fees import SqlAlchemyFrameOptimizeFees
+from haoai_backend.generation_core.frame_optimize_application import (
+    SqlAlchemyFrameOptimizeApplications,
+)
 from haoai_backend.generation_contracts.types import TextResult
+from haoai_backend.personal_production.notes.tables import metadata as notes_metadata
 from haoai_backend.generation_core.schema import (
     ApplicationRecordRow,
     GenerationResultReceiptRow,
@@ -43,6 +48,7 @@ from haoai_backend.generation_credentials.frame_optimize_snapshot_reader import 
     read_original_frame_optimize_execution_batch,
 )
 from haoai_backend.generation_credentials.persistence import prepared_payloads
+from haoai_backend.series_data.tables import chapters, storyboard_assets
 from generation_core.test_admission_staging import (
     ModelSource,
     _G2_JOINT_ACTOR_ID,
@@ -96,6 +102,9 @@ def admit_batch(
     prompt_source: ModelSource | None = ModelSource.SYSTEM,
     prompt_owner_id: str | None = None,
     wallet_credits: int | None = 500,
+    include_source_tables: bool = False,
+    no_storyboard_ids: bool = False,
+    original_text_by_index: dict[int, object] | None = None,
 ) -> FrameOptimizeCase:
     engine, sessions, capabilities, crypto_state, ids, request = _build_optimize_case(
         tmp_path,
@@ -106,6 +115,36 @@ def admit_batch(
         prompt_owner_id=prompt_owner_id,
         wallet_credits=wallet_credits,
     )
+    if include_source_tables:
+        # The admission fixture owns generation tables; source application also
+        # needs the real notes/media metadata used by the same-session writer.
+        notes_metadata.create_all(engine)
+        with engine.begin() as connection:
+            asset_columns = {
+                row["name"]
+                for row in connection.execute(text("PRAGMA table_info(storyboard_assets)")).mappings()
+            }
+            if "created_at" not in asset_columns:
+                connection.execute(text("ALTER TABLE storyboard_assets ADD COLUMN created_at DATETIME"))
+    if no_storyboard_ids or original_text_by_index:
+        with engine.begin() as connection:
+            chapter_row = connection.execute(
+                select(chapters.c.content).where(chapters.c.id == "joint-chapter-1")
+            ).scalar_one()
+            frames = json.loads(chapter_row)
+            for index, value in (original_text_by_index or {}).items():
+                frames[index]["original_text"] = value
+            if no_storyboard_ids:
+                for frame in frames:
+                    frame.pop("storyboard", None)
+                connection.execute(
+                    storyboard_assets.delete().where(storyboard_assets.c.chapter_id == "joint-chapter-1")
+                )
+            connection.execute(
+                update(chapters)
+                .where(chapters.c.id == "joint-chapter-1")
+                .values(content=json.dumps(frames, ensure_ascii=False))
+            )
     receipt = _admit(engine, sessions, capabilities, ids, request)
     return FrameOptimizeCase(
         engine=engine,
@@ -190,6 +229,22 @@ def fee_adapter(case: FrameOptimizeCase, *, prefix: str = "opt-fee"):
     )
 
 
+def application_adapter(
+    case: FrameOptimizeCase,
+    *,
+    token: str = "opt-application-claim",
+    continuation_claims=None,
+):
+    claims = continuation_claims or continuation_claim_adapter(case, token=token)
+    return SqlAlchemyFrameOptimizeApplications(
+        session_factory=case.sessions,
+        db_clock=lambda: case.clock[0],
+        crypto=case.capabilities.crypto,
+        proof_authority=case.capabilities.proof_authority,
+        continuation_claims=claims,
+    )
+
+
 def persist_result(case, claim, prepared, *, text: str = "optimized frame"):
     assert prepared.disposition == "committed"
     assert prepared.intent is not None
@@ -226,6 +281,11 @@ def persist_result_and_fee(case, claim, prepared, fees, *, text: str = "optimize
     work = next(row for row in state["work"] if row.unit_id == prepared.verified_item.unit_id)
     fee = fees.resolve_current_fee(claim, work.work_id)
     return receipt, fee
+
+
+def apply_current(case: FrameOptimizeCase, claim: ClaimAuthority, unit_id: str, *, adapter=None):
+    work = next(row for row in rows_for(case)["work"] if row.unit_id == unit_id)
+    return (adapter or application_adapter(case)).deliver_current(claim, work.work_id)
 
 
 def claim_one(case: FrameOptimizeCase, *, token: str = "frame-optimize-claim-token") -> ClaimAuthority:
@@ -362,6 +422,8 @@ __all__ = [
     "FrameOptimizeCase",
     "IdSequence",
     "admit_batch",
+    "application_adapter",
+    "apply_current",
     "assert_only_original_graph",
     "claim_adapter",
     "claim_one",

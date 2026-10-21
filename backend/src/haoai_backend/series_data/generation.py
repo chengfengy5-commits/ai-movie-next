@@ -72,6 +72,181 @@ def stage_frame_result(
     )
 
 
+def stage_frame_optimize_source(
+    session: Session,
+    receipt: GenerationResultReceipt,
+    target: TargetSnapshot,
+    requested_text: str,
+    expected_chapter: list[object],
+    optimized_text: str,
+) -> ApplicationOutcome:
+    """Stage one optimize source write using its authenticated batch baseline."""
+    if (
+        not isinstance(session, Session)
+        or receipt.operation != "frame.optimize"
+        or target.kind != "frame_text"
+        or not isinstance(requested_text, str)
+        or not isinstance(optimized_text, str)
+    ):
+        return ApplicationOutcome(
+            "write_failed", receipt.result_ref, None, None, "optimize application input is invalid"
+        )
+    actor_id = receipt.owner_id
+    if (
+        not target.series_id
+        or not target.chapter_id
+        or not _has_series_access(session, actor_id, target.series_id)
+    ):
+        return ApplicationOutcome(
+            "write_failed", receipt.result_ref, None, None, "current series access is unavailable"
+        )
+    try:
+        target_scope = target_scope_for_snapshot(target)
+        expected_digest = expected_target_digest(target)
+    except ValueError as exc:
+        return ApplicationOutcome("write_failed", receipt.result_ref, None, None, str(exc))
+
+    chapter = session.execute(
+        select(chapters)
+        .where(chapters.c.id == target.chapter_id, chapters.c.series_id == target.series_id)
+        .with_for_update()
+    ).mappings().one_or_none()
+    if chapter is None:
+        return ApplicationOutcome(
+            "target_deleted", receipt.result_ref, None, None, "target chapter was deleted"
+        )
+    frames = _parse_frames(chapter["content"])
+    if frames is None:
+        return ApplicationOutcome(
+            "target_conflict",
+            receipt.result_ref,
+            None,
+            None,
+            "chapter content is not a valid frame list",
+        )
+
+    frame_index = _resolve_current_frame_identity(frames, target)
+    if frame_index is None:
+        return ApplicationOutcome(
+            "target_conflict",
+            receipt.result_ref,
+            None,
+            None,
+            "current frame identity is missing or ambiguous",
+        )
+    if target.stable_storyboard_asset_id is None:
+        if _digest(frames) != _digest(expected_chapter):
+            return ApplicationOutcome(
+                "target_conflict",
+                receipt.result_ref,
+                None,
+                None,
+                "chapter changed after optimize admission",
+            )
+        if frame_index != target.compat_frame_index:
+            return ApplicationOutcome(
+                "target_conflict",
+                receipt.result_ref,
+                None,
+                None,
+                "no-ID frame moved after optimize admission",
+            )
+
+    current_frame = frames[frame_index]
+    if (
+        not isinstance(current_frame, dict)
+        or _digest(current_frame) != expected_digest
+        or not isinstance(current_frame.get("text"), str)
+        or _digest(current_frame.get("text")) != target.expected_text_digest
+    ):
+        return ApplicationOutcome(
+            "stale", receipt.result_ref, None, None, "frame changed after optimize admission"
+        )
+
+    storyboard_id = target.stable_storyboard_asset_id
+    asset = None
+    if storyboard_id:
+        asset = session.execute(
+            select(storyboard_assets)
+            .where(
+                storyboard_assets.c.id == storyboard_id,
+                storyboard_assets.c.chapter_id == target.chapter_id,
+                storyboard_assets.c.series_id == target.series_id,
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if asset is None:
+            return ApplicationOutcome(
+                "target_deleted", receipt.result_ref, None, None, "storyboard asset was deleted"
+            )
+
+    from haoai_backend.generation_core.frame_optimize_application_facts import apply_optimized_text
+
+    updated_frame = apply_optimized_text(current_frame, requested_text, optimized_text)
+    if updated_frame is None:
+        return ApplicationOutcome(
+            "target_conflict", receipt.result_ref, None, None, "target frame is invalid"
+        )
+    before_digest = _digest(current_frame)
+    frames[frame_index] = updated_frame
+    encoded = json.dumps(frames, ensure_ascii=False)
+    changed = session.execute(
+        update(chapters)
+        .where(
+            chapters.c.id == chapter["id"],
+            chapters.c.series_id == chapter["series_id"],
+            chapters.c.content.is_(None)
+            if chapter["content"] is None
+            else chapters.c.content == chapter["content"],
+        )
+        .values(content=encoded, updated_at=_database_now(session))
+    )
+    if changed.rowcount != 1:
+        return ApplicationOutcome(
+            "stale", receipt.result_ref, None, None, "chapter content compare-and-set lost"
+        )
+
+    if storyboard_id and asset is not None:
+        updated_asset = session.execute(
+            update(storyboard_assets)
+            .where(
+                storyboard_assets.c.id == storyboard_id,
+                storyboard_assets.c.chapter_id == target.chapter_id,
+                storyboard_assets.c.series_id == target.series_id,
+                storyboard_assets.c.description.is_(None)
+                if asset["description"] is None
+                else storyboard_assets.c.description == asset["description"],
+            )
+            .values(description=optimized_text, updated_at=_database_now(session))
+        )
+        if updated_asset.rowcount != 1:
+            raise GenerationError(
+                "target_conflict_deleted_stale",
+                "storyboard description changed during optimize application",
+            )
+
+    reconcile = stage_media_reconciliation(
+        session,
+        target.chapter_id,
+        chapter_content_override=encoded,
+        chapter_content_before=chapter["content"],
+        focus_storyboard_asset_id=storyboard_id,
+    )
+    after_digest = _digest(updated_frame)
+    record = stage_application_record(
+        session,
+        receipt,
+        target_scope,
+        before_digest,
+        after_digest,
+        media_revision_before=reconcile.media_revision_before,
+        media_revision_after=reconcile.media_revision_after,
+        notes_revision_before=reconcile.notes_revision_before,
+        notes_revision_after=reconcile.notes_revision_after,
+    )
+    return ApplicationOutcome("applied", receipt.result_ref, record.application_ref, after_digest)
+
+
 def stage_frame_preview(
     shared_session: Session,
     authority: CanvasApplyAuthority,

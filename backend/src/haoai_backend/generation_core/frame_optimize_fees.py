@@ -370,8 +370,7 @@ class SqlAlchemyFrameOptimizeFees:
                         or fee.get("application_ref") is not None
                         or not _same_time(fee.get("resolved_at"), write.resolved_at)
                         or work.get("work_id") != write.work_id
-                        or work.get("phase") != write.work_phase
-                        or work.get("phase_version") != write.work_phase_version
+                        or not _fee_work_state_matches(work, write)
                         or work.get("result_ref") != write.result_ref
                         or receipt.get("result_ref") != write.result_ref
                     ):
@@ -444,6 +443,18 @@ def _outcome(disposition, unit_id, result_ref=None, fee=None, *, amount=0):
         ledger_ref=fee.get("ledger_ref") if fee else None,
         amount=amount,
     )
+
+
+def _fee_work_state_matches(work, write: _FeeWrite) -> bool:
+    actual = (work.get("phase"), work.get("phase_version"))
+    initial = (write.work_phase, write.work_phase_version)
+    if initial == ("delivery_pending", 1):
+        return actual in {
+            initial,
+            ("finalize_pending", 2),
+            ("stopped_delivery_failed", 2),
+        }
+    return actual == initial
 
 
 class _FeeWriteConflict(RuntimeError):

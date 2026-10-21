@@ -326,8 +326,7 @@ def _unit_is_unprepared(unit, step) -> bool:
 def _first_send_is_current(*, task, unit, step, external, now: datetime) -> bool:
     deadline = unit.get("deadline_at")
     return bool(
-        task.get("result") is None
-        and unit.get("billing_status") == "unbilled"
+        unit.get("billing_status") == "unbilled"
         and unit.get("result_status") == "pending"
         and unit.get("debited_amount") == 0
         and unit.get("refunded_amount") == 0
