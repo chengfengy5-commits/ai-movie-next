@@ -22,6 +22,7 @@ import {
   type AssetFrameUsageFrameTarget,
   type AssetFrameUsageOwner,
 } from "./AssetFrameUsagePanel";
+import { AssetReplacementDialog } from "./replacement/AssetReplacementDialog";
 
 type AssetRecord = Character | Scene | Prop;
 
@@ -103,6 +104,18 @@ interface AssetMaintenanceRequest {
   acceptedDirectoryReloadVersion: number | null;
   port: NonNullable<WorkspaceServices["assetMaintenance"]>;
   orphanActionsLocked: boolean;
+}
+
+interface AssetReplacementRequest {
+  id: number;
+  scope: LibraryScope;
+  category: AssetLibraryType;
+  asset: AssetRecord;
+  directoryResult: ScopedAssetResult;
+  port: NonNullable<WorkspaceServices["assetReplacement"]>;
+  openEpoch: number;
+  writeInFlight: boolean;
+  hasAttempt: boolean;
 }
 
 const assetTypes: Array<{ id: AssetLibraryType; label: string }> = [
@@ -265,6 +278,8 @@ function AssetCard({
   failed,
   onImageError,
   onShowUsage,
+  onReplace,
+  replacementUnavailable,
   onEdit,
   onDelete,
   usageUnavailable,
@@ -279,6 +294,8 @@ function AssetCard({
   failed: boolean;
   onImageError(): void;
   onShowUsage?: (() => void) | undefined;
+  onReplace?: (() => void) | undefined;
+  replacementUnavailable?: string | undefined;
   onEdit?: (() => void) | undefined;
   onDelete?: (() => void) | undefined;
   usageUnavailable: boolean;
@@ -344,6 +361,12 @@ function AssetCard({
             素材身份暂无法核对，不能查看关联镜头。
           </p>
         )}
+        <div className="asset-card-replacement-action">
+          <button className="secondary-button" disabled={onReplace === undefined} onClick={onReplace} type="button">
+            替换章节引用
+          </button>
+          {replacementUnavailable !== undefined && <small role="note">{replacementUnavailable}</small>}
+        </div>
         {(onEdit !== undefined || onDelete !== undefined) && (
           <div className="asset-card-management-actions" aria-label={name + "素材操作"}>
             {onEdit !== undefined && <button onClick={onEdit} type="button">编辑</button>}
@@ -403,6 +426,13 @@ export function AssetLibrary({
   const maintenanceRequestRef = useRef(maintenanceRequest);
   maintenanceRequestRef.current = maintenanceRequest;
   const maintenanceRequestIdRef = useRef(0);
+  const [replacementRequests, setReplacementRequests] = useState<AssetReplacementRequest[]>([]);
+  const replacementRequestsRef = useRef(replacementRequests);
+  replacementRequestsRef.current = replacementRequests;
+  const [activeReplacementId, setActiveReplacementId] = useState<number | null>(null);
+  const activeReplacementIdRef = useRef(activeReplacementId);
+  activeReplacementIdRef.current = activeReplacementId;
+  const replacementRequestIdRef = useRef(0);
   const [pendingLocateAsset, setPendingLocateAsset] = useState<{
     assetId: string;
     scope: LibraryScope;
@@ -486,6 +516,8 @@ export function AssetLibrary({
     setManagementRequest(null);
     maintenanceRequestRef.current = null;
     setMaintenanceRequest(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
     setNavigationIssue(null);
     setNavigationFeedback(null);
     setSelectedType(effectiveNavigationIntent.category);
@@ -661,6 +693,8 @@ export function AssetLibrary({
     openEpochRef.current += 1;
     usageOwnerRef.current = null;
     setUsageOwner(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
   }
 
   function abandonNavigationIntent() {
@@ -688,6 +722,9 @@ export function AssetLibrary({
     setManagementRequest(null);
     maintenanceRequestRef.current = null;
     setMaintenanceRequest(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
+    openEpochRef.current += 1;
     resetAssetSearch();
     if (navigationIntentRef.current?.category !== type) {
       abandonNavigationIntent();
@@ -703,6 +740,7 @@ export function AssetLibrary({
     item: AssetByCategory[Category],
     directorySnapshot: AssetByCategory[Category][],
   ) {
+    if (replacementRequestsRef.current.some((request) => request.writeInFlight)) return;
     const activeOwner = usageOwnerRef.current;
     if (
       activeOwner !== null
@@ -724,6 +762,7 @@ export function AssetLibrary({
     ) {
       return;
     }
+    invalidateUsage();
 
     const owner: AssetFrameUsageOwner = {
       userId,
@@ -751,6 +790,7 @@ export function AssetLibrary({
     item: AssetRecord | null,
     directoryItems: AssetRecord[],
   ) {
+    if (replacementRequestsRef.current.some((request) => request.writeInFlight)) return;
     const activeResult = resultRef.current;
     if (
       category !== selectedTypeRef.current
@@ -765,6 +805,7 @@ export function AssetLibrary({
     if (item !== null && !hasUniqueUsageIdentity(directoryItems, item, series.id)) {
       return;
     }
+    invalidateUsage();
     const request: AssetManagementRequest = {
       id: ++managementRequestIdRef.current,
       scope: libraryScope,
@@ -779,6 +820,7 @@ export function AssetLibrary({
   }
 
   function openMaintenance(): void {
+    if (replacementRequestsRef.current.some((request) => request.writeInFlight)) return;
     const activeResult = resultRef.current;
     const port = services.assetMaintenance;
     if (
@@ -809,6 +851,162 @@ export function AssetLibrary({
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
     setManagementRequest(null);
+  }
+
+  function openReplacement(
+    category: AssetLibraryType,
+    item: AssetRecord,
+    directoryItems: AssetRecord[],
+  ): void {
+    if (replacementRequestsRef.current.some((request) => request.writeInFlight)) return;
+    const activeResult = resultRef.current;
+    const port = services.assetReplacement;
+    if (
+      series.can_enter === false
+      || port === undefined
+      || category !== selectedTypeRef.current
+      || activeResult === null
+      || activeResult.scope !== libraryScope
+      || activeResult.result.status !== "ready"
+      || activeResult.result.type !== category
+      || libraryScopeRef.current !== libraryScope
+      || !hasValidCategoryName(category, item)
+      || !hasUniqueUsageIdentity(directoryItems, item, series.id)
+    ) {
+      return;
+    }
+
+    invalidateUsage();
+    managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
+    setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+    resetAssetSearch();
+
+    const existing = replacementRequestsRef.current.find((request) => request.scope === libraryScope
+      && request.category === category
+      && request.asset.id === item.id
+      && request.port === port);
+    const requestEpoch = ++openEpochRef.current;
+    const request: AssetReplacementRequest = existing === undefined
+      ? {
+        id: ++replacementRequestIdRef.current,
+        scope: libraryScope,
+        category,
+        asset: item,
+        directoryResult: activeResult,
+        port,
+        openEpoch: requestEpoch,
+        writeInFlight: false,
+        hasAttempt: false,
+      }
+      : { ...existing, asset: item, directoryResult: activeResult, openEpoch: requestEpoch, writeInFlight: false };
+    const nextRequests = existing === undefined
+      ? [...replacementRequestsRef.current, request]
+      : replacementRequestsRef.current.map((candidate) => candidate.id === existing.id ? request : candidate);
+    replacementRequestsRef.current = nextRequests;
+    setReplacementRequests(nextRequests);
+    activeReplacementIdRef.current = request.id;
+    setActiveReplacementId(request.id);
+  }
+
+  function openReplacementRecord(request: AssetReplacementRequest): void {
+    const current = replacementRequestsRef.current.find((candidate) => candidate.id === request.id);
+    if (
+      current === undefined
+      || !current.hasAttempt
+      || current.writeInFlight
+      || current.scope !== libraryScope
+      || current.category !== selectedTypeRef.current
+      || current.port !== services.assetReplacement
+      || series.can_enter === false
+      || libraryScopeRef.current !== libraryScope
+    ) {
+      return;
+    }
+
+    invalidateUsage();
+    managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
+    setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+    resetAssetSearch();
+
+    const nextRequest = { ...current, openEpoch: ++openEpochRef.current };
+    const nextRequests = replacementRequestsRef.current.map((candidate) => candidate.id === current.id
+      ? nextRequest
+      : candidate);
+    replacementRequestsRef.current = nextRequests;
+    setReplacementRequests(nextRequests);
+    activeReplacementIdRef.current = nextRequest.id;
+    setActiveReplacementId(nextRequest.id);
+  }
+
+  function isCurrentReplacement(request: AssetReplacementRequest, requestEpoch: number): boolean {
+    const currentRequest = replacementRequestsRef.current.find((candidate) => candidate.id === request.id);
+    return currentRequest !== undefined
+      && currentRequest.openEpoch === requestEpoch
+      && activeReplacementIdRef.current === request.id
+      && openEpochRef.current === requestEpoch
+      && libraryScopeRef.current === request.scope
+      && request.scope.userId === userId
+      && request.scope.services === services
+      && request.scope.seriesId === series.id
+      && selectedTypeRef.current === request.category
+      && series.can_enter !== false
+      && services.assetReplacement === request.port;
+  }
+
+  function closeReplacement(request: AssetReplacementRequest, requestEpoch: number): void {
+    if (!isCurrentReplacement(request, requestEpoch)) return;
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
+    openEpochRef.current += 1;
+  }
+
+  function setReplacementWriteInFlight(request: AssetReplacementRequest, requestEpoch: number, busy: boolean): void {
+    const current = replacementRequestsRef.current.find((candidate) => candidate.id === request.id);
+    if (current === undefined || current.openEpoch !== requestEpoch || current.writeInFlight === busy) return;
+    const next = replacementRequestsRef.current.map((candidate) => candidate.id === request.id
+      ? { ...candidate, writeInFlight: busy, hasAttempt: candidate.hasAttempt || busy }
+      : candidate);
+    replacementRequestsRef.current = next;
+    setReplacementRequests(next);
+  }
+
+  function acceptReplacementDirectory(
+    request: AssetReplacementRequest,
+    items: AssetRecord[],
+    requestEpoch: number,
+  ): void {
+    if (!isCurrentReplacement(request, requestEpoch)) return;
+    let ready: AssetReadyResult;
+    switch (request.category) {
+      case "characters":
+        ready = { type: "characters", status: "ready", items: items as Character[] };
+        break;
+      case "scenes":
+        ready = { type: "scenes", status: "ready", items: items as Scene[] };
+        break;
+      case "props":
+        ready = { type: "props", status: "ready", items: items as Prop[] };
+        break;
+    }
+    const requestGeneration = ++directoryRequestGenerationRef.current;
+    cache.current.set(request.category, ready);
+    resetAssetSearch();
+    setNavigationFeedback(null);
+    const nextResult: ScopedAssetResult = {
+      scope: request.scope,
+      requestGeneration,
+      navigationEpoch: null,
+      result: ready,
+    };
+    request.directoryResult = nextResult;
+    resultRef.current = nextResult;
+    setResult(nextResult);
   }
 
   function isCurrentMaintenance(request: AssetMaintenanceRequest): boolean {
@@ -1022,6 +1220,13 @@ export function AssetLibrary({
   ) {
     const imageKey = libraryScope.generation + ":" + category + ":" + item.id + ":" + (item.image_url ?? "");
     const identityIsUnique = hasUniqueUsageIdentity(items, item, series.id) && hasValidCategoryName(category, item);
+    const replacementUnavailable = !identityIsUnique
+      ? "素材身份暂无法核对，不能替换章节引用。"
+        : series.can_enter === false
+        ? "当前账号不能进入此剧集，不能替换章节引用。"
+        : services.assetReplacement === undefined
+          ? services.mode === "demo" ? "演示模式暂未接入素材替换服务。" : "当前服务暂未接入素材替换接口。"
+          : undefined;
     return (
       <AssetCard
         apiBaseUrl={services.apiBaseUrl}
@@ -1050,6 +1255,8 @@ export function AssetLibrary({
         key={category + ":" + item.id + ":" + itemPosition}
         onImageError={() => setFailedImages((previous) => new Set(previous).add(imageKey))}
         onShowUsage={identityIsUnique ? () => openUsage(category, item, items) : undefined}
+        onReplace={replacementUnavailable === undefined ? () => openReplacement(category, item, items) : undefined}
+        replacementUnavailable={replacementUnavailable}
         onEdit={identityIsUnique ? () => openManagement("edit", category, item, items) : undefined}
         onDelete={identityIsUnique ? () => openManagement("delete", category, item, items) : undefined}
         usageUnavailable={!identityIsUnique}
@@ -1284,6 +1491,22 @@ export function AssetLibrary({
           >
             整理素材
           </button>
+          {replacementRequests
+            .filter((request) => request.hasAttempt
+              && request.scope === libraryScope
+              && request.category === selectedType
+              && request.port === services.assetReplacement)
+            .map((request) => (
+              <button
+                className="secondary-button"
+                disabled={request.writeInFlight || series.can_enter === false}
+                key={request.id}
+                onClick={() => openReplacementRecord(request)}
+                type="button"
+              >
+                查看替换记录：{assetName(request.category, request.asset)}（{request.asset.id}）
+              </button>
+            ))}
           <button
             className="primary-button"
             disabled={currentResult?.status !== "ready"}
@@ -1492,6 +1715,27 @@ export function AssetLibrary({
             userId={userId}
           />
         )}
+      {replacementRequests.filter((request) => request.scope === libraryScope
+        && services.assetReplacement === request.port).map((request) => (
+        <AssetReplacementDialog
+          asset={request.asset}
+          canEnter={series.can_enter !== false}
+          category={request.category}
+          epoch={request.openEpoch}
+          isCurrent={(requestEpoch) => isCurrentReplacement(request, requestEpoch)}
+          key={request.id}
+          onClose={(requestEpoch) => closeReplacement(request, requestEpoch)}
+          onBusyChange={(requestEpoch, busy) => setReplacementWriteInFlight(request, requestEpoch, busy)}
+          onDirectoryUpdated={(items, requestEpoch) => acceptReplacementDirectory(request, items, requestEpoch)}
+          onUnauthorized={(requestEpoch) => {
+            if (isCurrentReplacement(request, requestEpoch)) unauthorizedHandlerRef.current();
+          }}
+          open={activeReplacementId === request.id && selectedType === request.category && series.can_enter !== false}
+          seriesId={series.id}
+          seriesName={series.name}
+          services={services}
+        />
+      ))}
     </section>
   );
 }
