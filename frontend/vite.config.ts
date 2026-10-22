@@ -4,10 +4,19 @@ import { fileURLToPath } from "node:url";
 import { createApiProxyOptions } from "./devProxy.mjs";
 
 const devPort = Number(process.env.VITE_DEV_PORT ?? "5173");
-const apiProxyOptions = createApiProxyOptions(process.env.VITE_API_PROXY_TARGET);
-const apiProxy = apiProxyOptions
-  ? { "^/api(?:/|\\?|$)": apiProxyOptions }
-  : undefined;
+
+export function createApiAndUploadsProxy(value: string | undefined) {
+  const apiProxyOptions = createApiProxyOptions(value);
+  if (apiProxyOptions === undefined) {
+    return undefined;
+  }
+  return {
+    "^/api(?:/|\\?|$)": { ...apiProxyOptions },
+    "^/uploads/[^?]+$": { ...apiProxyOptions },
+  };
+}
+
+const apiProxy = createApiAndUploadsProxy(process.env.VITE_API_PROXY_TARGET);
 
 export default defineConfig({
   plugins: [react()],

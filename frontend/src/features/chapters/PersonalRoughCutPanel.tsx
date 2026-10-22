@@ -1,10 +1,15 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Chapter, StoryboardAsset } from "../../shared/api/contracts";
-import type { ApiError } from "../../shared/api/errors";
-import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import { ApiError } from "../../shared/api/errors";
+import {
+  normalizeApiError,
+  type PersonalRoughCutPlaybackReader,
+  type WorkspaceServices,
+} from "../../shared/api/services";
 import type { PersonalRoughCutFrame, PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import { findRoughCutFramePosition } from "./roughCutFrameNavigation";
 import { PersonalRoughCutEditor } from "./PersonalRoughCutEditor";
+import { PersonalRoughCutPlayback } from "./PersonalRoughCutPlayback";
 import { usePersonalRoughCutEditor } from "./usePersonalRoughCutEditor";
 import { inspectRoughCutSource } from "./personal-production/roughCutEdit";
 import {
@@ -53,10 +58,61 @@ interface PanelScope {
   userId: string;
 }
 
+interface RoughCutDirectoryIdentity {
+  readonly assets: StoryboardAsset[] | null;
+  readonly token: object | null;
+  readonly requestGeneration: number;
+  readonly status: "loading" | "ready" | "error";
+}
+
+interface RoughCutPortIdentity {
+  readonly services: WorkspaceServices;
+  readonly getPersonalRoughCut: WorkspaceServices["getPersonalRoughCut"];
+  readonly getPersonalRoughCutForPlayback: WorkspaceServices["getPersonalRoughCutForPlayback"];
+  readonly savePersonalRoughCut: WorkspaceServices["savePersonalRoughCut"];
+  readonly apiBaseUrl: WorkspaceServices["apiBaseUrl"];
+}
+
+function sameDirectoryIdentity(
+  left: RoughCutDirectoryIdentity,
+  right: RoughCutDirectoryIdentity,
+): boolean {
+  return left.assets === right.assets
+    && left.token === right.token
+    && left.requestGeneration === right.requestGeneration
+    && left.status === right.status;
+}
+
+function samePortIdentity(left: RoughCutPortIdentity, right: RoughCutPortIdentity): boolean {
+  return left.services === right.services
+    && left.getPersonalRoughCut === right.getPersonalRoughCut
+    && left.getPersonalRoughCutForPlayback === right.getPersonalRoughCutForPlayback
+    && left.savePersonalRoughCut === right.savePersonalRoughCut
+    && left.apiBaseUrl === right.apiBaseUrl;
+}
+
 type ReadState =
-  | { status: "loading"; requestGeneration: number }
-  | { status: "ready"; snapshot: PersonalRoughCutSnapshot; requestGeneration: number }
-  | { status: "error"; error: ApiError; requestGeneration: number };
+  | {
+      status: "loading";
+      requestGeneration: number;
+      portIdentity: RoughCutPortIdentity;
+      directoryIdentity: RoughCutDirectoryIdentity;
+    }
+  | {
+      status: "ready";
+      snapshot: PersonalRoughCutSnapshot;
+      reader: PersonalRoughCutPlaybackReader | null;
+      requestGeneration: number;
+      portIdentity: RoughCutPortIdentity;
+      directoryIdentity: RoughCutDirectoryIdentity;
+    }
+  | {
+      status: "error";
+      error: ApiError;
+      requestGeneration: number;
+      portIdentity: RoughCutPortIdentity;
+      directoryIdentity: RoughCutDirectoryIdentity;
+    };
 
 interface FilterSelection {
   snapshot: PersonalRoughCutSnapshot;
@@ -132,6 +188,34 @@ export function PersonalRoughCutPanel({
   onLocateFrame,
   onFrameNavigationInvalidated,
 }: PersonalRoughCutPanelProps) {
+  const directoryInput: RoughCutDirectoryIdentity = {
+    assets,
+    token: assetSnapshotToken,
+    requestGeneration: assetRequestGeneration,
+    status: assetDirectoryStatus,
+  };
+  const directoryIdentityRef = useRef<RoughCutDirectoryIdentity | null>(null);
+  if (directoryIdentityRef.current === null || !sameDirectoryIdentity(directoryIdentityRef.current, directoryInput)) {
+    directoryIdentityRef.current = directoryInput;
+  }
+  const directoryIdentity = directoryIdentityRef.current!;
+  const portInput: RoughCutPortIdentity = {
+    services,
+    getPersonalRoughCut: services.getPersonalRoughCut,
+    getPersonalRoughCutForPlayback: services.getPersonalRoughCutForPlayback,
+    savePersonalRoughCut: services.savePersonalRoughCut,
+    apiBaseUrl: services.apiBaseUrl,
+  };
+  const portIdentityRef = useRef<RoughCutPortIdentity | null>(null);
+  if (portIdentityRef.current === null || !samePortIdentity(portIdentityRef.current, portInput)) {
+    portIdentityRef.current = portInput;
+  }
+  const portIdentity = portIdentityRef.current!;
+  const currentDirectoryIdentityRef = useRef(directoryIdentity);
+  currentDirectoryIdentityRef.current = directoryIdentity;
+  const currentPortIdentityRef = useRef(portIdentity);
+  currentPortIdentityRef.current = portIdentity;
+
   const initialScope = useRef<PanelScope | null>(null);
   if (initialScope.current === null) {
     initialScope.current = { chapter, seriesId, services, userId };
@@ -151,7 +235,12 @@ export function PersonalRoughCutPanel({
 
   const requestGeneration = useRef(0);
   const closedRef = useRef(false);
-  const [readState, setReadState] = useState<ReadState>({ status: "loading", requestGeneration: 0 });
+  const [readState, setReadState] = useState<ReadState>(() => ({
+    status: "loading",
+    requestGeneration: 0,
+    portIdentity,
+    directoryIdentity,
+  }));
   const [filterSelection, setFilterSelection] = useState<FilterSelection | null>(null);
   const readStateRef = useRef(readState);
   readStateRef.current = readState;
@@ -160,27 +249,76 @@ export function PersonalRoughCutPanel({
   const [reloadGeneration, setReloadGeneration] = useState(0);
   const [navigationNotice, setNavigationNotice] = useState<string | null>(null);
   const activeController = useRef<AbortController | null>(null);
+  const stopPlaybackRef = useRef<(() => void) | null>(null);
+  const registerPlaybackStop = useCallback((stop: (() => void) | null) => {
+    stopPlaybackRef.current = stop;
+  }, []);
   const assetNavigationSnapshotRef = useRef({ assets, assetSnapshotToken, assetRequestGeneration });
   assetNavigationSnapshotRef.current = { assets, assetSnapshotToken, assetRequestGeneration };
+  const activeReadIdentityRef = useRef<{
+    portIdentity: RoughCutPortIdentity;
+    directoryIdentity: RoughCutDirectoryIdentity;
+  } | null>(null);
   const unauthorizedCallback = useRef(onUnauthorized);
   const frameNavigationInvalidatedCallback = useRef(onFrameNavigationInvalidated);
   unauthorizedCallback.current = onUnauthorized;
   frameNavigationInvalidatedCallback.current = onFrameNavigationInvalidated;
 
+  const hasCurrentCanonicalRead = readState.status === "ready"
+    && readState.portIdentity === portIdentity
+    && readState.requestGeneration === requestGeneration.current;
+  const hasCurrentPlaybackRead = hasCurrentCanonicalRead
+    && readState.directoryIdentity === directoryIdentity;
+
+  useLayoutEffect(() => {
+    const activeReadIdentity = activeReadIdentityRef.current;
+    if (
+      activeReadIdentity !== null
+      && (
+        activeReadIdentity.portIdentity !== portIdentity
+        || activeReadIdentity.directoryIdentity !== directoryIdentity
+      )
+    ) {
+      activeController.current?.abort();
+      activeController.current = null;
+      activeReadIdentityRef.current = null;
+    }
+    if (!hasCurrentPlaybackRead) {
+      stopPlaybackRef.current?.();
+    }
+  }, [directoryIdentity, hasCurrentPlaybackRead, portIdentity]);
+
   const roughCutEditor = usePersonalRoughCutEditor({
     chapterId: boundScope.chapter.id,
     save: boundScope.services.savePersonalRoughCut,
-    sourceCheck: readState.status === "ready"
+    sourceCheck: readState.status === "ready" && hasCurrentCanonicalRead
       ? inspectRoughCutSource(boundScope.chapter, readState.snapshot, assets, assetDirectoryStatus)
       : { valid: false, reason: "当前粗剪草稿尚未读取。", sourceIds: [] },
     sourceIdentity: { assets, token: assetSnapshotToken, requestGeneration: assetRequestGeneration, status: assetDirectoryStatus },
     isScopeCurrent: () => !closedRef.current && !scopeInvalidatedRef.current && sameScope(boundScope, currentScope.current),
     onBeforeSave: () => {
+      stopPlaybackRef.current?.();
       invalidateCurrentFrameNavigation();
       setNavigationNotice(null);
     },
     onSaved: (snapshot, generation) => {
-      const nextState: ReadState = { status: "ready", snapshot, requestGeneration: generation };
+      stopPlaybackRef.current?.();
+      const currentRead = readStateRef.current;
+      if (
+        currentRead.status !== "ready"
+        || currentRead.portIdentity !== currentPortIdentityRef.current
+        || currentRead.directoryIdentity !== currentDirectoryIdentityRef.current
+      ) {
+        return;
+      }
+      const nextState: ReadState = {
+        status: "ready",
+        snapshot,
+        reader: currentRead.reader,
+        requestGeneration: generation,
+        portIdentity: currentRead.portIdentity,
+        directoryIdentity: currentRead.directoryIdentity,
+      };
       readStateRef.current = nextState;
       setReadState(nextState);
     },
@@ -194,29 +332,80 @@ export function PersonalRoughCutPanel({
       return undefined;
     }
 
+    const portIdentityAtStart = portIdentity;
+    const directoryIdentityAtStart = directoryIdentity;
     const generation = ++requestGeneration.current;
     if (!roughCutEditor.beginRead(generation)) {
       return undefined;
     }
     const controller = new AbortController();
     activeController.current = controller;
+    activeReadIdentityRef.current = {
+      portIdentity: portIdentityAtStart,
+      directoryIdentity: directoryIdentityAtStart,
+    };
     let mounted = true;
     const isCurrent = () => mounted
+      && !closedRef.current
       && !controller.signal.aborted
       && requestGeneration.current === generation
-      && sameScope(boundScope, currentScope.current);
+      && sameScope(boundScope, currentScope.current)
+      && currentPortIdentityRef.current === portIdentityAtStart
+      && currentDirectoryIdentityRef.current === directoryIdentityAtStart;
 
     queueMicrotask(() => {
       if (!isCurrent()) {
         return;
       }
-      const loadingState: ReadState = { status: "loading", requestGeneration: generation };
+      const loadingState: ReadState = {
+        status: "loading",
+        requestGeneration: generation,
+        portIdentity: portIdentityAtStart,
+        directoryIdentity: directoryIdentityAtStart,
+      };
+      stopPlaybackRef.current?.();
       readStateRef.current = loadingState;
       setReadState(loadingState);
-      void boundScope.services.getPersonalRoughCut(boundScope.chapter.id, controller.signal).then((snapshot) => {
+      const readForPlayback = portIdentityAtStart.getPersonalRoughCutForPlayback;
+      const pendingRead = readForPlayback === undefined
+        ? portIdentityAtStart.getPersonalRoughCut.call(
+          portIdentityAtStart.services,
+          boundScope.chapter.id,
+          controller.signal,
+        )
+          .then((snapshot) => ({ snapshot, reader: null }))
+        : readForPlayback.call(portIdentityAtStart.services, boundScope.chapter.id, controller.signal);
+      void pendingRead.then(({ snapshot, reader }) => {
         if (isCurrent()) {
           roughCutEditor.acceptRead(snapshot, generation);
-          const nextState: ReadState = { status: "ready", snapshot, requestGeneration: generation };
+          const boundReader = reader === null ? null : Object.freeze({
+            isCurrent: () => isCurrent() && reader.isCurrent(),
+            read: async (previewUrl: string, signal: AbortSignal) => {
+              if (!isCurrent() || !reader.isCurrent() || signal.aborted) {
+                throw new ApiError("aborted", "Request was cancelled.");
+              }
+              try {
+                const blob = await reader.read(previewUrl, signal);
+                if (!isCurrent() || !reader.isCurrent() || signal.aborted) {
+                  throw new ApiError("aborted", "Request was cancelled.");
+                }
+                return blob;
+              } catch (cause) {
+                if (!isCurrent() || !reader.isCurrent() || signal.aborted) {
+                  throw new ApiError("aborted", "Request was cancelled.");
+                }
+                throw cause;
+              }
+            },
+          });
+          const nextState: ReadState = {
+            status: "ready",
+            snapshot,
+            reader: boundReader,
+            requestGeneration: generation,
+            portIdentity: portIdentityAtStart,
+            directoryIdentity: directoryIdentityAtStart,
+          };
           readStateRef.current = nextState;
           setReadState(nextState);
         }
@@ -229,7 +418,13 @@ export function PersonalRoughCutPanel({
           unauthorizedCallback.current();
           return;
         }
-        const errorState: ReadState = { status: "error", error, requestGeneration: generation };
+        const errorState: ReadState = {
+          status: "error",
+          error,
+          requestGeneration: generation,
+          portIdentity: portIdentityAtStart,
+          directoryIdentity: directoryIdentityAtStart,
+        };
         readStateRef.current = errorState;
         setReadState(errorState);
       });
@@ -242,13 +437,20 @@ export function PersonalRoughCutPanel({
       if (activeController.current === controller) {
         activeController.current = null;
       }
+      if (activeReadIdentityRef.current?.portIdentity === portIdentityAtStart) {
+        activeReadIdentityRef.current = null;
+      }
     };
   }, [reloadGeneration, scopeInvalidated, roughCutEditor.acceptRead, roughCutEditor.beginRead]);
 
   function invalidateCurrentFrameNavigation() {
     const currentRead = readStateRef.current;
     frameNavigationInvalidatedCallback.current?.({
-      snapshot: currentRead.status === "ready" ? currentRead.snapshot : null,
+      snapshot: currentRead.status === "ready"
+        && currentRead.portIdentity === currentPortIdentityRef.current
+        && currentRead.directoryIdentity === currentDirectoryIdentityRef.current
+        ? currentRead.snapshot
+        : null,
       requestGeneration: requestGeneration.current,
     });
   }
@@ -274,13 +476,21 @@ export function PersonalRoughCutPanel({
       return;
     }
     invalidateCurrentFrameNavigation();
+    stopPlaybackRef.current?.();
     if (closedRef.current || scopeInvalidatedRef.current || !sameScope(boundScope, currentScope.current)) {
       return;
     }
     requestGeneration.current = nextGeneration;
     activeController.current?.abort();
+    activeController.current = null;
+    activeReadIdentityRef.current = null;
     setNavigationNotice(null);
-    const nextState: ReadState = { status: "loading", requestGeneration: nextGeneration };
+    const nextState: ReadState = {
+      status: "loading",
+      requestGeneration: nextGeneration,
+      portIdentity,
+      directoryIdentity,
+    };
     readStateRef.current = nextState;
     setReadState(nextState);
     setReloadGeneration((generation) => generation + 1);
@@ -291,11 +501,14 @@ export function PersonalRoughCutPanel({
   }
 
   const presentation = readState.status === "error" ? errorPresentation(readState.error) : null;
-  const canonicalSnapshot = readState.status === "ready" ? readState.snapshot : null;
+  const canonicalSnapshot = readState.status === "ready" && hasCurrentCanonicalRead
+    ? readState.snapshot
+    : null;
   const snapshot = canonicalSnapshot;
   const indexedFrames = snapshot === null ? [] : indexRoughCutFrames(snapshot.frames);
   const statusCounts = countRoughCutStatusEntries(indexedFrames);
   const currentFilter = readState.status === "ready"
+    && hasCurrentCanonicalRead
     && filterSelection !== null
     && filterSelection.snapshot === readState.snapshot
     && filterSelection.requestGeneration === readState.requestGeneration
@@ -317,6 +530,7 @@ export function PersonalRoughCutPanel({
       || currentRead.status !== "ready"
       || currentRead.snapshot !== expectedSnapshot
       || currentRead.requestGeneration !== expectedGeneration
+      || currentRead.portIdentity !== currentPortIdentityRef.current
     ) {
       return;
     }
@@ -364,6 +578,8 @@ export function PersonalRoughCutPanel({
         && roughCutEditor.isCurrentNavigationRead(roughCutGeneration)
         && readStateRef.current.status === "ready"
         && readStateRef.current.snapshot === currentSnapshot
+        && readStateRef.current.portIdentity === currentPortIdentityRef.current
+        && readStateRef.current.directoryIdentity === currentDirectoryIdentityRef.current
         && assetNavigationSnapshotRef.current.assets === currentAssets
         && assetNavigationSnapshotRef.current.assetSnapshotToken === assetToken
         && assetNavigationSnapshotRef.current.assetRequestGeneration === assetGeneration
@@ -394,6 +610,7 @@ export function PersonalRoughCutPanel({
     };
     closedRef.current = true;
     requestGeneration.current += 1;
+    stopPlaybackRef.current?.();
     const controller = activeController.current;
     activeController.current = null;
     frameNavigationInvalidatedCallback.current?.(identity);
@@ -418,8 +635,11 @@ export function PersonalRoughCutPanel({
           {boundScope.services.savePersonalRoughCut !== undefined && (
             <button
               className="secondary-button"
-              disabled={!roughCutEditor.canEdit || roughCutEditor.editing}
-              onClick={roughCutEditor.openEditor}
+              disabled={!hasCurrentCanonicalRead || !roughCutEditor.canEdit || roughCutEditor.editing}
+              onClick={() => {
+                stopPlaybackRef.current?.();
+                roughCutEditor.openEditor();
+              }}
               type="button"
             >
               编辑编排
@@ -447,6 +667,13 @@ export function PersonalRoughCutPanel({
         </p>
       )}
 
+      {!hasCurrentCanonicalRead
+        && (readState.portIdentity !== portIdentity || readState.directoryIdentity !== directoryIdentity) && (
+        <p className="rough-cut-navigation-note" role="status" aria-live="polite">
+          素材目录已变化或粗剪读取服务已更新；旧播放队列已停用，请显式重新读取。
+        </p>
+      )}
+
       {presentation !== null && (
         <div className="state-panel error-panel request personal-rough-cut-error" role="alert">
           <div className="state-icon" aria-hidden="true">!</div>
@@ -471,7 +698,7 @@ export function PersonalRoughCutPanel({
         </div>
       )}
 
-      {roughCutEditor.editing && canonicalSnapshot !== null && (
+      {roughCutEditor.editing && hasCurrentCanonicalRead && canonicalSnapshot !== null && (
         <PersonalRoughCutEditor
           frames={canonicalSnapshot.frames}
           draft={roughCutEditor.draft}
@@ -498,7 +725,7 @@ export function PersonalRoughCutPanel({
         </section>
       )}
 
-      {snapshot !== null && (
+      {hasCurrentCanonicalRead && snapshot !== null && (
         <div className="personal-rough-cut-content">
           <div className="personal-rough-cut-summary">
             <strong>
@@ -510,6 +737,29 @@ export function PersonalRoughCutPanel({
               <span>{snapshot.removed_asset_ids.length} 个失效旧引用，仅显示数量。</span>
             )}
           </div>
+
+          {hasCurrentPlaybackRead ? <PersonalRoughCutPlayback
+            chapterId={boundScope.chapter.id}
+            enabled={hasCurrentPlaybackRead
+              && !roughCutEditor.editing
+              && !roughCutEditor.isSaving
+              && !roughCutEditor.isLocked}
+            onUnauthorized={() => {
+              if (readState.status === "ready" && hasCurrentPlaybackRead && readState.reader?.isCurrent()) {
+                unauthorizedCallback.current();
+              }
+            }}
+            reader={readState.status === "ready" && hasCurrentPlaybackRead ? readState.reader : null}
+            registerStop={registerPlaybackStop}
+            requestGeneration={readState.status === "ready" && hasCurrentPlaybackRead ? readState.requestGeneration : -1}
+            services={boundScope.services}
+            snapshot={snapshot}
+            userId={boundScope.userId}
+          /> : (
+            <p className="rough-cut-navigation-note" role="status" aria-live="polite">
+              素材目录已变化或粗剪读取服务已更新；旧播放队列已停用，请显式重新读取。
+            </p>
+          )}
 
           {snapshot.frames.length === 0 ? (
             <div className="personal-rough-cut-empty" role="status">
@@ -525,7 +775,7 @@ export function PersonalRoughCutPanel({
                       aria-pressed={currentFilter === option.value}
                       className="personal-rough-cut-filter-button"
                       key={option.value}
-                      onClick={() => chooseFilter(snapshot, readState.status === "ready" ? readState.requestGeneration : -1, option.value)}
+                      onClick={() => chooseFilter(snapshot, readState.status === "ready" && hasCurrentCanonicalRead ? readState.requestGeneration : -1, option.value)}
                       type="button"
                     >
                       {option.label} {statusCounts[option.value]}
@@ -542,7 +792,7 @@ export function PersonalRoughCutPanel({
                   <p>这份当前草稿投影中没有符合该条件的条目。</p>
                   <button
                     className="text-button"
-                    onClick={() => chooseFilter(snapshot, readState.status === "ready" ? readState.requestGeneration : -1, "all")}
+                    onClick={() => chooseFilter(snapshot, readState.status === "ready" && hasCurrentCanonicalRead ? readState.requestGeneration : -1, "all")}
                     type="button"
                   >
                     查看全部条目

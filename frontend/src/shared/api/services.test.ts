@@ -423,7 +423,7 @@ describe("API services", () => {
   it("surfaces 403 and invalid response failures without discarding the session", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "preserved-token");
-    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
       const pathname = new URL(String(input)).pathname;
       if (pathname.endsWith("/auth/me")) {
         return jsonResponse(responseForUser());
@@ -979,6 +979,66 @@ describe("API services", () => {
 
     await expect(pending).rejects.toMatchObject({ kind: "aborted" });
     expect(storage.getItem(API_TOKEN_KEY)).toBe("new-token");
+  });
+
+  it("reads rough-cut media through the configured API origin with the current bearer", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "current-media-token");
+    const fetcher = vi.fn(async (input: RequestInfo | URL, _init?: RequestInit) => {
+      if (new URL(String(input)).pathname.endsWith("/rough-cut")) {
+        return jsonResponse({
+          chapter_id: "chapter-one",
+          revision: 1,
+          saved: true,
+          frames: [],
+          removed_asset_ids: [],
+        });
+      }
+      return new Response("video-bytes", { headers: { "Content-Type": "video/mp4" } });
+    });
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const readForPlayback = services.getPersonalRoughCutForPlayback;
+    if (readForPlayback === undefined) throw new Error("Expected the API playback snapshot reader.");
+
+    const { snapshot, reader } = await readForPlayback("chapter-one", new AbortController().signal);
+    expect(snapshot.revision).toBe(1);
+    expect(reader).not.toBeNull();
+    if (reader === null) throw new Error("Expected a session-bound media reader.");
+    await expect(reader.read("/uploads/storyboard/clip.mp4", new AbortController().signal))
+      .resolves.toBeInstanceOf(Blob);
+
+    const [snapshotInput, snapshotInit] = fetcher.mock.calls[0] ?? [];
+    expect(String(snapshotInput)).toBe("http://127.0.0.1:4175/api/chapters/chapter-one/rough-cut");
+    expect(new Headers(snapshotInit?.headers).get("Authorization")).toBe("Bearer current-media-token");
+    const [input, init] = fetcher.mock.calls[1] ?? [];
+    expect(String(input)).toBe("http://127.0.0.1:4175/uploads/storyboard/clip.mp4");
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer current-media-token");
+  });
+
+  it("keeps the canonical rough-cut session anchor after the bearer changes", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "old-media-token");
+    const fetcher = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) => jsonResponse({
+      chapter_id: "chapter-one",
+      revision: 1,
+      saved: true,
+      frames: [],
+      removed_asset_ids: [],
+    }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const readForPlayback = services.getPersonalRoughCutForPlayback;
+    if (readForPlayback === undefined) throw new Error("Expected the API playback snapshot reader.");
+    const { reader } = await readForPlayback("chapter-one", new AbortController().signal);
+    if (reader === null) throw new Error("Expected a session-bound media reader.");
+    expect(reader.isCurrent()).toBe(true);
+
+    storage.setItem(API_TOKEN_KEY, "new-media-token");
+
+    expect(reader.isCurrent()).toBe(false);
+    await expect(reader.read("/uploads/storyboard/clip.mp4", new AbortController().signal))
+      .rejects.toMatchObject({ kind: "aborted" });
+    expect(fetcher).toHaveBeenCalledOnce();
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("new-media-token");
   });
 
   it("clears only API session data for an unauthorized series response", async () => {
