@@ -6,6 +6,11 @@ import type { Chapter, Character, Prop, Scene } from "../../shared/api/contracts
 import { ApiError } from "../../shared/api/errors";
 import type { AssetMaintenanceServicePort, AssetOrphanCheckInput } from "../../shared/api/assetMaintenance";
 import { AssetReplacementError, type AssetReplacementPort } from "../../shared/api/assetReplacement";
+import type {
+  AssetImageDirectory,
+  AssetImageUploadPort,
+  AssetImageUploadRunContext,
+} from "../../shared/api/assetImageUpload";
 import type { WorkspaceServices } from "../../shared/api/services";
 import { demoSeries } from "../series/demoSeries";
 import * as usagePanelModule from "./AssetFrameUsagePanel";
@@ -271,6 +276,111 @@ describe("asset library", () => {
     expect(serviceSet.listChapters).not.toHaveBeenCalled();
   });
 
+  it("keeps image upload records across a parent directory refresh without reusing old receipts", async () => {
+    const user = userEvent.setup();
+    const receiptUrl = "http://127.0.0.1:4175/uploads/library-image-558.png";
+    const contexts: AssetImageUploadRunContext[] = [];
+    const saveImage = vi.fn(async () => character({ image_url: receiptUrl }));
+    const readDirectory = vi.fn(async (): Promise<AssetImageDirectory> => ({
+      category: "characters",
+      items: [character({ image_url: receiptUrl })],
+      imageSources: new Map(),
+    }));
+    const port: AssetImageUploadPort = {
+      beginRun(context) {
+        contexts.push(context);
+        const receipt = Object.freeze({ kind: "asset-image-upload-receipt" as const, url: receiptUrl });
+        return {
+          isCurrent: context.isContextCurrent,
+          canSaveImage: (candidate) => candidate === receipt,
+          canReadImage: (candidate) => candidate === receipt,
+          initialImageSource: null,
+          uploadImage: vi.fn(async () => receipt),
+          saveImage,
+          readDirectory,
+          readImage: vi.fn(async () => new Blob([new Uint8Array([1])], { type: "image/png" })),
+        };
+      },
+    };
+    const services = makeServices({ assetImageUpload: port });
+    renderLibrary(services);
+    const card = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    await user.click(within(card).getByRole("button", { name: "上传/更换图片" }));
+    expect(await screen.findByRole("dialog", { name: /上传或更换图片：顾行舟/ })).toBeInTheDocument();
+    await screen.findByText("已读取当前素材目录，图片上传记录已就绪。");
+    expect(contexts[0]).toMatchObject({
+      actorId: "demo-user",
+      seriesId: series.id,
+      category: "characters",
+      assetId: character().id,
+    });
+    expect(contexts[0]?.isContextCurrent()).toBe(true);
+
+    await user.upload(screen.getByLabelText("选择图片文件"), new File(["image"], "portrait.png", { type: "image/png" }));
+    await user.click(screen.getByRole("button", { name: "上传所选图片" }));
+    expect(await screen.findByText("图片上传已收到服务器回执；尚未修改素材目录。")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "确认更新素材图片" }));
+    expect(await screen.findByText("更新回执与独立目录读取一致。")).toBeInTheDocument();
+    expect(saveImage).toHaveBeenCalledOnce();
+    expect(readDirectory).toHaveBeenCalledTimes(3);
+    await user.click(screen.getByRole("button", { name: "完成" }));
+
+    await user.click(screen.getByRole("button", { name: "重新读取" }));
+    expect(await screen.findByRole("heading", { name: "顾行舟" })).toBeInTheDocument();
+    const refreshedCard = screen.getByRole("article", { name: "顾行舟素材卡片" });
+    await user.click(within(refreshedCard).getByRole("button", { name: "上传/更换图片" }));
+    expect(await screen.findByRole("dialog", { name: /上传或更换图片：顾行舟/ })).toBeInTheDocument();
+    expect(screen.getByText("更新回执与独立目录读取一致。" )).toBeInTheDocument();
+    expect(contexts).toHaveLength(2);
+    expect(contexts[1]?.isContextCurrent()).toBe(true);
+    expect(saveImage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps upload history on close but starts a new run when the same asset is reopened", async () => {
+    const user = userEvent.setup();
+    const receiptUrl = "https://images.example.invalid/library-image.png";
+    const contexts: AssetImageUploadRunContext[] = [];
+    const port: AssetImageUploadPort = {
+      beginRun(context) {
+        contexts.push(context);
+        const receipt = Object.freeze({ kind: "asset-image-upload-receipt" as const, url: receiptUrl });
+        return {
+          isCurrent: context.isContextCurrent,
+          canSaveImage: (candidate) => candidate === receipt,
+          canReadImage: (candidate) => candidate === receipt,
+          initialImageSource: null,
+          uploadImage: vi.fn(async () => receipt),
+          saveImage: vi.fn(async () => character({ image_url: receiptUrl })),
+          readDirectory: vi.fn(async (): Promise<AssetImageDirectory> => ({
+            category: "characters",
+            items: [character()],
+            imageSources: new Map(),
+          })),
+          readImage: vi.fn(async () => new Blob(["image"], { type: "image/png" })),
+        };
+      },
+    };
+    renderLibrary(makeServices({ assetImageUpload: port }));
+    const card = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    const uploadButton = within(card).getByRole("button", { name: "上传/更换图片" });
+    await user.click(uploadButton);
+    await screen.findByRole("dialog", { name: /上传或更换图片：顾行舟/ });
+    await screen.findByText("已读取当前素材目录，图片上传记录已就绪。");
+    await user.upload(screen.getByLabelText("选择图片文件"), new File(["image"], "portrait.png", { type: "image/png" }));
+    await user.click(screen.getByRole("button", { name: "上传所选图片" }));
+    await screen.findByText("图片上传已收到服务器回执；尚未修改素材目录。");
+    await user.click(screen.getByRole("button", { name: "完成" }));
+
+    expect(contexts[0]?.isContextCurrent()).toBe(false);
+    await user.click(uploadButton);
+    await screen.findByRole("dialog", { name: /上传或更换图片：顾行舟/ });
+    expect(contexts).toHaveLength(2);
+    expect(contexts[1]?.isContextCurrent()).toBe(true);
+    expect(screen.getByText("图片上传已收到服务器回执；尚未修改素材目录。" )).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "确认更新素材图片" })).not.toBeInTheDocument();
+    expect(screen.getByText(/先前目录读取代次/)).toBeInTheDocument();
+  });
+
   it("opens replacement from the unique same-series asset card and keeps the demo entry disabled", async () => {
     const user = userEvent.setup();
     const demo = renderLibrary(makeServices({ mode: "demo" }));
@@ -429,6 +539,92 @@ describe("asset library", () => {
 
     finishWrite?.({ message: "已替换" });
     await screen.findByText(/服务已确认，但回读内容与预览不符/);
+  });
+
+  it("blocks image upload while a closed replacement dialog still has a pending write", async () => {
+    const user = userEvent.setup();
+    let finishWrite!: (receipt: { message: string }) => void;
+    const replaceChapter = vi.fn(() => new Promise<{ message: string }>((resolve) => {
+      finishWrite = resolve;
+    }));
+    const replacementPort: AssetReplacementPort = {
+      beginRun: () => ({ isCurrent: () => true, replaceChapter }),
+    };
+    const beginImageRun = vi.fn((context: AssetImageUploadRunContext) => {
+      const receipt = Object.freeze({ kind: "asset-image-upload-receipt" as const, url: "https://images.example.invalid/image.png" });
+      return {
+        isCurrent: context.isContextCurrent,
+        canSaveImage: (candidate: unknown) => candidate === receipt,
+        canReadImage: (candidate: unknown) => candidate === receipt,
+        initialImageSource: null,
+        uploadImage: vi.fn(async () => receipt),
+        saveImage: vi.fn(async () => character({ image_url: receipt.url })),
+        readDirectory: vi.fn(async (): Promise<AssetImageDirectory> => ({ category: "characters", items: [character()], imageSources: new Map() })),
+        readImage: vi.fn(async () => new Blob(["image"], { type: "image/png" })),
+      };
+    });
+    const services = makeServices({
+      assetReplacement: replacementPort,
+      assetImageUpload: { beginRun: beginImageRun },
+      listCharacters: vi.fn(async () => [character(), character({ id: "new-character-id", name: "新角色" })]),
+      listChapters: vi.fn(async () => [chapter("chapter-real-id", "第一章引用")]),
+    });
+    renderLibrary(services);
+    const oldCard = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    await user.click(within(oldCard).getByRole("button", { name: "替换章节引用" }));
+    await user.selectOptions(await screen.findByRole("combobox", { name: "新角色" }), "new-character-id");
+    await user.click(await screen.findByRole("checkbox", { name: /^选择章节 / }));
+    await user.click(screen.getByRole("checkbox", { name: /我已核对所选章节/ }));
+    await user.click(screen.getByRole("button", { name: /确认并逐章替换/ }));
+    await waitFor(() => expect(replaceChapter).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("button", { name: "关闭并保留本次记录" }));
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+
+    await user.click(within(oldCard).getByRole("button", { name: "上传/更换图片" }));
+    expect(beginImageRun).not.toHaveBeenCalled();
+    expect(screen.queryByRole("dialog", { name: /上传或更换图片/ })).not.toBeInTheDocument();
+
+    finishWrite?.({ message: "已替换" });
+    await waitFor(() => expect(within(oldCard).getByRole("button", { name: "上传/更换图片" })).toBeEnabled());
+    await user.click(within(oldCard).getByRole("button", { name: "上传/更换图片" }));
+    await screen.findByRole("dialog", { name: /上传或更换图片/ });
+    await screen.findByText("已读取当前素材目录，图片上传记录已就绪。");
+    expect(beginImageRun).toHaveBeenCalledOnce();
+  });
+
+  it("traps focus in the image dialog and prevents a background usage action from invalidating it", async () => {
+    const user = userEvent.setup();
+    const receipt = Object.freeze({ kind: "asset-image-upload-receipt" as const, url: "https://images.example.invalid/image.png" });
+    const port: AssetImageUploadPort = {
+      beginRun: (context) => ({
+        isCurrent: context.isContextCurrent,
+        canSaveImage: (candidate) => candidate === receipt,
+        canReadImage: (candidate) => candidate === receipt,
+        initialImageSource: null,
+        uploadImage: vi.fn(async () => receipt),
+        saveImage: vi.fn(async () => character({ image_url: receipt.url })),
+        readDirectory: vi.fn(async (): Promise<AssetImageDirectory> => ({ category: "characters", items: [character()], imageSources: new Map() })),
+        readImage: vi.fn(async () => new Blob(["image"], { type: "image/png" })),
+      }),
+    };
+    const services = makeServices({ assetImageUpload: port });
+    const cardView = renderLibrary(services);
+    const card = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    const uploadButton = within(card).getByRole("button", { name: "上传/更换图片" });
+    await user.click(uploadButton);
+    const dialog = await screen.findByRole("dialog", { name: /上传或更换图片：顾行舟/ });
+    const closeButton = within(dialog).getByRole("button", { name: "关闭图片上传" });
+    await waitFor(() => expect(document.activeElement).toBe(closeButton));
+    expect(card.closest("[inert]")).not.toBeNull();
+
+    await user.click(within(card).getByRole("button", { name: "查看关联镜头：顾行舟" }));
+    expect(screen.queryByRole("region", { name: "关联镜头" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: /上传或更换图片/ })).toBeInTheDocument();
+    await user.keyboard("{Escape}");
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: /上传或更换图片/ })).not.toBeInTheDocument());
+    expect(document.activeElement).toBe(uploadButton);
+    cardView.unmount();
   });
 
   it("keeps maintenance unconnected without a port and bridges confirmed orphans to the existing delete preview", async () => {

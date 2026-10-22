@@ -23,6 +23,14 @@ import {
   type AssetFrameUsageOwner,
 } from "./AssetFrameUsagePanel";
 import { AssetReplacementDialog } from "./replacement/AssetReplacementDialog";
+import {
+  AssetImageUploadDialog,
+  type AssetImageUploadAttempt,
+} from "./media/AssetImageUploadDialog";
+import type {
+  AssetImageDirectory,
+  AssetImageUploadRun,
+} from "../../shared/api/assetImageUpload";
 
 type AssetRecord = Character | Scene | Prop;
 
@@ -116,6 +124,19 @@ interface AssetReplacementRequest {
   openEpoch: number;
   writeInFlight: boolean;
   hasAttempt: boolean;
+}
+
+interface AssetImageUploadRequest {
+  id: number;
+  scope: LibraryScope;
+  category: AssetLibraryType;
+  asset: AssetRecord;
+  directoryResult: ScopedAssetResult;
+  port: NonNullable<WorkspaceServices["assetImageUpload"]>;
+  run: AssetImageUploadRun;
+  attempts: AssetImageUploadAttempt[];
+  openEpoch: number;
+  invalidateRun(): void;
 }
 
 const assetTypes: Array<{ id: AssetLibraryType; label: string }> = [
@@ -280,6 +301,8 @@ function AssetCard({
   onShowUsage,
   onReplace,
   replacementUnavailable,
+  onUploadImage,
+  imageUploadUnavailable,
   onEdit,
   onDelete,
   usageUnavailable,
@@ -296,6 +319,8 @@ function AssetCard({
   onShowUsage?: (() => void) | undefined;
   onReplace?: (() => void) | undefined;
   replacementUnavailable?: string | undefined;
+  onUploadImage?: (() => void) | undefined;
+  imageUploadUnavailable?: string | undefined;
   onEdit?: (() => void) | undefined;
   onDelete?: (() => void) | undefined;
   usageUnavailable: boolean;
@@ -367,6 +392,12 @@ function AssetCard({
           </button>
           {replacementUnavailable !== undefined && <small role="note">{replacementUnavailable}</small>}
         </div>
+        <div className="asset-card-image-upload-action">
+          <button className="secondary-button" disabled={onUploadImage === undefined} onClick={onUploadImage} type="button">
+            上传/更换图片
+          </button>
+          {imageUploadUnavailable !== undefined && <small role="note">{imageUploadUnavailable}</small>}
+        </div>
         {(onEdit !== undefined || onDelete !== undefined) && (
           <div className="asset-card-management-actions" aria-label={name + "素材操作"}>
             {onEdit !== undefined && <button onClick={onEdit} type="button">编辑</button>}
@@ -433,6 +464,15 @@ export function AssetLibrary({
   const activeReplacementIdRef = useRef(activeReplacementId);
   activeReplacementIdRef.current = activeReplacementId;
   const replacementRequestIdRef = useRef(0);
+  const [imageUploadRequests, setImageUploadRequests] = useState<AssetImageUploadRequest[]>([]);
+  const imageUploadRequestsRef = useRef(imageUploadRequests);
+  imageUploadRequestsRef.current = imageUploadRequests;
+  const [activeImageUploadId, setActiveImageUploadId] = useState<number | null>(null);
+  const activeImageUploadIdRef = useRef(activeImageUploadId);
+  activeImageUploadIdRef.current = activeImageUploadId;
+  const imageUploadRequestIdRef = useRef(0);
+  const imageUploadAttemptIdRef = useRef(0);
+  const [imageUploadIssue, setImageUploadIssue] = useState<string | null>(null);
   const [pendingLocateAsset, setPendingLocateAsset] = useState<{
     assetId: string;
     scope: LibraryScope;
@@ -462,8 +502,43 @@ export function AssetLibrary({
   navigationAbandonedHandlerRef.current = onNavigationAbandoned;
   unauthorizedHandlerRef.current = onUnauthorized;
 
+  function invalidateActiveImageUpload(): void {
+    const activeId = activeImageUploadIdRef.current;
+    if (activeId === null) return;
+    const request = imageUploadRequestsRef.current.find((candidate) => candidate.id === activeId);
+    if (request !== undefined) {
+      request.invalidateRun();
+      const lastAttempt = request.attempts.at(-1);
+      if (lastAttempt?.state === "uploading" || lastAttempt?.state === "confirming"
+        || lastAttempt?.state === "saving" || lastAttempt?.state === "acknowledged") {
+        const nextAttempts = request.attempts.map((attempt) => attempt.id === lastAttempt.id
+          ? {
+            ...attempt,
+            state: lastAttempt.state === "uploading"
+              ? "upload-unknown" as const
+              : lastAttempt.state === "confirming"
+                ? "uploaded" as const
+                : lastAttempt.state === "saving" ? "save-unknown" as const : "acknowledged-read-failed" as const,
+            message: lastAttempt.state === "confirming"
+              ? "窗口在确认前只读核对期间关闭；目录更新未发送，上传回执已保留。"
+              : "操作窗口已关闭或目录状态已变化，原写入结果尚未确认。",
+          }
+          : attempt);
+        const nextRequests = imageUploadRequestsRef.current.map((candidate) => candidate.id === request.id
+          ? { ...candidate, attempts: nextAttempts }
+          : candidate);
+        imageUploadRequestsRef.current = nextRequests;
+        setImageUploadRequests(nextRequests);
+      }
+    }
+    activeImageUploadIdRef.current = null;
+    setActiveImageUploadId(null);
+    openEpochRef.current += 1;
+  }
+
   const previousScope = libraryScopeRef.current;
   if (previousScope.userId !== userId || previousScope.services !== services || previousScope.seriesId !== series.id) {
+    invalidateActiveImageUpload();
     libraryScopeRef.current = { userId, services, seriesId: series.id, generation: previousScope.generation + 1 };
     directoryRequestGenerationRef.current += 1;
     searchGenerationRef.current += 1;
@@ -503,6 +578,7 @@ export function AssetLibrary({
   if (effectiveNavigationIntent === null) {
     observedNavigationEpochRef.current = null;
   } else if (observedNavigationEpochRef.current !== effectiveNavigationIntent.navigationEpoch) {
+    invalidateActiveImageUpload();
     observedNavigationEpochRef.current = effectiveNavigationIntent.navigationEpoch;
     directoryRequestGenerationRef.current += 1;
     searchGenerationRef.current += 1;
@@ -717,6 +793,7 @@ export function AssetLibrary({
       return;
     }
     directoryRequestGenerationRef.current += 1;
+    invalidateActiveImageUpload();
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
     setManagementRequest(null);
@@ -741,6 +818,7 @@ export function AssetLibrary({
     directorySnapshot: AssetByCategory[Category][],
   ) {
     if (replacementRequestsRef.current.some((request) => request.writeInFlight)) return;
+    if (activeImageUploadIdRef.current !== null) return;
     const activeOwner = usageOwnerRef.current;
     if (
       activeOwner !== null
@@ -805,6 +883,7 @@ export function AssetLibrary({
     if (item !== null && !hasUniqueUsageIdentity(directoryItems, item, series.id)) {
       return;
     }
+    invalidateActiveImageUpload();
     invalidateUsage();
     const request: AssetManagementRequest = {
       id: ++managementRequestIdRef.current,
@@ -833,6 +912,7 @@ export function AssetLibrary({
     ) {
       return;
     }
+    invalidateActiveImageUpload();
     const request: AssetMaintenanceRequest = {
       id: ++maintenanceRequestIdRef.current,
       scope: libraryScope,
@@ -876,6 +956,7 @@ export function AssetLibrary({
       return;
     }
 
+    invalidateActiveImageUpload();
     invalidateUsage();
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
@@ -911,6 +992,199 @@ export function AssetLibrary({
     setActiveReplacementId(request.id);
   }
 
+  function isCurrentImageUploadContext(requestId: number): boolean {
+    const request = imageUploadRequestsRef.current.find((candidate) => candidate.id === requestId);
+    const activeResult = resultRef.current;
+    return request !== undefined
+      && request.scope === libraryScopeRef.current
+      && request.scope.userId === userId
+      && request.scope.services === services
+      && request.scope.seriesId === series.id
+      && request.category === selectedTypeRef.current
+      && request.port === services.assetImageUpload
+      && series.can_enter !== false
+      && activeResult === request.directoryResult
+      && activeResult.result.status === "ready"
+      && activeResult.result.type === request.category
+      && directoryRequestGenerationRef.current === request.directoryResult.requestGeneration
+      && hasUniqueUsageIdentity(activeResult.result.items, request.asset, series.id);
+  }
+
+  function isCurrentImageUpload(request: AssetImageUploadRequest, requestEpoch: number): boolean {
+    const activeRequest = imageUploadRequestsRef.current.find((candidate) => candidate.id === request.id);
+    return activeRequest !== undefined
+      && activeRequest.openEpoch === requestEpoch
+      && activeImageUploadIdRef.current === request.id
+      && openEpochRef.current === requestEpoch
+      && activeRequest.scope === libraryScopeRef.current
+      && activeRequest.scope.userId === userId
+      && activeRequest.scope.services === services
+      && activeRequest.scope.seriesId === series.id
+      && activeRequest.category === selectedTypeRef.current
+      && activeRequest.port === services.assetImageUpload
+      && series.can_enter !== false
+      && resultRef.current === activeRequest.directoryResult
+      && resultRef.current.result.status === "ready"
+      && resultRef.current.result.type === activeRequest.category
+      && directoryRequestGenerationRef.current === activeRequest.directoryResult.requestGeneration
+      && hasUniqueUsageIdentity(resultRef.current.result.items, activeRequest.asset, series.id);
+  }
+
+  function openImageUpload(
+    category: AssetLibraryType,
+    item: AssetRecord,
+    directoryItems: AssetRecord[],
+  ): void {
+    const activeResult = resultRef.current;
+    const port = services.assetImageUpload;
+    if (
+      replacementRequestsRef.current.some((request) => request.writeInFlight)
+      ||
+      series.can_enter === false
+      || port === undefined
+      || category !== selectedTypeRef.current
+      || activeResult === null
+      || activeResult.scope !== libraryScope
+      || activeResult.result.status !== "ready"
+      || activeResult.result.type !== category
+      || libraryScopeRef.current !== libraryScope
+      || !hasValidCategoryName(category, item)
+      || !hasUniqueUsageIdentity(directoryItems, item, series.id)
+    ) {
+      return;
+    }
+
+    const existing = imageUploadRequestsRef.current.find((request) => request.scope === libraryScope
+      && request.category === category
+      && request.asset.id === item.id
+      && request.port === port
+      && request.directoryResult === activeResult
+      && request.run.isCurrent());
+    if (existing !== undefined) {
+      invalidateActiveImageUpload();
+      invalidateUsage();
+      managementRequestRef.current = null;
+      invalidatedManagementRequestRef.current = null;
+      setManagementRequest(null);
+      maintenanceRequestRef.current = null;
+      setMaintenanceRequest(null);
+      const openEpoch = ++openEpochRef.current;
+      const nextRequest = { ...existing, asset: item, openEpoch };
+      const nextRequests = imageUploadRequestsRef.current.map((request) => request.id === existing.id ? nextRequest : request);
+      imageUploadRequestsRef.current = nextRequests;
+      setImageUploadRequests(nextRequests);
+      activeImageUploadIdRef.current = nextRequest.id;
+      setActiveImageUploadId(nextRequest.id);
+      setImageUploadIssue(null);
+      return;
+    }
+
+    invalidateActiveImageUpload();
+    invalidateUsage();
+    managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
+    setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
+    resetAssetSearch();
+    const previous = imageUploadRequestsRef.current.filter((request) => request.scope === libraryScope
+      && request.category === category
+      && request.asset.id === item.id
+      && request.port === port).at(-1);
+    const requestId = ++imageUploadRequestIdRef.current;
+    const requestEpoch = ++openEpochRef.current;
+    let runIsOpen = true;
+    let request: AssetImageUploadRequest;
+    try {
+      const run = port.beginRun({
+        actorId: userId,
+        seriesId: series.id,
+        category,
+        assetId: item.id,
+        directoryEpoch: activeResult.requestGeneration,
+        portEpoch: requestId,
+        asset: item,
+        isContextCurrent: () => runIsOpen && isCurrentImageUploadContext(requestId),
+      });
+      request = {
+        id: requestId,
+        scope: libraryScope,
+        category,
+        asset: item,
+        directoryResult: activeResult,
+        port,
+        run,
+        attempts: previous?.attempts ?? [],
+        openEpoch: requestEpoch,
+        invalidateRun: () => { runIsOpen = false; },
+      };
+    } catch (error) {
+      setImageUploadIssue(error instanceof Error ? error.message : "无法创建图片操作，请重新读取素材目录。");
+      return;
+    }
+    const nextRequests = [...imageUploadRequestsRef.current, request];
+    imageUploadRequestsRef.current = nextRequests;
+    setImageUploadRequests(nextRequests);
+    activeImageUploadIdRef.current = request.id;
+    setActiveImageUploadId(request.id);
+    setImageUploadIssue(null);
+  }
+
+  function setImageUploadAttempts(
+    request: AssetImageUploadRequest,
+    requestEpoch: number,
+    attempts: AssetImageUploadAttempt[],
+  ): void {
+    if (!isCurrentImageUpload(request, requestEpoch)) return;
+    const nextRequests = imageUploadRequestsRef.current.map((candidate) => candidate.id === request.id
+      ? { ...candidate, attempts }
+      : candidate);
+    imageUploadRequestsRef.current = nextRequests;
+    setImageUploadRequests(nextRequests);
+  }
+
+  function acceptImageUploadDirectory(
+    request: AssetImageUploadRequest,
+    directory: AssetImageDirectory,
+    requestEpoch: number,
+  ): void {
+    if (!isCurrentImageUpload(request, requestEpoch) || directory.category !== request.category) return;
+    let ready: AssetReadyResult;
+    switch (directory.category) {
+      case "characters": ready = { type: "characters", status: "ready", items: directory.items }; break;
+      case "scenes": ready = { type: "scenes", status: "ready", items: directory.items }; break;
+      case "props": ready = { type: "props", status: "ready", items: directory.items }; break;
+    }
+    const requestGeneration = ++directoryRequestGenerationRef.current;
+    cache.current.set(directory.category, ready);
+    resetAssetSearch();
+    usageOwnerRef.current = null;
+    setUsageOwner(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
+    setNavigationFeedback(null);
+    const nextResult: ScopedAssetResult = {
+      scope: request.scope,
+      requestGeneration,
+      navigationEpoch: null,
+      result: ready,
+    };
+    const nextRequests = imageUploadRequestsRef.current.map((candidate) => candidate.id === request.id
+      ? { ...candidate, asset: ready.items.find((item) => item.id === candidate.asset.id) ?? candidate.asset, directoryResult: nextResult }
+      : candidate);
+    imageUploadRequestsRef.current = nextRequests;
+    setImageUploadRequests(nextRequests);
+    resultRef.current = nextResult;
+    setResult(nextResult);
+  }
+
+  function closeImageUpload(request: AssetImageUploadRequest, requestEpoch: number): void {
+    if (!isCurrentImageUpload(request, requestEpoch)) return;
+    invalidateActiveImageUpload();
+  }
+
   function openReplacementRecord(request: AssetReplacementRequest): void {
     const current = replacementRequestsRef.current.find((candidate) => candidate.id === request.id);
     if (
@@ -926,6 +1200,7 @@ export function AssetLibrary({
       return;
     }
 
+    invalidateActiveImageUpload();
     invalidateUsage();
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
@@ -1171,6 +1446,7 @@ export function AssetLibrary({
   }
 
   function reloadCurrentType(): number {
+    invalidateActiveImageUpload();
     const nextReloadVersion = reloadVersionRef.current + 1;
     reloadVersionRef.current = nextReloadVersion;
     directoryRequestGenerationRef.current += 1;
@@ -1201,6 +1477,7 @@ export function AssetLibrary({
   }
 
   function goBack() {
+    invalidateActiveImageUpload();
     abandonNavigationIntent();
     invalidateUsage();
     invalidatedManagementRequestRef.current = null;
@@ -1226,6 +1503,15 @@ export function AssetLibrary({
         ? "当前账号不能进入此剧集，不能替换章节引用。"
         : services.assetReplacement === undefined
           ? services.mode === "demo" ? "演示模式暂未接入素材替换服务。" : "当前服务暂未接入素材替换接口。"
+          : undefined;
+    const imageUploadUnavailable = !identityIsUnique
+      ? "素材身份暂无法核对，不能更新图片。"
+      : series.can_enter === false
+        ? "当前账号不能进入此剧集，不能更新图片。"
+        : replacementRequestsRef.current.some((request) => request.writeInFlight)
+          ? "章节素材替换仍在进行，暂不能更新图片。"
+        : services.assetImageUpload === undefined
+          ? services.mode === "demo" ? "演示模式暂未接入图片上传服务。" : "当前服务暂未接入图片上传接口。"
           : undefined;
     return (
       <AssetCard
@@ -1257,6 +1543,8 @@ export function AssetLibrary({
         onShowUsage={identityIsUnique ? () => openUsage(category, item, items) : undefined}
         onReplace={replacementUnavailable === undefined ? () => openReplacement(category, item, items) : undefined}
         replacementUnavailable={replacementUnavailable}
+        onUploadImage={imageUploadUnavailable === undefined ? () => openImageUpload(category, item, items) : undefined}
+        imageUploadUnavailable={imageUploadUnavailable}
         onEdit={identityIsUnique ? () => openManagement("edit", category, item, items) : undefined}
         onDelete={identityIsUnique ? () => openManagement("delete", category, item, items) : undefined}
         usageUnavailable={!identityIsUnique}
@@ -1532,6 +1820,9 @@ export function AssetLibrary({
           {services.mode === "demo" ? "演示模式暂未接入素材维护服务。" : "当前服务暂未接入素材维护接口。"}
         </p>
       )}
+      {imageUploadIssue !== null && (
+        <p className="asset-image-upload-issue" role="alert">{imageUploadIssue}</p>
+      )}
 
       <div className="asset-library-toolbar">
         <div className="asset-type-tabs" role="group" aria-label="素材分类">
@@ -1734,6 +2025,28 @@ export function AssetLibrary({
           seriesId={series.id}
           seriesName={series.name}
           services={services}
+        />
+      ))}
+      {imageUploadRequests.filter((request) => request.id === activeImageUploadId
+        && request.scope === libraryScope
+        && request.category === selectedType
+        && request.port === services.assetImageUpload).map((request) => (
+        <AssetImageUploadDialog
+          allocateAttemptId={() => ++imageUploadAttemptIdRef.current}
+          asset={request.asset}
+          attempts={request.attempts}
+          category={request.category}
+          isCurrent={() => isCurrentImageUpload(request, request.openEpoch)}
+          key={request.id}
+          onAttemptsChange={(attempts) => setImageUploadAttempts(request, request.openEpoch, attempts)}
+          onClose={() => closeImageUpload(request, request.openEpoch)}
+          onDirectoryUpdated={(directory) => acceptImageUploadDirectory(request, directory, request.openEpoch)}
+          onUnauthorized={() => {
+            if (isCurrentImageUpload(request, request.openEpoch)) unauthorizedHandlerRef.current();
+          }}
+          run={request.run}
+          runId={request.id}
+          seriesName={series.name}
         />
       ))}
     </section>
