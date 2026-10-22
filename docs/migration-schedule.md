@@ -14,13 +14,17 @@
 
 ## 最新进展（2026-10-22）
 
-Root553 已将 F 播放器合入并普通推送至 main 与 F，当前两者均为 `d1b047fbc93da0626401fa0e7ce8535b9b798d1b`。Root552 在合并后的源码上完成受影响前端门禁：10 个文件 176 项通过，`services.test.ts` 定向 7 项通过、另 46 项跳过；TypeScript `--noEmit` 与生产构建通过。该结果不是全前端全量门禁，也未运行 backend。正式 539-03 源码复核将 RCP539-01～06 全部关闭；它证明源码复核通过，不代表实际浏览器解码或可听播放已验收。
+当前 main、图片上传功能分支 `codex/asset-image-upload-556` 及各自的 origin 远端 refs 均指向 `57ffad1933568de7810d7aaa8561b563104c31bb`；F 播放器功能分支 `codex/rough-cut-playback-533` 及其 origin 远端仍指向 `57c0996e400f54096e32e55417093a979bb1a921`。本次 main 提交“接入素材图片上传、引用保存与受保护预览”包含已整合的 F 播放器功能及 U05.5 图片上传接线；各提交的边界和历史状态仍按对应收据解释。
 
-U08.2 当前为 P/P、V=P、A=U：canonical 视频队列（含视频自带声音）、连续播放、失败重试、protected 上传的 Bearer→Blob URL 与清理、会话目录隔离已接入 main。本行只部分完成，整行剩余义务仍开放。独立音轨、真实浏览器解码/可听、E2E 不在本批；导出另属 U08.3。开发/接线/验证动作计数保持 21/18/51。用户当前只暂缓 E2E，其他工作按需要继续开发、单测、类型检查和源码复核。
+U05.5 当前为 P/P、V=P、A=U：三类素材卡片已提供 image-only 上传入口，按 fresh 目录 GET、一次 multipart 上传、明确确认前再次 GET、一次仅写 `image_url` 的 PUT、独立 GET 回读执行；保留原 run/token 身份与迟到 401 防护、unknown/ACK 区分、关窗历史及旧写资格失效，并提供受保护 proxy/Blob 预览与回收、焦点管理和 StrictMode 重放恢复。本行仍未闭合：完成 `MediaUploadApplication` 存储适配器的显式装配（当前默认 `storage=None`）并补相应验证；音视频、OSS 重试、生成历史、其他媒体引用链及真实 R2 配置/验收和浏览器验收仍待。
+
+U08.2 仍为 P/P、V=P、A=U：canonical 视频队列（含视频自带声音）、连续播放、失败重试、protected 上传的 Bearer→Blob URL 与清理、会话目录隔离已接入 main。RCP539-01～06 已经 539-03 源码复核关闭，但这不代表实际浏览器解码或可听播放验收；独立音轨、E2E 不在本批，导出另属 U08.3。开发/接线/验证动作计数保持 21/18/51。用户当前只暂缓 E2E，其他工作按需要继续开发、单测、类型检查和源码复核。
+
+U05.5 受影响的四个前端测试文件共 89 项通过（Dialog 9、AssetLibrary 65、API 12、Preview 3）；未变的 services 测试复用同一源码版本既有结果 1 项通过、52 项跳过。TypeScript 检查与 Root 生产构建通过。560-03 源码复核关闭 AIMG560-01～09，并保留 AIMG558-01。以上是定向源码复核、受影响测试、类型检查和生产构建证据，不是全前端门禁，也不证明 HTTP、真实存储或浏览器行为。
 
 frame.optimize P6 已提交并推送至功能分支 `codex/frame-optimize-apply-512`，tip 为 `e54d03b8a319f5bfcc956f2c70a907bbf39016e7`；15 个受影响 backend 文件的 153 项检查通过，Root542-02 源码复核 PASS，但尚未合入 main。N6 取消/恢复、runtime、HTTP 与 UI 仍待继续。U04.2/U04.3 仍为 P/P；A01–A39 完整矩阵接受数仍为 0，A39 GrillMe 保持 `OFFLINE_PENDING`。
 
-本次进展依据：Root553 整合收据 SHA-256 `c0172bc27a1459d5626951c38ec681a7dedb94bb9d2df8ee9a62add132b0b432`；Root552 合并后受影响门禁 SHA-256 `458e9547681be3a28af8153da0639db114d3e189305974e7c92f721fece00afd`；539-03 源码复核 SHA-256 `373915e1bc88b5a7c544537d9b2c653ac02469cd9fa0137e383d6475d2dd8522`；frame.optimize P6 发布收据 SHA-256 `b6f4ad7d7089f594b66bea0a6ab737f08372936c385b0a378eac0a710e3d09e0`；Root542-02 源码复核 SHA-256 `7d7b01c76b165064d48f811a054085c047ba9f5b270e2f7d3b1bc8e12555391a`。
+本次进展依据：作者 558-03 收据 SHA-256 `71871d730aabedb1d674e11d2060d4664b8beac57f58a3df49e706d389350a84`；560-03 源码复核 SHA-256 `bdcd01338017c4ea1900ddc5b6b08827f8754d43c6793897869f8007830bb79d`；Root561 生产构建收据 SHA-256 `4bf89777bc0f5c6c8d59d81272b6fd7447e4e16e9c6887d7fcd48e0972fd0cd7`；Root562 发布收据 SHA-256 `da66c5f4b87dafb2be967043007e7014eb3b6985ddb916323dde547080c5b92a`。frame.optimize P6 发布收据 SHA-256 `b6f4ad7d7089f594b66bea0a6ab737f08372936c385b0a378eac0a710e3d09e0`；Root542-02 源码复核 SHA-256 `7d7b01c76b165064d48f811a054085c047ba9f5b270e2f7d3b1bc8e12555391a`。
 
 状态简写：C＝已实现或已接入；P＝部分；M＝缺失；I＝进行中；U＝当前没有足够验证；E＝依赖外部授权或外部环境。验证和接受状态分别以 V/A 标明。实现、接线状态为 C 的行只在相应列记为完成；局部测试、历史浏览器和当前完整接受不可互相替代。
 
@@ -68,7 +72,7 @@ frame.optimize P6 已提交并推送至功能分支 `codex/frame-optimize-apply-
 | U05.2 | 孤立项、重复项、忽略/取消忽略和合并 | C | C | V=P / A=U；素材维护 UI/API 已随十路径整合至 main@43b10ec；owned HTTP 五类维护路由×角色/场景/道具三类与 SQLite 检查通过，GUI 为部分通过 | 集中补齐 fault/unknown、独立 merge POST 计数与无自动重试、403/scope 切换、完整焦点路径及权限/媒体/认可保全；用户当前只暂缓 E2E，必要开发与单元/类型/源码检查继续，最终验收待补。 |
 | U05.3 | 融合素材查看/编辑/删除与生成 | P | M | V=P / A=U；准入/claim/应用和 ports 已有，create_app 默认 runtime/storage 为 None | 接入现有 runtime/storage 并做 owned 本地验证，再建 UI、任务回读和失败状态；真实 provider 另行验收。 |
 | U05.4 | 跨章节素材替换 | C | C | V=P / A=U；素材卡片、逐章影响预览与选择、再次读取核对/明确确认、串行单次 POST、独立 GET 核对、逐章 ACK/unknown/未发送状态及显式只读恢复已接入；5 个受影响前端测试文件 134 项、TSC 和生产构建通过 | 补 HTTP、GUI 与 E2E 验收，并继续核对权限、媒体与认可保全；用户当前暂缓 E2E。 |
-| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | M | V=P / A=U；后端上传/R2 adapter 存在，前端当前仅剧集封面上传 | 装配 MediaUploadApplication 和 storage/fetch 能力；补上传、预览、历史选择和引用链；本地 owned 文件先验，真实 R2 另授权。 |
+| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | P | V=P / A=U；57ffad1 已将 image-only 三类素材卡片入口接入 main，完成 fresh 目录 GET→multipart 上传→确认前 GET→仅 image_url PUT→独立 GET；含原 run/token 与迟到 401 防护、unknown/ACK、关窗历史与旧资格失效、受保护 proxy/Blob 预览回收、焦点及 StrictMode 恢复。560-03 复核关闭 AIMG560-01～09；四个受影响测试文件 89 项通过，TSC 与生产构建通过。非全前端、HTTP、真实存储或浏览器验收。 | 完成存储适配器的显式装配（当前默认 `storage=None`）并补相应验证；补音视频、OSS 重试、生成历史及其他媒体引用链；真实 R2 配置/验收与浏览器验收仍待。 |
 
 ### U06 AI 助手、生成、提取、Worker 与恢复
 
