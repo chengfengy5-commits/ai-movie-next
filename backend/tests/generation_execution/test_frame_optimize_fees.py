@@ -277,9 +277,16 @@ def test_insufficient_fee_stops_new_intents_even_after_wallet_recharge(tmp_path)
         after = rows_for(case)
         assert len(after["external"]) == 2
         assert len(after["receipts"]) == 2
-        assert len(after["fees"]) == 2
+        assert len(after["fees"]) == 3
         assert len(after["creditLogs"]) == 1
         assert after["wallet"][0]["credits"] == 50
+        third_fee = next(row for row in after["fees"] if row.unit_id == third.unit_id)
+        assert third_fee.resolution == "stopped_insufficient"
+        assert third_fee.ledger_ref is None
+        assert third_fee.generation_result_ref is None
+        assert third_fee.application_ref is None
+        assert not any(row.unit_id == third.unit_id for row in after["work"])
+        assert not any(row.unit_id == third.unit_id for row in after["receipts"])
         assert next(row for row in after["work"] if row.unit_id == first.unit_id).phase == "delivery_pending"
         assert next(row for row in after["work"] if row.unit_id == second.unit_id).phase == "stopped_insufficient"
     finally:

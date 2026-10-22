@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Mapping
@@ -30,6 +31,7 @@ from haoai_backend.generation_core.schema import (
     ApplicationRecordRow,
     GenerationResultReceiptRow,
     LocalContinuationWorkRow,
+    PolicyStopEventRow,
     UnitFeeDecisionRow,
 )
 
@@ -51,8 +53,11 @@ class FrameOptimizeProgress:
     ledgers_by_unit: Mapping[str, Mapping[str, object]]
     applications_by_unit: Mapping[str, Mapping[str, object]]
     applied_by_unit: Mapping[str, AppliedFrameOptimizeFact]
+    unstarted_insufficient_by_unit: Mapping[str, Mapping[str, object]]
     partial_results: tuple[tuple[int, str], ...]
     stopped_insufficient: bool
+    policy_stop_event_refs: tuple[str, ...]
+    terminal_error: str | None
 
 
 def lock_frame_optimize_progress(
@@ -109,6 +114,12 @@ def lock_frame_optimize_progress(
         .order_by(ApplicationRecordRow.unit_id, ApplicationRecordRow.application_ref)
         .with_for_update()
     ).mappings().all()
+    policy_stop_rows = session.execute(
+        select(PolicyStopEventRow.__table__)
+        .where(PolicyStopEventRow.task_id == task_id)
+        .order_by(PolicyStopEventRow.event_id)
+        .with_for_update()
+    ).mappings().all()
 
     receipts = _unique_by_unit(receipt_rows, "unit_id")
     works = _unique_by_unit(work_rows, "unit_id")
@@ -133,6 +144,8 @@ def lock_frame_optimize_progress(
 
     evidence_by_unit: dict[str, Mapping[str, object]] = {}
     applied_by_unit: dict[str, AppliedFrameOptimizeFact] = {}
+    unstarted_insufficient: dict[str, Mapping[str, object]] = {}
+    insufficient_anchors: set[str] = set()
     units = graph.units_by_id
     steps = graph.steps_by_unit
     external = graph.external_by_step
@@ -162,7 +175,6 @@ def lock_frame_optimize_progress(
         if receipt is None:
             if (
                 work is not None
-                or fee is not None
                 or ledger is not None
                 or application is not None
                 or unit.get("result_status") != "pending"
@@ -172,6 +184,15 @@ def lock_frame_optimize_progress(
                 or unit.get("success_confirmed_at") is not None
             ):
                 return None
+            if fee is not None:
+                if not _unstarted_insufficient_matches(
+                    fee,
+                    unit,
+                    step,
+                    graph.external_by_step.get(str(step.get("id"))),
+                ):
+                    return None
+                unstarted_insufficient[unit_id] = fee
             continue
 
         evidence = evidence_by_id.get(str(receipt.get("evidence_id")))
@@ -226,9 +247,10 @@ def lock_frame_optimize_progress(
 
         phase = work.get("phase")
         resolution = fee.get("resolution") if fee else None
-        if phase == "finalize_pending":
+        if phase in {"finalize_pending", "done"}:
+            expected_phase_version = 2 if phase == "finalize_pending" else 3
             if (
-                work.get("phase_version") != 2
+                work.get("phase_version") != expected_phase_version
                 or work.get("fee_decision_ref") != unit_id
                 or fee is None
                 or application is None
@@ -271,7 +293,7 @@ def lock_frame_optimize_progress(
                 return None
         elif application is not None or work.get("application_ref") is not None:
             return None
-        if phase not in {"finalize_pending", "stopped_delivery_failed"} and (
+        if phase not in {"finalize_pending", "done", "stopped_delivery_failed"} and (
             step.get("execution_status") != "result_observed"
             or evidence.get("application_status") != "pending"
             or evidence.get("applied_at") is not None
@@ -283,7 +305,7 @@ def lock_frame_optimize_progress(
             external_row,
             step,
             decoded,
-            applied=phase == "finalize_pending",
+            applied=phase in {"finalize_pending", "done"},
         ):
             return None
         if phase == "fee_pending":
@@ -313,7 +335,7 @@ def lock_frame_optimize_progress(
                 pass
             else:
                 return None
-        elif phase in {"finalize_pending", "stopped_delivery_failed"}:
+        elif phase in {"finalize_pending", "done", "stopped_delivery_failed"}:
             if not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount):
                 return None
             if resolution == "charged":
@@ -336,11 +358,17 @@ def lock_frame_optimize_progress(
                 return None
             if phase == "stopped_insufficient":
                 saw_insufficient = True
+                if amount > 0:
+                    insufficient_anchors.add(unit_id)
         else:
             return None
 
+    if unstarted_insufficient and not insufficient_anchors:
+        return None
     items_by_index = {item.frame_index: item for item in graph.verified.items}
-    partial_results = parse_partial_results(graph.task.get("result"), items_by_index)
+    partial_results, terminal_error = _parse_task_results(
+        graph.task, items_by_index, works, unstarted_insufficient
+    )
     if partial_results is None:
         return None
     expected_results = {
@@ -370,6 +398,26 @@ def lock_frame_optimize_progress(
     if not saw_insufficient and graph.task.get("recovery_status") != "ready":
         return None
 
+    all_closed = _all_generation_slots_closed(unit_ids, works, unstarted_insufficient)
+    task_status = graph.task.get("status")
+    if task_status == "completed" and (
+        not all_closed or not applied_by_unit or terminal_error is not None
+    ):
+        return None
+    if task_status == "failed" and (
+        not all_closed or applied_by_unit or terminal_error is None
+    ):
+        return None
+    if task_status in {"completed", "failed"} and (
+        graph.task.get("progress") != 100
+        or graph.task.get("claimed_by") is not None
+        or graph.task.get("claim_token") is not None
+        or graph.task.get("lease_until") is not None
+    ):
+        return None
+    if task_status not in {"failed", "completed"} and terminal_error is not None:
+        return None
+
     return FrameOptimizeProgress(
         receipts_by_unit=receipts,
         evidence_by_unit=evidence_by_unit,
@@ -378,9 +426,88 @@ def lock_frame_optimize_progress(
         ledgers_by_unit=ledgers,
         applications_by_unit=applications,
         applied_by_unit=applied_by_unit,
+        unstarted_insufficient_by_unit=unstarted_insufficient,
         partial_results=partial_results,
         stopped_insufficient=saw_insufficient,
+        policy_stop_event_refs=tuple(str(row["event_id"]) for row in policy_stop_rows),
+        terminal_error=terminal_error,
     )
+
+
+def _unstarted_insufficient_matches(fee, unit, step, external) -> bool:
+    return bool(
+        fee.get("unit_id") == unit.get("id")
+        and fee.get("charge_phase") == "pre_apply"
+        and fee.get("resolution") == "stopped_insufficient"
+        and fee.get("ledger_ref") is None
+        and fee.get("generation_result_ref") is None
+        and fee.get("application_ref") is None
+        and _utc(fee.get("resolved_at")) is not None
+        and type(unit.get("quoted_amount")) is int
+        and unit.get("quoted_amount") >= 0
+        and unit.get("result_status") == "pending"
+        and unit.get("billing_status") == "unbilled"
+        and unit.get("debited_amount") == 0
+        and unit.get("refunded_amount") == 0
+        and unit.get("first_intent_at") is None
+        and unit.get("deadline_at") is None
+        and unit.get("success_confirmed_at") is None
+        and unit.get("user_cancelled_at") is None
+        and step.get("execution_status") == "prepared"
+        and external is None
+    )
+
+
+def _parse_task_results(task, items_by_index, works, unstarted_insufficient):
+    raw = task.get("result")
+    parsed = parse_partial_results(raw, items_by_index)
+    if parsed is not None:
+        return parsed, None
+    if task.get("status") != "failed" or not isinstance(raw, str):
+        return None, None
+    try:
+        value = json.loads(raw)
+    except (TypeError, json.JSONDecodeError):
+        return None, None
+    if not isinstance(value, dict) or set(value) != {"partial", "error"}:
+        return None, None
+    if value.get("partial") != [] or not isinstance(value.get("error"), str):
+        return None, None
+    expected = _failure_reason(works, unstarted_insufficient)
+    if expected is None or value.get("error") != expected:
+        return None, None
+    return (), expected
+
+
+def _failure_reason(works, unstarted_insufficient):
+    if unstarted_insufficient or any(
+        work.get("phase") == "stopped_insufficient" for work in works.values()
+    ):
+        return "insufficient_credits"
+    reasons = {
+        str(work.get("terminal_reason"))
+        for work in works.values()
+        if work.get("phase") in {"stopped_delivery_failed", "stopped_late_generation"}
+        and isinstance(work.get("terminal_reason"), str)
+    }
+    if len(reasons) == 1:
+        return next(iter(reasons))
+    if reasons:
+        return "frame_optimize_results_unapplied"
+    return None
+
+
+def _all_generation_slots_closed(unit_ids, works, unstarted_insufficient):
+    terminal_phases = {
+        "done",
+        "stopped_insufficient",
+        "stopped_delivery_failed",
+        "stopped_late_generation",
+    }
+    closed = {
+        unit_id for unit_id, work in works.items() if work.get("phase") in terminal_phases
+    } | set(unstarted_insufficient)
+    return closed == set(unit_ids) and set(works) <= set(unit_ids)
 
 
 def decode_optimize_text(locator: object, expected_digest: object) -> str | None:

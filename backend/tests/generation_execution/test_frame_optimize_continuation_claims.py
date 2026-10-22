@@ -15,6 +15,7 @@ from generation_execution.frame_optimize_execution_helpers import (
     claim_one,
     fee_adapter,
     intent_adapter,
+    locked_batch,
     persist_result,
     persist_result_and_fee,
     prepare_item,
@@ -171,7 +172,14 @@ def test_insufficient_continuation_release_clears_its_lease_and_preserves_siblin
         assert rows["task"]["credit_cost"] == 3
         assert rows["wallet"][0]["credits"] == 0
         assert len(rows["receipts"]) == len(rows["evidence"]) == len(rows["work"]) == 2
-        assert len(rows["fees"]) == 2
+        assert len(rows["fees"]) == 3
+        unstarted = locked_batch(case).verified.items[2]
+        unstarted_fee = next(row for row in rows["fees"] if row.unit_id == unstarted.unit_id)
+        assert unstarted_fee.resolution == "stopped_insufficient"
+        assert unstarted_fee.generation_result_ref is None
+        assert unstarted_fee.ledger_ref is None
+        assert not any(row.unit_id == unstarted.unit_id for row in rows["work"])
+        assert not any(row.unit_id == unstarted.unit_id for row in rows["receipts"])
         assert len(rows["creditLogs"]) == 1
         assert rows["creditLogs"][0].billing_unit_id == paid_item.unit_id
         assert rows["applications"] == []

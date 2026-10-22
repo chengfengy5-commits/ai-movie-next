@@ -32,6 +32,9 @@ from haoai_backend.generation_core.frame_optimize_continuation_claims import (
     SqlAlchemyFrameOptimizeContinuationClaims,
 )
 from haoai_backend.generation_core.frame_optimize_fees import SqlAlchemyFrameOptimizeFees
+from haoai_backend.generation_core.frame_optimize_finalization import (
+    SqlAlchemyFrameOptimizeFinalization,
+)
 from haoai_backend.generation_core.frame_optimize_application import (
     SqlAlchemyFrameOptimizeApplications,
 )
@@ -245,6 +248,19 @@ def application_adapter(
     )
 
 
+def finalization_adapter(case: FrameOptimizeCase, *, continuation_claims=None):
+    claims = continuation_claims or continuation_claim_adapter(
+        case, token="opt-finalization-claim"
+    )
+    return SqlAlchemyFrameOptimizeFinalization(
+        session_factory=case.sessions,
+        db_clock=lambda: case.clock[0],
+        crypto=case.capabilities.crypto,
+        proof_authority=case.capabilities.proof_authority,
+        continuation_claims=claims,
+    )
+
+
 def persist_result(case, claim, prepared, *, text: str = "optimized frame"):
     assert prepared.disposition == "committed"
     assert prepared.intent is not None
@@ -286,6 +302,13 @@ def persist_result_and_fee(case, claim, prepared, fees, *, text: str = "optimize
 def apply_current(case: FrameOptimizeCase, claim: ClaimAuthority, unit_id: str, *, adapter=None):
     work = next(row for row in rows_for(case)["work"] if row.unit_id == unit_id)
     return (adapter or application_adapter(case)).deliver_current(claim, work.work_id)
+
+
+def finalize_current(
+    case: FrameOptimizeCase, claim: ClaimAuthority, unit_id: str, *, adapter=None
+):
+    work = next(row for row in rows_for(case)["work"] if row.unit_id == unit_id)
+    return (adapter or finalization_adapter(case)).finalize_current(claim, work.work_id)
 
 
 def claim_one(case: FrameOptimizeCase, *, token: str = "frame-optimize-claim-token") -> ClaimAuthority:
@@ -429,6 +452,8 @@ __all__ = [
     "claim_one",
     "continuation_claim_adapter",
     "fee_adapter",
+    "finalization_adapter",
+    "finalize_current",
     "intent_adapter",
     "locked_batch",
     "prepare_item",

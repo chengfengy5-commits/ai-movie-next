@@ -325,6 +325,18 @@ class SqlAlchemyFrameOptimizeFees:
             next_work, expected_phase_version=int(work["phase_version"])
         ).status != "updated":
             raise _FeeWriteConflict
+        if stop:
+            from haoai_backend.generation_core.frame_optimize_stop_settlement import (
+                stage_unstarted_insufficient_siblings,
+            )
+
+            stage_unstarted_insufficient_siblings(
+                session,
+                locked.graph,
+                progress,
+                trigger_unit_id=claim.unit_id,
+                resolved_at=commit_now,
+            )
         return _FeeWrite(
             owner_id=claim.owner_scope.user_id,
             task_id=claim.owner_scope.task_id,

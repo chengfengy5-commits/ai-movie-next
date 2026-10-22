@@ -309,7 +309,19 @@ class SqlAlchemyFrameOptimizeClaims:
                 has_intent = has_any_intent(graph)
                 if not valid_intent_projection(graph):
                     return None
-                status = "reconciling" if has_intent else "queued"
+                progress = lock_frame_optimize_progress(session, graph)
+                if progress is None:
+                    return None
+                has_ready_finalization = any(
+                    work.get("phase") == "finalize_pending"
+                    and work.get("phase_version") == 2
+                    for work in progress.works_by_unit.values()
+                )
+                status = (
+                    "queued"
+                    if not has_intent or has_ready_finalization
+                    else "reconciling"
+                )
                 table = AITaskRow.__table__
                 result = session.execute(
                     update(table)
@@ -397,6 +409,19 @@ class SqlAlchemyFrameOptimizeClaims:
                     if graph is None:
                         return None
                     task = graph.task
+                    progress = lock_frame_optimize_progress(session, graph)
+                    if progress is None:
+                        return None
+                    has_ready_finalization = any(
+                        work.get("phase") == "finalize_pending"
+                        and work.get("phase_version") == 2
+                        for work in progress.works_by_unit.values()
+                    )
+                    release_state_matches = (
+                        has_any_intent(graph)
+                        if write.status == "reconciling"
+                        else not has_any_intent(graph) or has_ready_finalization
+                    )
                     return write.status if all(
                         (
                             task.get("status") == write.status,
@@ -406,7 +431,7 @@ class SqlAlchemyFrameOptimizeClaims:
                             task.get("execution_generation") == claim.execution_generation,
                             task.get("user_cancelled_at") is None,
                             _same_time(task.get("updated_at"), write.updated_at),
-                            has_any_intent(graph) == (write.status == "reconciling"),
+                            release_state_matches,
                         )
                     ) else None
         except Exception:
