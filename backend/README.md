@@ -100,6 +100,19 @@ backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分
 组件职责与两阶段边界见[架构说明](../docs/architecture/chapter-asset-replacement-backend.md)，实际验证和限制见[本批验证记录](../openspec/changes/modularize-backend-chapter-asset-replacement/verification.md)。本地 SQLite/HTTP 验收不等于 PostgreSQL 并发或生产数据库验收。
 
 
+## 显式后端宿主
+
+`backend.server` 是现有 `haoai_backend.app.create_app` 的显式运行入口。它只在启动时读取 `ENVIRONMENT`、`DATABASE_URL`、`SECRET_KEY` 和命名的对象存储变量，不加载 `.env` 或 AWS 默认配置；创建一个 Engine，并把同一个 Session factory 交给认证与业务 app。入口只监听 `127.0.0.1:8000`，使用单进程并让 Uvicorn 托管既有 app lifespan。启动和关闭不创建 schema、执行迁移或种子数据。
+
+运行时依赖见 `backend/requirements-server.txt`。从仓库根目录运行需显式设置 `PYTHONPATH=backend/src`。必需的 `ENVIRONMENT` 为 `development`、`test` 或 `production`；`DATABASE_URL` 必须明确指向 SQLite 或 PostgreSQL，开发和测试环境中的 SQLite 只接受绝对文件路径，空库、内存库和 `mode=memory` URI 均拒绝，生产只接受 PostgreSQL；生产 `SECRET_KEY` 至少 32 个字符。没有对象存储配置时，非生产环境仍可启动，但上传保持未接线并返回既有失败响应，生产启动则失败关闭。
+
+只有同时提供 `OBJECT_STORAGE_ENDPOINT_URL`、`OBJECT_STORAGE_ACCESS_KEY_ID`、`OBJECT_STORAGE_SECRET_ACCESS_KEY`、`OBJECT_STORAGE_BUCKET`、`OBJECT_STORAGE_PUBLIC_BASE_URL` 和已存在且可写的 `TRANSFER_TMP_DIR`，才会装配现有 R2 上传 adapter。`ALLOW_R2_DEV=true` 仅允许非生产环境显式使用 `r2.dev`。读取变量本身不会连接数据库或 R2；运行健康探测仅在 `/ready` 请求时执行。该入口不表示真实 R2、PostgreSQL、部署或浏览器验收已经完成。
+
+```sh
+PYTHONPATH=backend/src python3.12 -m backend.server
+```
+
+
 ## 团队功能
 
 团队后端由 management、series、reporting 三个族组成，分别承接团队与邀请管理、剧集共享和认领、团队用量查询。每个族提供自己的 HTTP router、应用服务和持久化适配器；应用装配继续注入当前认证身份、团队策略和同一数据库 Session。

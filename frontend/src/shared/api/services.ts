@@ -93,6 +93,7 @@ import {
   type PersonalRoughCutSnapshot,
   type PersonalRoughCutUpdate,
 } from "./personalRoughCut";
+import { readRoughCutMedia as readRoughCutMediaBlob } from "./roughCutMedia";
 import { inspectRoughCutSource } from "../../features/chapters/personal-production/roughCutEdit";
 import { demoTaskRecords, getDemoMyTaskPage } from "../../features/tasks/demoTasks";
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
@@ -128,6 +129,12 @@ import { createTeamSeriesHttpPort } from "./teamSeriesHttp";
 import type { TeamSeriesServicePort } from "./teamSeries";
 import { createTeamReportingHttpPort } from "./teamReportingHttp";
 import type { TeamReportingServicePort } from "./teamReporting";
+import { createAssetMaintenanceHttpPort } from "./assetMaintenanceHttp";
+import type { AssetMaintenanceServicePort } from "./assetMaintenance";
+import { createAssetReplacementHttpPort } from "./assetReplacementHttp";
+import type { AssetReplacementPort } from "./assetReplacement";
+import { createAssetImageUploadHttpPort } from "./assetImageUploadHttp";
+import type { AssetImageUploadPort } from "./assetImageUpload";
 import {
   parseStoryboardModels,
   parseStoryboardPrompts,
@@ -181,6 +188,9 @@ export interface WorkspaceServices {
   readonly teamManagement?: TeamManagementServicePort;
   readonly teamSeries?: TeamSeriesServicePort;
   readonly teamReporting?: TeamReportingServicePort;
+  readonly assetMaintenance?: AssetMaintenanceServicePort;
+  readonly assetReplacement?: AssetReplacementPort;
+  readonly assetImageUpload?: AssetImageUploadPort;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
@@ -237,6 +247,10 @@ export interface WorkspaceServices {
     signal: AbortSignal,
   ): Promise<PersonalProductionSnapshot>;
   getPersonalRoughCut(chapterId: string, signal: AbortSignal): Promise<PersonalRoughCutSnapshot>;
+  getPersonalRoughCutForPlayback?(
+    chapterId: string,
+    signal: AbortSignal,
+  ): Promise<PersonalRoughCutPlaybackRead>;
   savePersonalRoughCut?(
     chapterId: string,
     update: PersonalRoughCutUpdate,
@@ -251,6 +265,16 @@ export interface WorkspaceServices {
   exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
   importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
   logout(): void;
+}
+
+export interface PersonalRoughCutPlaybackReader {
+  isCurrent(): boolean;
+  read(previewUrl: string, signal: AbortSignal): Promise<Blob>;
+}
+
+export interface PersonalRoughCutPlaybackRead {
+  snapshot: PersonalRoughCutSnapshot;
+  reader: PersonalRoughCutPlaybackReader | null;
 }
 
 export interface ServiceOptions {
@@ -2749,6 +2773,24 @@ export function createApiServices(
       timeoutMs,
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
+    assetMaintenance: createAssetMaintenanceHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    assetReplacement: createAssetReplacementHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    assetImageUpload: createAssetImageUploadHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
     creatorSettings,
     frameReview,
     accountProfile,
@@ -3192,6 +3234,71 @@ export function createApiServices(
         return parsePersonalRoughCutSnapshot(payload, chapterId);
       } catch (error) {
         if (signal.aborted || storage.getItem(API_TOKEN_KEY) !== token) {
+          throw new ApiError("aborted", "Request was cancelled.");
+        }
+        throw error;
+      }
+    },
+    async getPersonalRoughCutForPlayback(chapterId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      const token = storage.getItem(API_TOKEN_KEY);
+      if (!token) {
+        throw new ApiError("http", "登录状态已失效，请重新登录。", 401);
+      }
+
+      const isCurrent = () => storage.getItem(API_TOKEN_KEY) === token;
+      const reader: PersonalRoughCutPlaybackReader = Object.freeze({
+        isCurrent,
+        async read(previewUrl: string, mediaSignal: AbortSignal) {
+          if (mediaSignal.aborted || !isCurrent()) {
+            throw new ApiError("aborted", "Request was cancelled.");
+          }
+
+          let safeBaseUrl: string;
+          try {
+            const pageUrl = typeof window === "undefined" ? apiBaseUrl : window.location.href;
+            safeBaseUrl = resolveApiBaseUrl(apiBaseUrl, pageUrl);
+          } catch (error) {
+            const message = error instanceof ApiConfigurationError
+              ? error.message
+              : "当前配置不允许读取粗剪视频。";
+            throw new ApiError("invalid-response", message);
+          }
+
+          try {
+            const blob = await readRoughCutMediaBlob({
+              previewUrl,
+              apiBaseUrl: safeBaseUrl,
+              token,
+              fetcher,
+              signal: mediaSignal,
+            });
+            if (mediaSignal.aborted || !isCurrent()) {
+              throw new ApiError("aborted", "Request was cancelled.");
+            }
+            return blob;
+          } catch (error) {
+            if (mediaSignal.aborted || !isCurrent()) {
+              throw new ApiError("aborted", "Request was cancelled.");
+            }
+            throw error;
+          }
+        },
+      });
+
+      try {
+        const payload = await request("personalRoughCut", token, signal, undefined, { chapterId });
+        if (signal.aborted || !isCurrent()) {
+          throw new ApiError("aborted", "Request was cancelled.");
+        }
+        return {
+          snapshot: parsePersonalRoughCutSnapshot(payload, chapterId),
+          reader,
+        };
+      } catch (error) {
+        if (signal.aborted || !isCurrent()) {
           throw new ApiError("aborted", "Request was cancelled.");
         }
         throw error;

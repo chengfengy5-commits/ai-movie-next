@@ -1,7 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useLayoutEffect, useState } from "react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, StoryboardAsset } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
@@ -99,6 +99,38 @@ function makeSnapshot(chapterId = "chapter-rough-cut"): PersonalRoughCutSnapshot
   };
 }
 
+function makePlayableAssets(chapter: Chapter, assetIds: string[]): StoryboardAsset[] {
+  return assetIds.map((id, index) => ({
+    id,
+    series_id: chapter.series_id,
+    chapter_id: chapter.id,
+    frame_index: index,
+    name: `素材 ${index + 1}`,
+    description: null,
+    image_url: null,
+    created_at: "2026-10-01T00:00:00Z",
+    updated_at: "2026-10-02T00:00:00Z",
+  }));
+}
+
+function makePlayableSnapshot(chapterId: string, assetIds: string[], revision = 4): PersonalRoughCutSnapshot {
+  return {
+    chapter_id: chapterId,
+    revision,
+    saved: true,
+    frames: assetIds.map((assetId, index) => ({
+      asset_id: assetId,
+      frame_index: index,
+      text: `镜头 ${index + 1}`,
+      preview_url: `/uploads/${assetId}.mp4`,
+      missing_reason: null,
+      included: true,
+      pending: false,
+    })),
+    removed_asset_ids: [],
+  };
+}
+
 function makeServices(getPersonalRoughCut: WorkspaceServices["getPersonalRoughCut"]): WorkspaceServices {
   return {
     mode: "api",
@@ -152,9 +184,404 @@ function renderPanel(
 }
 
 describe("personal rough-cut panel", () => {
+  beforeEach(() => {
+    class TestURL extends URL {
+      static createObjectURL = vi.fn((_blob: Blob) => "blob:panel-playback/1");
+      static revokeObjectURL = vi.fn((_url: string) => undefined);
+    }
+    vi.stubGlobal("URL", TestURL);
+    vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
+  });
+
   afterEach(() => {
     cleanup();
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
     jsxRuntimeProbe.buttonProps.length = 0;
+  });
+
+  it("keeps playback bound to the saved snapshot across filtering and stops before editing", async () => {
+    const chapter = makeChapter();
+    chapter.content = ["frame-a", "frame-b", "frame-excluded"].map((id) => ({
+      text: id,
+      storyboard: [id],
+      preview: `/uploads/${id}.mp4`,
+    }));
+    const assets: StoryboardAsset[] = ["frame-a", "frame-b", "frame-excluded"].map((id, index) => ({
+      id,
+      series_id: chapter.series_id,
+      chapter_id: chapter.id,
+      frame_index: index,
+      name: `素材${index}`,
+      description: null,
+      image_url: null,
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-02T00:00:00Z",
+    }));
+    const savedSnapshot: PersonalRoughCutSnapshot = {
+      chapter_id: chapter.id,
+      revision: 4,
+      saved: true,
+      frames: ["frame-a", "frame-b", "frame-excluded"].map((id, index) => ({
+        asset_id: id,
+        frame_index: index,
+        text: id,
+        preview_url: `/uploads/${id}.mp4`,
+        missing_reason: null,
+        included: id !== "frame-excluded",
+        pending: false,
+      })),
+      removed_asset_ids: [],
+    };
+    const mediaRead = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["video"]));
+    const reader = { isCurrent: () => true, read: mediaRead };
+    const services = {
+      ...makeServices(async () => savedSnapshot),
+      getPersonalRoughCutForPlayback: vi.fn(async () => ({ snapshot: savedSnapshot, reader })),
+      savePersonalRoughCut: vi.fn(async () => savedSnapshot),
+    };
+    render(
+      <PersonalRoughCutPanel
+        assets={assets}
+        assetDirectoryStatus="ready"
+        assetRequestGeneration={2}
+        assetSnapshotToken={assets}
+        chapter={chapter}
+        onClose={vi.fn()}
+        onUnauthorized={vi.fn()}
+        seriesId={chapter.series_id}
+        services={services}
+        userId="demo-user"
+      />,
+    );
+
+    const playQueue = await screen.findByRole("list", { name: "保存顺序播放队列" });
+    expect(within(playQueue).getAllByRole("listitem")).toHaveLength(2);
+    fireEvent.click(screen.getByRole("button", { name: "已排除 1" }));
+    expect(within(screen.getByRole("list", { name: "保存顺序播放队列" })).getAllByRole("listitem"))
+      .toHaveLength(2);
+
+    const firstQueueButton = within(screen.getByRole("list", { name: "保存顺序播放队列" }))
+      .getAllByRole("button", { name: "从此镜试看" })[0]!;
+    fireEvent.click(firstQueueButton);
+    const video = screen.getByLabelText("当前镜头视频预览") as HTMLVideoElement;
+    await waitFor(() => expect(video.getAttribute("src")).toBe("blob:panel-playback/1"));
+    const signal = mediaRead.mock.calls[0]?.[1];
+
+    fireEvent.click(screen.getByRole("button", { name: "编辑编排" }));
+
+    expect(signal?.aborted).toBe(true);
+    expect(video.getAttribute("src")).toBeNull();
+    expect(screen.getByText("编辑或保存期间，试看已停止。")).toBeInTheDocument();
+    expect(within(screen.getByRole("list", { name: "保存顺序播放队列" })).getAllByRole("listitem"))
+      .toHaveLength(2);
+  });
+
+  it("keeps the previous saved queue disabled after an unknown save until an explicit reread", async () => {
+    const user = userEvent.setup();
+    const chapter = makeChapter();
+    const assetIds = ["rough-a", "rough-b"];
+    chapter.content = assetIds.map((id) => ({ text: `正文 ${id}`, storyboard: [id] }));
+    const assets = makePlayableAssets(chapter, assetIds);
+    const savedSnapshot = makePlayableSnapshot(chapter.id, assetIds);
+    const rereadSnapshot = makePlayableSnapshot(chapter.id, ["rough-b", "rough-a"], 5);
+    const initialMediaRead = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["old clip"]));
+    const refreshedMediaRead = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["new clip"]));
+    const initialReader = { isCurrent: () => true, read: initialMediaRead };
+    const refreshedReader = { isCurrent: () => true, read: refreshedMediaRead };
+    const pendingSave = deferred<PersonalRoughCutSnapshot>();
+    const save = vi.fn((_chapterId: string, _update: unknown, _signal: AbortSignal) => pendingSave.promise);
+    const readForPlayback = vi.fn()
+      .mockResolvedValueOnce({ snapshot: savedSnapshot, reader: initialReader })
+      .mockResolvedValueOnce({ snapshot: rereadSnapshot, reader: refreshedReader });
+    const services = {
+      ...makeServices(async () => savedSnapshot),
+      getPersonalRoughCutForPlayback: readForPlayback,
+      savePersonalRoughCut: save,
+    };
+    const panelProps = {
+      assets,
+      assetDirectoryStatus: "ready" as const,
+      assetRequestGeneration: 4,
+      assetSnapshotToken: assets,
+      chapter,
+      onClose: vi.fn(),
+      onUnauthorized: vi.fn(),
+      seriesId: chapter.series_id,
+      services,
+      userId: "demo-user",
+    };
+    render(<PersonalRoughCutPanel {...panelProps} />);
+
+    await screen.findByRole("list", { name: "保存顺序播放队列" });
+    expect(screen.getByRole("button", { name: "从头试看" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "编辑编排" }));
+    await user.click(screen.getByRole("button", { name: "下移镜头 1" }));
+    await user.click(screen.getByRole("button", { name: "保存粗剪编排" }));
+    expect(await screen.findByText("正在保存粗剪编排…")).toBeInTheDocument();
+
+    await act(async () => {
+      pendingSave.reject(new ApiError("network", "保存结果暂不可确认"));
+      await pendingSave.promise.catch(() => undefined);
+    });
+
+    expect(await screen.findByText("等待核实的只读意图")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "从头试看" })).toBeDisabled();
+    const queue = screen.getByRole("list", { name: "保存顺序播放队列" });
+    for (const button of within(queue).getAllByRole("button", { name: "从此镜试看" })) {
+      expect(button).toBeDisabled();
+    }
+    fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+    expect(initialMediaRead).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "重新读取" }));
+    await screen.findByText("已保存草稿的当前投影 · 版本 5");
+    expect(screen.getByRole("button", { name: "从头试看" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+    await waitFor(() => expect(refreshedMediaRead).toHaveBeenCalledWith("/uploads/rough-b.mp4", expect.any(AbortSignal)));
+    expect(readForPlayback).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["success", "unauthorized"] as const)(
+    "invalidates an in-flight GET from a replaced playback port and requires an explicit reread (%s)",
+    async (outcome) => {
+      const chapter = makeChapter();
+      const staleSnapshot = makePlayableSnapshot(chapter.id, ["old-port"], 91);
+      const currentSnapshot = makePlayableSnapshot(chapter.id, ["new-port"], 7);
+      const staleReader = { isCurrent: () => true, read: vi.fn(async () => new Blob(["stale"])) };
+      const currentReader = { isCurrent: () => true, read: vi.fn(async () => new Blob(["current"])) };
+      const oldGet = deferred<{ snapshot: PersonalRoughCutSnapshot; reader: typeof staleReader }>();
+      const oldPort = vi.fn(() => oldGet.promise);
+      const newPort = vi.fn(async () => ({ snapshot: currentSnapshot, reader: currentReader }));
+      const services = {
+        ...makeServices(async () => staleSnapshot),
+        getPersonalRoughCutForPlayback: oldPort,
+      };
+      const onUnauthorized = vi.fn();
+      const panelProps = {
+        chapter,
+        onClose: vi.fn(),
+        onUnauthorized,
+        seriesId: chapter.series_id,
+        services,
+        userId: "demo-user",
+      };
+      const view = render(<PersonalRoughCutPanel {...panelProps} />);
+      await waitFor(() => expect(oldPort).toHaveBeenCalledOnce());
+
+      services.getPersonalRoughCutForPlayback = newPort;
+      view.rerender(<PersonalRoughCutPanel {...panelProps} />);
+      await act(async () => {
+        if (outcome === "success") {
+          oldGet.resolve({ snapshot: staleSnapshot, reader: staleReader });
+          await oldGet.promise;
+        } else {
+          oldGet.reject(new ApiError("http", "old port unauthorized", 401));
+          await oldGet.promise.catch(() => undefined);
+        }
+      });
+
+      expect(screen.queryByText("已保存草稿的当前投影 · 版本 91")).not.toBeInTheDocument();
+      expect(onUnauthorized).not.toHaveBeenCalled();
+      expect(newPort).not.toHaveBeenCalled();
+      fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+      expect(await screen.findByText("已保存草稿的当前投影 · 版本 7")).toBeInTheDocument();
+      expect(newPort).toHaveBeenCalledOnce();
+      expect(staleReader.read).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(["success", "unauthorized"] as const)(
+    "stops an old reader after an in-place playback-port replacement and uses the new port only after reread (%s)",
+    async (outcome) => {
+      const chapter = makeChapter();
+      const assetIds = ["port-frame"];
+      const snapshot = makePlayableSnapshot(chapter.id, assetIds, 4);
+      const nextSnapshot = makePlayableSnapshot(chapter.id, ["new-port-frame"], 5);
+      const pendingMedia = deferred<Blob>();
+      const oldMediaRead = vi.fn((_url: string, _signal: AbortSignal) => pendingMedia.promise);
+      const currentMediaRead = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["current"]));
+      const oldReader = { isCurrent: () => true, read: oldMediaRead };
+      const currentReader = { isCurrent: () => true, read: currentMediaRead };
+      const oldPort = vi.fn(async () => ({ snapshot, reader: oldReader }));
+      const newPort = vi.fn(async () => ({ snapshot: nextSnapshot, reader: currentReader }));
+      const services = {
+        ...makeServices(async () => snapshot),
+        getPersonalRoughCutForPlayback: oldPort,
+      };
+      const onUnauthorized = vi.fn();
+      const panelProps = {
+        chapter,
+        onClose: vi.fn(),
+        onUnauthorized,
+        seriesId: chapter.series_id,
+        services,
+        userId: "demo-user",
+      };
+      const view = render(<PersonalRoughCutPanel {...panelProps} />);
+      await screen.findByRole("list", { name: "保存顺序播放队列" });
+      fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+      await waitFor(() => expect(oldMediaRead).toHaveBeenCalledOnce());
+      const oldSignal = oldMediaRead.mock.calls[0]?.[1];
+
+      services.getPersonalRoughCutForPlayback = newPort;
+      view.rerender(<PersonalRoughCutPanel {...panelProps} />);
+      await act(async () => {
+        if (outcome === "success") {
+          pendingMedia.resolve(new Blob(["late old media"]));
+          await pendingMedia.promise;
+        } else {
+          pendingMedia.reject(new ApiError("http", "old reader unauthorized", 401));
+          await pendingMedia.promise.catch(() => undefined);
+        }
+      });
+
+      expect(oldSignal?.aborted).toBe(true);
+      expect(oldMediaRead).toHaveBeenCalledOnce();
+      expect(URL.createObjectURL).not.toHaveBeenCalled();
+      expect(onUnauthorized).not.toHaveBeenCalled();
+      expect(screen.queryByRole("list", { name: "保存顺序播放队列" })).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+      await screen.findByRole("list", { name: "保存顺序播放队列" });
+      fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+      await waitFor(() => expect(currentMediaRead).toHaveBeenCalledWith("/uploads/new-port-frame.mp4", expect.any(AbortSignal)));
+      expect(newPort).toHaveBeenCalledOnce();
+      expect(oldMediaRead).toHaveBeenCalledOnce();
+    },
+  );
+
+  it("discards a playback queue when the asset directory epoch changes and waits for reread", async () => {
+    const chapter = makeChapter();
+    const assetIds = ["directory-frame"];
+    chapter.content = assetIds.map((id) => ({ text: id, storyboard: [id] }));
+    const assets = makePlayableAssets(chapter, assetIds);
+    const nextAssets = makePlayableAssets(chapter, assetIds);
+    const snapshot = makePlayableSnapshot(chapter.id, assetIds);
+    const pendingMedia = deferred<Blob>();
+    const oldMediaRead = vi.fn((_url: string, _signal: AbortSignal) => pendingMedia.promise);
+    const currentMediaRead = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["current"]));
+    const oldReader = { isCurrent: () => true, read: oldMediaRead };
+    const currentReader = { isCurrent: () => true, read: currentMediaRead };
+    const getForPlayback = vi.fn()
+      .mockResolvedValueOnce({ snapshot, reader: oldReader })
+      .mockResolvedValueOnce({ snapshot, reader: currentReader });
+    const services = {
+      ...makeServices(async () => snapshot),
+      getPersonalRoughCutForPlayback: getForPlayback,
+    };
+    const onUnauthorized = vi.fn();
+    const firstToken = {};
+    const nextToken = {};
+    const props = {
+      chapter,
+      onClose: vi.fn(),
+      onUnauthorized,
+      seriesId: chapter.series_id,
+      services,
+      userId: "demo-user",
+    };
+    const view = render(
+      <PersonalRoughCutPanel
+        {...props}
+        assetDirectoryStatus="ready"
+        assetRequestGeneration={8}
+        assetSnapshotToken={firstToken}
+        assets={assets}
+      />,
+    );
+    await screen.findByRole("list", { name: "保存顺序播放队列" });
+    fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+    await waitFor(() => expect(oldMediaRead).toHaveBeenCalledOnce());
+    const oldSignal = oldMediaRead.mock.calls[0]?.[1];
+
+    view.rerender(
+      <PersonalRoughCutPanel
+        {...props}
+        assetDirectoryStatus="ready"
+        assetRequestGeneration={9}
+        assetSnapshotToken={nextToken}
+        assets={nextAssets}
+      />,
+    );
+    expect(oldSignal?.aborted).toBe(true);
+    expect(screen.queryByRole("list", { name: "保存顺序播放队列" })).not.toBeInTheDocument();
+    expect(screen.getByText(/素材目录已变化/)).toBeInTheDocument();
+    expect(getForPlayback).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      pendingMedia.resolve(new Blob(["late directory media"]));
+      await pendingMedia.promise;
+    });
+    expect(URL.createObjectURL).not.toHaveBeenCalled();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+    await screen.findByRole("list", { name: "保存顺序播放队列" });
+    expect(getForPlayback).toHaveBeenCalledTimes(2);
+    fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+    await waitFor(() => expect(currentMediaRead).toHaveBeenCalledOnce());
+  });
+
+  it("keeps the old queue fenced when a directory epoch closes the editor", async () => {
+    const user = userEvent.setup();
+    const chapter = makeChapter();
+    const assetIds = ["editing-frame"];
+    chapter.content = assetIds.map((id) => ({ text: id, storyboard: [id] }));
+    const assets = makePlayableAssets(chapter, assetIds);
+    const nextAssets = makePlayableAssets(chapter, assetIds);
+    const snapshot = makePlayableSnapshot(chapter.id, assetIds);
+    const nextReader = { isCurrent: () => true, read: vi.fn(async () => new Blob(["next"])) };
+    const getForPlayback = vi.fn()
+      .mockResolvedValueOnce({ snapshot, reader: { isCurrent: () => true, read: vi.fn(async () => new Blob(["old"])) } })
+      .mockResolvedValueOnce({ snapshot, reader: nextReader });
+    const services = {
+      ...makeServices(async () => snapshot),
+      getPersonalRoughCutForPlayback: getForPlayback,
+      savePersonalRoughCut: vi.fn(async () => snapshot),
+    };
+    const props = {
+      chapter,
+      onClose: vi.fn(),
+      onUnauthorized: vi.fn(),
+      seriesId: chapter.series_id,
+      services,
+      userId: "demo-user",
+    };
+    const view = render(
+      <PersonalRoughCutPanel
+        {...props}
+        assetDirectoryStatus="ready"
+        assetRequestGeneration={2}
+        assetSnapshotToken={assets}
+        assets={assets}
+      />,
+    );
+    await screen.findByRole("list", { name: "保存顺序播放队列" });
+    await user.click(screen.getByRole("button", { name: "编辑编排" }));
+    expect(screen.getByRole("region", { name: "编辑粗剪编排" })).toBeInTheDocument();
+
+    view.rerender(
+      <PersonalRoughCutPanel
+        {...props}
+        assetDirectoryStatus="ready"
+        assetRequestGeneration={3}
+        assetSnapshotToken={{ epoch: 3 }}
+        assets={nextAssets}
+      />,
+    );
+
+    expect(screen.queryByRole("region", { name: "编辑粗剪编排" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "保存顺序播放队列" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "从头试看" })).not.toBeInTheDocument();
+    expect(getForPlayback).toHaveBeenCalledOnce();
+
+    await user.click(screen.getByRole("button", { name: "重新读取" }));
+    await screen.findByRole("list", { name: "保存顺序播放队列" });
+    expect(getForPlayback).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "从头试看" })).toBeEnabled();
   });
 
   it("keeps filters hidden while the initial read is pending", async () => {
@@ -430,6 +857,17 @@ describe("personal rough-cut panel", () => {
     const chapter = makeChapter();
     chapter.content = [{ text: "镜头正文", storyboard: ["private-asset-id"] }];
     const snapshot = makeSnapshot();
+    snapshot.frames[0]!.preview_url = "/uploads/private-asset-id.mp4";
+    snapshot.frames.push({
+      asset_id: "excluded-private-asset-id",
+      frame_index: 6,
+      text: "已排除项，来源章节第 7 个镜头",
+      preview_url: "/uploads/excluded.mp4",
+      missing_reason: null,
+      included: false,
+      pending: false,
+    });
+    const originalFrames = [...snapshot.frames];
     const firstAsset: StoryboardAsset = {
       id: "private-asset-id",
       series_id: chapter.series_id,
@@ -444,9 +882,17 @@ describe("personal rough-cut panel", () => {
     const firstAssetSnapshotToken = {};
     const readyAssetSnapshotToken = {};
     const getRoughCut = vi.fn(async () => snapshot);
+    const mediaRead = vi.fn(async () => new Blob(["must not read media"]));
+    const reader = { isCurrent: () => true, read: mediaRead };
+    const getForPlayback = vi.fn(async () => ({ snapshot, reader }));
+    const save = vi.fn(async () => snapshot);
     const onLocateFrame = vi.fn();
     const onFrameNavigationInvalidated = vi.fn();
-    const services = makeServices(getRoughCut);
+    const services = {
+      ...makeServices(getRoughCut),
+      getPersonalRoughCutForPlayback: getForPlayback,
+      savePersonalRoughCut: save,
+    };
     const props = {
       chapter,
       onClose: vi.fn(),
@@ -468,6 +914,7 @@ describe("personal rough-cut panel", () => {
     );
 
     const filterGroup = await screen.findByRole("group", { name: "按草稿状态筛选" });
+    expect(await screen.findByRole("list", { name: "保存顺序播放队列" })).toBeInTheDocument();
     fireEvent.click(within(filterGroup).getByRole("button", { name: "已纳入 1" }));
     expect(within(filterGroup).getByRole("button", { name: "已纳入 1" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.queryByText("还在等待安排")).not.toBeInTheDocument();
@@ -485,9 +932,95 @@ describe("personal rough-cut panel", () => {
     expect(within(screen.getByRole("group", { name: "按草稿状态筛选" }))
       .getByRole("button", { name: "已纳入 1" })).toHaveAttribute("aria-pressed", "true");
     expect(await screen.findByRole("button", { name: "定位到对应镜头 1" })).toBeInTheDocument();
-    expect(getRoughCut).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("list", { name: "保存顺序播放队列" })).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "定位到对应镜头 1" }));
     expect(onLocateFrame).not.toHaveBeenCalled();
+
+    const refreshedFilterGroup = screen.getByRole("group", { name: "按草稿状态筛选" });
+    fireEvent.click(within(refreshedFilterGroup).getByRole("button", { name: "已排除 2" }));
+    expect(within(refreshedFilterGroup).getByRole("button", { name: "已排除 2" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getAllByRole("listitem")).toHaveLength(2);
+    expect(screen.getByText("草稿列表第 2 项 · 读取时章节第 1 个镜头")).toBeInTheDocument();
+    expect(screen.getByText("草稿列表第 3 项 · 读取时章节第 7 个镜头")).toBeInTheDocument();
+    expect(screen.getByText("已排除项，来源章节第 7 个镜头")).toBeInTheDocument();
+    expect(screen.queryByText("第二项先显示，来源章节第 2 个镜头")).not.toBeInTheDocument();
+    expect(screen.getByText("还在等待安排")).toBeInTheDocument();
+
+    expect(getRoughCut).not.toHaveBeenCalled();
+    expect(getForPlayback).toHaveBeenCalledTimes(1);
+    expect(mediaRead).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+    expect(snapshot.frames).toEqual(originalFrames);
+    snapshot.frames.forEach((frame, index) => expect(frame).toBe(originalFrames[index]));
     expect(onFrameNavigationInvalidated).not.toHaveBeenCalled();
+  });
+
+  it("restores all entries from an empty filter after the asset directory epoch changes", async () => {
+    const chapter = makeChapter();
+    chapter.content = [{ text: "镜头正文", storyboard: ["private-asset-id"] }];
+    const snapshot = makeSnapshot();
+    snapshot.frames = [snapshot.frames[0]!];
+    const asset = makePlayableAssets(chapter, ["private-asset-id"])[0]!;
+    const initialToken = {};
+    const readyToken = {};
+    const getRoughCut = vi.fn(async () => snapshot);
+    const mediaRead = vi.fn(async () => new Blob(["must not read media"]));
+    const reader = { isCurrent: () => true, read: mediaRead };
+    const getForPlayback = vi.fn(async () => ({ snapshot, reader }));
+    const save = vi.fn(async () => snapshot);
+    const onLocateFrame = vi.fn();
+    const services = {
+      ...makeServices(getRoughCut),
+      getPersonalRoughCutForPlayback: getForPlayback,
+      savePersonalRoughCut: save,
+    };
+    const props = {
+      chapter,
+      onClose: vi.fn(),
+      onLocateFrame,
+      onUnauthorized: vi.fn(),
+      seriesId: chapter.series_id,
+      services,
+      userId: "demo-user",
+    };
+    const view = render(
+      <PersonalRoughCutPanel
+        {...props}
+        assetDirectoryStatus="loading"
+        assetRequestGeneration={2}
+        assetSnapshotToken={initialToken}
+        assets={[]}
+      />,
+    );
+    await screen.findByRole("list", { name: "当前粗剪草稿条目" });
+
+    view.rerender(
+      <PersonalRoughCutPanel
+        {...props}
+        assetDirectoryStatus="ready"
+        assetRequestGeneration={3}
+        assetSnapshotToken={readyToken}
+        assets={[asset]}
+      />,
+    );
+
+    const filterGroup = screen.getByRole("group", { name: "按草稿状态筛选" });
+    fireEvent.click(within(filterGroup).getByRole("button", { name: "已排除 0" }));
+    expect(within(filterGroup).getByRole("button", { name: "已排除 0" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.queryByRole("list", { name: "当前粗剪草稿条目" })).not.toBeInTheDocument();
+    expect(screen.getByText("这份当前草稿投影中没有符合该条件的条目。")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "查看全部条目" }));
+    expect(within(screen.getByRole("group", { name: "按草稿状态筛选" }))
+      .getByRole("button", { name: "全部 1" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getAllByRole("listitem")).toHaveLength(1);
+    expect(screen.getByText("草稿列表第 1 项 · 读取时章节第 2 个镜头")).toBeInTheDocument();
+    expect(screen.getByText("第二项先显示，来源章节第 2 个镜头")).toBeInTheDocument();
+    expect(getRoughCut).not.toHaveBeenCalled();
+    expect(getForPlayback).toHaveBeenCalledTimes(1);
+    expect(mediaRead).not.toHaveBeenCalled();
+    expect(save).not.toHaveBeenCalled();
+    expect(onLocateFrame).not.toHaveBeenCalled();
   });
 
   it("ignores an old filter callback after rereading the same snapshot in a new generation", async () => {

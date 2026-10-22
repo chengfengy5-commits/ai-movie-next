@@ -682,7 +682,7 @@ describe("personal rough-cut editing panel", () => {
     await user.click(screen.getByRole("button", { name: "编辑编排" }));
     await user.click(screen.getByRole("button", { name: "排除粗剪：镜头 1" }));
     await user.click(screen.getByRole("button", { name: "保存粗剪编排" }));
-    expect(await screen.findByRole("status")).toHaveTextContent("正在保存粗剪编排");
+    expect(await screen.findByText("正在保存粗剪编排…")).toBeInTheDocument();
     expect(locatedTarget.isCurrent()).toBe(false);
 
     await act(async () => invokeCaptured(oldLocateHandler));

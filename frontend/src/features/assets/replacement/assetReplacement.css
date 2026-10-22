@@ -1,0 +1,212 @@
+.asset-replacement-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  background: rgb(18 25 34 / 58%);
+}
+
+.asset-card-replacement-action {
+  display: grid;
+  justify-items: start;
+  gap: 5px;
+  margin-top: 10px;
+}
+
+.asset-card-replacement-action small {
+  color: var(--text-muted, #647184);
+  line-height: 1.4;
+}
+
+.asset-replacement-dialog {
+  display: flex;
+  flex-direction: column;
+  width: min(860px, 100%);
+  max-height: min(90vh, 900px);
+  overflow: hidden;
+  border: 1px solid var(--border-color, #d8dee8);
+  border-radius: 16px;
+  background: var(--surface, #fff);
+  color: var(--text-primary, #18212d);
+  box-shadow: 0 24px 80px rgb(13 24 36 / 24%);
+}
+
+.asset-replacement-header,
+.asset-replacement-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--border-color, #d8dee8);
+}
+
+.asset-replacement-header h2,
+.asset-replacement-preview h3,
+.asset-replacement-results h3,
+.asset-replacement-history h3 {
+  margin: 4px 0 0;
+}
+
+.asset-replacement-close {
+  width: 40px;
+  height: 40px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: inherit;
+  font-size: 28px;
+  cursor: pointer;
+}
+
+.asset-replacement-body {
+  display: grid;
+  gap: 16px;
+  overflow: auto;
+  padding: 20px 22px;
+}
+
+.asset-replacement-body p,
+.asset-replacement-body ol,
+.asset-replacement-body ul {
+  margin-top: 6px;
+  margin-bottom: 6px;
+}
+
+.asset-replacement-boundary,
+.asset-replacement-error,
+.asset-replacement-empty,
+.asset-replacement-progress {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 8px;
+  background: var(--surface-muted, #f3f6fa);
+  line-height: 1.55;
+}
+
+.asset-replacement-error {
+  color: var(--danger, #9b2c2c);
+  background: #fff3f2;
+}
+
+.asset-replacement-new-asset {
+  display: grid;
+  gap: 7px;
+  max-width: 560px;
+  font-weight: 600;
+}
+
+.asset-replacement-new-asset select {
+  min-height: 42px;
+  padding: 8px 10px;
+  border: 1px solid var(--border-color, #cbd3df);
+  border-radius: 8px;
+  background: var(--surface, #fff);
+  color: inherit;
+}
+
+.asset-replacement-preview,
+.asset-replacement-results,
+.asset-replacement-history {
+  display: grid;
+  gap: 12px;
+}
+
+.asset-replacement-preview-heading {
+  display: flex;
+  align-items: end;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.asset-replacement-preview-heading > div:last-child {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.asset-replacement-chapters {
+  display: grid;
+  gap: 10px;
+}
+
+.asset-replacement-chapter {
+  padding: 14px;
+  border: 1px solid var(--border-color, #d8dee8);
+  border-radius: 10px;
+  background: var(--surface, #fff);
+}
+
+.asset-replacement-chapter > header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.asset-replacement-chapter > header label {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.asset-replacement-chapter > header span {
+  color: var(--text-muted, #647184);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.asset-replacement-chapter li,
+.asset-replacement-results li {
+  margin-top: 8px;
+  padding-left: 4px;
+}
+
+.asset-replacement-chapter small {
+  color: var(--text-muted, #647184);
+}
+
+.asset-replacement-confirm-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  line-height: 1.5;
+}
+
+.asset-replacement-footer {
+  justify-content: flex-end;
+  border-top: 1px solid var(--border-color, #d8dee8);
+  border-bottom: 0;
+}
+
+@media (max-width: 640px) {
+  .asset-replacement-overlay {
+    padding: 8px;
+  }
+
+  .asset-replacement-dialog {
+    max-height: 96vh;
+    border-radius: 12px;
+  }
+
+  .asset-replacement-header,
+  .asset-replacement-footer {
+    padding: 14px;
+  }
+
+  .asset-replacement-body {
+    padding: 14px;
+  }
+
+  .asset-replacement-preview-heading,
+  .asset-replacement-chapter > header {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .asset-replacement-footer .primary-button {
+    flex: 1;
+  }
+}
