@@ -14,17 +14,17 @@
 
 ## 最新进展（2026-10-22）
 
-当前 main、图片上传功能分支 `codex/asset-image-upload-556` 及各自的 origin 远端 refs 均指向 `57ffad1933568de7810d7aaa8561b563104c31bb`；F 播放器功能分支 `codex/rough-cut-playback-533` 及其 origin 远端仍指向 `57c0996e400f54096e32e55417093a979bb1a921`。本次 main 提交“接入素材图片上传、引用保存与受保护预览”包含已整合的 F 播放器功能及 U05.5 图片上传接线；各提交的边界和历史状态仍按对应收据解释。
+存储源码基线为 `d26910f24fffc0d22d8ab32a172a1e0dd9e3b9b4`；Root579 核对时，main、`codex/asset-image-upload-556` 及 `origin/main`、`origin/codex/asset-image-upload-556` 均精确指向该提交。该批将非 core 的 `backend.server` host/CLI 接到显式 R2 配置、原 R2 adapter 与同一 `create_app`；鉴权和业务共用同一 Session factory。原始 `create_app` 的默认 `storage=None` 保持不变，缺少配置时存储能力仍诚实不可用；这不是默认启用全部能力的启动器。
 
-U05.5 当前为 P/P、V=P、A=U：三类素材卡片已提供 image-only 上传入口，按 fresh 目录 GET、一次 multipart 上传、明确确认前再次 GET、一次仅写 `image_url` 的 PUT、独立 GET 回读执行；保留原 run/token 身份与迟到 401 防护、unknown/ACK 区分、关窗历史及旧写资格失效，并提供受保护 proxy/Blob 预览与回收、焦点管理和 StrictMode 重放恢复。本行仍未闭合：完成 `MediaUploadApplication` 存储适配器的显式装配（当前默认 `storage=None`）并补相应验证；音视频、OSS 重试、生成历史、其他媒体引用链及真实 R2 配置/验收和浏览器验收仍待。
+U05.5 当前为 P/P、V=P、A=U：三类素材卡片已提供 image-only 上传入口，按 fresh 目录 GET、一次 multipart 上传、明确确认前再次 GET、一次仅写 `image_url` 的 PUT、独立 GET 回读执行；保留原 run/token 身份与迟到 401 防护、unknown/ACK 区分、关窗历史及旧写资格失效，并提供受保护 proxy/Blob 预览与回收、焦点管理和 StrictMode 重放恢复。存储侧的 host/CLI 显式装配已接入主线，但原始 `create_app` 仍默认 `storage=None`，缺少配置时存储能力不可用。音视频、OSS 重试、生成历史、其他媒体引用链以及真实 R2 行为和浏览器验收仍待，本行整体义务尚未闭合。
 
 U08.2 仍为 P/P、V=P、A=U：canonical 视频队列（含视频自带声音）、连续播放、失败重试、protected 上传的 Bearer→Blob URL 与清理、会话目录隔离已接入 main。RCP539-01～06 已经 539-03 源码复核关闭，但这不代表实际浏览器解码或可听播放验收；独立音轨、E2E 不在本批，导出另属 U08.3。开发/接线/验证动作计数保持 21/18/51。用户当前只暂缓 E2E，其他工作按需要继续开发、单测、类型检查和源码复核。
 
-U05.5 受影响的四个前端测试文件共 89 项通过（Dialog 9、AssetLibrary 65、API 12、Preview 3）；未变的 services 测试复用同一源码版本既有结果 1 项通过、52 项跳过。TypeScript 检查与 Root 生产构建通过。560-03 源码复核关闭 AIMG560-01～09，并保留 AIMG558-01。以上是定向源码复核、受影响测试、类型检查和生产构建证据，不是全前端门禁，也不证明 HTTP、真实存储或浏览器行为。
+U05.5 图片链的四个前端测试文件共 89 项通过（Dialog 9、AssetLibrary 65、API 12、Preview 3）；未变的 services 测试复用同一源码版本既有结果 1 项通过、52 项跳过。TypeScript 检查与 Root561 生产构建通过。560-03 源码复核关闭 AIMG560-01～09，并保留 AIMG558-01。本批 Root577 的 12 个定向后端测试文件 155 项通过（2 warnings），覆盖合成 SQLite、fake SDK 和 in-process ASGI；同一基线的 `create_app` registry 为 250 个方法、36 个参数项。测试使用隔离的 `python-multipart` 0.0.32 overlay。P2-576-01、02、03 均已关闭。上述均为定向验证，不是全前端/全后端门禁，也不证明真实 R2、PG、HTTP listener、GUI、部署或浏览器行为。
 
-frame.optimize P6 已提交并推送至功能分支 `codex/frame-optimize-apply-512`，tip 为 `e54d03b8a319f5bfcc956f2c70a907bbf39016e7`；15 个受影响 backend 文件的 153 项检查通过，Root542-02 源码复核 PASS，但尚未合入 main。N6 取消/恢复、runtime、HTTP 与 UI 仍待继续。U04.2/U04.3 仍为 P/P；A01–A39 完整矩阵接受数仍为 0，A39 GrillMe 保持 `OFFLINE_PENDING`。
+frame.optimize 的取消 component 已在功能分支提交 `d421b8a7d938452ddef56dd32e7c8b8c5d93edb1`；runtime/host consumer 正在 C 的功能分支开发，尚未独立复核或合入 main。N6 取消/恢复、runtime、HTTP 与 UI 仍待继续。Canvas CAV01 当前 7 项修复待独立复核，不代表 U07 已全部迁完。U04.2/U04.3 仍为 P/P；A01–A39 完整矩阵接受数仍为 0，A39 GrillMe 保持 `OFFLINE_PENDING`。
 
-本次进展依据：作者 558-03 收据 SHA-256 `71871d730aabedb1d674e11d2060d4664b8beac57f58a3df49e706d389350a84`；560-03 源码复核 SHA-256 `bdcd01338017c4ea1900ddc5b6b08827f8754d43c6793897869f8007830bb79d`；Root561 生产构建收据 SHA-256 `4bf89777bc0f5c6c8d59d81272b6fd7447e4e16e9c6887d7fcd48e0972fd0cd7`；Root562 发布收据 SHA-256 `da66c5f4b87dafb2be967043007e7014eb3b6985ddb916323dde547080c5b92a`。frame.optimize P6 发布收据 SHA-256 `b6f4ad7d7089f594b66bea0a6ab737f08372936c385b0a378eac0a710e3d09e0`；Root542-02 源码复核 SHA-256 `7d7b01c76b165064d48f811a054085c047ba9f5b270e2f7d3b1bc8e12555391a`。
+本次进展依据：作者 558-03 收据 SHA-256 `71871d730aabedb1d674e11d2060d4664b8beac57f58a3df49e706d389350a84`；560-03 源码复核 SHA-256 `bdcd01338017c4ea1900ddc5b6b08827f8754d43c6793897869f8007830bb79d`；Root561 生产构建收据 SHA-256 `4bf89777bc0f5c6c8d59d81272b6fd7447e4e16e9c6887d7fcd48e0972fd0cd7`；Root562 发布收据 SHA-256 `da66c5f4b87dafb2be967043007e7014eb3b6985ddb916323dde547080c5b92a`。存储批次依据：作者 574-03 收据 SHA-256 `823a9c95ec0b4549f4f00134605a4ef0a77c952390f969bf679ab3b48104f519`；576-03 源码复核 SHA-256 `ca11053f14a18efbd7e069a7cadaf7dca41b2b114c6042b1281047a65f9c5d1e`；Root577 定向回归 SHA-256 `e5f88e139a6caabcfae21892e5751bd5c11843229a4c46fd5f562d97adfdbfbb`；Root578 发布 SHA-256 `ec82a10c3a880fb3b2f1a2b2acd6f0ecf62021233c7e989af75cd943c1e495ae`；Root579 同步核对 SHA-256 `0a31fb5010480871aaaf89cb64fcf8497dec119b38cce68a2b4996baacc23df3`。frame.optimize 取消 component 源码基线 `d421b8a7d938452ddef56dd32e7c8b8c5d93edb1`；Root542-02 旧 P6 源码复核与发布收据仅作历史记录，分别为 `7d7b01c76b165064d48f811a054085c047ba9f5b270e2f7d3b1bc8e12555391a` 和 `b6f4ad7d7089f594b66bea0a6ab737f08372936c385b0a378eac0a710e3d09e0`。
 
 状态简写：C＝已实现或已接入；P＝部分；M＝缺失；I＝进行中；U＝当前没有足够验证；E＝依赖外部授权或外部环境。验证和接受状态分别以 V/A 标明。实现、接线状态为 C 的行只在相应列记为完成；局部测试、历史浏览器和当前完整接受不可互相替代。
 
@@ -72,7 +72,7 @@ frame.optimize P6 已提交并推送至功能分支 `codex/frame-optimize-apply-
 | U05.2 | 孤立项、重复项、忽略/取消忽略和合并 | C | C | V=P / A=U；素材维护 UI/API 已随十路径整合至 main@43b10ec；owned HTTP 五类维护路由×角色/场景/道具三类与 SQLite 检查通过，GUI 为部分通过 | 集中补齐 fault/unknown、独立 merge POST 计数与无自动重试、403/scope 切换、完整焦点路径及权限/媒体/认可保全；用户当前只暂缓 E2E，必要开发与单元/类型/源码检查继续，最终验收待补。 |
 | U05.3 | 融合素材查看/编辑/删除与生成 | P | M | V=P / A=U；准入/claim/应用和 ports 已有，create_app 默认 runtime/storage 为 None | 接入现有 runtime/storage 并做 owned 本地验证，再建 UI、任务回读和失败状态；真实 provider 另行验收。 |
 | U05.4 | 跨章节素材替换 | C | C | V=P / A=U；素材卡片、逐章影响预览与选择、再次读取核对/明确确认、串行单次 POST、独立 GET 核对、逐章 ACK/unknown/未发送状态及显式只读恢复已接入；5 个受影响前端测试文件 134 项、TSC 和生产构建通过 | 补 HTTP、GUI 与 E2E 验收，并继续核对权限、媒体与认可保全；用户当前暂缓 E2E。 |
-| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | P | V=P / A=U；57ffad1 已将 image-only 三类素材卡片入口接入 main，完成 fresh 目录 GET→multipart 上传→确认前 GET→仅 image_url PUT→独立 GET；含原 run/token 与迟到 401 防护、unknown/ACK、关窗历史与旧资格失效、受保护 proxy/Blob 预览回收、焦点及 StrictMode 恢复。560-03 复核关闭 AIMG560-01～09；四个受影响测试文件 89 项通过，TSC 与生产构建通过。非全前端、HTTP、真实存储或浏览器验收。 | 完成存储适配器的显式装配（当前默认 `storage=None`）并补相应验证；补音视频、OSS 重试、生成历史及其他媒体引用链；真实 R2 配置/验收与浏览器验收仍待。 |
+| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | P | V=P / A=U；d26910f 存储源码基线已在 main。图片侧已将 image-only 三类素材卡片入口接入 main，完成 fresh 目录 GET→multipart 上传→确认前 GET→仅 image_url PUT→独立 GET；含原 run/token 与迟到 401 防护、unknown/ACK、关窗历史与旧资格失效、受保护 proxy/Blob 预览回收、焦点及 StrictMode 恢复。560-03 复核关闭 AIMG560-01～09；前端四文件 89 项通过、TSC与Root561生产构建通过。后端非 core host/CLI 已接显式 R2 配置→原 adapter→同一 create_app，鉴权/业务共用 Session factory；raw create_app 默认 `storage=None` 不变，缺配置时存储能力不可用。Root577 定向后端 155 项通过，registry 250 方法/36 参数 exact，multipart 0.0.32 隔离 overlay；不代表全栈或真实 R2/PG/HTTP/浏览器验收。 | 完成音视频、OSS 重试、生成历史及其他媒体引用链；补真实 R2 配置下的存储验收和浏览器验收。 |
 
 ### U06 AI 助手、生成、提取、Worker 与恢复
 
@@ -163,7 +163,7 @@ frame.optimize P6 已提交并推送至功能分支 `codex/frame-optimize-apply-
 | INT-LOCAL-COMPOSITION | create_app 显式配置，lifespan 可拥有 image-single service；frame.review各边界也采用显式依赖注入；没有全特性 launcher 证据 | 建可复现的全特性本地组合根，明确 DB/auth/providers/media ports、readiness 和 shutdown；不依赖旧 app/env 自动发现或隐式建表。 |
 | INT-DB | SQLAlchemy UoW、generation migration/readiness、credential migration 和 scoped owned PG 收据存在 | image.single 到期 recovery/due 的owned PG范围见E181/E185；frame.review I07的五类owned PG范围由PG392确认通过并清理。两者不覆盖完整服务/PG重启或真实数据库，不连接或写真实数据库。 |
 | INT-PROVIDERS | 部分真实 transport adapter 和显式 ports 已有 | 完成剩余 adapter、loopback/fake 协议、原 credential principal/snapshot 绑定及配置消费者；实际账号/付费调用另授权。 |
-| INT-STORAGE | media storage typed ports、OwnedMediaRuntime、R2 upload storage 和本地读取器存在 | 接入四类能力、upload application/fused storage/MediaStore；本地验证权限、大小/MIME、DNS、重定向、内容绑定和清理；R2 账号另授权。 |
+| INT-STORAGE | 非 core 的 `backend.server` host/CLI 已消费显式 R2 配置，装配原 R2 adapter 并交给同一 `create_app`；鉴权与业务共用 Session factory。原始 `create_app` 默认 `storage=None`，缺显式配置时存储能力不可用。Root577 的 155 项定向合成 SQLite/fake SDK/in-process ASGI 检查通过，registry 250 方法/36 参数 exact，使用隔离 multipart 0.0.32；P2-576-01～03 已关闭。 | 接入四类媒体能力的其余消费者，完成 fused runtime-storage 与 MediaStore 组合，并补权限、大小/MIME、DNS、重定向、内容绑定和资源清理验证；继续补齐音视频、OSS 重试、生成历史与其它媒体引用能力，并在具备真实配置后验收 R2 行为。本批不证明真实 R2、PG、HTTP listener、部署或浏览器结果。 |
 | INT-SMTP | sender callbacks、加密 SMTP 账户配置/每日重置及后台账户管理页面已有并接入 | 先完成账户管理真实 HTTP/owned SQL 与浏览器验收；开发 sender 并用 owned SMTP sink 验输送语义。真实邮箱交付需后续适用授权，本轮不索要密钥。 |
 | INT-QUOTA | provider quota/balance transports 与连接测试组件已有 | 接入 Creator Settings 配额/连接/角色动作；owned transport 本地验密钥处理，真实余额查询另授权。 |
 | INT-DOWNLOAD | 兼容 GET 禁用路径和签名下载接口已有 identity resolver | 按需要实现 resolver 与本地安全下载/导出字节、命名/顺序/失败清理；链接或 200 不证明文件或可播放成片。 |
