@@ -348,8 +348,7 @@ class SqlAlchemyFrameOptimizeApplications:
                         or fact.application.get("application_ref") != expected.application_ref
                         or fact.optimized_text != expected.optimized_text
                         or fact.item.frame_index != expected.frame_index
-                        or work.get("phase") != "finalize_pending"
-                        or work.get("phase_version") != 2
+                        or not _application_ack_phase_matches(work, progress)
                     ):
                         return None
                     return _outcome(
@@ -386,8 +385,7 @@ class SqlAlchemyFrameOptimizeApplications:
                     fact = progress.applied_by_unit.get(unit_id)
                     if (
                         fact is None
-                        or work.get("phase") != "finalize_pending"
-                        or work.get("phase_version") != 2
+                        or not _application_ack_phase_matches(work, progress)
                     ):
                         return None
                     return _outcome(
@@ -418,6 +416,23 @@ def _outcome(kind: str, result_ref: str, *, application_ref=None, detail=None) -
 
 def _db_time(value: datetime) -> datetime:
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _application_ack_phase_matches(work, progress) -> bool:
+    if work.get("phase") == "finalize_pending" and work.get("phase_version") == 2:
+        return True
+    if (
+        work.get("phase") == "done"
+        and work.get("phase_version") == 3
+        and work.get("terminal_reason") is None
+    ):
+        return True
+    return bool(
+        progress.cancellation_marker is not None
+        and work.get("phase") == "stopped_cancelled"
+        and work.get("phase_version") == 3
+        and work.get("terminal_reason") == "user_cancelled"
+    )
 
 
 __all__ = ["SqlAlchemyFrameOptimizeApplications"]

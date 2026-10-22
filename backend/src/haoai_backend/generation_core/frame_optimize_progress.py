@@ -40,6 +40,8 @@ _POLICY_VERSION = "frame_optimize_pre_apply_v1"
 _PHASE_ORDER = ["fee_pending", "delivery_pending", "finalize_pending"]
 _INLINE_PREFIX = "frame-optimize-inline-text-v1:"
 _VALIDATION_VERSION = "frame-optimize-text-v1"
+_CANCEL_MARKER_PREFIX = "frame_optimize_cancel:"
+_CANCELLED_ERROR = "用户已停止批量优化"
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,8 +56,10 @@ class FrameOptimizeProgress:
     applications_by_unit: Mapping[str, Mapping[str, object]]
     applied_by_unit: Mapping[str, AppliedFrameOptimizeFact]
     unstarted_insufficient_by_unit: Mapping[str, Mapping[str, object]]
+    unstarted_cancelled_by_unit: Mapping[str, Mapping[str, object]]
     partial_results: tuple[tuple[int, str], ...]
     stopped_insufficient: bool
+    cancellation_marker: str | None
     policy_stop_event_refs: tuple[str, ...]
     terminal_error: str | None
 
@@ -150,9 +154,15 @@ def lock_frame_optimize_progress(
     steps = graph.steps_by_unit
     external = graph.external_by_step
     item_by_unit = graph.items_by_unit
+    cancellation_marker, cancellation_markers_valid = _cancellation_marker(
+        graph.task, units.values()
+    )
+    if not cancellation_markers_valid:
+        return None
     total_debited = 0
     saw_insufficient = False
     all_decisions = len(fees) == len(units)
+    unstarted_cancelled: dict[str, Mapping[str, object]] = {}
     for unit_id in unit_ids:
         unit = units[unit_id]
         step = steps.get(unit_id)
@@ -178,7 +188,6 @@ def lock_frame_optimize_progress(
                 or ledger is not None
                 or application is not None
                 or unit.get("result_status") != "pending"
-                or unit.get("billing_status") != "unbilled"
                 or unit.get("debited_amount") != 0
                 or unit.get("refunded_amount") != 0
                 or unit.get("success_confirmed_at") is not None
@@ -190,9 +199,22 @@ def lock_frame_optimize_progress(
                     unit,
                     step,
                     graph.external_by_step.get(str(step.get("id"))),
+                    allow_cancelled=cancellation_marker is not None,
                 ):
-                    return None
-                unstarted_insufficient[unit_id] = fee
+                    if cancellation_marker is None or not _unstarted_cancelled_matches(
+                        fee,
+                        unit,
+                        step,
+                        graph.external_by_step.get(str(step.get("id"))),
+                    ):
+                        return None
+                    unstarted_cancelled[unit_id] = fee
+                else:
+                    unstarted_insufficient[unit_id] = fee
+            elif cancellation_marker is not None:
+                return None
+            elif unit.get("billing_status") != "unbilled":
+                return None
             continue
 
         evidence = evidence_by_id.get(str(receipt.get("evidence_id")))
@@ -247,6 +269,7 @@ def lock_frame_optimize_progress(
 
         phase = work.get("phase")
         resolution = fee.get("resolution") if fee else None
+        is_cancelled_application = phase == "stopped_cancelled" and work.get("phase_version") == 3
         if phase in {"finalize_pending", "done"}:
             expected_phase_version = 2 if phase == "finalize_pending" else 3
             if (
@@ -256,6 +279,31 @@ def lock_frame_optimize_progress(
                 or application is None
                 or work.get("application_ref") != application.get("application_ref")
                 or work.get("terminal_reason") is not None
+                or step.get("execution_status") != "applied"
+                or evidence.get("application_status") != "applied"
+                or evidence.get("applied_at") is None
+                or not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount)
+            ):
+                return None
+            fact = application_fact(
+                application,
+                item,
+                owner_id=owner_id,
+                task_id=task_id,
+                result_ref=str(receipt.get("result_ref")),
+                result_digest=str(receipt.get("content_digest")),
+                optimized_text=decoded,
+            )
+            if fact is None:
+                return None
+            applied_by_unit[unit_id] = fact
+        elif is_cancelled_application:
+            if (
+                cancellation_marker is None
+                or work.get("terminal_reason") != "user_cancelled"
+                or work.get("fee_decision_ref") != unit_id
+                or application is None
+                or work.get("application_ref") != application.get("application_ref")
                 or step.get("execution_status") != "applied"
                 or evidence.get("application_status") != "applied"
                 or evidence.get("applied_at") is None
@@ -291,12 +339,33 @@ def lock_frame_optimize_progress(
                 or not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount)
             ):
                 return None
+        elif phase == "stopped_cancelled":
+            phase_version = work.get("phase_version")
+            if (
+                cancellation_marker is None
+                or phase_version not in {1, 2}
+                or work.get("terminal_reason") != "user_cancelled"
+                or work.get("fee_decision_ref") != unit_id
+                or application is not None
+                or work.get("application_ref") is not None
+                or fee is None
+            ):
+                return None
+            if phase_version == 1:
+                if not _cancelled_waiver_matches(fee, unit, receipt, amount):
+                    return None
+            elif not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount):
+                return None
         elif application is not None or work.get("application_ref") is not None:
             return None
-        if phase not in {"finalize_pending", "done", "stopped_delivery_failed"} and (
-            step.get("execution_status") != "result_observed"
-            or evidence.get("application_status") != "pending"
-            or evidence.get("applied_at") is not None
+        if (
+            phase not in {"finalize_pending", "done", "stopped_delivery_failed"}
+            and not is_cancelled_application
+            and (
+                step.get("execution_status") != "result_observed"
+                or evidence.get("application_status") != "pending"
+                or evidence.get("applied_at") is not None
+            )
         ):
             return None
         if not _evidence_matches(
@@ -305,7 +374,7 @@ def lock_frame_optimize_progress(
             external_row,
             step,
             decoded,
-            applied=phase in {"finalize_pending", "done"},
+            applied=phase in {"finalize_pending", "done"} or is_cancelled_application,
         ):
             return None
         if phase == "fee_pending":
@@ -342,6 +411,17 @@ def lock_frame_optimize_progress(
                 total_debited += amount
             elif resolution != "no_charge":
                 return None
+        elif phase == "stopped_cancelled":
+            if work.get("phase_version") == 1:
+                if not _cancelled_waiver_matches(fee, unit, receipt, amount):
+                    return None
+            else:
+                if not _fee_matches(fee, owner_id, task_id, unit, receipt, ledger, amount):
+                    return None
+                if resolution == "charged":
+                    total_debited += amount
+                elif resolution != "no_charge":
+                    return None
         elif phase in {"stopped_insufficient", "stopped_late_generation"}:
             expected_resolution = phase
             if (
@@ -367,7 +447,12 @@ def lock_frame_optimize_progress(
         return None
     items_by_index = {item.frame_index: item for item in graph.verified.items}
     partial_results, terminal_error = _parse_task_results(
-        graph.task, items_by_index, works, unstarted_insufficient
+        graph.task,
+        items_by_index,
+        works,
+        unstarted_insufficient,
+        unstarted_cancelled,
+        cancellation_marker=cancellation_marker,
     )
     if partial_results is None:
         return None
@@ -398,16 +483,20 @@ def lock_frame_optimize_progress(
     if not saw_insufficient and graph.task.get("recovery_status") != "ready":
         return None
 
-    all_closed = _all_generation_slots_closed(unit_ids, works, unstarted_insufficient)
+    all_closed = _all_generation_slots_closed(
+        unit_ids, works, unstarted_insufficient, unstarted_cancelled
+    )
     task_status = graph.task.get("status")
     if task_status == "completed" and (
         not all_closed or not applied_by_unit or terminal_error is not None
     ):
         return None
-    if task_status == "failed" and (
-        not all_closed or applied_by_unit or terminal_error is None
-    ):
-        return None
+    if task_status == "failed":
+        if cancellation_marker is not None:
+            if not all_closed or terminal_error != _CANCELLED_ERROR:
+                return None
+        elif not all_closed or applied_by_unit or terminal_error is None:
+            return None
     if task_status in {"completed", "failed"} and (
         graph.task.get("progress") != 100
         or graph.task.get("claimed_by") is not None
@@ -427,14 +516,47 @@ def lock_frame_optimize_progress(
         applications_by_unit=applications,
         applied_by_unit=applied_by_unit,
         unstarted_insufficient_by_unit=unstarted_insufficient,
+        unstarted_cancelled_by_unit=unstarted_cancelled,
         partial_results=partial_results,
         stopped_insufficient=saw_insufficient,
+        cancellation_marker=cancellation_marker,
         policy_stop_event_refs=tuple(str(row["event_id"]) for row in policy_stop_rows),
         terminal_error=terminal_error,
     )
 
 
-def _unstarted_insufficient_matches(fee, unit, step, external) -> bool:
+def _cancellation_marker(task, units):
+    task_marker = task.get("cancellation_reason")
+    task_cancelled_at = _utc(task.get("user_cancelled_at"))
+    unit_rows = tuple(units)
+    if task_marker is None and task_cancelled_at is None:
+        # Unit-level markers can predate this batch projection. Existing
+        # committed facts remain readable; every new write path checks the
+        # relevant Task and Unit markers in its own authority fence.
+        return None, True
+    if (
+        not isinstance(task_marker, str)
+        or not task_marker.startswith(_CANCEL_MARKER_PREFIX)
+        or not task_marker[len(_CANCEL_MARKER_PREFIX):]
+        or len(task_marker) > 64
+        or task_cancelled_at is None
+        or not unit_rows
+        or any(
+            row.get("cancellation_reason") != task_marker
+            or not _same_time(row.get("user_cancelled_at"), task_cancelled_at)
+            for row in unit_rows
+        )
+    ):
+        return None, False
+    return task_marker, True
+
+
+def _unstarted_insufficient_matches(fee, unit, step, external, *, allow_cancelled=False) -> bool:
+    cancelled = (
+        isinstance(unit.get("cancellation_reason"), str)
+        and unit.get("cancellation_reason").startswith(_CANCEL_MARKER_PREFIX)
+        and _utc(unit.get("user_cancelled_at")) is not None
+    )
     return bool(
         fee.get("unit_id") == unit.get("id")
         and fee.get("charge_phase") == "pre_apply"
@@ -452,15 +574,88 @@ def _unstarted_insufficient_matches(fee, unit, step, external) -> bool:
         and unit.get("first_intent_at") is None
         and unit.get("deadline_at") is None
         and unit.get("success_confirmed_at") is None
-        and unit.get("user_cancelled_at") is None
+        and (unit.get("user_cancelled_at") is None if not allow_cancelled else cancelled)
         and step.get("execution_status") == "prepared"
         and external is None
     )
 
 
-def _parse_task_results(task, items_by_index, works, unstarted_insufficient):
+def _unstarted_cancelled_matches(fee, unit, step, external) -> bool:
+    amount = unit.get("quoted_amount")
+    expected_resolution = "no_charge" if amount == 0 else "waived_cancelled"
+    expected_billing = "no_charge" if amount == 0 else "unbilled"
+    common = bool(
+        type(amount) is int
+        and amount >= 0
+        and fee.get("unit_id") == unit.get("id")
+        and fee.get("charge_phase") == "pre_apply"
+        and fee.get("resolution") == expected_resolution
+        and fee.get("ledger_ref") is None
+        and fee.get("generation_result_ref") is None
+        and fee.get("application_ref") is None
+        and _utc(fee.get("resolved_at")) is not None
+        and unit.get("billing_status") == expected_billing
+        and unit.get("debited_amount") == 0
+        and unit.get("refunded_amount") == 0
+        and isinstance(unit.get("cancellation_reason"), str)
+        and unit["cancellation_reason"].startswith(_CANCEL_MARKER_PREFIX)
+        and _utc(unit.get("user_cancelled_at")) is not None
+    )
+    if not common:
+        return False
+    if external is None:
+        return bool(
+            unit.get("first_intent_at") is None
+            and unit.get("deadline_at") is None
+            and step.get("execution_status") in {"prepared", "ready"}
+        )
+    return bool(
+        _same_time(unit.get("first_intent_at"), external.get("intent_at"))
+        and _same_time(unit.get("deadline_at"), external.get("deadline_at"))
+        and step.get("execution_status") in {"submitting", "reconciling", "completed"}
+    )
+
+
+def _cancelled_waiver_matches(fee, unit, receipt, amount) -> bool:
+    expected_resolution = "no_charge" if amount == 0 else "waived_cancelled"
+    expected_billing = "no_charge" if amount == 0 else "unbilled"
+    return bool(
+        fee.get("unit_id") == unit.get("id")
+        and fee.get("charge_phase") == "pre_apply"
+        and fee.get("resolution") == expected_resolution
+        and fee.get("ledger_ref") is None
+        and fee.get("generation_result_ref") == receipt.get("result_ref")
+        and fee.get("application_ref") is None
+        and _utc(fee.get("resolved_at")) is not None
+        and unit.get("billing_status") == expected_billing
+        and unit.get("debited_amount") == 0
+        and unit.get("refunded_amount") == 0
+    )
+
+
+def _parse_task_results(task, items_by_index, works, unstarted_insufficient,
+                        unstarted_cancelled, *, cancellation_marker):
     raw = task.get("result")
     parsed = parse_partial_results(raw, items_by_index)
+    if cancellation_marker is not None:
+        if task.get("status") != "failed" or not isinstance(raw, str):
+            return None, None
+        try:
+            value = json.loads(raw)
+        except (TypeError, json.JSONDecodeError):
+            return None, None
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"partial", "error"}
+            or value.get("error") != _CANCELLED_ERROR
+            or not isinstance(value.get("partial"), list)
+        ):
+            return None, None
+        if not value["partial"]:
+            return (), _CANCELLED_ERROR
+        partial_raw = json.dumps(value["partial"], ensure_ascii=False, separators=(",", ":"))
+        partial = parse_partial_results(partial_raw, items_by_index)
+        return (partial, _CANCELLED_ERROR) if partial is not None else (None, None)
     if parsed is not None:
         return parsed, None
     if task.get("status") != "failed" or not isinstance(raw, str):
@@ -497,16 +692,17 @@ def _failure_reason(works, unstarted_insufficient):
     return None
 
 
-def _all_generation_slots_closed(unit_ids, works, unstarted_insufficient):
+def _all_generation_slots_closed(unit_ids, works, unstarted_insufficient, unstarted_cancelled=()):
     terminal_phases = {
         "done",
+        "stopped_cancelled",
         "stopped_insufficient",
         "stopped_delivery_failed",
         "stopped_late_generation",
     }
     closed = {
         unit_id for unit_id, work in works.items() if work.get("phase") in terminal_phases
-    } | set(unstarted_insufficient)
+    } | set(unstarted_insufficient) | set(unstarted_cancelled)
     return closed == set(unit_ids) and set(works) <= set(unit_ids)
 
 

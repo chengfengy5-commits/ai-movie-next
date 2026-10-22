@@ -382,7 +382,9 @@ class SqlAlchemyFrameOptimizeFees:
                         or fee.get("application_ref") is not None
                         or not _same_time(fee.get("resolved_at"), write.resolved_at)
                         or work.get("work_id") != write.work_id
-                        or not _fee_work_state_matches(work, write)
+                        or not _fee_work_state_matches(
+                            work, write, cancellation_marker=progress.cancellation_marker
+                        )
                         or work.get("result_ref") != write.result_ref
                         or receipt.get("result_ref") != write.result_ref
                     ):
@@ -457,14 +459,24 @@ def _outcome(disposition, unit_id, result_ref=None, fee=None, *, amount=0):
     )
 
 
-def _fee_work_state_matches(work, write: _FeeWrite) -> bool:
+def _fee_work_state_matches(
+    work, write: _FeeWrite, *, cancellation_marker: str | None
+) -> bool:
     actual = (work.get("phase"), work.get("phase_version"))
     initial = (write.work_phase, write.work_phase_version)
     if initial == ("delivery_pending", 1):
+        if actual == ("stopped_cancelled", 3):
+            return bool(
+                cancellation_marker is not None
+                and work.get("terminal_reason") == "user_cancelled"
+            )
         return actual in {
             initial,
             ("finalize_pending", 2),
+            ("done", 3),
             ("stopped_delivery_failed", 2),
+            ("stopped_cancelled", 2),
+            ("stopped_cancelled", 3),
         }
     return actual == initial
 

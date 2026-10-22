@@ -505,6 +505,13 @@ class SqlAlchemyFrameOptimizeFinalization:
                 progress = lock_frame_optimize_progress(session, graph) if graph else None
                 if graph is None or progress is None:
                     return None
+                cancelled = _cancelled_parent_matches(graph, progress)
+                partial_matches = progress.partial_results == write.partial_results or (
+                    cancelled
+                    and len(progress.partial_results) >= len(write.partial_results)
+                    and progress.partial_results[: len(write.partial_results)]
+                    == write.partial_results
+                )
                 work = progress.works_by_unit.get(write.unit_id)
                 if (
                     work is None
@@ -513,11 +520,14 @@ class SqlAlchemyFrameOptimizeFinalization:
                     or work.get("phase") != "done"
                     or work.get("phase_version") != 3
                     or work.get("last_execution_generation") != write.execution_generation
-                    or progress.partial_results != write.partial_results
-                    or graph.task.get("result") != write.task_result
+                    or not partial_matches
                 ):
                     return None
                 status = graph.task.get("status")
+                if cancelled:
+                    return _outcome("work_finalized", write.task_id, write.unit_id)
+                if graph.task.get("result") != write.task_result:
+                    return None
                 if status == "completed":
                     if (
                         graph.task.get("progress") != 100
@@ -564,6 +574,8 @@ class SqlAlchemyFrameOptimizeFinalization:
                 if graph.task.get("status") == "completed":
                     return _outcome("already_finalized", task_id, unit_id)
                 if graph.task.get("status") == "processing":
+                    return _outcome("already_finalized", task_id, unit_id)
+                if _cancelled_parent_matches(graph, progress):
                     return _outcome("already_finalized", task_id, unit_id)
                 return None
         except Exception:
@@ -657,6 +669,7 @@ class _FinalizationWriteConflict(RuntimeError):
 def _all_slots_closed(graph: LockedFrameOptimizeBatch, progress: FrameOptimizeProgress) -> bool:
     terminal = {
         "done",
+        "stopped_cancelled",
         "stopped_insufficient",
         "stopped_delivery_failed",
         "stopped_late_generation",
@@ -664,7 +677,9 @@ def _all_slots_closed(graph: LockedFrameOptimizeBatch, progress: FrameOptimizePr
     closed = {
         unit_id for unit_id, work in progress.works_by_unit.items()
         if work.get("phase") in terminal
-    } | set(progress.unstarted_insufficient_by_unit)
+    } | set(progress.unstarted_insufficient_by_unit) | set(
+        progress.unstarted_cancelled_by_unit
+    )
     return closed == set(graph.units_by_id) and set(progress.works_by_unit) <= set(graph.units_by_id)
 
 
@@ -682,6 +697,21 @@ def _failure_reason(progress: FrameOptimizeProgress) -> str | None:
     if reasons:
         return "frame_optimize_results_unapplied"
     return None
+
+
+def _cancelled_parent_matches(graph: LockedFrameOptimizeBatch, progress: FrameOptimizeProgress) -> bool:
+    task = graph.task
+    return bool(
+        progress.cancellation_marker is not None
+        and progress.terminal_error == "用户已停止批量优化"
+        and task.get("status") == "failed"
+        and task.get("progress") == 100
+        and task.get("progress_message") == "用户已停止批量优化"
+        and task.get("claimed_by") is None
+        and task.get("claim_token") is None
+        and task.get("lease_until") is None
+        and _all_slots_closed(graph, progress)
+    )
 
 
 def _generation_claim_matches(claim, task, owner_id, task_id, instance, now) -> bool:

@@ -38,6 +38,9 @@ from haoai_backend.generation_core.frame_optimize_finalization import (
 from haoai_backend.generation_core.frame_optimize_application import (
     SqlAlchemyFrameOptimizeApplications,
 )
+from haoai_backend.generation_core.frame_optimize_cancellation import (
+    SqlAlchemyFrameOptimizeCancellation,
+)
 from haoai_backend.generation_contracts.types import TextResult
 from haoai_backend.personal_production.notes.tables import metadata as notes_metadata
 from haoai_backend.generation_core.schema import (
@@ -258,6 +261,16 @@ def finalization_adapter(case: FrameOptimizeCase, *, continuation_claims=None):
         crypto=case.capabilities.crypto,
         proof_authority=case.capabilities.proof_authority,
         continuation_claims=claims,
+    )
+
+
+def cancellation_adapter(case: FrameOptimizeCase, *, prefix: str = "opt-cancel"):
+    return SqlAlchemyFrameOptimizeCancellation(
+        session_factory=case.sessions,
+        db_clock=lambda: case.clock[0],
+        id_factory=IdSequence(prefix),
+        crypto=case.capabilities.crypto,
+        proof_authority=case.capabilities.proof_authority,
     )
 
 
