@@ -1,0 +1,266 @@
+import { describe, expect, it } from "vitest";
+import type { Character, Chapter, StoryboardAsset } from "../../shared/api/contracts";
+import { buildCanvasGraph } from "./canvasGraph";
+
+const chapter: Chapter = {
+  id: "chapter-a",
+  series_id: "series-a",
+  title: "第一章",
+  order: 1,
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+  lock: null,
+  content: [{
+    text: "当前分镜",
+    storyboard: ["storyboard-a"],
+    character: ["character-a"],
+    scene: [],
+    prop: [],
+    preview: "/uploads/preview.png",
+    videos: ["/uploads/video.mp4"],
+  }],
+};
+
+const character = {
+  id: "character-a",
+  series_id: "series-a",
+  name: "林澜",
+  description: "当前章节引用",
+  image_url: "/uploads/character.png",
+} as Character;
+
+const storyboard: StoryboardAsset = {
+  id: "storyboard-a",
+  series_id: "series-a",
+  chapter_id: "chapter-a",
+  frame_index: 88,
+  name: "夜雨构图",
+  description: null,
+  image_url: "/uploads/storyboard.png",
+  created_at: "2026-01-01T00:00:00Z",
+  updated_at: "2026-01-01T00:00:00Z",
+};
+
+describe("chapter canvas graph projection", () => {
+  it("projects exact current sources and legacy index layouts without guessing identities", () => {
+    const graph = buildCanvasGraph(
+      chapter,
+      [storyboard],
+      [character],
+      [],
+      [],
+      {
+        nodeLayouts: [
+          { refId: "frame:0", x: 0, y: -4 },
+          { refId: "storyboard:storyboard-a", x: 900, y: 0 },
+          { refId: "media:0:0", x: 1100, y: 20 },
+        ],
+        notes: [{ id: "note-a", text: "备注", x: 0, y: 0 }],
+        manualEdges: [{ id: "edge-a", sourceRef: "deleted", targetRef: "frame:0", relation: "unknown" }],
+      },
+    );
+    const frame = graph.nodes.find((node) => node.ref === "frame:0");
+    const media = graph.nodes.find((node) => node.ref === "storyboard:storyboard-a");
+    const preview = graph.nodes.find((node) => node.ref === "media:0:0");
+    expect(frame?.x).toBe(0);
+    expect(frame?.y).toBe(-4);
+    expect(media?.x).toBe(900);
+    expect(media?.imageUrl).toBe("/uploads/storyboard.png");
+    expect(preview?.x).toBe(1100);
+    expect(preview?.imageUrl).toBe("/uploads/preview.png");
+    expect(graph.nodes.some((node) => node.ref === "character:character-a")).toBe(true);
+    expect(graph.nodes.some((node) => node.ref === "media:0:0")).toBe(true);
+    expect(graph.nodes.some((node) => node.ref === "media:0:1")).toBe(true);
+    expect(graph.nodes.some((node) => node.ref === "note-a")).toBe(true);
+    expect(graph.edges.some((edge) => edge.sourceRef === "character:character-a" && edge.relation === "uses")).toBe(true);
+    expect(graph.edges.some((edge) => edge.sourceRef === "frame:0" && edge.targetRef === "storyboard:storyboard-a")).toBe(true);
+    expect(graph.edges.some((edge) => edge.id === "edge-a")).toBe(false);
+  });
+
+  it("omits ambiguous source identities while leaving persisted data untouched", () => {
+    const graph = buildCanvasGraph(
+      chapter,
+      [storyboard, { ...storyboard, name: "重复故事板" }],
+      [character, character],
+      [],
+      [],
+      { nodes: [{ id: "unknown" }], manualEdges: [{ id: "dangling", sourceRef: "a", targetRef: "b", relation: "future" }] },
+    );
+    expect(graph.nodes.some((node) => node.kind === "media")).toBe(false);
+    expect(graph.nodes.some((node) => node.kind === "character")).toBe(false);
+    expect(graph.nodes.some((node) => node.kind === "frame")).toBe(true);
+  });
+
+  it("restores the legacy persisted refs, labels, media indexes, and manual edges", () => {
+    const legacyChapter = {
+      ...chapter,
+      content: [{
+        ...chapter.content![0],
+        character: ["character-a"],
+        scene: [],
+        prop: [],
+        storyboard: ["storyboard-a"],
+        preview: "/uploads/preview.png",
+        videos: ["/uploads/video.mp4"],
+      }],
+    };
+    const graph = buildCanvasGraph(
+      legacyChapter,
+      [storyboard],
+      [character],
+      [],
+      [],
+      {
+        nodeLayouts: [
+          { refId: "storyboard:storyboard-a", x: 900, y: 0 },
+          { refId: "media:0:0", x: 1200, y: 10 },
+          { refId: "media:0:1", x: 1500, y: 20 },
+        ],
+        notes: [{ id: "note-a", text: "便签", x: 0, y: 0 }],
+        cards: [{ id: "card-a", type: "chapter-card", label: "旧章节卡" }],
+        manualEdges: [{ id: "old-edge", sourceRef: "note-a", targetRef: "card:card-a" }],
+        hiddenRelations: ["uses", "future-relationship"],
+      },
+    );
+    expect(graph.nodes.find((node) => node.ref === "storyboard:storyboard-a")?.x).toBe(900);
+    expect(graph.nodes.find((node) => node.ref === "media:0:0")?.kind).toBe("preview");
+    expect(graph.nodes.find((node) => node.ref === "media:0:1")?.kind).toBe("video");
+    expect(graph.nodes.find((node) => node.ref === "note-a")?.detail).toBe("便签");
+    expect(graph.nodes.find((node) => node.ref === "card:card-a")?.title).toBe("章节卡片");
+    expect(graph.nodes.find((node) => node.ref === "card:card-a")?.detail).toBe("旧章节卡");
+    expect(graph.edges.some((edge) => edge.id === "old-edge" && edge.relation === "manual")).toBe(true);
+    expect(graph.edges.some((edge) => edge.relation === "uses")).toBe(false);
+  });
+
+  it("restores video refs from the legacy media sequence when a preview is absent", () => {
+    const noPreviewChapter = {
+      ...chapter,
+      content: [{ ...chapter.content![0], preview: null, videos: ["/uploads/first.mp4", "/uploads/second.mp4"] }],
+    };
+    const graph = buildCanvasGraph(noPreviewChapter, [], [character], [], [], {
+      nodeLayouts: [
+        { refId: "media:0:0", x: 0, y: 12 },
+        { refId: "media:0:1", x: 24, y: 36 },
+      ],
+      manualEdges: [{ id: "legacy-video-edge", sourceRef: "media:0:0", targetRef: "frame:0" }],
+    });
+
+    expect(graph.nodes.find((node) => node.ref === "media:0:0"))
+      .toMatchObject({ kind: "video", detail: "/uploads/first.mp4", x: 0, y: 12 });
+    expect(graph.nodes.find((node) => node.ref === "media:0:1"))
+      .toMatchObject({ kind: "video", detail: "/uploads/second.mp4", x: 24, y: 36 });
+    expect(graph.edges.some((edge) => edge.id === "legacy-video-edge" && edge.manual)).toBe(true);
+  });
+
+  it("keeps persisted media refs when a preview URL is not renderable and restores source references", () => {
+    const sourceFrame = {
+      ...chapter.content![0],
+      character: ["character-a"],
+      scene: ["scene-a"],
+      prop: ["prop-a"],
+      preview: "data:image/png;base64,AAAA",
+      videos: ["/uploads/video.mp4"],
+    };
+    const sourceChapter = { ...chapter, content: [sourceFrame] };
+    const scene = { id: "scene-a", series_id: "series-a", title: "雨巷", description: "scene", image_url: null } as unknown as import("../../shared/api/contracts").Scene;
+    const prop = { id: "prop-a", series_id: "series-a", name: "信件", description: "prop", image_url: null } as unknown as import("../../shared/api/contracts").Prop;
+    const graph = buildCanvasGraph(sourceChapter, [], [character], [scene], [prop], {
+      nodeLayouts: [
+        { refId: "media:0:0", x: 0, y: 0 },
+        { refId: "media:0:1", x: 20, y: 30 },
+      ],
+    });
+
+    expect(graph.nodes.find((node) => node.ref === "media:0:0"))
+      .toMatchObject({ kind: "preview", imageUrl: null, x: 0, y: 0 });
+    expect(graph.nodes.find((node) => node.ref === "media:0:1"))
+      .toMatchObject({ kind: "video", x: 20, y: 30 });
+    const sourceRefs = ["character:character-a", "scene:scene-a", "prop:prop-a"];
+    for (const sourceRef of sourceRefs) {
+      expect(graph.edges.some((edge) => edge.sourceRef === sourceRef && edge.targetRef === "media:0:0"
+        && edge.relation === "reference")).toBe(true);
+    }
+    expect(graph.edges.some((edge) => edge.sourceRef === "frame:0" && edge.targetRef === "media:0:0"
+      && edge.relation === "generates")).toBe(true);
+  });
+
+  it.each([
+    { label: "null preview", preview: null, expectedVideoOrdinal: 2 },
+    { label: "empty preview", preview: "", expectedVideoOrdinal: 2 },
+    { label: "whitespace preview", preview: " \t", expectedVideoOrdinal: 3 },
+    { label: "renderable preview", preview: "/uploads/preview.png", expectedVideoOrdinal: 3 },
+    { label: "non-renderable preview", preview: "data:image/png;base64,AAAA", expectedVideoOrdinal: 3 },
+  ])("preserves legacy media ordinals for a $label", ({ preview, expectedVideoOrdinal }) => {
+    const videoUrl = "/uploads/real.mp4";
+    const sourceFrame = {
+      ...chapter.content![0],
+      preview,
+      videos: ["", " \t", null, 7, videoUrl],
+    };
+    const sourceChapter = { ...chapter, content: [sourceFrame] };
+    const originalChapter = structuredClone(sourceChapter);
+    const expectedVideoRef = "media:0:" + expectedVideoOrdinal;
+    const expectedY = 28 + expectedVideoOrdinal;
+    const document = {
+      nodeLayouts: [
+        { refId: "media:0:0", x: 880, y: 10 },
+        { refId: "media:0:1", x: 881, y: 11 },
+        { refId: expectedVideoRef, x: 0, y: expectedY },
+      ],
+      manualEdges: [{ id: "legacy-media-edge", sourceRef: expectedVideoRef, targetRef: "frame:0" }],
+    };
+    const originalDocument = structuredClone(document);
+
+    const graph = buildCanvasGraph(sourceChapter, [], [character], [], [], document);
+
+    expect(graph.nodes.find((node) => node.ref === expectedVideoRef))
+      .toMatchObject({ kind: "video", detail: videoUrl, x: 0, y: expectedY });
+    expect(graph.edges.some((edge) => edge.id === "legacy-media-edge" && edge.manual)).toBe(true);
+    if (preview === "/uploads/preview.png" || preview === "data:image/png;base64,AAAA") {
+      expect(graph.nodes.find((node) => node.ref === "media:0:0"))
+        .toMatchObject({ kind: "preview", detail: preview });
+    }
+    expect(sourceChapter).toEqual(originalChapter);
+    expect(document).toEqual(originalDocument);
+  });
+
+  it("places all unpositioned previews and videos in a stable non-overlapping media lane", () => {
+    const twoFrames = {
+      ...chapter,
+      content: [
+        { ...chapter.content![0], preview: "/uploads/preview-a.png", videos: ["/uploads/a.mp4", "/uploads/b.mp4"] },
+        { ...chapter.content![0], preview: "/uploads/preview-b.png", videos: ["/uploads/c.mp4"] },
+      ],
+    };
+    const graph = buildCanvasGraph(twoFrames, [], [character], [], [], {
+      nodeLayouts: [{ refId: "media:1:1", x: 0, y: 0 }],
+    });
+    const media = graph.nodes.filter((node) => node.kind === "preview" || node.kind === "video");
+
+    expect(media.find((node) => node.ref === "media:1:1")?.x).toBe(0);
+    expect(media.find((node) => node.ref === "media:1:1")?.y).toBe(0);
+    expect(media).toHaveLength(5);
+    expect(media.every((node, index) => media.slice(index + 1).every((other) =>
+      node.x + node.width <= other.x || other.x + other.width <= node.x ||
+      node.y + node.height <= other.y || other.y + other.height <= node.y,
+    ))).toBe(true);
+  });
+
+  it("places new source columns without overlap while respecting explicit zero layouts", () => {
+    const allSourcesChapter = {
+      ...chapter,
+      content: [{ ...chapter.content![0], character: ["character-a"], scene: ["scene-a"], prop: ["prop-a"], storyboard: ["storyboard-a"] }],
+    };
+    const scene = { id: "scene-a", series_id: "series-a", title: "屋内", description: "scene", image_url: null } as unknown as import("../../shared/api/contracts").Scene;
+    const prop = { id: "prop-a", series_id: "series-a", name: "信件", description: "prop", image_url: null } as unknown as import("../../shared/api/contracts").Prop;
+    const graph = buildCanvasGraph(allSourcesChapter, [storyboard], [character], [scene], [prop], {
+      nodeLayouts: [{ refId: "character:character-a", x: 0, y: 0 }],
+    });
+    const nodes = graph.nodes.filter((node) => ["character", "scene", "prop", "frame", "media"].includes(node.kind));
+    expect(nodes.find((node) => node.kind === "character")?.x).toBe(0);
+    expect([...nodes].every((node, index) => nodes.slice(index + 1).every((other) =>
+      node.x + node.width <= other.x || other.x + other.width <= node.x ||
+      node.y + node.height <= other.y || other.y + other.height <= node.y,
+    ))).toBe(true);
+  });
+});

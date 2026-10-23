@@ -818,9 +818,11 @@ describe("read-only workspace", () => {
     expect(mobileSettingsEntry).toBeInTheDocument();
     fireEvent.click(mobileSettingsEntry);
 
-    expect(await screen.findByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    const creatorSettingsRegion = await screen.findByRole("region", { name: "创作者设置" });
+    expect(within(creatorSettingsRegion).getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
     await waitFor(() => expect(creatorSettings.listModels).toHaveBeenCalled());
-    await user.click(screen.getByRole("button", { name: "新建模型" }));
+    const newModelButton = within(creatorSettingsRegion).getByRole("button", { name: "新建模型" });
+    await user.click(newModelButton);
     expect(await screen.findByLabelText("名称")).toBeInTheDocument();
 
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
@@ -828,22 +830,29 @@ describe("read-only workspace", () => {
       .getByRole("button", { name: "我的任务" });
     await user.click(taskNav);
     expect(confirm).toHaveBeenCalledWith("当前有未保存的创作者设置草稿或待核对操作，离开将丢弃页面状态。继续吗？");
-    expect(screen.getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    expect(within(creatorSettingsRegion).getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "我的任务" })).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "退出登录" }));
+    const workspaceSidebar = screen.getByRole("complementary");
+    const logoutButton = within(workspaceSidebar).getByRole("button", { name: "退出登录" });
+    await user.click(logoutButton);
     expect(confirm).toHaveBeenCalledTimes(2);
-    expect(screen.getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    expect(within(creatorSettingsRegion).getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
 
     confirm.mockReturnValue(true);
     await user.click(taskNav);
-    expect(await screen.findByRole("heading", { name: "我的任务" })).toBeInTheDocument();
+    const tasksRegion = await screen.findByRole("region", { name: "我的任务" });
+    expect(within(tasksRegion).getByRole("heading", { name: "我的任务" })).toBeInTheDocument();
 
     fireEvent.click(within(screen.getByRole("banner"))
       .getByRole("button", { name: "创作者设置", hidden: true }));
-    expect(await screen.findByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "返回工作空间" }));
-    expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
+    const creatorSettingsRegionAfterTasks = await screen.findByRole("region", { name: "创作者设置" });
+    expect(within(creatorSettingsRegionAfterTasks).getByRole("heading", { name: "创作者设置" })).toBeInTheDocument();
+    const settingsBackButton = within(creatorSettingsRegionAfterTasks)
+      .getByRole("button", { name: "返回工作空间" });
+    await user.click(settingsBackButton);
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    expect(within(seriesRegion).getByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
   });
 
   it("routes to account on mobile, protects its dirty draft, and refreshes the full user in-session", async () => {
@@ -1897,7 +1906,8 @@ describe("read-only workspace", () => {
     }
     await user.click(within(sourceCard).getByRole("button", { name: /只读查看素材库/ }));
     await screen.findByRole("heading", { name: sourceSeries.name + " · 素材库" });
-    await user.click(screen.getByRole("button", { name: "查看关联镜头：来源素材角色" }));
+    const sourceAssetLibrary = await screen.findByRole("region", { name: sourceSeries.name + " · 素材库" });
+    await user.click(within(sourceAssetLibrary).getByRole("button", { name: "查看关联镜头：来源素材角色" }));
 
     const usagePanel = await screen.findByRole("region", { name: "关联镜头" });
     expect(await within(usagePanel).findByText("来源目标文字")).toBeInTheDocument();
@@ -1914,7 +1924,8 @@ describe("read-only workspace", () => {
     expect(staleTarget?.chapterId).toBe(sourceTarget.id);
     expect(staleTarget?.isCurrent()).toBe(false);
 
-    await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+    const sourceChapterBrowser = await screen.findByRole("region", { name: sourceSeries.name });
+    await user.click(within(sourceChapterBrowser).getByRole("button", { name: "返回剧集列表" }));
     expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
     const nextSeriesCard = screen.getByRole("heading", { name: nextSeries.name }).closest("article");
     if (!(nextSeriesCard instanceof HTMLElement)) {
@@ -2659,7 +2670,9 @@ describe("read-only workspace", () => {
       renderWorkspace(services);
       let seriesList = await screen.findByRole("region", { name: "我的剧集" });
       const getSeriesCard = async (name: string): Promise<HTMLElement> => {
-        const heading = await within(seriesList).findByRole("heading", { name });
+        const heading = await within(seriesList).findByText(name, { selector: "h3", exact: true });
+        expect(heading).toBeVisible();
+        expect(heading).toHaveAccessibleName(name);
         const card = heading.closest("article");
         if (!(card instanceof HTMLElement)) {
           throw new Error("Series card was not rendered: " + name);
@@ -2715,7 +2728,10 @@ describe("read-only workspace", () => {
       expect(listChapters).toHaveBeenCalledTimes(firstReadsBeforeFilter.chapters);
       expect(listStoryboardAssets).toHaveBeenCalledTimes(firstReadsBeforeFilter.assets);
 
-      await user.click(within(firstChapterRegion).getByRole("button", { name: "返回剧集列表" }));
+      const firstChapterReturn = within(firstChapterRegion).getByText("返回剧集列表", { selector: "button" });
+      expect(firstChapterReturn).toBeVisible();
+      expect(firstChapterReturn).toHaveAccessibleName("返回剧集列表");
+      await user.click(firstChapterReturn);
       seriesList = await screen.findByRole("region", { name: "我的剧集" });
       const secondCard = await getSeriesCard(secondSeries.name);
       await user.click(within(secondCard).getByRole("button", { name: /只读查看章节/ }));
@@ -2723,8 +2739,14 @@ describe("read-only workspace", () => {
       await user.click(within(otherSeriesChapterRegion).getByRole("button", { name: "查看我的制作记录" }));
       await waitFor(() => expect(pendingRequests).toHaveLength(1));
 
-      await user.click(within(otherSeriesChapterRegion).getByRole("button", { name: "返回剧集列表" }));
-      await user.click(screen.getByRole("button", { name: "退出" }));
+      const otherSeriesReturn = within(otherSeriesChapterRegion).getByText("返回剧集列表", { selector: "button" });
+      expect(otherSeriesReturn).toBeVisible();
+      expect(otherSeriesReturn).toHaveAccessibleName("返回剧集列表");
+      await user.click(otherSeriesReturn);
+      const exitButton = screen.getByText("退出", { selector: "button" });
+      expect(exitButton).toBeVisible();
+      expect(exitButton).toHaveAccessibleName("退出");
+      await user.click(exitButton);
       const loginCard = await screen.findByRole("region", { name: "欢迎回来" });
       const accountInput = within(loginCard).getByLabelText("账号");
       const passwordInput = within(loginCard).getByLabelText("密码");
@@ -2734,8 +2756,15 @@ describe("read-only workspace", () => {
       await user.paste("pass");
       await user.click(within(loginCard).getByRole("button", { name: "登录工作台" }));
       seriesList = await screen.findByRole("region", { name: "我的剧集" });
-      await user.click(within(seriesList).getByRole("button", { name: "团队剧集" }));
-      await user.click(within(seriesList).getByRole("button", { name: /全部剧集/ }));
+      const seriesFilterGroup = within(seriesList).getByRole("group", { name: "剧集筛选" });
+      const teamFilter = within(seriesFilterGroup).getByRole("button", { name: "团队剧集" });
+      expect(teamFilter).toBeVisible();
+      expect(teamFilter).toHaveAccessibleName("团队剧集");
+      await user.click(teamFilter);
+      const allFilter = within(seriesFilterGroup).getByRole("button", { name: /全部剧集/ });
+      expect(allFilter).toBeVisible();
+      expect(allFilter).toHaveAccessibleName(/全部剧集/);
+      await user.click(allFilter);
       await user.click(within(seriesList).getByRole("button", { name: /加载更多/ }));
       expect(within(seriesList).getByText("显示 24 / 24 部")).toBeInTheDocument();
       const secondSessionCard = await getSeriesCard(firstSeries.name);
@@ -2815,10 +2844,14 @@ describe("read-only workspace", () => {
         await waitFor(() => expect(listMyTasks).toHaveBeenCalledTimes(1));
         expect(screen.queryByRole("heading", { name: "我的制作记录" })).not.toBeInTheDocument();
 
-        await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+        const tasksRegion = screen.getByRole("region", { name: "我的任务" });
+        const tasksReturn = within(tasksRegion).getByText("返回剧集列表", { selector: "button" });
+        expect(tasksReturn).toBeVisible();
+        expect(tasksReturn).toHaveAccessibleName("返回剧集列表");
+        await user.click(tasksReturn);
         expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
         expect(within(seriesList).getByText("显示 24 / 24 部")).toBeInTheDocument();
-        expect(screen.getByRole("button", { name: /全部剧集/ })).toHaveAttribute("aria-pressed", "true");
+        expect(within(seriesFilterGroup).getByRole("button", { name: /全部剧集/ })).toHaveAttribute("aria-pressed", "true");
         expect(listMyTasks).toHaveBeenCalledTimes(1);
         expect(getPersonalProductionNotes).toHaveBeenCalledTimes(readsBeforeLocate.notes);
         expect(listChapters).toHaveBeenCalledTimes(readsBeforeLocate.chapters);
@@ -4175,9 +4208,10 @@ describe("read-only workspace", () => {
         targetChapterId,
         expect.any(AbortSignal),
       );
+      const chapterBrowserRegion = await screen.findByRole("region", { name: series.name });
 
       if (category === "characters") {
-        const sameChapterButtons = screen.getAllByRole("button", { name: /同名章节/ });
+        const sameChapterButtons = within(chapterBrowserRegion).getAllByRole("button", { name: /同名章节/ });
         expect(sameChapterButtons).toHaveLength(2);
         await user.click(sameChapterButtons[1]!);
         expect(chapterNavigationProbe.abandonedEpochs).toHaveLength(0);
@@ -4222,14 +4256,14 @@ describe("read-only workspace", () => {
 
       if (category === "characters") {
         scrollProbe.targets.length = 0;
-        await user.click(screen.getByRole("button", { name: "重新读取章节" }));
+        await user.click(within(chapterBrowserRegion).getByRole("button", { name: "重新读取章节" }));
         await waitFor(() => expect(listChapters).toHaveBeenCalledTimes(3));
         expect(chapterNavigationProbe.intent).toBeNull();
         expect(chapterNavigationProbe.consumedEpochs).toEqual([acceptedEpoch]);
         expect(scrollProbe.targets).toHaveLength(0);
       }
 
-      await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+      await user.click(within(chapterBrowserRegion).getByRole("button", { name: "返回剧集列表" }));
       expect(await screen.findByRole("heading", { name: "我的剧集" })).toBeInTheDocument();
       expect(screen.getByText("显示 24 / 24 部")).toBeInTheDocument();
       expect(screen.getByRole("button", { name: /全部剧集/ })).toHaveAttribute("aria-pressed", "true");
@@ -5850,10 +5884,12 @@ describe("read-only workspace", () => {
     await screen.findAllByRole("article");
     const navigation = screen.getByRole("navigation", { name: "主要导航" });
     await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
-    await user.click(await screen.findByRole("button", { name: /宿主团队/ }));
+    const teamDirectory = await screen.findByRole("region", { name: "我的团队目录" });
+    await user.click(await within(teamDirectory).findByRole("button", { name: /宿主团队/ }));
     await screen.findByRole("heading", { name: "宿主团队" });
     await user.click(screen.getByRole("tab", { name: "邀请码" }));
-    await user.click(screen.getByRole("button", { name: "读取邀请码" }));
+    const firstInvitePanel = await screen.findByRole("tabpanel", { name: "邀请码管理" });
+    await user.click(within(firstInvitePanel).getByRole("button", { name: "读取邀请码" }));
     await waitFor(() => expect(inviteReadCount).toBe(1));
 
     await user.click(screen.getByRole("tab", { name: "成员与权限" }));
@@ -5873,7 +5909,8 @@ describe("read-only workspace", () => {
 
     vi.spyOn(window, "confirm").mockReturnValue(true);
     await user.click(screen.getByRole("tab", { name: "邀请码" }));
-    await user.click(screen.getByRole("button", { name: "读取邀请码" }));
+    const secondInvitePanel = await screen.findByRole("tabpanel", { name: "邀请码管理" });
+    await user.click(within(secondInvitePanel).getByRole("button", { name: "读取邀请码" }));
     expect(await screen.findByRole("button", { name: "登录工作台" })).toBeInTheDocument();
     expect(window.localStorage.getItem(API_TOKEN_KEY)).toBeNull();
     expect(inviteReadCount).toBe(2);

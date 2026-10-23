@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .domain import CanvasDocumentRecord, parse_stored_document
+from .domain import CanvasDocumentRecord, canvas_save_receipt, parse_stored_document
 
 
 def canvas_document_payload(
@@ -22,3 +22,9 @@ def canvas_document_payload(
         "updated_by": record.updated_by,
         "updated_at": record.updated_at,
     }
+
+
+def guarded_canvas_document_payload(record: CanvasDocumentRecord) -> dict[str, Any]:
+    payload = canvas_document_payload(record)
+    payload["save_receipt"] = canvas_save_receipt(record)
+    return payload

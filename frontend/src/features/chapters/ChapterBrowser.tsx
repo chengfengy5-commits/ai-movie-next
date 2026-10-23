@@ -39,6 +39,7 @@ import { projectStoryboardFrames, type TextField } from "./storyboardProjection"
 import { findRoughCutFramePosition } from "./roughCutFrameNavigation";
 import { resolveProductionNoteFrameTarget } from "./productionNoteFrameNavigation";
 import { ChapterManagementDialog, type ChapterManagementAction } from "./ChapterManagementDialog";
+import { CanvasWorkspace } from "../canvas/CanvasWorkspace";
 import { ChapterOrderDialog } from "./ChapterOrderDialog";
 import { FrameTextEditor, type FrameTextSaveResult } from "./FrameTextEditor";
 import { FrameReviewDialog, type FrameReviewSourceCheck } from "./FrameReviewDialog";
@@ -72,6 +73,7 @@ interface ChapterBrowserProps {
   series: Series;
   services: WorkspaceServices;
   userId: string;
+  sessionGeneration?: number;
   onBack(): void;
   onUnauthorized(): void;
   navigationIntent?: ChapterNavigationIntent | null;
@@ -562,6 +564,7 @@ export function ChapterBrowser({
   series,
   services,
   userId,
+  sessionGeneration = 0,
   onBack,
   onUnauthorized,
   navigationIntent = null,
@@ -596,6 +599,7 @@ export function ChapterBrowser({
   const invalidateFrameEditingWorkflowRef = useRef<(options?: FrameEditingInvalidationOptions) => void>(() => undefined);
   const pendingFrameLockReleaseRef = useRef<ChapterEditLockOwner | null>(null);
   const [chapterMutationNotice, setChapterMutationNotice] = useState<string | null>(null);
+  const [canvasChapter, setCanvasChapter] = useState<Chapter | null>(null);
   const [navigationIssue, setNavigationIssue] = useState<{ epoch: number; issue: NavigationIssue } | null>(null);
   const [pendingFrameNavigation, setPendingFrameNavigation] = useState<PendingFrameNavigation | null>(null);
   const pendingFrameNavigationRef = useRef<PendingFrameNavigation | null>(null);
@@ -2852,6 +2856,7 @@ export function ChapterBrowser({
     || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null || frameEditOpening
     || storyboardGenerationDialog !== null || frameReviewDialog !== null;
   const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
+  const canOpenCanvas = series.can_enter && services.canvasData !== undefined;
   const canEditFrameStructure = series.can_enter
     && services.updateChapter !== undefined
     && services.deleteFrame !== undefined;
@@ -3412,6 +3417,13 @@ export function ChapterBrowser({
                 </div>
                 <div className="selected-chapter-actions">
                   <span className="readonly-pill">{canEditStoryboard ? "可编辑分镜文字" : "只读"}</span>
+                  {canOpenCanvas && (
+                    <button
+                      className="text-button"
+                      onClick={() => setCanvasChapter(selectedChapter)}
+                      type="button"
+                    >创作画布</button>
+                  )}
                   {canEditFrameStructure && (
                     <button
                       className="text-button frame-structure-insert-opening"
@@ -3921,6 +3933,19 @@ export function ChapterBrowser({
           seriesName={series.name}
           services={storyboardGenerationDialog.scope.services}
           userId={storyboardGenerationDialog.scope.userId}
+        />
+      )}
+      {canvasChapter !== null && services.canvasData !== undefined && (
+        <CanvasWorkspace
+          key={userId + ":" + sessionGeneration + ":" + series.id + ":" + canvasChapter.id}
+          chapter={canvasChapter}
+          onClose={() => setCanvasChapter(null)}
+          onUnauthorized={onUnauthorized}
+          port={services.canvasData}
+          series={series}
+          services={services}
+          sessionGeneration={sessionGeneration}
+          userId={userId}
         />
       )}
     </section>

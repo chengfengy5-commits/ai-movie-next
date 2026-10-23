@@ -36,6 +36,13 @@ class CanvasDocumentRecord:
     updated_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class CanvasSaveGuard:
+    mode: str
+    document_id: str | None
+    version: int
+
+
 def empty_canvas_document(chapter_id: str) -> dict[str, Any]:
     """Return a fresh copy of the source route's literal empty canvas."""
     return {
@@ -76,3 +83,12 @@ def exceeds_document_limit(serialized: str) -> bool:
 
 def next_document_version(current_version: int | None) -> int:
     return (current_version or 1) + 1
+
+
+def canvas_save_receipt(record: CanvasDocumentRecord) -> dict[str, Any]:
+    """Project the identity and revision produced by one guarded write."""
+    return {
+        "mode": "guarded-v1",
+        "id": record.id,
+        "version": record.version,
+    }

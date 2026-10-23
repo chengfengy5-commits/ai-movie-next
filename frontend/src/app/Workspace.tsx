@@ -581,6 +581,7 @@ function Dashboard() {
           >
             <SeriesPage
               onUnauthorized={logoutFromWorkspace}
+              sessionGeneration={sessionGeneration}
               onViewChapters={(series) => {
                 clearChapterNavigationIntent();
                 clearAssetNavigationIntent();
@@ -598,7 +599,6 @@ function Dashboard() {
               collaborationWriteScope={collaborationWriteScope}
               teamDirectoryRevision={teamDirectoryRevision}
               seriesRevision={seriesRevision}
-              sessionGeneration={sessionGeneration}
               shareGuardScopeKey={seriesShareGuardScopeKey}
               onShareGuardChange={updateSeriesShareGuard}
               onSeriesChanged={() => setSeriesRevision((revision) => revision + 1)}
@@ -617,6 +617,7 @@ function Dashboard() {
                 setSelectedView("series");
               }}
               onUnauthorized={logoutFromWorkspace}
+              sessionGeneration={sessionGeneration}
               navigationIntent={chapterNavigationIntent}
               onNavigationAbandoned={(epoch) => clearChapterNavigationIntent(epoch)}
               onNavigateToAsset={acceptFrameReferenceTarget}

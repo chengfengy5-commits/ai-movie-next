@@ -6,7 +6,7 @@ import inspect
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
 
 from haoai_backend.shared.errors import BusinessError
 from haoai_backend.shared.identity import TrustedActor
@@ -14,6 +14,7 @@ from haoai_backend.shared.identity import TrustedActor
 from . import application
 from .errors import CanvasDataUnavailable
 from .ports import UnitOfWorkFactory
+from .domain import CanvasSaveGuard
 from .schemas import CanvasDocumentResponse, CanvasDocumentUpdate
 
 ActorResolver = Callable[[Request], TrustedActor | Awaitable[TrustedActor]]
@@ -40,20 +41,23 @@ def build_canvas_data_router(
             raise HTTPException(status_code=error.status_code, detail=error.detail)
         return actor
 
-    def invoke(call: Callable[..., Any], *args: Any) -> Any:
+    def invoke(call: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
         try:
-            return call(uow_factory, *args)
+            return call(uow_factory, *args, **kwargs)
         except BusinessError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
 
-    @router.get("/{chapter_id}/canvas", response_model=CanvasDocumentResponse)
+    @router.get("/{chapter_id}/canvas", response_model=CanvasDocumentResponse, response_model_exclude_unset=True)
     def get_canvas(
         chapter_id: str,
+        save_mode: str | None = Query(default=None),
         actor: TrustedActor = Depends(trusted_actor),
     ) -> dict[str, Any]:
-        return invoke(application.get_chapter_canvas, actor, chapter_id)
+        if save_mode not in (None, "guarded-v1"):
+            raise HTTPException(status_code=400, detail="画布读取模式无效")
+        return invoke(application.get_chapter_canvas, actor, chapter_id, guarded=save_mode == "guarded-v1")
 
-    @router.put("/{chapter_id}/canvas", response_model=CanvasDocumentResponse)
+    @router.put("/{chapter_id}/canvas", response_model=CanvasDocumentResponse, response_model_exclude_unset=True)
     def put_canvas(
         chapter_id: str,
         request: CanvasDocumentUpdate,
@@ -65,6 +69,11 @@ def build_canvas_data_router(
             chapter_id,
             request.document_json,
             request.version,
+            CanvasSaveGuard(
+                mode=request.save_guard.mode,
+                document_id=request.save_guard.id,
+                version=request.save_guard.version,
+            ) if request.save_guard is not None else None,
         )
 
     return router

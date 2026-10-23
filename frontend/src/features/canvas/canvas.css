@@ -1,0 +1,348 @@
+.canvas-dialog-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1200;
+  display: grid;
+  padding: 18px;
+  background: rgb(15 23 42 / 58%);
+}
+
+.canvas-dialog {
+  display: flex;
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #d6dce7;
+  border-radius: 16px;
+  background: #f8fafc;
+  color: #172033;
+  box-shadow: 0 24px 80px rgb(15 23 42 / 28%);
+}
+
+.canvas-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 16px 20px;
+  border-bottom: 1px solid #e1e6ef;
+  background: #fff;
+}
+
+.canvas-header h2 {
+  margin: 2px 0 4px;
+  font-size: 18px;
+}
+
+.canvas-header .eyebrow {
+  margin: 0;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.canvas-header-actions,
+.canvas-tool-row,
+.canvas-filter-row,
+.canvas-relation-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.canvas-header-actions button,
+.canvas-tool-row button,
+.canvas-filter-row button,
+.canvas-relation-row button,
+.canvas-message button,
+.canvas-close-confirm button {
+  min-height: 34px;
+  padding: 6px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #334155;
+  font: inherit;
+  cursor: pointer;
+}
+
+.canvas-header-actions button:disabled,
+.canvas-tool-row button:disabled,
+.canvas-relation-row button:disabled,
+.canvas-message button:disabled {
+  cursor: not-allowed;
+  opacity: .48;
+}
+
+.canvas-header-actions .primary-button {
+  border-color: #4f46e5;
+  background: #4f46e5;
+  color: #fff;
+}
+
+.canvas-header-actions .canvas-close-button {
+  border-color: transparent;
+}
+
+.canvas-save-status {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.canvas-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid #e1e6ef;
+  background: #fff;
+}
+
+.canvas-filter-row {
+  flex-wrap: wrap;
+}
+
+.canvas-relation-row {
+  flex-wrap: wrap;
+}
+
+.canvas-filter-row button {
+  min-height: 30px;
+  padding: 4px 9px;
+  font-size: 12px;
+}
+
+.canvas-filter-row button.is-active {
+  border-color: #a5b4fc;
+  background: #eef2ff;
+  color: #4338ca;
+}
+
+.canvas-tool-row {
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.canvas-message,
+.canvas-error {
+  margin: 0;
+  padding: 8px 18px;
+  background: #fffbeb;
+  color: #92400e;
+  font-size: 13px;
+}
+
+.canvas-error {
+  background: #fef2f2;
+  color: #b91c1c;
+}
+
+.canvas-viewport {
+  position: relative;
+  flex: 1;
+  min-height: 280px;
+  overflow: hidden;
+  background-color: #f1f5f9;
+  background-image: radial-gradient(#cbd5e1 1px, transparent 1px);
+  background-size: 22px 22px;
+  cursor: grab;
+  touch-action: none;
+}
+
+.canvas-viewport:active {
+  cursor: grabbing;
+}
+
+.canvas-scene {
+  position: absolute;
+  inset: 0 auto auto 0;
+  width: 4000px;
+  height: 3000px;
+  transform-origin: 0 0;
+}
+
+.canvas-edge-layer {
+  position: absolute;
+  inset: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+
+.canvas-edge {
+  fill: none;
+  stroke: #94a3b8;
+  stroke-width: 2;
+  pointer-events: stroke;
+  cursor: pointer;
+}
+
+.canvas-edge.is-manual {
+  stroke: #6366f1;
+  stroke-dasharray: 7 5;
+}
+
+.canvas-node {
+  position: absolute;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  box-sizing: border-box;
+  padding: 12px;
+  overflow: hidden;
+  border: 1px solid #cbd5e1;
+  border-radius: 12px;
+  background: #fff;
+  box-shadow: 0 4px 12px rgb(15 23 42 / 8%);
+  cursor: grab;
+  touch-action: none;
+}
+
+.canvas-node.is-selected {
+  border-color: #6366f1;
+  box-shadow: 0 0 0 2px rgb(99 102 241 / 22%);
+}
+
+.canvas-node.is-connectable {
+  cursor: crosshair;
+}
+
+.canvas-node-title {
+  color: #1e293b;
+  font-size: 13px;
+}
+
+.canvas-node p,
+.canvas-node textarea {
+  max-height: 100px;
+  margin: 0;
+  overflow: auto;
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.canvas-node textarea {
+  min-height: 60px;
+  resize: vertical;
+  border: 1px solid #e2e8f0;
+  border-radius: 7px;
+  padding: 6px;
+  font: inherit;
+}
+
+.canvas-node-character { border-top: 3px solid #f59e0b; }
+.canvas-node-scene { border-top: 3px solid #14b8a6; }
+.canvas-node-prop { border-top: 3px solid #8b5cf6; }
+.canvas-node-frame { border-top: 3px solid #3b82f6; }
+.canvas-node-media,
+.canvas-node-preview { border-top: 3px solid #ec4899; }
+.canvas-node-video { border-top: 3px solid #0f766e; }
+.canvas-node-note { border-top: 3px solid #facc15; background: #fefce8; }
+.canvas-node-card { border-top: 3px solid #94a3b8; }
+
+.canvas-media-image {
+  display: block;
+  width: 100%;
+  max-height: 112px;
+  object-fit: contain;
+  border-radius: 6px;
+  background: #f1f5f9;
+}
+
+.canvas-media-status {
+  display: grid;
+  min-height: 48px;
+  place-items: center;
+  border-radius: 6px;
+  background: #f1f5f9;
+  color: #64748b;
+  font-size: 11px;
+}
+
+.canvas-empty-state {
+  display: grid;
+  height: 100%;
+  min-height: 240px;
+  place-items: center;
+  color: #64748b;
+}
+
+.canvas-connect-hint {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  padding: 8px 12px;
+  border: 1px solid #c7d2fe;
+  border-radius: 9px;
+  background: #eef2ff;
+  color: #4338ca;
+  font-size: 13px;
+}
+
+.canvas-confirm-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  display: grid;
+  place-items: center;
+  background: rgb(15 23 42 / 34%);
+}
+
+.canvas-close-confirm {
+  width: min(460px, calc(100% - 32px));
+  padding: 20px;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 20px 60px rgb(15 23 42 / 24%);
+}
+
+.canvas-close-confirm h3 {
+  margin: 0 0 8px;
+}
+
+.canvas-close-confirm p {
+  color: #475569;
+  line-height: 1.6;
+}
+
+.canvas-close-confirm > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+@media (max-width: 720px) {
+  .canvas-dialog-backdrop {
+    padding: 0;
+  }
+  .canvas-dialog {
+    border: 0;
+    border-radius: 0;
+  }
+  .canvas-header {
+    align-items: flex-start;
+    padding: 12px;
+  }
+  .canvas-header-actions {
+    flex-wrap: wrap;
+    justify-content: flex-end;
+  }
+  .canvas-toolbar {
+    padding: 8px;
+  }
+  .canvas-filter-row {
+    flex-wrap: nowrap;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+  .canvas-tool-row {
+    flex-wrap: nowrap;
+    max-width: 100%;
+    overflow-x: auto;
+  }
+}
