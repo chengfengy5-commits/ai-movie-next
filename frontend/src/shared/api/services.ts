@@ -118,12 +118,21 @@ import {
   type CreatorSettingsServicePort,
 } from "./creatorSettings";
 import type { FrameReviewServicePort } from "./frameReview";
+import type { FrameOptimizeServicePort } from "./frameOptimize";
 import {
   parseFrameReviewCancelReceipt,
   parseFrameReviewCapabilities,
   parseFrameReviewReceipt,
   parseFrameReviewTask,
 } from "./frameReviewHttp";
+import {
+  parseFrameOptimizeCancelReceipt,
+  parseFrameOptimizeCapabilities,
+  parseFrameOptimizeRunning,
+  parseFrameOptimizeSubmitReceipt,
+  parseFrameOptimizeTaskStatus,
+  validateFrameOptimizeSubmitInput,
+} from "./frameOptimizeHttp";
 import { parseMyTeamList, type MyTeam } from "./teams";
 import { createTeamManagementHttpPort } from "./teamManagementHttp";
 import type { TeamManagementServicePort } from "./teamManagement";
@@ -264,6 +273,7 @@ export interface WorkspaceServices {
   getTaskRequest?(taskId: string, signal: AbortSignal): Promise<TaskRequestRecord>;
   readonly storyboardGeneration?: StoryboardGenerationServicePort;
   readonly frameReview?: FrameReviewServicePort;
+  readonly frameOptimize?: FrameOptimizeServicePort;
   readonly creatorSettings?: CreatorSettingsServicePort;
   exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
   importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
@@ -2003,6 +2013,11 @@ type ApiEndpoint =
   | "frameReviewSubmit"
   | "frameReviewTask"
   | "frameReviewCancel"
+  | "frameOptimizeCapabilities"
+  | "frameOptimizeSubmit"
+  | "frameOptimizeRunning"
+  | "frameOptimizeTaskStatus"
+  | "frameOptimizeCancel"
   | "exportSeries"
   | "importSeries"
   | "uploadSeriesCover"
@@ -2164,6 +2179,25 @@ function apiRequestDefinition(
     return { path: "/chat/ai-review/" + taskId, method: "GET", expectedStatus: 200 };
   }
   if (endpoint === "frameReviewCancel") {
+    const taskId = encodeApiPathId(identifiers?.taskId, "任务");
+    return { path: "/chat/batch-optimize/" + taskId + "/cancel", method: "POST", expectedStatus: 200 };
+  }
+  if (endpoint === "frameOptimizeCapabilities") {
+    return { path: "/chat/frame-optimize/capabilities", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "frameOptimizeSubmit") {
+    return { path: "/chat/frame-optimize", method: "POST", expectedStatus: 200 };
+  }
+  if (endpoint === "frameOptimizeRunning") {
+    const chapterId = validateApiPathId(identifiers?.chapterId, "章节");
+    const query = new URLSearchParams({ chapter_id: chapterId });
+    return { path: "/chat/batch-optimize/running?" + query.toString(), method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "frameOptimizeTaskStatus") {
+    const taskId = encodeApiPathId(identifiers?.taskId, "任务");
+    return { path: "/chat/batch-optimize/" + taskId + "/status", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "frameOptimizeCancel") {
     const taskId = encodeApiPathId(identifiers?.taskId, "任务");
     return { path: "/chat/batch-optimize/" + taskId + "/cancel", method: "POST", expectedStatus: 200 };
   }
@@ -2757,6 +2791,53 @@ export function createApiServices(
     },
   };
 
+  const frameOptimize: FrameOptimizeServicePort = {
+    async getCapabilities(signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameOptimizeCapabilities(
+        await requestForCurrentApiSession("frameOptimizeCapabilities", token, signal),
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async submit(input, signal) {
+      validateFrameOptimizeSubmitInput(input);
+      const token = requireApiToken(storage);
+      const result = parseFrameOptimizeSubmitReceipt(
+        await requestForCurrentApiSession("frameOptimizeSubmit", token, signal, input),
+        { chapterId: input.chapter_id, frameCount: input.frames.length },
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async getRunning(chapterId, signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameOptimizeRunning(
+        await requestForCurrentApiSession("frameOptimizeRunning", token, signal, undefined, { chapterId }),
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async getTaskStatus(taskId, signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameOptimizeTaskStatus(
+        await requestForCurrentApiSession("frameOptimizeTaskStatus", token, signal, undefined, { taskId }),
+        taskId,
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+    async cancel(taskId, signal) {
+      const token = requireApiToken(storage);
+      const result = parseFrameOptimizeCancelReceipt(
+        await requestForCurrentApiSession("frameOptimizeCancel", token, signal, undefined, { taskId }),
+        taskId,
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return result;
+    },
+  };
+
   const accountProfile: AccountProfileServicePort = {
     async getCredits(signal) {
       const token = requireApiToken(storage);
@@ -2848,6 +2929,7 @@ export function createApiServices(
     }),
     creatorSettings,
     frameReview,
+    frameOptimize,
     accountProfile,
     accountMembership,
     accountSecurity,

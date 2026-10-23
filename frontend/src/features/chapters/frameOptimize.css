@@ -1,0 +1,95 @@
+.frame-optimize-dialog {
+  display: grid;
+  gap: 1rem;
+  max-height: min(90vh, 900px);
+  overflow-y: auto;
+}
+
+.frame-optimize-selection {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.frame-optimize-selection-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.frame-optimize-selection ul {
+  display: grid;
+  gap: 0.65rem;
+  max-height: 18rem;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.frame-optimize-selection li {
+  border: 1px solid var(--line, #d8dee8);
+  border-radius: 0.65rem;
+  padding: 0.65rem 0.75rem;
+}
+
+.frame-optimize-selection li label,
+.frame-optimize-thinking {
+  display: flex;
+  align-items: center;
+  gap: 0.55rem;
+  color: var(--ink-700, #384250);
+  font-weight: 650;
+}
+
+.frame-optimize-selection li p {
+  margin: 0.4rem 0 0;
+  color: var(--ink-700, #384250);
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.frame-optimize-selection li small,
+.frame-optimize-muted {
+  color: var(--ink-600, #5b6573);
+  font-size: 0.86rem;
+}
+
+.frame-optimize-label {
+  display: grid;
+  gap: 0.4rem;
+  color: var(--ink-700, #384250);
+  font-size: 0.9rem;
+  font-weight: 650;
+}
+
+.frame-optimize-label select,
+.frame-optimize-label input {
+  border: 1px solid var(--line-strong, #c5ceda);
+  border-radius: 0.65rem;
+  background: var(--surface, #fff);
+  color: inherit;
+  font: inherit;
+  padding: 0.65rem 0.75rem;
+}
+
+.frame-optimize-task {
+  display: grid;
+  gap: 0.45rem;
+  border-top: 1px solid var(--line, #d8dee8);
+  padding-top: 0.85rem;
+  overflow-wrap: anywhere;
+}
+
+.frame-optimize-warning {
+  border-left: 3px solid var(--warning, #b86b16);
+  background: var(--warning-surface, #fff7e9);
+  padding: 0.65rem 0.8rem;
+}
+
+.frame-optimize-actions {
+  position: sticky;
+  bottom: -1.25rem;
+  background: var(--surface, #fff);
+  padding-block: 0.8rem 0.25rem;
+}
