@@ -13,12 +13,14 @@ import {
 import type { WorkspaceServices } from "../../shared/api/services";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
 import type { FrameReviewCapabilities, FrameReviewServicePort, FrameReviewTask } from "../../shared/api/frameReview";
+import { parseFrameOptimizeTaskStatus } from "../../shared/api/frameOptimizeHttp";
 import type {
   FrameOptimizeCapabilities,
   FrameOptimizeServicePort,
   FrameOptimizeSubmitInput,
   FrameOptimizeTaskStatus,
 } from "../../shared/api/frameOptimize";
+import frameOptimizeStatusWire from "../../testing/fixtures/frameOptimizeStatusWire.json";
 import type { StoryboardGenerationServicePort } from "../storyboard-generation/contracts";
 import { digestPersonalProductionMediaIdentity } from "./personal-production/mediaIdentity";
 import { demoSeries } from "../series/demoSeries";
@@ -4825,7 +4827,7 @@ describe("read-only chapter browser", () => {
     await screen.findByRole("heading", { name: "部分结果读回章节" });
     await userEvent.setup().click(screen.getByRole("button", { name: "批量优化分镜" }));
     const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
-    expect(await dialog.findByText("任务已结束；章节与素材已重新读取，部分结果、原文和镜头身份均与服务端真源核对一致。"))
+    expect(await dialog.findByText("任务已结束；章节与素材已重新读取，任务结果、原文和镜头身份均与服务端真源核对一致。"))
       .toBeInTheDocument();
     expect(dialog.getByText("终态：失败（可能含部分结果）")).toBeInTheDocument();
     expect(frameOptimize.submit).not.toHaveBeenCalled();
@@ -4833,6 +4835,79 @@ describe("read-only chapter browser", () => {
     expect(frame.getCurrentChapters()[0]?.content).toEqual([
       { text: "已应用优化", original_text: "提交时原文", storyboard: ["optimize-partial-readback-asset"], keep: "字段" },
     ]);
+  });
+
+  it("verifies a completed projection array against fresh chapter and assets without writing task output", async () => {
+    const current = chapter("chapter-optimize-array-readback", "成功数组读回章节", [
+      { text: "提交时原文", storyboard: ["optimize-array-readback-asset"], keep: "字段" },
+    ]);
+    const sourceAsset = { ...asset("optimize-array-readback-asset", current.id), frame_index: 0 };
+    const frame = makeServices([current], { [current.id]: [sourceAsset] }, false, true);
+    const request: FrameOptimizeSubmitInput = {
+      chapter_id: current.id,
+      model_id: "system-text-model",
+      prompt_id: "",
+      enable_thinking: false,
+      concurrency: 5,
+      chapter_texts: ["【剧情片段】\n提交时原文"],
+      frames: [{ index: 0, text: "提交时原文", asset_context: "" }],
+    };
+    const processingWire = frameOptimizeStatusWire.cases.processingArray.wire;
+    const completedWire = frameOptimizeStatusWire.cases.completedArray.wire;
+    let statusReads = 0;
+    Object.assign(frame.services, {
+      getTaskRequest: vi.fn(async (taskId: string) => ({
+        id: taskId,
+        type: "batch-optimize",
+        status: "processing",
+        modelName: null,
+        creditCost: null,
+        externalTaskId: null,
+        externalProvider: null,
+        createdAt: null,
+        request,
+      })),
+    });
+    const { frameOptimize } = attachFrameOptimizeServices(frame.services, {
+      getRunning: vi.fn()
+        .mockResolvedValueOnce({
+          task_id: processingWire.task_id, status: "processing", progress: 45, progress_message: "已应用1项", created_at: null,
+        })
+        .mockResolvedValue(null),
+      getTaskStatus: vi.fn(async (taskId: string) => {
+        const wire = statusReads++ === 0 ? processingWire : completedWire;
+        if (wire.status === "completed") {
+          frame.setCurrentChapters([{
+            ...current,
+            content: [{
+              text: "合成成功文字", original_text: "提交时原文",
+              storyboard: ["optimize-array-readback-asset"], keep: "字段",
+            }],
+          }]);
+          frame.assetsByChapter[current.id] = [{
+            ...sourceAsset, description: "合成成功文字", updated_at: "2026-10-23T00:00:00Z",
+          }];
+        }
+        return parseFrameOptimizeTaskStatus(wire, taskId);
+      }),
+    });
+    renderBrowser(frame.services);
+
+    await screen.findByRole("heading", { name: "成功数组读回章节" });
+    await userEvent.setup().click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    await waitFor(() => expect(dialog.getByText(
+      "任务已结束；章节与素材已重新读取，任务结果、原文和镜头身份均与服务端真源核对一致。",
+    )).toBeInTheDocument(), { timeout: 4000 });
+    expect(dialog.getByText("终态：完成")).toBeInTheDocument();
+    expect(dialog.getByRole("region", { name: "任务返回的分镜结果" })).toHaveTextContent("镜头 1：合成成功文字");
+    expect(statusReads).toBe(2);
+    expect(frameOptimize.submit).not.toHaveBeenCalled();
+    expect(frame.updateChapter).not.toHaveBeenCalled();
+    expect(frame.getCurrentChapters()[0]?.content).toEqual([{
+      text: "合成成功文字", original_text: "提交时原文",
+      storyboard: ["optimize-array-readback-asset"], keep: "字段",
+    }]);
   });
 
   it("observes a same-account legacy batch task read-only and refreshes the chapter on terminal status", async () => {

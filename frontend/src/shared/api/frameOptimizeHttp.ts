@@ -6,6 +6,7 @@ import type {
   FrameOptimizeRunningTask,
   FrameOptimizeSubmitInput,
   FrameOptimizeSubmitReceipt,
+  FrameOptimizeTaskResultEntry,
   FrameOptimizeTaskStatus,
 } from "./frameOptimize";
 
@@ -46,6 +47,25 @@ function progressValue(value: Record<string, unknown>, label: string): number {
     throw new ApiError("invalid-response", `${label}.progress格式无效。`);
   }
   return progress;
+}
+
+function parseTaskResultEntries(value: unknown): FrameOptimizeTaskResultEntry[] {
+  if (!Array.isArray(value)) throw new ApiError("invalid-response", "分镜优化任务result数组格式无效。");
+  const entries: FrameOptimizeTaskResultEntry[] = [];
+  const seen = new Set<number>();
+  for (const rawEntry of value) {
+    if (rawEntry === null || typeof rawEntry !== "object" || Array.isArray(rawEntry)) {
+      throw new ApiError("invalid-response", "分镜优化任务result数组项格式无效。");
+    }
+    const entry = rawEntry as Record<string, unknown>;
+    if (!Number.isSafeInteger(entry.index) || (entry.index as number) < 0
+      || typeof entry.optimized_text !== "string" || seen.has(entry.index as number)) {
+      throw new ApiError("invalid-response", "分镜优化任务result数组项格式无效。");
+    }
+    seen.add(entry.index as number);
+    entries.push({ index: entry.index as number, optimized_text: entry.optimized_text });
+  }
+  return entries;
 }
 
 export function parseFrameOptimizeCapabilities(value: unknown): FrameOptimizeCapabilities {
@@ -154,8 +174,16 @@ export function parseFrameOptimizeTaskStatus(value: unknown, expectedTaskId: str
     throw new ApiError("invalid-response", "分镜优化任务状态缺少result字段。");
   }
   const rawResult = payload.result;
-  if (rawResult !== null && typeof rawResult !== "string"
-    && (typeof rawResult !== "object" || Array.isArray(rawResult))) {
+  if (Array.isArray(rawResult)) {
+    return {
+      task_id: taskId,
+      status: requiredString(payload, "status", "分镜优化任务状态"),
+      progress: progressValue(payload, "分镜优化任务状态"),
+      progress_message: requiredText(payload, "progress_message", "分镜优化任务状态"),
+      result: parseTaskResultEntries(rawResult),
+    };
+  }
+  if (rawResult !== null && typeof rawResult !== "string" && typeof rawResult !== "object") {
     throw new ApiError("invalid-response", "分镜优化任务result格式无效。");
   }
   return {

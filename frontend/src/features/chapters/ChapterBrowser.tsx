@@ -19,7 +19,7 @@ import {
   applyFrameOptimizePartialToContent,
   frameOptimizeChapterContentAfterWrite,
   frameOptimizeSourceText,
-  parseFrameOptimizePartialResult,
+  parseFrameOptimizeTaskResult,
   restoreFrameOptimizeOriginals as buildFrameOptimizeRestoration,
   sameFrameOptimizeAssets,
   sameFrameOptimizeAssetsAfterChapterWrite,
@@ -3130,10 +3130,10 @@ export function ChapterBrowser({
     if (request.chapter_id !== owner.chapter.id) {
       return { status: "unconfirmed", message: "任务已结束，但章节请求身份无法核对；结果没有写回，仍需人工检查。" };
     }
-    const parsed = parseFrameOptimizePartialResult(status.result);
+    const parsed = parseFrameOptimizeTaskResult(status.result);
     if (!parsed.valid) return { status: "unconfirmed", message: "任务已结束，但返回结果格式无法识别；未据此修改章节。请重新读取真源核对。" };
     const requestByIndex = new Map(request.frames.map((frame) => [frame.index, frame]));
-    if (parsed.partial.some((item) => !requestByIndex.has(item.index))) {
+    if (parsed.results.some((item) => !requestByIndex.has(item.index))) {
       return { status: "unconfirmed", message: "任务部分结果含有未提交的镜头索引；没有据此修改章节。" };
     }
     const baseContent = owner.chapter.content;
@@ -3162,7 +3162,7 @@ export function ChapterBrowser({
     const sourceMappingValid = matches.length === 1 && latest !== undefined
       && latest.series_id === owner.scope.seriesId
       && sameChapterOrderSnapshot(owner.baseDirectory, directory, owner.scope.seriesId)
-      && sameFrameOptimizeAssets(owner.baseAssets, assets, parsed.partial)
+      && sameFrameOptimizeAssets(owner.baseAssets, assets, parsed.results)
       && inspectStoryboardReferences(latest.content, assets, owner.scope.seriesId, latest.id).ok
       && areReferencedFrameAssetPositionsValid(latest, assets, owner.scope.seriesId)
       && request.frames.every((frame) => storyboardFrameId(latest.content?.[frame.index])
@@ -3170,7 +3170,7 @@ export function ChapterBrowser({
     if (!sourceMappingValid || latest === undefined) {
       return { status: "unconfirmed", message: "任务已结束，但章节、素材 ID 或镜头映射发生变化；结果未被标记为应用。" };
     }
-    const expectedContent = applyFrameOptimizePartialToContent(baseContent, request.frames, parsed.partial);
+    const expectedContent = applyFrameOptimizePartialToContent(baseContent, request.frames, parsed.results);
     if (expectedContent === null) return { status: "unconfirmed", message: "任务回读内容无法安全构造；没有写入任务结果。" };
     const verified = sameChapterContent(expectedContent, latest.content);
     applyFreshChapterDirectory(directory, owner.scope);
@@ -3181,7 +3181,7 @@ export function ChapterBrowser({
       setFrameOptimizeDialog(refreshedOwner);
     }
     return verified
-      ? { status: "verified", message: "任务已结束；章节与素材已重新读取，部分结果、原文和镜头身份均与服务端真源核对一致。" }
+      ? { status: "verified", message: "任务已结束；章节与素材已重新读取，任务结果、原文和镜头身份均与服务端真源核对一致。" }
       : { status: "conflict", message: "任务已结束；已重新读取章节和素材，但实际内容与任务部分结果不同。页面已切换到最新真源，请核对后再恢复或继续提交。" };
   }
 

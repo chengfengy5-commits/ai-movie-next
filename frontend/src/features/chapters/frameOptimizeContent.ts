@@ -1,6 +1,6 @@
 import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
 import type { CreatorPrompt } from "../../shared/api/creatorSettings";
-import type { FrameOptimizeSubmitInput } from "../../shared/api/frameOptimize";
+import type { FrameOptimizeSubmitInput, FrameOptimizeTaskResultEntry } from "../../shared/api/frameOptimize";
 
 export interface FrameOptimizeAssetNames {
   characters: Character[];
@@ -210,26 +210,37 @@ export function frameOptimizeChapterContentAfterWrite(content: StoryboardFrame[]
     : frame);
 }
 
-export function parseFrameOptimizePartialResult(
-  result: Record<string, unknown> | string | null,
-): { partial: Array<{ index: number; optimized_text: string }>; error: string | null; valid: boolean } {
-  if (result === null) return { partial: [], error: null, valid: true };
-  if (typeof result === "string") return { partial: [], error: null, valid: false };
-  const rawPartial = result.partial;
-  if (!Array.isArray(rawPartial)) return { partial: [], error: null, valid: false };
-  const partial: Array<{ index: number; optimized_text: string }> = [];
+function parseTaskResultEntries(value: unknown): FrameOptimizeTaskResultEntry[] | null {
+  if (!Array.isArray(value)) return null;
+  const entries: FrameOptimizeTaskResultEntry[] = [];
   const seen = new Set<number>();
-  for (const entry of rawPartial) {
+  for (const entry of value) {
     if (!isRecord(entry) || !Number.isSafeInteger(entry.index) || (entry.index as number) < 0
       || typeof entry.optimized_text !== "string" || seen.has(entry.index as number)) {
-      return { partial: [], error: null, valid: false };
+      return null;
     }
     seen.add(entry.index as number);
-    partial.push({ index: entry.index as number, optimized_text: entry.optimized_text });
+    entries.push({ index: entry.index as number, optimized_text: entry.optimized_text });
   }
+  return entries;
+}
+
+export function parseFrameOptimizeTaskResult(
+  result: unknown,
+): { results: FrameOptimizeTaskResultEntry[]; error: string | null; valid: boolean } {
+  if (result === null) return { results: [], error: null, valid: true };
+  if (Array.isArray(result)) {
+    const results = parseTaskResultEntries(result);
+    return results === null
+      ? { results: [], error: null, valid: false }
+      : { results, error: null, valid: true };
+  }
+  if (!isRecord(result)) return { results: [], error: null, valid: false };
+  const results = parseTaskResultEntries(result.partial);
+  if (results === null) return { results: [], error: null, valid: false };
   const error = result.error;
-  if (error !== undefined && typeof error !== "string") return { partial: [], error: null, valid: false };
-  return { partial, error: typeof error === "string" ? error : null, valid: true };
+  if (error !== undefined && typeof error !== "string") return { results: [], error: null, valid: false };
+  return { results, error: typeof error === "string" ? error : null, valid: true };
 }
 
 export function applyFrameOptimizePartialToContent(

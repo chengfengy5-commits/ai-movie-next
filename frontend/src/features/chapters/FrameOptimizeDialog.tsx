@@ -7,7 +7,7 @@ import type {
   FrameOptimizeTaskStatus,
 } from "../../shared/api/frameOptimize";
 import type { TaskRequestRecord } from "../../shared/api/taskDetails";
-import { buildFrameOptimizeRequest, frameOptimizeSourceText, parseFrameOptimizePartialResult } from "./frameOptimizeContent";
+import { buildFrameOptimizeRequest, frameOptimizeSourceText, parseFrameOptimizeTaskResult } from "./frameOptimizeContent";
 import type { FrameOptimizeAssetNames as ContentAssetNames } from "./frameOptimizeContent";
 import {
   beginFrameOptimizeSubmit,
@@ -181,7 +181,7 @@ export function FrameOptimizeDialog({
     const frame = frames[index];
     return isRecord(frame) && typeof frame.original_text === "string" && frame.original_text !== "";
   });
-  const parsedTaskResult = task === null ? null : parseFrameOptimizePartialResult(task.result);
+  const parsedTaskResult = task === null ? null : parseFrameOptimizeTaskResult(task.result);
   const restoreBlocked = frameOptimizeRestoreIsBusy(userId, seriesId, chapter.id);
   const current = () => mounted.current && isCurrentRef.current();
 
@@ -648,11 +648,11 @@ export function FrameOptimizeDialog({
           <section aria-label="批量分镜优化任务状态" className="frame-optimize-task" role="status">
             <p>任务编号：{taskId}</p>
             {task !== null && <><p>任务状态：{task.status}</p><progress max={100} value={task.progress} />{task.progress_message && <p>{task.progress_message}</p>}</>}
-            {parsedTaskResult !== null && parsedTaskResult.valid && parsedTaskResult.partial.length > 0 && (
-              <section aria-label="任务返回的部分分镜结果">
-                <p>任务返回的部分结果（只读展示，未据此写入章节）：</p>
+            {parsedTaskResult !== null && parsedTaskResult.valid && parsedTaskResult.results.length > 0 && (
+              <section aria-label="任务返回的分镜结果">
+                <p>任务返回的分镜结果（只读展示，未据此写入章节）：</p>
                 <ol>
-                  {parsedTaskResult.partial.map((item) => (
+                  {parsedTaskResult.results.map((item) => (
                     <li key={item.index}>镜头 {item.index + 1}：{item.optimized_text}</li>
                   ))}
                 </ol>
