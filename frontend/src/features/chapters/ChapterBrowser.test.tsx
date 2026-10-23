@@ -11,8 +11,14 @@ import {
   type PersonalProductionSnapshot,
 } from "../../shared/api/personalProductionNotes";
 import type { WorkspaceServices } from "../../shared/api/services";
-import type { CreatorModel, CreatorPrompt } from "../../shared/api/creatorSettings";
+import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
 import type { FrameReviewCapabilities, FrameReviewServicePort, FrameReviewTask } from "../../shared/api/frameReview";
+import type {
+  FrameOptimizeCapabilities,
+  FrameOptimizeServicePort,
+  FrameOptimizeSubmitInput,
+  FrameOptimizeTaskStatus,
+} from "../../shared/api/frameOptimize";
 import type { StoryboardGenerationServicePort } from "../storyboard-generation/contracts";
 import { digestPersonalProductionMediaIdentity } from "./personal-production/mediaIdentity";
 import { demoSeries } from "../series/demoSeries";
@@ -31,6 +37,7 @@ const personalNotesBridge = vi.hoisted(() => ({
   onLocateProductionNoteFrame: null as ((target: PersonalProductionNoteFrameTarget) => boolean) | null,
   onClose: null as ((identity: PersonalProductionNoteReadIdentity | null) => void) | null,
   lastProductionNoteTarget: null as PersonalProductionNoteFrameTarget | null,
+  assets: [] as StoryboardAsset[],
 }));
 
 const frameAssetReferencesBridge = vi.hoisted(() => ({
@@ -51,6 +58,7 @@ vi.mock("./PersonalProductionNotesPanel", async (importOriginal) => {
   return {
     ...actual,
     PersonalProductionNotesPanel: (props: ComponentProps<typeof actual.PersonalProductionNotesPanel>) => {
+      personalNotesBridge.assets = props.assets;
       personalNotesBridge.onLocateResume = props.onLocateResume;
       personalNotesBridge.onResumeInvalidated = props.onResumeInvalidated;
       personalNotesBridge.onRegisterFrameRead = props.onRegisterFrameRead;
@@ -295,6 +303,42 @@ function renderBrowser(
   return { ...view, onBack, onUnauthorized };
 }
 
+function attachFrameOptimizeServices(
+  services: WorkspaceServices,
+  overrides: Partial<FrameOptimizeServicePort> = {},
+) {
+  const capabilities: FrameOptimizeCapabilities = {
+    operation: "frame.optimize",
+    enabled: true,
+    reason: null,
+    supported_providers: ["openai"],
+  };
+  const model: CreatorModel = {
+    id: "frame-optimize-model",
+    category: "text",
+    name: "测试文本模型",
+    provider: "openai",
+    params: null,
+    sort_order: 1,
+    is_system: true,
+    user_id: "system",
+  };
+  const frameOptimize: FrameOptimizeServicePort = {
+    getCapabilities: vi.fn(async () => capabilities),
+    submit: vi.fn(async (input) => ({ task_id: "chapter-optimize-task", chapter_id: input.chapter_id, frame_count: input.frames.length })),
+    getRunning: vi.fn(async () => null),
+    getTaskStatus: vi.fn(async () => ({ task_id: "chapter-optimize-task", status: "processing", progress: 0, progress_message: "处理中", result: null })),
+    cancel: vi.fn(async (taskId) => ({ task_id: taskId, status: "cancelling" as const })),
+    ...overrides,
+  };
+  const creatorSettings = {
+    listModels: vi.fn(async () => [model]),
+    listPrompts: vi.fn(async (_category?: string | null) => [] as CreatorPrompt[]),
+  } as unknown as Pick<CreatorSettingsServicePort, "listModels" | "listPrompts">;
+  Object.assign(services, { frameOptimize, creatorSettings });
+  return { frameOptimize, creatorSettings };
+}
+
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason: unknown) => void;
@@ -458,6 +502,7 @@ describe("read-only chapter browser", () => {
     personalNotesBridge.onLocateProductionNoteFrame = null;
     personalNotesBridge.onClose = null;
     personalNotesBridge.lastProductionNoteTarget = null;
+    personalNotesBridge.assets = [];
     frameAssetReferencesBridge.onClose = null;
     frameAssetReferencesBridge.owner = null;
     roughCutPanelBridge.onClose = null;
@@ -4607,6 +4652,508 @@ describe("read-only chapter browser", () => {
     expect(frame.updateChapter).toHaveBeenCalledTimes(1);
     expect(frame.releaseChapterEditLock).not.toHaveBeenCalled();
     expect(frame.getChapterEditLock.mock.calls.every((call) => call.length === 2)).toBe(true);
+  });
+
+  it("restores selected originals only after confirming the team lock and a complete source readback", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-optimize-restore", "恢复原文章节", [
+      {
+        text: "服务器优化文字",
+        original_text: "保留的原始文字",
+        storyboard: ["optimize-restore-asset"],
+        editor_note: "保留其它字段",
+      },
+      { text: "相邻镜头", storyboard: ["optimize-restore-neighbor"] },
+    ]);
+    const { services, updateChapter, getChapterEditLock, acquireChapterEditLock, releaseChapterEditLock, getCurrentChapters, setCurrentChapters, assetsByChapter } = makeServices(
+      [current],
+      { [current.id]: [
+        { ...asset("optimize-restore-asset", current.id), frame_index: 0 },
+        { ...asset("optimize-restore-neighbor", current.id), frame_index: 1 },
+      ] },
+      false,
+      true,
+    );
+    attachFrameOptimizeServices(services);
+    updateChapter.mockImplementation(async (seriesId, chapterId, update) => {
+      const updated = getCurrentChapters().map((row) => row.id === chapterId ? { ...row, ...update } : row);
+      setCurrentChapters(updated);
+      const result = updated.find((row) => row.id === chapterId);
+      if (result === undefined || result.series_id !== seriesId) throw new ApiError("http", "missing", 404);
+      const frames = Array.isArray(update.content) ? update.content as Array<Record<string, unknown>> : [];
+      const expectedById = new Map<string, { frame: Record<string, unknown>; index: number }>();
+      frames.forEach((value, index) => {
+        const refs = value.storyboard;
+        if (Array.isArray(refs) && typeof refs[0] === "string") {
+          expectedById.set(refs[0], { frame: value, index });
+        }
+      });
+      assetsByChapter[chapterId] = (assetsByChapter[chapterId] ?? []).flatMap((sourceAsset) => {
+        const expected = expectedById.get(sourceAsset.id);
+        if (expected === undefined) return [];
+        const description = expected.frame.text || expected.frame.original_text || "";
+        return [{
+          ...sourceAsset,
+          frame_index: expected.index,
+          name: `分镜 ${expected.index + 1}`,
+          description: typeof description === "string" ? description : "",
+          updated_at: "2026-10-23T12:00:00Z",
+        }];
+      });
+      return result;
+    });
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    getChapterEditLock.mockImplementation(async (_chapterId, _signal, lease) => (
+      lease === undefined ? { locked: false } : ownedLock
+    ));
+    const teamSeries = { ...series, team_id: "team-optimize-restore" };
+    renderBrowser(services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByRole("heading", { name: "恢复原文章节" });
+    await user.click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    await user.click(dialog.getByRole("checkbox", { name: "镜头 1 · 已有原文" }));
+    await user.click(dialog.getByRole("button", { name: "恢复所选镜头原文" }));
+
+    expect(await dialog.findByText("所选原文已恢复；章节与素材重新读取后通过完整内容核对。")).toBeInTheDocument();
+    expect(acquireChapterEditLock).toHaveBeenCalledTimes(1);
+    expect(getChapterEditLock).toHaveBeenLastCalledWith(current.id, expect.any(AbortSignal), expect.any(Object));
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+    expect(updateChapter).toHaveBeenCalledWith(series.id, current.id, {
+      content: [
+        { text: "保留的原始文字", storyboard: ["optimize-restore-asset"], editor_note: "保留其它字段" },
+        { text: "相邻镜头", storyboard: ["optimize-restore-neighbor"] },
+      ],
+    }, expect.any(AbortSignal));
+    expect(getCurrentChapters()[0]?.content).toEqual([
+      { text: "保留的原始文字", storyboard: ["optimize-restore-asset"], editor_note: "保留其它字段" },
+      { text: "相邻镜头", storyboard: ["optimize-restore-neighbor"] },
+    ]);
+    expect(assetsByChapter[current.id]).toMatchObject([
+      { id: "optimize-restore-asset", name: "分镜 1", description: "保留的原始文字" },
+      { id: "optimize-restore-neighbor", name: "分镜 2", description: "相邻镜头" },
+    ]);
+    expect(releaseChapterEditLock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not submit after the dialog source baseline changes", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-optimize-source-drift", "优化源变化章节", [
+      { text: "打开时原文", storyboard: ["optimize-source-drift-asset"] },
+    ]);
+    const frame = makeServices(
+      [current],
+      { [current.id]: [{ ...asset("optimize-source-drift-asset", current.id), frame_index: 0 }] },
+      false,
+      true,
+    );
+    const { frameOptimize } = attachFrameOptimizeServices(frame.services);
+    renderBrowser(frame.services);
+
+    await screen.findByRole("heading", { name: "优化源变化章节" });
+    await user.click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    frame.setCurrentChapters([{
+      ...current,
+      content: [{ text: "外部改动后的文字", storyboard: ["optimize-source-drift-asset"] }],
+    }]);
+    await user.click(dialog.getByRole("checkbox", { name: "镜头 1 · 未保存原文" }));
+    await user.click(dialog.getByRole("button", { name: "提交优化" }));
+    expect(await dialog.findByText(/提交前发现章节文字、顺序或素材基线变化/)).toBeInTheDocument();
+    expect(frameOptimize.submit).not.toHaveBeenCalled();
+  });
+
+  it("checks an applied partial result against the refreshed chapter and asset descriptions without writing it", async () => {
+    const current = chapter("chapter-optimize-partial-readback", "部分结果读回章节", [
+      { text: "提交时原文", storyboard: ["optimize-partial-readback-asset"], keep: "字段" },
+    ]);
+    const sourceAsset = { ...asset("optimize-partial-readback-asset", current.id), frame_index: 0 };
+    const frame = makeServices([current], { [current.id]: [sourceAsset] }, false, true);
+    const request: FrameOptimizeSubmitInput = {
+      chapter_id: current.id,
+      model_id: "system-text-model",
+      prompt_id: "",
+      enable_thinking: false,
+      concurrency: 5,
+      chapter_texts: ["【剧情片段】\n提交时原文"],
+      frames: [{ index: 0, text: "提交时原文", asset_context: "" }],
+    };
+    const status: FrameOptimizeTaskStatus = {
+      task_id: "partial-readback-task",
+      status: "failed",
+      progress: 100,
+      progress_message: "其它镜头失败",
+      result: { partial: [{ index: 0, optimized_text: "已应用优化" }], error: "one_item_failed" },
+    };
+    Object.assign(frame.services, {
+      getTaskRequest: vi.fn(async (taskId: string) => ({
+        id: taskId,
+        type: "batch-optimize",
+        status: "processing",
+        modelName: null,
+        creditCost: null,
+        externalTaskId: null,
+        externalProvider: null,
+        createdAt: null,
+        request,
+      })),
+    });
+    const { frameOptimize } = attachFrameOptimizeServices(frame.services, {
+      getRunning: vi.fn()
+        .mockResolvedValueOnce({
+          task_id: status.task_id, status: "processing", progress: 50, progress_message: "处理中", created_at: null,
+        })
+        .mockResolvedValue(null),
+      getTaskStatus: vi.fn(async () => {
+        frame.setCurrentChapters([{
+          ...current,
+          content: [{ text: "已应用优化", original_text: "提交时原文", storyboard: ["optimize-partial-readback-asset"], keep: "字段" }],
+        }]);
+        frame.assetsByChapter[current.id] = [{ ...sourceAsset, description: "已应用优化", updated_at: "2026-10-23T00:00:00Z" }];
+        return status;
+      }),
+    });
+    renderBrowser(frame.services);
+
+    await screen.findByRole("heading", { name: "部分结果读回章节" });
+    await userEvent.setup().click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    expect(await dialog.findByText("任务已结束；章节与素材已重新读取，部分结果、原文和镜头身份均与服务端真源核对一致。"))
+      .toBeInTheDocument();
+    expect(dialog.getByText("终态：失败（可能含部分结果）")).toBeInTheDocument();
+    expect(frameOptimize.submit).not.toHaveBeenCalled();
+    expect(frame.updateChapter).not.toHaveBeenCalled();
+    expect(frame.getCurrentChapters()[0]?.content).toEqual([
+      { text: "已应用优化", original_text: "提交时原文", storyboard: ["optimize-partial-readback-asset"], keep: "字段" },
+    ]);
+  });
+
+  it("observes a same-account legacy batch task read-only and refreshes the chapter on terminal status", async () => {
+    const current = chapter("chapter-optimize-legacy-readback", "旧版任务读回章节", [
+      { text: "提交时原文", storyboard: ["optimize-legacy-readback-asset"] },
+    ]);
+    const sourceAsset = { ...asset("optimize-legacy-readback-asset", current.id), frame_index: 0 };
+    const frame = makeServices([current], { [current.id]: [sourceAsset] }, false, true);
+    Object.assign(frame.services, {
+      getTaskRequest: vi.fn(async (taskId: string) => ({
+        id: taskId,
+        type: "batch-optimize",
+        status: "processing",
+        modelName: null,
+        creditCost: null,
+        externalTaskId: null,
+        externalProvider: null,
+        createdAt: null,
+        request: { chapter_id: current.id, frame_count: 1 },
+      })),
+    });
+    const { frameOptimize } = attachFrameOptimizeServices(frame.services, {
+      getRunning: vi.fn()
+        .mockResolvedValueOnce({
+          task_id: "legacy-readback-task", status: "processing", progress: 50, progress_message: "旧任务处理中", created_at: null,
+        })
+        .mockResolvedValue(null),
+      getTaskStatus: vi.fn(async () => {
+        frame.setCurrentChapters([{
+          ...current,
+          content: [{ text: "旧任务已应用文字", original_text: "提交时原文", storyboard: ["optimize-legacy-readback-asset"] }],
+        }]);
+        frame.assetsByChapter[current.id] = [{ ...sourceAsset, description: "旧任务已应用文字", updated_at: "2026-10-23T00:00:00Z" }];
+        return {
+          task_id: "legacy-readback-task",
+          status: "failed",
+          progress: 100,
+          progress_message: "旧任务有部分成功",
+          result: { partial: [{ index: 0, optimized_text: "旧任务已应用文字" }], error: "legacy_failure" },
+        };
+      }),
+    });
+    renderBrowser(frame.services);
+
+    await screen.findByRole("heading", { name: "旧版任务读回章节" });
+    await userEvent.setup().click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialogElement = await screen.findByRole("dialog", { name: "批量优化分镜" });
+    const dialog = within(dialogElement);
+    expect(await dialog.findByText("旧版任务已结束；章节与素材已重新读取，旧任务输出未用于写入或判断章节内容。"))
+      .toBeInTheDocument();
+    expect(dialogElement).toHaveTextContent("仅提供状态读取和取消请求");
+    expect(frame.getCurrentChapters()[0]?.content?.[0]).toMatchObject({
+      text: "旧任务已应用文字",
+      original_text: "提交时原文",
+    });
+    expect(frameOptimize.submit).not.toHaveBeenCalled();
+    expect(frame.updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("ignores a late frame-optimize capability 401 after the user scope changes", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-optimize-scope-change", "切换优化范围章节", [
+      { text: "待优化文字", storyboard: ["optimize-scope-change-asset"] },
+    ]);
+    const frame = makeServices(
+      [current],
+      { [current.id]: [{ ...asset("optimize-scope-change-asset", current.id), frame_index: 0 }] },
+      false,
+      true,
+    );
+    const pendingCapabilities = deferred<FrameOptimizeCapabilities>();
+    const { frameOptimize } = attachFrameOptimizeServices(frame.services, {
+      getCapabilities: vi.fn(() => pendingCapabilities.promise),
+    });
+    const onUnauthorized = vi.fn();
+    const view = renderBrowser(frame.services, vi.fn(), onUnauthorized);
+
+    await screen.findByRole("heading", { name: "切换优化范围章节" });
+    await user.click(screen.getByRole("button", { name: "批量优化分镜" }));
+    await screen.findByRole("dialog", { name: "批量优化分镜" });
+    view.rerender(
+      <ChapterBrowser
+        onBack={view.onBack}
+        onUnauthorized={onUnauthorized}
+        series={series}
+        services={frame.services}
+        userId="another-user"
+      />,
+    );
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "批量优化分镜" })).not.toBeInTheDocument());
+    await act(async () => {
+      pendingCapabilities.reject(new ApiError("http", "expired", 401));
+      await pendingCapabilities.promise.catch(() => undefined);
+    });
+
+    expect(frameOptimize.getCapabilities).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("freezes an ambiguous original-text restore and never sends it twice", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-optimize-restore-unknown", "恢复结果不明章节", [
+      { text: "当前优化文字", original_text: "需要恢复的原文", storyboard: ["optimize-restore-unknown-asset"] },
+    ]);
+    const frame = makeServices(
+      [current],
+      { [current.id]: [{ ...asset("optimize-restore-unknown-asset", current.id), frame_index: 0 }] },
+      false,
+      true,
+    );
+    attachFrameOptimizeServices(frame.services);
+    frame.updateChapter.mockRejectedValueOnce(new ApiError("network", "connection lost"));
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    frame.getChapterEditLock.mockImplementation(async (_chapterId, _signal, lease) => (
+      lease === undefined ? { locked: false } : ownedLock
+    ));
+    const teamSeries = { ...series, team_id: "team-optimize-restore-unknown" };
+    renderBrowser(frame.services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByRole("heading", { name: "恢复结果不明章节" });
+    await user.click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    await user.click(dialog.getByRole("checkbox", { name: "镜头 1 · 已有原文" }));
+    await user.click(dialog.getByRole("button", { name: "恢复所选镜头原文" }));
+    expect(await dialog.findByText("恢复请求可能已生效，但读回内容与唯一预期不一致；已冻结再次写入，请人工核对服务器真源。")).toBeInTheDocument();
+    expect(frame.updateChapter).toHaveBeenCalledTimes(1);
+    expect(dialog.queryByRole("button", { name: "恢复所选镜头原文" })).not.toBeInTheDocument();
+  });
+
+  it("rechecks running optimization after acquiring the team lock before restoring originals", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-optimize-active-before-write", "锁后活任务章节", [
+      { text: "优化文字", original_text: "原文", storyboard: ["optimize-active-before-write-asset"] },
+    ]);
+    const frame = makeServices(
+      [current],
+      { [current.id]: [{ ...asset("optimize-active-before-write-asset", current.id), frame_index: 0 }] },
+      false,
+      true,
+    );
+    const running = {
+      task_id: "active-optimization", status: "processing", progress: 10,
+      progress_message: "处理中", created_at: null,
+    };
+    const getRunning = vi.fn()
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(running);
+    attachFrameOptimizeServices(frame.services, { getRunning });
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    frame.getChapterEditLock.mockImplementation(async (_chapterId, _signal, lease) => (
+      lease === undefined ? { locked: false } : ownedLock
+    ));
+    const teamSeries = { ...series, team_id: "team-optimize-active-before-write" };
+    renderBrowser(frame.services, vi.fn(), vi.fn(), teamSeries);
+
+    await screen.findByRole("heading", { name: "锁后活任务章节" });
+    await user.click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    await user.click(dialog.getByRole("checkbox", { name: "镜头 1 · 已有原文" }));
+    await user.click(dialog.getByRole("button", { name: "恢复所选镜头原文" }));
+
+    expect(await dialog.findByText("本章节存在运行中的分镜优化任务；原文恢复已停止，请先核对任务终态。")).toBeInTheDocument();
+    expect(getRunning).toHaveBeenCalledTimes(3);
+    expect(frame.updateChapter).not.toHaveBeenCalled();
+    expect(frame.releaseChapterEditLock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not log out a new account when an old-scope restore receives a late unauthorized write", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-optimize-late-401", "迟到401章节", [
+      { text: "优化文字", original_text: "原文", storyboard: ["optimize-late-401-asset"] },
+    ]);
+    const frame = makeServices(
+      [current],
+      { [current.id]: [{ ...asset("optimize-late-401-asset", current.id), frame_index: 0 }] },
+      false,
+      true,
+    );
+    attachFrameOptimizeServices(frame.services);
+    const pendingWrite = deferred<Chapter>();
+    frame.updateChapter.mockImplementation(() => pendingWrite.promise);
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    frame.getChapterEditLock.mockImplementation(async (_chapterId, _signal, lease) => (
+      lease === undefined ? { locked: false } : ownedLock
+    ));
+    const onUnauthorized = vi.fn();
+    const view = renderBrowser(frame.services, vi.fn(), onUnauthorized, { ...series, team_id: "team-optimize-late-401" });
+
+    await screen.findByRole("heading", { name: "迟到401章节" });
+    await user.click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    await user.click(dialog.getByRole("checkbox", { name: "镜头 1 · 已有原文" }));
+    await user.click(dialog.getByRole("button", { name: "恢复所选镜头原文" }));
+    await waitFor(() => expect(frame.updateChapter).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={view.onBack}
+        onUnauthorized={onUnauthorized}
+        series={{ ...series, team_id: "team-optimize-late-401" }}
+        services={frame.services}
+        userId="another-user"
+      />,
+    );
+    await act(async () => {
+      pendingWrite.reject(new ApiError("http", "expired", 401));
+      await pendingWrite.promise.catch(() => undefined);
+    });
+
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(frame.releaseChapterEditLock).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not refresh the new scope asset cache from a late restore conflict read", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-optimize-late-read", "迟到读回章节", [
+      { text: "优化文字", original_text: "原文", storyboard: ["optimize-late-read-asset"] },
+    ]);
+    const oldAsset = { ...asset("optimize-late-read-asset", current.id), frame_index: 0 };
+    const newScopeAsset = { ...oldAsset, description: "new-scope-description", updated_at: "new-scope" };
+    const frame = makeServices([current], { [current.id]: [oldAsset] }, false, true);
+    attachFrameOptimizeServices(frame.services);
+    const pendingLatestDirectory = deferred<Chapter[]>();
+    const pendingLatestAssets = deferred<StoryboardAsset[]>();
+    let lockAcquired = false;
+    let lockedDirectoryReadStarted = false;
+    let lockedAssetsReadStarted = false;
+    frame.acquireChapterEditLock.mockImplementation(async () => {
+      lockAcquired = true;
+      return {
+        state: {
+          locked: true,
+          user_id: "demo-user",
+          username: "演示创作者",
+          is_mine: true,
+          acquired_at: "2026-10-15T10:00:00Z",
+          expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+        },
+        lease: {} as ChapterEditLockLeaseHandle,
+      };
+    });
+    frame.getChapterEditLock.mockImplementation(async (_chapterId, _signal, lease) => (
+      lease === undefined ? { locked: false } : {
+        locked: true,
+        user_id: "demo-user",
+        username: "演示创作者",
+        is_mine: true,
+        acquired_at: "2026-10-15T10:00:00Z",
+        expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+      }
+    ));
+    frame.listChapters.mockImplementation(async () => {
+      if (lockAcquired && !lockedDirectoryReadStarted) {
+        lockedDirectoryReadStarted = true;
+        return pendingLatestDirectory.promise;
+      }
+      return frame.getCurrentChapters();
+    });
+    frame.listStoryboardAssets.mockImplementation(async (_seriesId, chapterId) => {
+      if (lockAcquired && lockedDirectoryReadStarted && !lockedAssetsReadStarted) {
+        lockedAssetsReadStarted = true;
+        return pendingLatestAssets.promise;
+      }
+      return frame.assetsByChapter[chapterId] ?? [];
+    });
+    const view = renderBrowser(frame.services, vi.fn(), vi.fn(), { ...series, team_id: "team-optimize-late-read" });
+
+    await screen.findByRole("heading", { name: "迟到读回章节" });
+    await user.click(screen.getByRole("button", { name: "批量优化分镜" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    await user.click(dialog.getByRole("checkbox", { name: "镜头 1 · 已有原文" }));
+    await user.click(dialog.getByRole("button", { name: "恢复所选镜头原文" }));
+    await waitFor(() => expect(lockedDirectoryReadStarted && lockedAssetsReadStarted).toBe(true));
+
+    frame.assetsByChapter[current.id] = [newScopeAsset];
+    view.rerender(
+      <ChapterBrowser
+        onBack={view.onBack}
+        onUnauthorized={view.onUnauthorized}
+        series={{ ...series, team_id: "team-optimize-late-read" }}
+        services={frame.services}
+        userId="another-user"
+      />,
+    );
+    await screen.findByRole("heading", { name: "迟到读回章节" });
+    await user.click(await screen.findByRole("button", { name: "查看我的制作记录" }));
+    await waitFor(() => expect(personalNotesBridge.assets[0]?.description).toBe("new-scope-description"));
+
+    await act(async () => {
+      pendingLatestDirectory.resolve([{
+        ...current,
+        content: [{ text: "另一范围的旧读回", storyboard: [oldAsset.id] }],
+      }]);
+      pendingLatestAssets.resolve([oldAsset]);
+      await Promise.all([pendingLatestDirectory.promise, pendingLatestAssets.promise]);
+      await Promise.resolve();
+    });
+
+    expect(personalNotesBridge.assets).toEqual([newScopeAsset]);
   });
 
 });

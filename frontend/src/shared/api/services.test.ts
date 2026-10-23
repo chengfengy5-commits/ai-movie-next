@@ -1683,6 +1683,100 @@ describe("API services", () => {
     });
   });
 
+  it("routes frame optimize submission and observation through their distinct endpoints", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "creative-token");
+    const taskId = "optimize/task-1";
+    const calls: Array<{ url: URL; init: RequestInit }> = [];
+    const responses = [
+      jsonResponse({
+        operation: "frame.optimize",
+        enabled: true,
+        reason: null,
+        supported_providers: ["openai", "deepseek", "custom"],
+      }),
+      jsonResponse({ task_id: taskId, chapter_id: "chapter-1", frame_count: 1 }),
+      jsonResponse({
+        task: {
+          task_id: taskId,
+          status: "reconciling",
+          progress: 80,
+          progress_message: "等待账务核验",
+          created_at: null,
+        },
+      }),
+      jsonResponse({
+        task_id: taskId,
+        status: "failed",
+        progress: 100,
+        progress_message: "partial",
+        result: { partial: [{ index: 0, optimized_text: "优化结果" }], error: "one_item_failed" },
+      }),
+      jsonResponse({ task_id: taskId, status: "cancelling" }),
+    ];
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      calls.push({ url, init });
+      const next = responses.shift();
+      if (next === undefined) throw new Error("Unexpected extra frame optimize request.");
+      return next;
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const port = services.frameOptimize;
+    if (port === undefined) throw new Error("Frame optimize API is unavailable.");
+    const signal = new AbortController().signal;
+    const input = {
+      chapter_id: "chapter-1",
+      model_id: "model-1",
+      prompt_id: "",
+      enable_thinking: false,
+      concurrency: 5,
+      chapter_texts: ["【剧情片段】\n原文"],
+      frames: [{ index: 0, text: "原文", asset_context: "角色：小林" }],
+    };
+    await expect(port.getCapabilities(signal)).resolves.toMatchObject({ enabled: true });
+    await expect(port.submit(input, signal)).resolves.toEqual({
+      task_id: taskId, chapter_id: "chapter-1", frame_count: 1,
+    });
+    await expect(port.getRunning("chapter/one", signal)).resolves.toMatchObject({ status: "reconciling" });
+    await expect(port.getTaskStatus(taskId, signal)).resolves.toMatchObject({ status: "failed" });
+    await expect(port.cancel(taskId, signal)).resolves.toEqual({ task_id: taskId, status: "cancelling" });
+
+    expect(calls.map(({ url, init }) => [init.method, url.pathname])).toEqual([
+      ["GET", "/api/chat/frame-optimize/capabilities"],
+      ["POST", "/api/chat/frame-optimize"],
+      ["GET", "/api/chat/batch-optimize/running"],
+      ["GET", "/api/chat/batch-optimize/optimize%2Ftask-1/status"],
+      ["POST", "/api/chat/batch-optimize/optimize%2Ftask-1/cancel"],
+    ]);
+    expect(calls[2]?.url.searchParams.get("chapter_id")).toBe("chapter/one");
+    expect(calls.every(({ init }) => new Headers(init.headers).get("Authorization") === "Bearer creative-token"))
+      .toBe(true);
+    expect(JSON.parse(String(calls[1]?.init.body))).toEqual(input);
+  });
+
+  it("does not allow a stale session response to attach a frame optimize capability", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "old-token");
+    let resolveFetch!: (response: Response) => void;
+    const fetcher = vi.fn(() => new Promise<Response>((resolve) => { resolveFetch = resolve; }));
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const port = services.frameOptimize;
+    if (port === undefined) throw new Error("Frame optimize API is unavailable.");
+
+    const pending = port.getCapabilities(new AbortController().signal);
+    storage.setItem(API_TOKEN_KEY, "new-token");
+    resolveFetch(jsonResponse({
+      operation: "frame.optimize",
+      enabled: true,
+      reason: null,
+      supported_providers: ["openai"],
+    }, 401));
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("new-token");
+  });
+
   it("ignores a late 401 from an old token while reading frame review capabilities", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "old-token");

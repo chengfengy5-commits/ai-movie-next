@@ -14,6 +14,22 @@ import type {
 import type { PersonalProductionSnapshot } from "../../shared/api/personalProductionNotes";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import type { FrameOptimizeTaskStatus, FrameOptimizeSubmitInput } from "../../shared/api/frameOptimize";
+import {
+  applyFrameOptimizePartialToContent,
+  frameOptimizeChapterContentAfterWrite,
+  frameOptimizeSourceText,
+  parseFrameOptimizePartialResult,
+  restoreFrameOptimizeOriginals as buildFrameOptimizeRestoration,
+  sameFrameOptimizeAssets,
+  sameFrameOptimizeAssetsAfterChapterWrite,
+  sameFrameOptimizeAssetIdentity,
+} from "./frameOptimizeContent";
+import {
+  beginFrameOptimizeRestore,
+  finishFrameOptimizeRestore,
+  freezeUnknownFrameOptimizeRestore,
+} from "./frameOptimizeSafety";
 import {
   FrameAssetReferencesPanel,
   type FrameAssetReferenceAssetTarget,
@@ -44,6 +60,7 @@ import { ChapterOrderDialog } from "./ChapterOrderDialog";
 import { FrameTextEditor, type FrameTextSaveResult } from "./FrameTextEditor";
 import { FrameReviewDialog, type FrameReviewSourceCheck } from "./FrameReviewDialog";
 import type { FrameReviewResult } from "../../shared/api/frameReview";
+import { FrameOptimizeDialog, type FrameOptimizeAssetNames, type FrameOptimizeSourceCheck, type FrameOptimizeSourceSnapshot } from "./FrameOptimizeDialog";
 import {
   FrameStructureEditor,
   type FrameStructureMode,
@@ -154,6 +171,16 @@ interface FrameReviewDialogOwner {
   sourceText: string;
   sourceVersion: string;
   requestGeneration: number;
+}
+
+interface FrameOptimizeDialogOwner {
+  scope: ChapterBrowserScope;
+  chapter: Chapter;
+  baseDirectory: Chapter[];
+  baseAssets: StoryboardAsset[];
+  names: FrameOptimizeAssetNames;
+  requestGeneration: number;
+  openEpoch: number;
 }
 
 interface FrameStructureEditorContext extends ChapterEditLockOwner {
@@ -587,6 +614,11 @@ export function ChapterBrowser({
   const frameReviewDialogRef = useRef<FrameReviewDialogOwner | null>(null);
   frameReviewDialogRef.current = frameReviewDialog;
   const frameReviewVerifiedSourceRef = useRef<FrameReviewDialogOwner | null>(null);
+  const [frameOptimizeDialog, setFrameOptimizeDialog] = useState<FrameOptimizeDialogOwner | null>(null);
+  const frameOptimizeDialogRef = useRef<FrameOptimizeDialogOwner | null>(null);
+  frameOptimizeDialogRef.current = frameOptimizeDialog;
+  const frameOptimizeOpenEpoch = useRef(0);
+  const [frameOptimizeOpening, setFrameOptimizeOpening] = useState(false);
   const [frameStructureEditor, setFrameStructureEditor] = useState<FrameStructureEditorContext | null>(null);
   const frameStructureEditorRef = useRef<FrameStructureEditorContext | null>(null);
   frameStructureEditorRef.current = frameStructureEditor;
@@ -681,6 +713,10 @@ export function ChapterBrowser({
     frameReviewDialogRef.current = null;
     frameReviewVerifiedSourceRef.current = null;
     setFrameReviewDialog(null);
+    frameOptimizeOpenEpoch.current += 1;
+    frameOptimizeDialogRef.current = null;
+    setFrameOptimizeDialog(null);
+    setFrameOptimizeOpening(false);
     chapterOrderEditorRef.current = null;
     setChapterOrderEditor(null);
     invalidateFrameEditingWorkflow({ deferLockRelease: true });
@@ -1886,6 +1922,12 @@ export function ChapterBrowser({
       || (openingChapterId !== null && openingChapterId !== selectedChapterId)) {
       invalidateFrameEditingWorkflowRef.current();
     }
+    const optimizeOwner = frameOptimizeDialogRef.current;
+    if (optimizeOwner !== null && optimizeOwner.chapter.id !== selectedChapterId) {
+      frameOptimizeOpenEpoch.current += 1;
+      frameOptimizeDialogRef.current = null;
+      setFrameOptimizeDialog(null);
+    }
   }, [selectedChapterId]);
 
   useEffect(() => () => {
@@ -2854,7 +2896,8 @@ export function ChapterBrowser({
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
   const chapterManagementBlocked = chapterPanelsOpen
     || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null || frameEditOpening
-    || storyboardGenerationDialog !== null || frameReviewDialog !== null;
+    || storyboardGenerationDialog !== null || frameReviewDialog !== null
+    || frameOptimizeDialog !== null || frameOptimizeOpening;
   const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
   const canOpenCanvas = series.can_enter && services.canvasData !== undefined;
   const canEditFrameStructure = series.can_enter
@@ -2896,6 +2939,468 @@ export function ChapterBrowser({
       && storyboardFrameId(currentFrame) === owner.storyboardAssetId
       && frameSourceVersion(chapter, currentFrame) === owner.sourceVersion
       && readEditableFrameText(chapter, owner.position) === owner.sourceText;
+  }
+
+  function closeFrameOptimizeDialog(expected?: FrameOptimizeDialogOwner): void {
+    const currentOwner = frameOptimizeDialogRef.current;
+    if (expected !== undefined && currentOwner?.openEpoch !== expected.openEpoch) return;
+    frameOptimizeOpenEpoch.current += 1;
+    frameOptimizeDialogRef.current = null;
+    setFrameOptimizeDialog(null);
+  }
+
+  function isFrameOptimizeOwnerCurrent(owner: FrameOptimizeDialogOwner): boolean {
+    const directory = chapterDirectoryRef.current;
+    const matching = directory.chapters?.filter((item) => item.id === owner.chapter.id) ?? [];
+    return frameOptimizeDialogRef.current?.openEpoch === owner.openEpoch
+      && sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+      && owner.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === owner.chapter.id
+      && sameChapterBrowserScope(directory.scope, owner.scope)
+      && directory.requestGeneration === owner.requestGeneration
+      && matching.length === 1
+      && matching[0]?.series_id === owner.scope.seriesId;
+  }
+
+  async function openFrameOptimize(): Promise<void> {
+    const directoryAtOpen = chapterDirectoryRef.current;
+    if (!canEditStoryboard || chapterManagement !== null || chapterManagementBlocked
+      || frameOptimizeOpening || frameOptimizeDialogRef.current !== null || chaptersLoading
+      || chaptersError !== null || chapters === null || selectedChapter === null
+      || currentAssetResult?.status !== "ready"
+      || directoryAtOpen.chapters !== chapters
+      || !sameChapterBrowserScope(directoryAtOpen.scope, currentScope)
+      || directoryAtOpen.requestGeneration !== chapterRequestGeneration.current
+      || !isChapterSelectableFromDirectory(directoryAtOpen.chapters, selectedChapter.id, series.id)) return;
+
+    const epoch = ++frameOptimizeOpenEpoch.current;
+    const requestGeneration = directoryAtOpen.requestGeneration;
+    const openScope = currentScope;
+    const openChapter = selectedChapter;
+    const openDirectory = [...directoryAtOpen.chapters];
+    const openAssets = snapshotStoryboardAssetPositions(currentAssetResult.assets);
+    const controller = new AbortController();
+    setFrameOptimizeOpening(true);
+    setChapterMutationNotice(null);
+    const isOpeningCurrent = () => epoch === frameOptimizeOpenEpoch.current
+      && sameChapterBrowserScope(openScope, activeScopeRef.current)
+      && chapterRequestGeneration.current === requestGeneration
+      && selectedChapterIdRef.current === openChapter.id
+      && !controller.signal.aborted;
+    try {
+      const [latestDirectory, latestAssets, characters, scenes, props, prompts] = await Promise.all([
+        services.listChapters(series.id, controller.signal),
+        services.listStoryboardAssets(series.id, openChapter.id, controller.signal),
+        services.listCharacters(series.id, controller.signal),
+        services.listScenes(series.id, controller.signal),
+        services.listProps(series.id, controller.signal),
+        services.creatorSettings?.listPrompts(undefined, controller.signal) ?? Promise.resolve([]),
+      ]);
+      if (!isOpeningCurrent()) return;
+      const matches = latestDirectory.filter((item) => item.id === openChapter.id);
+      const latestChapter = matches[0];
+      if (!sameChapterOrderSnapshot(openDirectory, latestDirectory, series.id)
+        || matches.length !== 1 || latestChapter === undefined || latestChapter.series_id !== series.id
+        || latestChapter.order !== openChapter.order
+        || !sameChapterContent(openChapter.content, latestChapter.content)
+        || !sameFrameOptimizeAssets(openAssets, latestAssets, [])) {
+        applyFreshChapterDirectory(latestDirectory, openScope);
+        refreshAssetsAfterFrameRead(openChapter.id, latestAssets);
+        throw new ApiError("http", "打开前章节内容、顺序或素材目录已变化；已重新读取，请再次打开核对。", 409);
+      }
+      const references = inspectStoryboardReferences(latestChapter.content, latestAssets, series.id, latestChapter.id);
+      if (!references.ok || !areReferencedFrameAssetPositionsValid(latestChapter, latestAssets, series.id)) {
+        throw new ApiError("http", references.ok ? "分镜素材位置与当前章节不匹配，已停止打开。" : references.message, 409);
+      }
+      const owner: FrameOptimizeDialogOwner = {
+        scope: openScope,
+        chapter: latestChapter,
+        baseDirectory: latestDirectory,
+        baseAssets: snapshotStoryboardAssetPositions(latestAssets),
+        names: {
+          characters: characters.filter((item) => item.series_id === series.id),
+          scenes: scenes.filter((item) => item.series_id === series.id),
+          props: props.filter((item) => item.series_id === series.id),
+          prompts,
+        },
+        requestGeneration,
+        openEpoch: epoch,
+      };
+      if (!isOpeningCurrent()) return;
+      frameOptimizeDialogRef.current = owner;
+      setFrameOptimizeDialog(owner);
+      applyFreshChapterDirectory(latestDirectory, openScope);
+      refreshAssetsAfterFrameRead(openChapter.id, latestAssets);
+    } catch (cause) {
+      if (!isOpeningCurrent()) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      setChapterMutationNotice(error.detail ?? error.message);
+    } finally {
+      if (epoch === frameOptimizeOpenEpoch.current) setFrameOptimizeOpening(false);
+    }
+  }
+
+  async function prepareFrameOptimizeSubmit(
+    owner: FrameOptimizeDialogOwner,
+    signal: AbortSignal,
+  ): Promise<FrameOptimizeSourceSnapshot> {
+    if (!isFrameOptimizeOwnerCurrent(owner)) throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+    const [directory, assets, characters, scenes, props, prompts] = await Promise.all([
+      owner.scope.services.listChapters(owner.scope.seriesId, signal),
+      owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+      owner.scope.services.listCharacters(owner.scope.seriesId, signal),
+      owner.scope.services.listScenes(owner.scope.seriesId, signal),
+      owner.scope.services.listProps(owner.scope.seriesId, signal),
+      owner.scope.services.creatorSettings?.listPrompts(undefined, signal) ?? Promise.resolve([]),
+    ]);
+    if (!isFrameOptimizeOwnerCurrent(owner)) throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+    const matches = directory.filter((chapter) => chapter.id === owner.chapter.id);
+    const latest = matches[0];
+    if (matches.length !== 1 || latest === undefined || latest.series_id !== owner.scope.seriesId
+      || !sameChapterOrderSnapshot(owner.baseDirectory, directory, owner.scope.seriesId)
+      || latest.order !== owner.chapter.order || !sameChapterContent(owner.chapter.content, latest.content)
+      || !sameFrameOptimizeAssets(owner.baseAssets, assets, [])) {
+      throw new ApiError("http", "提交前发现章节文字、顺序或素材基线变化；未发送请求。请关闭窗口并重新打开核对。", 409);
+    }
+    const references = inspectStoryboardReferences(latest.content, assets, owner.scope.seriesId, owner.chapter.id);
+    if (!references.ok || !areReferencedFrameAssetPositionsValid(latest, assets, owner.scope.seriesId)) {
+      throw new ApiError("http", references.ok ? "素材位置与镜头引用不一致；未发送请求。" : references.message, 409);
+    }
+    return {
+      chapter: latest,
+      assets,
+      names: {
+        characters: characters.filter((item) => item.series_id === owner.scope.seriesId),
+        scenes: scenes.filter((item) => item.series_id === owner.scope.seriesId),
+        props: props.filter((item) => item.series_id === owner.scope.seriesId),
+        prompts,
+      },
+    };
+  }
+
+  async function verifyFrameOptimizeTaskSource(
+    owner: FrameOptimizeDialogOwner,
+    status: FrameOptimizeTaskStatus,
+    request: FrameOptimizeSubmitInput | null,
+    signal: AbortSignal,
+  ): Promise<FrameOptimizeSourceCheck> {
+    if (!isFrameOptimizeOwnerCurrent(owner)) {
+      return { status: "unconfirmed", message: "任务已结束，但页面范围已变化；结果没有写回，仍需人工检查。" };
+    }
+    if (request === null) {
+      let directory: Chapter[];
+      let assets: StoryboardAsset[];
+      try {
+        [directory, assets] = await Promise.all([
+          owner.scope.services.listChapters(owner.scope.seriesId, signal),
+          owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+        ]);
+      } catch (cause) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401 && isFrameOptimizeOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+        return { status: "unconfirmed", message: "旧版任务已结束，但章节或素材真源读取失败；没有使用任务输出写回。" };
+      }
+      if (!isFrameOptimizeOwnerCurrent(owner)) {
+        return { status: "unconfirmed", message: "读取旧版任务结果期间页面范围已变化；没有使用任务输出写回。" };
+      }
+      const matches = directory.filter((chapter) => chapter.id === owner.chapter.id);
+      const latest = matches[0];
+      const sourceMappingValid = matches.length === 1 && latest !== undefined
+        && latest.series_id === owner.scope.seriesId
+        && sameChapterOrderSnapshot(owner.baseDirectory, directory, owner.scope.seriesId)
+        && sameFrameOptimizeAssetIdentity(owner.baseAssets, assets)
+        && inspectStoryboardReferences(latest.content, assets, owner.scope.seriesId, latest.id).ok
+        && areReferencedFrameAssetPositionsValid(latest, assets, owner.scope.seriesId);
+      if (!sourceMappingValid || latest === undefined) {
+        return { status: "unconfirmed", message: "旧版任务已结束，但章节、素材 ID 或镜头映射无法核对；任务输出没有写回。" };
+      }
+      applyFreshChapterDirectory(directory, owner.scope);
+      refreshAssetsAfterFrameRead(owner.chapter.id, assets);
+      const refreshedOwner = { ...owner, chapter: latest, baseDirectory: directory, baseAssets: snapshotStoryboardAssetPositions(assets) };
+      if (frameOptimizeDialogRef.current?.openEpoch === owner.openEpoch) {
+        frameOptimizeDialogRef.current = refreshedOwner;
+        setFrameOptimizeDialog(refreshedOwner);
+      }
+      return {
+        status: "verified",
+        message: "旧版任务已结束；章节与素材已重新读取，旧任务输出未用于写入或判断章节内容。",
+      };
+    }
+    if (request.chapter_id !== owner.chapter.id) {
+      return { status: "unconfirmed", message: "任务已结束，但章节请求身份无法核对；结果没有写回，仍需人工检查。" };
+    }
+    const parsed = parseFrameOptimizePartialResult(status.result);
+    if (!parsed.valid) return { status: "unconfirmed", message: "任务已结束，但返回结果格式无法识别；未据此修改章节。请重新读取真源核对。" };
+    const requestByIndex = new Map(request.frames.map((frame) => [frame.index, frame]));
+    if (parsed.partial.some((item) => !requestByIndex.has(item.index))) {
+      return { status: "unconfirmed", message: "任务部分结果含有未提交的镜头索引；没有据此修改章节。" };
+    }
+    const baseContent = owner.chapter.content;
+    if (!Array.isArray(baseContent) || request.frames.some((frame) => {
+      const sourceFrame = baseContent[frame.index];
+      return sourceFrame === undefined || frameOptimizeSourceText(sourceFrame) !== frame.text
+        || storyboardFrameId(sourceFrame) === null;
+    })) {
+      return { status: "unconfirmed", message: "任务请求与本次打开时的原文或稳定镜头引用不一致；未将结果标记为已应用。" };
+    }
+    let directory: Chapter[];
+    let assets: StoryboardAsset[];
+    try {
+      [directory, assets] = await Promise.all([
+        owner.scope.services.listChapters(owner.scope.seriesId, signal),
+        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+      ]);
+    } catch (cause) {
+      const error = normalizeApiError(cause);
+      if (error.status === 401 && isFrameOptimizeOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+      return { status: "unconfirmed", message: "任务已结束，但章节或素材真源读取失败；请重新读取后核对。" };
+    }
+    if (!isFrameOptimizeOwnerCurrent(owner)) return { status: "unconfirmed", message: "读取期间页面范围已变化，结果尚未核对。" };
+    const matches = directory.filter((chapter) => chapter.id === owner.chapter.id);
+    const latest = matches[0];
+    const sourceMappingValid = matches.length === 1 && latest !== undefined
+      && latest.series_id === owner.scope.seriesId
+      && sameChapterOrderSnapshot(owner.baseDirectory, directory, owner.scope.seriesId)
+      && sameFrameOptimizeAssets(owner.baseAssets, assets, parsed.partial)
+      && inspectStoryboardReferences(latest.content, assets, owner.scope.seriesId, latest.id).ok
+      && areReferencedFrameAssetPositionsValid(latest, assets, owner.scope.seriesId)
+      && request.frames.every((frame) => storyboardFrameId(latest.content?.[frame.index])
+        === storyboardFrameId(baseContent[frame.index]));
+    if (!sourceMappingValid || latest === undefined) {
+      return { status: "unconfirmed", message: "任务已结束，但章节、素材 ID 或镜头映射发生变化；结果未被标记为应用。" };
+    }
+    const expectedContent = applyFrameOptimizePartialToContent(baseContent, request.frames, parsed.partial);
+    if (expectedContent === null) return { status: "unconfirmed", message: "任务回读内容无法安全构造；没有写入任务结果。" };
+    const verified = sameChapterContent(expectedContent, latest.content);
+    applyFreshChapterDirectory(directory, owner.scope);
+    refreshAssetsAfterFrameRead(owner.chapter.id, assets);
+    const refreshedOwner = { ...owner, chapter: latest, baseDirectory: directory, baseAssets: snapshotStoryboardAssetPositions(assets) };
+    if (frameOptimizeDialogRef.current?.openEpoch === owner.openEpoch) {
+      frameOptimizeDialogRef.current = refreshedOwner;
+      setFrameOptimizeDialog(refreshedOwner);
+    }
+    return verified
+      ? { status: "verified", message: "任务已结束；章节与素材已重新读取，部分结果、原文和镜头身份均与服务端真源核对一致。" }
+      : { status: "conflict", message: "任务已结束；已重新读取章节和素材，但实际内容与任务部分结果不同。页面已切换到最新真源，请核对后再恢复或继续提交。" };
+  }
+
+  async function restoreFrameOptimizeOriginals(
+    owner: FrameOptimizeDialogOwner,
+    indices: number[],
+    signal: AbortSignal,
+  ): Promise<FrameOptimizeSourceCheck> {
+    if (!isFrameOptimizeOwnerCurrent(owner)) return { status: "unconfirmed", message: "当前章节范围已切换，未执行原文恢复。" };
+    const restoreLease = beginFrameOptimizeRestore(owner.scope.userId, owner.scope.seriesId, owner.chapter.id);
+    if (restoreLease === null) {
+      return { status: "unconfirmed", message: "本章节有优化提交或原文恢复尚未确认；请先核对任务和服务器真源。" };
+    }
+    let writeStarted = false;
+    let lockLease: ChapterEditLockLeaseHandle | null = null;
+    let lockIdentity: ChapterEditLockIdentity = null;
+    let newlyAcquiredLock = false;
+    let refreshLockOnClose = false;
+    let lockNotice: string | null = null;
+    const finish = (status: FrameOptimizeSourceCheck["status"], message: string): FrameOptimizeSourceCheck => {
+      if (status === "unconfirmed" && writeStarted) {
+        freezeUnknownFrameOptimizeRestore(restoreLease);
+      } else {
+        finishFrameOptimizeRestore(restoreLease);
+      }
+      return { status, message };
+    };
+    const checkNoRunningTask = async (): Promise<FrameOptimizeSourceCheck | null> => {
+      const frameOptimize = owner.scope.services.frameOptimize;
+      if (frameOptimize === undefined) {
+        return { status: "conflict", message: "当前运行模式没有分镜优化任务查询能力，已停止原文恢复。" };
+      }
+      try {
+        const running = await frameOptimize.getRunning(owner.chapter.id, signal);
+        if (!isFrameOptimizeOwnerCurrent(owner)) {
+          return { status: "unconfirmed", message: "恢复期间页面范围已变化；未继续写入原文。" };
+        }
+        return running === null
+          ? null
+          : { status: "conflict", message: "本章节存在运行中的分镜优化任务；原文恢复已停止，请先核对任务终态。" };
+      } catch (cause) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401 && isFrameOptimizeOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+        return { status: "unconfirmed", message: "无法确认本章节没有运行中的分镜优化任务；未写入原文。" };
+      }
+    };
+    try {
+      const initialTaskCheck = await checkNoRunningTask();
+      if (initialTaskCheck !== null) return finish(initialTaskCheck.status, initialTaskCheck.message);
+      if (!isFrameOptimizeOwnerCurrent(owner)) return finish("unconfirmed", "当前章节范围已变化；未开始恢复。" );
+      const [beforeDirectory, beforeAssets] = await Promise.all([
+        owner.scope.services.listChapters(owner.scope.seriesId, signal),
+        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+      ]);
+      if (!isFrameOptimizeOwnerCurrent(owner)) return finish("unconfirmed", "页面范围已变化；没有开始恢复。请重新核对章节。" );
+      const beforeMatches = beforeDirectory.filter((chapter) => chapter.id === owner.chapter.id);
+      const before = beforeMatches[0];
+      if (beforeMatches.length !== 1 || before === undefined || before.series_id !== owner.scope.seriesId
+        || !sameChapterOrderSnapshot(owner.baseDirectory, beforeDirectory, owner.scope.seriesId)
+        || before.order !== owner.chapter.order || !sameChapterContent(owner.chapter.content, before.content)
+        || !sameFrameOptimizeAssets(owner.baseAssets, beforeAssets, [])) {
+        applyFreshChapterDirectory(beforeDirectory, owner.scope);
+        refreshAssetsAfterFrameRead(owner.chapter.id, beforeAssets);
+        return finish("conflict", "恢复前章节内容、顺序或素材已变化；未写入，页面已刷新，请核对当前真源后重开。" );
+      }
+      const references = inspectStoryboardReferences(before.content, beforeAssets, owner.scope.seriesId, before.id);
+      if (!references.ok || !areReferencedFrameAssetPositionsValid(before, beforeAssets, owner.scope.seriesId)) {
+        return finish("conflict", references.ok ? "镜头素材位置不匹配；未写入。" : references.message);
+      }
+      const restored = buildFrameOptimizeRestoration(before.content, indices);
+      if (restored === null) return finish("conflict", "所选镜头已变化；未写入原文。" );
+      if (restored.restoredIndices.length === 0) return finish("verified", "所选镜头没有可恢复的原文；章节未修改。" );
+
+      if (typeof series.team_id === "string" && series.team_id !== "") {
+        const getLock = owner.scope.services.getChapterEditLock;
+        const acquireLock = owner.scope.services.acquireChapterEditLock;
+        if (getLock === undefined || acquireLock === undefined || owner.scope.services.releaseChapterEditLock === undefined) {
+          return finish("conflict", "团队章节锁能力不可用，已停止恢复。" );
+        }
+        const existing = await getLock(before.id, signal);
+        if (!isFrameOptimizeOwnerCurrent(owner)) return finish("unconfirmed", "恢复前页面范围已变化。" );
+        if (existing.locked) {
+          if (!validOwnedChapterLock(existing, owner.scope.userId)) {
+            return finish("conflict", existing.username ? `章节由 ${existing.username} 编辑，未恢复原文。` : "章节由其他创作者编辑，未恢复原文。");
+          }
+          lockIdentity = chapterEditLockIdentity(existing);
+          refreshLockOnClose = true;
+          lockNotice = "已核对当前账号现有编辑锁。";
+        } else {
+          const acquisition = await acquireLock(before.id, signal);
+          lockLease = acquisition.lease;
+          if (!acquisition.state.locked || typeof acquisition.state.expires_at !== "string"
+            || utcTimestampMilliseconds(acquisition.state.expires_at) <= Date.now()) {
+            return finish("conflict", acquisition.state.message ?? "无法取得有效章节编辑锁，未恢复原文。" );
+          }
+          newlyAcquiredLock = lockLease !== null;
+          refreshLockOnClose = lockLease === null;
+          const verifiedLock = lockLease === null
+            ? await getLock(before.id, signal)
+            : await getLock(before.id, signal, lockLease);
+          if (!validOwnedChapterLock(verifiedLock, owner.scope.userId)) {
+            return finish("conflict", "取得锁后无法确认所有权和有效期，未恢复原文。" );
+          }
+          lockIdentity = chapterEditLockIdentity(verifiedLock);
+          lockNotice = "已取得并核对章节编辑锁。";
+        }
+      }
+
+      const [latestDirectory, latestAssets] = await Promise.all([
+        owner.scope.services.listChapters(owner.scope.seriesId, signal),
+        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+      ]);
+      const latestMatches = latestDirectory.filter((chapter) => chapter.id === owner.chapter.id);
+      const latest = latestMatches[0];
+      if (!isFrameOptimizeOwnerCurrent(owner)) return finish("unconfirmed", "取得锁后页面范围已变化；未写入原文。" );
+      if (latestMatches.length !== 1 || latest === undefined || latest.series_id !== owner.scope.seriesId
+        || !sameChapterOrderSnapshot(beforeDirectory, latestDirectory, owner.scope.seriesId)
+        || latest.order !== before.order || !sameChapterContent(before.content, latest.content)
+        || !sameFrameOptimizeAssets(beforeAssets, latestAssets, [])) {
+        if (isFrameOptimizeOwnerCurrent(owner)) {
+          applyFreshChapterDirectory(latestDirectory, owner.scope);
+          refreshAssetsAfterFrameRead(owner.chapter.id, latestAssets);
+        }
+        return finish("conflict", "取得锁后章节或素材再次变化；未写入原文，请重新核对。" );
+      }
+      const latestReferences = inspectStoryboardReferences(latest.content, latestAssets, owner.scope.seriesId, latest.id);
+      if (!latestReferences.ok || !areReferencedFrameAssetPositionsValid(latest, latestAssets, owner.scope.seriesId)) {
+        return finish("conflict", latestReferences.ok ? "取得锁后镜头素材位置不匹配；未写入。" : latestReferences.message);
+      }
+      if (typeof series.team_id === "string" && series.team_id !== "") {
+        const getLock = owner.scope.services.getChapterEditLock;
+        if (getLock === undefined) return finish("conflict", "恢复前无法核对章节锁。" );
+        const lock = lockLease === null
+          ? await getLock(owner.chapter.id, signal)
+          : await getLock(owner.chapter.id, signal, lockLease);
+        if (!validOwnedChapterLock(lock, owner.scope.userId) || !sameChapterEditLockIdentity(lockIdentity, lock)) {
+          return finish("conflict", "恢复前无法确认当前账号仍持有原章节锁。" );
+        }
+      }
+      const finalTaskCheck = await checkNoRunningTask();
+      if (finalTaskCheck !== null) return finish(finalTaskCheck.status, finalTaskCheck.message);
+      if (!isFrameOptimizeOwnerCurrent(owner)) return finish("unconfirmed", "页面范围已变化，未发送恢复请求。" );
+      if (owner.scope.services.updateChapter === undefined) return finish("conflict", "当前服务不支持章节更新，未恢复原文。" );
+      writeStarted = true;
+      let writeError: ApiError | null = null;
+      try {
+        await owner.scope.services.updateChapter(owner.scope.seriesId, owner.chapter.id, { content: restored.content }, signal);
+      } catch (cause) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401 && isFrameOptimizeOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+        if (error.kind === "aborted") throw cause;
+        writeError = error;
+      }
+
+      if (!isFrameOptimizeOwnerCurrent(owner)) {
+        return finish("unconfirmed", "恢复请求已发送，但页面范围已变化；已冻结再次写入并保留锁清理。" );
+      }
+
+      let readDirectory: Chapter[];
+      let readAssets: StoryboardAsset[];
+      try {
+        [readDirectory, readAssets] = await Promise.all([
+          owner.scope.services.listChapters(owner.scope.seriesId, new AbortController().signal),
+          owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, new AbortController().signal),
+        ]);
+      } catch (cause) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401 && isFrameOptimizeOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+        return finish("unconfirmed", "恢复请求已发送，但章节或素材读回失败；已冻结再次写入。" );
+      }
+      const readMatches = readDirectory.filter((chapter) => chapter.id === owner.chapter.id);
+      const readback = readMatches[0];
+      const readbackValid = readMatches.length === 1 && readback !== undefined
+        && readback.series_id === owner.scope.seriesId
+        && sameChapterOrderSnapshot(latestDirectory, readDirectory, owner.scope.seriesId)
+        && sameFrameOptimizeAssetsAfterChapterWrite(latestAssets, readAssets, restored.content)
+        && sameChapterContent(frameOptimizeChapterContentAfterWrite(restored.content), readback.content)
+        && inspectStoryboardReferences(readback.content, readAssets, owner.scope.seriesId, readback.id).ok
+        && areReferencedFrameAssetPositionsValid(readback, readAssets, owner.scope.seriesId);
+      if (readbackValid && readback !== undefined) {
+        if (isFrameOptimizeOwnerCurrent(owner)) {
+          applyFreshChapterDirectory(readDirectory, owner.scope);
+          refreshAssetsAfterFrameRead(owner.chapter.id, readAssets);
+          const nextOwner = { ...owner, chapter: readback, baseDirectory: readDirectory, baseAssets: snapshotStoryboardAssetPositions(readAssets) };
+          frameOptimizeDialogRef.current = nextOwner;
+          setFrameOptimizeDialog(nextOwner);
+        }
+        return finish("verified", writeError === null
+          ? "所选原文已恢复；章节与素材重新读取后通过完整内容核对。"
+          : "恢复请求回执未确认，但服务器真源与本次唯一请求完全一致；已按读回结果核对。" );
+      }
+      const unchanged = readMatches.length === 1 && readback !== undefined
+        && sameChapterContent(latest.content, readback.content)
+        && sameFrameOptimizeAssets(latestAssets, readAssets, []);
+      if (unchanged && writeError?.kind === "http" && writeError.status !== null && writeError.status < 500) {
+        return finish("conflict", writeError.detail ?? "服务器明确拒绝恢复，读回章节仍为原值；可核对后重试。" );
+      }
+      if (isFrameOptimizeOwnerCurrent(owner) && readMatches.length === 1 && readback !== undefined) {
+        applyFreshChapterDirectory(readDirectory, owner.scope);
+        refreshAssetsAfterFrameRead(owner.chapter.id, readAssets);
+      }
+      return finish("unconfirmed", "恢复请求可能已生效，但读回内容与唯一预期不一致；已冻结再次写入，请人工核对服务器真源。" );
+    } catch (cause) {
+      const error = normalizeApiError(cause);
+      if (error.status === 401 && isFrameOptimizeOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+      if (writeStarted) return finish("unconfirmed", "原文恢复请求结果不明，已冻结再次写入。" );
+      return finish(error.status === 409 ? "conflict" : "unconfirmed", error.detail ?? error.message);
+    } finally {
+      if (newlyAcquiredLock && lockLease !== null && owner.scope.services.releaseChapterEditLock !== undefined) {
+        try {
+          await owner.scope.services.releaseChapterEditLock(owner.chapter.id, new AbortController().signal, lockLease);
+        } catch (cause) {
+          const error = normalizeApiError(cause);
+          if (error.status === 401 && isFrameOptimizeOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+        }
+      } else if (refreshLockOnClose && lockNotice !== null && isFrameOptimizeOwnerCurrent(owner)) {
+        setChapterMutationNotice(lockNotice);
+      }
+    }
   }
 
   async function openFrameReview(
@@ -3424,6 +3929,15 @@ export function ChapterBrowser({
                       type="button"
                     >创作画布</button>
                   )}
+                  {canEditStoryboard && (
+                    <button
+                      className="text-button frame-optimize-open-button"
+                      disabled={chapterManagementBlocked || chapterManagement !== null || frameOptimizeOpening || chaptersLoading}
+                      onClick={() => void openFrameOptimize()}
+                      title={chapterPanelsOpen ? "请先关闭当前制作记录或素材引用面板" : undefined}
+                      type="button"
+                    >{frameOptimizeOpening ? "正在核对…" : "批量优化分镜"}</button>
+                  )}
                   {canEditFrameStructure && (
                     <button
                       className="text-button frame-structure-insert-opening"
@@ -3858,6 +4372,28 @@ export function ChapterBrowser({
             storyboardAssetId={frameReviewDialog.storyboardAssetId}
             seriesId={frameReviewDialog.scope.seriesId}
             userId={frameReviewDialog.scope.userId}
+          />
+        )}
+      {frameOptimizeDialog !== null
+        && sameChapterBrowserScope(frameOptimizeDialog.scope, currentScope)
+        && selectedChapterId === frameOptimizeDialog.chapter.id && (
+          <FrameOptimizeDialog
+            key={`${frameOptimizeDialog.scope.userId}:${frameOptimizeDialog.scope.seriesId}:${frameOptimizeDialog.chapter.id}:${frameOptimizeDialog.requestGeneration}:${frameOptimizeDialog.openEpoch}`}
+            assets={frameOptimizeDialog.baseAssets}
+            chapter={frameOptimizeDialog.chapter}
+            isCurrent={() => isFrameOptimizeOwnerCurrent(frameOptimizeDialog)}
+            onClose={() => closeFrameOptimizeDialog(frameOptimizeDialog)}
+            onUnauthorized={() => {
+              if (isFrameOptimizeOwnerCurrent(frameOptimizeDialog)) unauthorizedHandlerRef.current();
+            }}
+            prepareSubmit={(signal) => prepareFrameOptimizeSubmit(frameOptimizeDialog, signal)}
+            restoreOriginals={(indices, signal) => restoreFrameOptimizeOriginals(frameOptimizeDialog, indices, signal)}
+            series={series}
+            seriesId={frameOptimizeDialog.scope.seriesId}
+            seriesName={series.name}
+            services={frameOptimizeDialog.scope.services}
+            userId={frameOptimizeDialog.scope.userId}
+            verifyTaskSource={(status, request, signal) => verifyFrameOptimizeTaskSource(frameOptimizeDialog, status, request, signal)}
           />
         )}
       {frameTextEditor !== null && sameChapterBrowserScope(frameTextEditor.scope, currentScope) && (
