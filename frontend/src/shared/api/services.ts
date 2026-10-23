@@ -6,6 +6,8 @@ import { getDemoPersonalProductionNotes } from "../../features/chapters/demoPers
 import { clonePersonalRoughCutSnapshot, getDemoPersonalRoughCut } from "../../features/chapters/demoPersonalRoughCut";
 import { ApiConfigurationError, readEnvironmentConfiguration, resolveApiBaseUrl, type AppMode } from "./config";
 import { ApiError, isAbortError } from "./errors";
+import { createCanvasDataHttpPort } from "./canvasDataHttp";
+import { CanvasDataError, type CanvasDataPort, type CanvasEnvelope } from "./canvasData";
 import {
   parseAccountActionReceipt,
   parseEmailCodeReceipt,
@@ -191,6 +193,7 @@ export interface WorkspaceServices {
   readonly assetMaintenance?: AssetMaintenanceServicePort;
   readonly assetReplacement?: AssetReplacementPort;
   readonly assetImageUpload?: AssetImageUploadPort;
+  readonly canvasData?: CanvasDataPort;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
@@ -544,6 +547,7 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
   }
   const personalNoteSnapshots = new Map<string, PersonalProductionSnapshot>();
   const personalRoughCutSnapshots = new Map<string, PersonalRoughCutSnapshot>();
+  const demoCanvasDocuments = new Map<string, { id: string; version: number; document: Record<string, unknown>; updatedAt: string }>();
   const demoChapterLocks = new Map<string, { userId: string; username: string; acquiredAt: string; lastActiveAt: string; expiresAt: string }>();
   const demoChapterLockLeases = new Map<ChapterEditLockLeaseHandle, {
     chapterId: string;
@@ -828,10 +832,60 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
     },
   };
 
+  const canvasData: CanvasDataPort = {
+    async get(chapterId, signal) {
+      if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+      ensureDemoSession(storage);
+      const stored = demoCanvasDocuments.get(chapterId);
+      return {
+        id: stored?.id ?? null,
+        chapter_id: chapterId,
+        version: stored?.version ?? 1,
+        document_json: stored?.document ?? {
+          version: 1,
+          viewport: { x: 0, y: 0, zoom: 1 },
+          nodes: [],
+          edges: [],
+          notes: [],
+        },
+        updated_by: stored === undefined ? null : demoUser.id,
+        updated_at: stored?.updatedAt ?? null,
+        save_capability: "guarded-v1",
+      };
+    },
+    async save(chapterId, document, guard, signal) {
+      if (signal.aborted) throw new ApiError("aborted", "Request was cancelled.");
+      ensureDemoSession(storage);
+      const current = demoCanvasDocuments.get(chapterId);
+      if ((guard.id === null && current !== undefined)
+        || (guard.id !== null && (current?.id !== guard.id || current.version !== guard.version))) {
+        throw new CanvasDataError("conflict", "画布已被其他成员更新，草稿仍保留。", 409);
+      }
+      const id = current?.id ?? "demo-canvas-" + chapterId;
+      const version = current === undefined ? 1 : current.version + 1;
+      const updatedAt = new Date().toISOString();
+      demoCanvasDocuments.set(chapterId, { id, version, document, updatedAt });
+      const envelope: CanvasEnvelope = {
+        id,
+        chapter_id: chapterId,
+        version,
+        document_json: document,
+        updated_by: demoUser.id,
+        updated_at: updatedAt,
+        save_receipt: { mode: "guarded-v1", id, version },
+      };
+      return envelope;
+    },
+    async readImage() {
+      throw new CanvasDataError("rejected", "演示内容没有可读取的真实图片。");
+    },
+  };
+
   return {
     mode: "demo",
     apiBaseUrl: null,
     creatorSettings,
+    canvasData,
     async restore(signal) {
       if (signal.aborted) {
         throw new ApiError("aborted", "Request was cancelled.");
@@ -2755,6 +2809,7 @@ export function createApiServices(
   return {
     mode: "api",
     apiBaseUrl,
+    canvasData: createCanvasDataHttpPort(apiBaseUrl, { storage, fetcher }),
     teamManagement: createTeamManagementHttpPort(apiBaseUrl, {
       storage,
       fetcher,
