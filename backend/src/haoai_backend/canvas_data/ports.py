@@ -8,7 +8,7 @@ from typing import Any, Protocol
 
 from haoai_backend.shared.identity import TrustedActor
 
-from .domain import CanvasDocumentRecord, ChapterRecord
+from .domain import CanvasDocumentRecord, CanvasSaveGuard, ChapterRecord
 
 
 class CanvasDataUnitOfWork(Protocol):
@@ -43,6 +43,16 @@ class CanvasDataUnitOfWork(Protocol):
     ) -> None: ...
 
     def refresh_canvas_document(self, document_id: str) -> CanvasDocumentRecord | None: ...
+
+    def save_guarded_canvas_document(
+        self,
+        *,
+        series_id: str,
+        chapter_id: str,
+        user_id: str,
+        document_json: str,
+        guard: CanvasSaveGuard,
+    ) -> CanvasDocumentRecord | None: ...
 
     def commit(self) -> None: ...
 

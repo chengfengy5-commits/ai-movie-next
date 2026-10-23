@@ -8,6 +8,8 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import insert, select, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
 
 from haoai_backend.series_access.domain import ActorIdentity
@@ -16,7 +18,7 @@ from haoai_backend.series_access.application import require_series_access
 from haoai_backend.series_access.persistence import SqlAlchemySeriesAccessReader
 from haoai_backend.shared.identity import TrustedActor
 
-from .domain import CanvasDocumentRecord, ChapterRecord
+from .domain import CanvasDocumentRecord, CanvasSaveGuard, ChapterRecord
 from .errors import CanvasDataForbidden, CanvasDataNotFound
 from .tables import canvas_documents, chapter_locks, chapters, system_configs
 
@@ -143,6 +145,60 @@ class SqlAlchemyCanvasDataUnitOfWork:
     def refresh_canvas_document(self, document_id: str) -> CanvasDocumentRecord | None:
         row = self._session.execute(
             select(canvas_documents).where(canvas_documents.c.id == document_id)
+        ).mappings().first()
+        return self._canvas_document(row) if row is not None else None
+
+    def save_guarded_canvas_document(
+        self,
+        *,
+        series_id: str,
+        chapter_id: str,
+        user_id: str,
+        document_json: str,
+        guard: CanvasSaveGuard,
+    ) -> CanvasDocumentRecord | None:
+        now = self._now()
+        if guard.document_id is None:
+            values = {
+                "id": self._new_id(),
+                "series_id": series_id,
+                "chapter_id": chapter_id,
+                "version": 1,
+                "document_json": document_json,
+                "created_by": user_id,
+                "updated_by": user_id,
+                "created_at": now,
+                "updated_at": now,
+            }
+            dialect = self._session.get_bind().dialect.name
+            if dialect == "postgresql":
+                statement = pg_insert(canvas_documents).values(**values)
+            elif dialect == "sqlite":
+                statement = sqlite_insert(canvas_documents).values(**values)
+            else:
+                raise RuntimeError("guarded canvas insert requires PostgreSQL or SQLite")
+            row = self._session.execute(
+                statement.on_conflict_do_nothing(index_elements=[canvas_documents.c.chapter_id])
+                .returning(canvas_documents)
+            ).mappings().first()
+            return self._canvas_document(row) if row is not None else None
+
+        values: dict[str, Any] = {
+            "version": guard.version + 1,
+            "document_json": document_json,
+            "updated_by": user_id,
+            "updated_at": now,
+        }
+        row = self._session.execute(
+            update(canvas_documents)
+            .where(
+                canvas_documents.c.id == guard.document_id,
+                canvas_documents.c.chapter_id == chapter_id,
+                canvas_documents.c.series_id == series_id,
+                canvas_documents.c.version == guard.version,
+            )
+            .values(**values)
+            .returning(canvas_documents)
         ).mappings().first()
         return self._canvas_document(row) if row is not None else None
 

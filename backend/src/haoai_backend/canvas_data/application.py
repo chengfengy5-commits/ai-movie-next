@@ -7,6 +7,7 @@ from typing import Any
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import (
+    CanvasSaveGuard,
     empty_canvas_document,
     exceeds_document_limit,
     next_document_version,
@@ -19,7 +20,7 @@ from .errors import (
     CanvasDataUnavailable,
 )
 from .ports import UnitOfWorkFactory
-from .presentation import canvas_document_payload
+from .presentation import canvas_document_payload, guarded_canvas_document_payload
 
 
 DOCUMENT_TOO_LARGE = "画布文档过大，请精简节点后重试"
@@ -53,6 +54,8 @@ def get_chapter_canvas(
     factory: UnitOfWorkFactory | None,
     actor: TrustedActor,
     chapter_id: str,
+    *,
+    guarded: bool = False,
 ) -> dict[str, Any]:
     uow = _open(factory)
     try:
@@ -62,8 +65,12 @@ def get_chapter_canvas(
         uow.require_series_access(actor, chapter.series_id)
         document = uow.load_canvas_document(chapter_id)
         if document is None:
-            return empty_canvas_document(chapter_id)
-        return canvas_document_payload(document)
+            payload = empty_canvas_document(chapter_id)
+        else:
+            payload = canvas_document_payload(document)
+        if guarded:
+            payload["save_capability"] = "guarded-v1"
+        return payload
     except BaseException:
         _rollback(uow)
         raise
@@ -77,6 +84,7 @@ def save_chapter_canvas(
     chapter_id: str,
     document_json: dict[str, Any],
     version: int | None = None,
+    save_guard: CanvasSaveGuard | None = None,
 ) -> dict[str, Any]:
     uow = _open(factory)
     try:
@@ -89,6 +97,23 @@ def save_chapter_canvas(
         serialized = serialize_document(document_json)
         if exceeds_document_limit(serialized):
             raise CanvasDataBadRequest(DOCUMENT_TOO_LARGE)
+
+        if save_guard is not None:
+            if save_guard.mode != "guarded-v1":
+                raise CanvasDataBadRequest("画布保存模式无效")
+            if version is not None and version != save_guard.version:
+                raise CanvasDataBadRequest("画布版本参数不一致")
+            record = uow.save_guarded_canvas_document(
+                series_id=chapter.series_id,
+                chapter_id=chapter_id,
+                user_id=actor.user_id,
+                document_json=serialized,
+                guard=save_guard,
+            )
+            if record is None:
+                raise CanvasDataConflict(VERSION_CONFLICT)
+            uow.commit()
+            return guarded_canvas_document_payload(record)
 
         current = uow.load_canvas_document(chapter_id)
         if current is not None and version is not None and version != current.version:
