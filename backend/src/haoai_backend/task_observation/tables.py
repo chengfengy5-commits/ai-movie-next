@@ -29,6 +29,8 @@ billing_units = Table(
     "billing_units",
     metadata,
     Column("task_id", String(36), nullable=False),
+    Column("operation", String(64), nullable=False),
+    Column("step_graph_version", String(64), nullable=False),
     Column("quoted_amount", Integer, nullable=False),
     Column("billing_status", String(32), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),

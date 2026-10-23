@@ -1,6 +1,6 @@
 # HaoAI-next 完整剩余工作清单与排期
 
-更新日期：2026-10-22（北京时间）
+更新日期：2026-10-23（北京时间）
 
 本文依据已确认的 main 基线、历史开发分支和已接受收据校准完整剩余范围。它是唯一的迁移清单，不是新的架构设计，也不代表整站功能已验收。
 
@@ -12,7 +12,7 @@
 
 清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。U12.5 与 U12.7 又各完成一行开发和接线后为27、24、51。e094将 U03.1、U03.2、U03.3 各一行的开发与接线义务并入主线，计数为24、21、51；U03.4 闭合一行开发和接线后为23、20、51；U05.2闭合一行开发和接线后，计数为22、19、51；随后 U05.4 再闭合一行开发和接线义务，当前计数为21、18、51，验证/接受仍为51。U12.6 的运行时消费者接线仍待完成。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
 
-## 最新进展（2026-10-22）
+## 历史进展（2026-10-22）
 
 存储源码基线为 `d26910f24fffc0d22d8ab32a172a1e0dd9e3b9b4`；Root579 核对时，main、`codex/asset-image-upload-556` 及 `origin/main`、`origin/codex/asset-image-upload-556` 均精确指向该提交。该批将非 core 的 `backend.server` host/CLI 接到显式 R2 配置、原 R2 adapter 与同一 `create_app`；鉴权和业务共用同一 Session factory。原始 `create_app` 的默认 `storage=None` 保持不变，缺少配置时存储能力仍诚实不可用；这不是默认启用全部能力的启动器。
 
@@ -27,6 +27,18 @@ frame.optimize 的取消 component 已在功能分支提交 `d421b8a7d938452ddef
 本次进展依据：作者 558-03 收据 SHA-256 `71871d730aabedb1d674e11d2060d4664b8beac57f58a3df49e706d389350a84`；560-03 源码复核 SHA-256 `bdcd01338017c4ea1900ddc5b6b08827f8754d43c6793897869f8007830bb79d`；Root561 生产构建收据 SHA-256 `4bf89777bc0f5c6c8d59d81272b6fd7447e4e16e9c6887d7fcd48e0972fd0cd7`；Root562 发布收据 SHA-256 `da66c5f4b87dafb2be967043007e7014eb3b6985ddb916323dde547080c5b92a`。存储批次依据：作者 574-03 收据 SHA-256 `823a9c95ec0b4549f4f00134605a4ef0a77c952390f969bf679ab3b48104f519`；576-03 源码复核 SHA-256 `ca11053f14a18efbd7e069a7cadaf7dca41b2b114c6042b1281047a65f9c5d1e`；Root577 定向回归 SHA-256 `e5f88e139a6caabcfae21892e5751bd5c11843229a4c46fd5f562d97adfdbfbb`；Root578 发布 SHA-256 `ec82a10c3a880fb3b2f1a2b2acd6f0ecf62021233c7e989af75cd943c1e495ae`；Root579 同步核对 SHA-256 `0a31fb5010480871aaaf89cb64fcf8497dec119b38cce68a2b4996baacc23df3`。frame.optimize 取消 component 源码基线 `d421b8a7d938452ddef56dd32e7c8b8c5d93edb1`；Root542-02 旧 P6 源码复核与发布收据仅作历史记录，分别为 `7d7b01c76b165064d48f811a054085c047ba9f5b270e2f7d3b1bc8e12555391a` 和 `b6f4ad7d7089f594b66bea0a6ab737f08372936c385b0a378eac0a710e3d09e0`。
 
 状态简写：C＝已实现或已接入；P＝部分；M＝缺失；I＝进行中；U＝当前没有足够验证；E＝依赖外部授权或外部环境。验证和接受状态分别以 V/A 标明。实现、接线状态为 C 的行只在相应列记为完成；局部测试、历史浏览器和当前完整接受不可互相替代。
+
+## 最新进展（2026-10-23）
+
+HaoAI-next H 批 commit `cf54bdb` 已合并并推送至 main@`cb89220`。Root607 在与合并后 main 相同的前端源码上通过 Workspace 84 项、TSC、定向 services 和生产 build；九个既有前端文件 182 项及后端 44 项结果仅复用各自匹配源码的既有结果。E2E 仍按用户安排暂缓。这些结果分别只证明对应 gate，不扩展为完整浏览器或业务接受。
+
+Canvas U07 当前按下面四个子行更新。H commit 和对应源码的 Root607 验证已进入主线；U07.1–U07.4 仍有明确剩余功能和接受义务，不能将这一批画布交付计为整行闭合。
+
+frame.optimize 后端现已接入唯一的 `backend.server` host/CLI：默认关闭，显式配置 Root 凭据包后，使用同一 Session factory、数据库时钟和 ID 工厂装配注册、准入、worker 与取消路径。新增离线凭据预配及初次登记、AES-GCM 加密材料和实际 aiohttp 流式客户端；注册提交未知只确认原 attempt，不自动重放。注册批已串起逐项单次发送、原结果与收费、写回和收尾，并能在任务租约释放或到期后只接手真正未发送的分镜，接续已有本地 Work，保留未知结果观察和安全取消。认证与业务 Session factory 错配会在建立该任务能力前拒绝。
+
+Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项通过、2 项旧测试失败。两处分别是旧 N3 用例禁止接手任何兄弟、HTTP 替身缺少新只读端口；仅校准两份测试后，Root614-02 在另一冻结副本上对这两份完整模块复验 28 项通过。Root614-02 的输入中，除两份测试外，生产源码及其他输入与首次门禁精确一致，其余通过证据按原范围复用；原失败日志保留。验证包括合成 SQLite、受控 HTTP、任务恢复与取消、旧图兼容和启动边界；当前默认路由登记新增两个 frame.optimize 入口，旧方法保留。前端 341 项流水线输入与 H 批完全一致，复用对应前端证据，未重新运行全前端测试。
+
+本次仍是有限后端交付：React 批量优化入口、原文与素材/风格上下文、运行中任务恢复和结果真源核对尚待接入；完整 Group/event N6、失败/到期金融闭环、其他生成家族和统一启动接线、PostgreSQL 竞争、浏览器及部署接受也未完成。U04.2/U04.3、U06.5 仍为 P/P；当前 21/18/51 工作动作计数不减少，A01–A39、附加规范 6 项及 30 个修复子例的原义务与计数全部保留，A39 仍为 `OFFLINE_PENDING`。整体目标继续执行。
 
 ## 十二类工作流与 51 项交付
 
@@ -61,7 +73,7 @@ frame.optimize 的取消 component 已在功能分支提交 `d421b8a7d938452ddef
 | ID | 交付内容 | 实现 | 接入 | 验证/验收 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
 | U04.1 | 分镜浏览、文字/结构编辑及素材引用导航 | C | C | V=P / A=P；编辑器、引用面板及历史正文/排序主链已证 | 补结构插入/删除、引用清理、未知写入和团队权限的当前真实后端浏览器分支。 |
-| U04.2 | AI 复核/批量优化、上下文、部分成功与统计 | P | P | V=P / A=U；React 单镜头 frame.review 入口已接入 main，并有有限真实 HTTP/GUI 验收；frame.optimize、其它生成 family、其它 AI 入口、full launcher 及完整角色/会话/取消/unknown/conflict矩阵仍待 | 恢复开发后继续补 frame.optimize、其它 family producer/consumer、其余 AI 入口与角色/会话异常矩阵；U04.2 仍为 P/P。 |
+| U04.2 | AI 复核/批量优化、上下文、部分成功与统计 | P | P | V=P / A=U；React 单镜头 frame.review 有有限真实 HTTP/GUI 验收；frame.optimize 注册后端、单次发送、有限恢复/取消及显式 host/CLI 已接线并通过相关冻结副本回归，React 消费者尚待 | 接批量优化 React 入口、原文和资产/风格上下文、运行中任务恢复、部分结果真源核对；继续其它 family、其余 AI 入口、统一启动及完整角色/会话/异常矩阵。 |
 | U04.3 | 生成结果应用、媒体版本与认可失效 | P | P | V=P / A=U；frame.review 已有两次真实 P5 apply/post_apply fee 与 A→B→C 源刷新；HTTP覆盖排队与处理中取消；GUI有限覆盖处理中取消及真实目标冲突时保留人工正文且不计费；其它 family、媒体版本与认可失效仍待 | 恢复开发后补齐其它结果家族、媒体版本/认可失效及剩余异常矩阵；稳定 ID、no-ID、重复、迟到与回执未知仍分别验收。 |
 
 ### U05 素材浏览管理、维护、融合、替换和上传
@@ -82,17 +94,17 @@ frame.optimize 的取消 component 已在功能分支提交 `d421b8a7d938452ddef
 | U06.2 | 两步分镜生成、报价、SSE 预览和确认保存 | C | C | V=P / A=P；真实 JWT/Target API/owned SQLite + FakeRuntime 主链已通过 | 保留主链收据，补受影响的失败、断流、原 key 恢复和权限分支；FakeRuntime 不代表真实 provider。 |
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
 | U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；路由、解析和保存已有，提取 runtime 仍需注入 | 装配 StoryboardAssetRuntime，接提取结果编辑/确认和批量保存；验证失败不覆盖源内容及未知回读。 |
-| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single 原链与 frame.review 独立注入后端链各有局部实现；总体多 family、React 控制与完整恢复接受仍待 | image.single 到期恢复的有界PG证据见E179/E181/E185；frame.review 的 I06 recovery、C01 shutdown、I07 cancel另有e094/PG392范围证据。它们不证明完整服务重启或任意crash恢复。其它family consumer、React控制、可验证原输出恢复、六项附加义务和完整A01–A39验收仍待；U06.5宽范围仍为P/P、V=P/A=U。 |
+| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 已有真实调度、未发兄弟接手、三阶段 Work 接续、未知观察和有限取消的 SQLite 回归，完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
 | U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
 
 ### U07 多节点创作画布和结果回填
 
 | ID | 交付内容 | 实现 | 接入 | 验证/验收 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| U07.1 | 图结构、缩放平移、节点/边选择和布局 | M | M | V=U / A=U；后端 GET/PUT 有，React 尚无画布入口 | 开发画布视图，按章节加载并隔离 scope/session；验真实章节/素材图、键盘和窄屏。 |
-| U07.2 | 节点编辑、手动连线、卡片/便签和撤销重做 | M | M | V=U / A=U；固定旧 canvas-manager 有对应交互，本次只核过方法元数据 | 读取旧行为后迁移交互并复用来源 CRUD；保全写入影响、选中状态及未知字段。 |
-| U07.3 | 画布文档/视口保存、版本冲突和失败恢复 | P | M | V=P / A=U；后端 GET/PUT 有版本字段，当前不提供 SQL version CAS | 接 React 脏状态/防抖/重试/离开确认和真实 API；验证并发、迟到保存和失败，未知写入不自动重放。 |
-| U07.4 | 画布触发生成及 owned 结果应用 | P | M | V=P / A=U；authority/result reader 和 writer 有，缺真实 HTTP/UI 消费者 | 接 generation_application 和结果回填；验证 owner、完成任务、当前权限、稳定目标/CAS、重复应用不增 revision。 |
+| U07.1 | 图结构、缩放平移、节点/边选择和布局 | P | P | V=P / A=U；章节图、布局、缩放平移及节点/边选择已接入，完整旧行为对照和浏览器矩阵仍待 | 补齐旧图编辑行为与真实章节/素材图、多用户、键盘和窄屏浏览器验收。 |
+| U07.2 | 节点编辑、手动连线、卡片/便签和撤销重做 | P | P | V=P / A=U；本地便签、卡片、手动关系和 50 步 undo 已接入；来源 CRUD 与 CAV02 仍待 | 接来源 CRUD 与 CAV02，验编辑影响、选中状态、未知字段及撤销/重做边界。 |
+| U07.3 | 画布文档/视口保存、版本冲突和失败恢复 | P | P | V=P / A=U；opt-in guarded-v1 SQL id/version CAS、2 秒防抖和配对 receipt 已接入；unknown/conflict 会停止自动保存。legacy blind-writer convergence、PostgreSQL 及完整浏览器接受仍待 | 补 legacy writer 收敛、PG 并发与完整浏览器失败恢复矩阵；维持未知写入停止自动重放。 |
+| U07.4 | 画布触发生成及 owned 结果应用 | P | M | V=P / A=U；authority/result reader 与 writer 已有，CAV03 owned-result 和 CAV04 生成消费者尚未接入 | 接入并验 owner、完成任务、当前权限、稳定目标/CAS 和重复应用不增 revision。 |
 
 ### U08 连续预览、粗剪、媒体导出与实际输出
 

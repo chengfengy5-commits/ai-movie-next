@@ -40,6 +40,29 @@ def decode_request_data(raw: Any) -> Any:
         return {"_raw": raw}
 
 
+def has_frame_optimize_registration_hint(raw_request_data: object) -> bool:
+    """Recognize only explicit registered frame.optimize request markers."""
+    if isinstance(raw_request_data, Mapping):
+        request_data = raw_request_data
+    elif isinstance(raw_request_data, str):
+        try:
+            parsed = json.loads(raw_request_data)
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(parsed, Mapping):
+            return False
+        request_data = parsed
+    else:
+        return False
+
+    return (
+        request_data.get("operation") == "frame.optimize"
+        or request_data.get("graph_version") == "frame-optimize-v1"
+        or request_data.get("step_graph_version") == "frame-optimize-v1"
+        or request_data.get("mode") == "frame_optimize"
+    )
+
+
 def build_task_request(task: Mapping[str, Any] | TaskRecord) -> dict[str, Any]:
     def value(name: str, default: Any = None) -> Any:
         if isinstance(task, Mapping):

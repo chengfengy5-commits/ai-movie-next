@@ -427,8 +427,8 @@ def _canonical_optimize(request: dict[str, object]) -> dict[str, object]:
         raise AdmissionContextError("prompt_id exceeds 255 characters")
     concurrency = _integer(request.get("concurrency", 5), "concurrency", minimum=3, maximum=10)
     chapter_texts_raw = request.get("chapter_texts") or []
-    if not isinstance(chapter_texts_raw, (list, tuple)) or len(chapter_texts_raw) > 40:
-        raise AdmissionContextError("chapter_texts must contain at most 40 entries")
+    if not isinstance(chapter_texts_raw, (list, tuple)):
+        raise AdmissionContextError("chapter_texts must be an ordered list")
     chapter_texts = [_string(value, "chapter_texts entry") for value in chapter_texts_raw]
     frames_raw = request.get("frames")
     if not isinstance(frames_raw, (list, tuple)) or not 1 <= len(frames_raw) <= 30:

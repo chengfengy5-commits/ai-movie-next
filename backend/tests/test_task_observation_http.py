@@ -36,6 +36,10 @@ class HttpUnitOfWork:
         self.events.append(("first_billing_unit", task_id))
         return None
 
+    def list_task_billing_units(self, task_id: str) -> list[dict[str, Any]]:
+        self.events.append(("list_task_billing_units", task_id))
+        return []
+
     def count_owned_tasks(self, actor_id: str) -> int:
         self.events.append(("count_owned_tasks", actor_id))
         return 0
@@ -290,5 +294,13 @@ def test_cancel_route_sets_local_signal_before_independent_writer() -> None:
 
     assert response.status_code == 200
     assert response.json() == {"task_id": "task-a", "status": "cancelling"}
-    assert events.index(("signal.set",)) < events.index(("writer.request_cancel", "task-a"))
-    assert events[-2:] == [("rollback",), ("close",)]
+    assert events == [
+        ("open",),
+        ("load_owned_task", "user-a", "task-a"),
+        ("list_task_billing_units", "task-a"),
+        ("signal.get", "task-a"),
+        ("signal.set",),
+        ("writer.request_cancel", "task-a"),
+        ("rollback",),
+        ("close",),
+    ]

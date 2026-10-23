@@ -174,7 +174,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             for route in app.routes
             for method in getattr(route, "methods", set())
         }
-        assert len(app.routes) == 250
+        assert len(app.routes) == 252
         assert effects == [], effects
         for key, caller, stack in environment_reads:
             caller_path = pathlib.Path(caller).resolve()

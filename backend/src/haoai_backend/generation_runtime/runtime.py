@@ -268,14 +268,20 @@ class _ConfiguredRuntime:
     def consume_cancel_and_due(
         self, scope: OwnerTaskScope
     ) -> Literal["settled", "retained", "pending", "terminal_projection"]:
-        if type(scope) is not OwnerTaskScope or scope.operation != "frame.review":
+        if type(scope) is not OwnerTaskScope:
+            return "pending"
+        task_type = {
+            "frame.review": "ai-review",
+            "frame.optimize": "batch-optimize",
+        }.get(scope.operation)
+        if task_type is None:
             return "pending"
         factory = next(
             (
                 candidate
                 for candidate in self._executor_factories
                 if isinstance(candidate, RegisteredExecutorFactory)
-                and candidate.task_type == "ai-review"
+                and candidate.task_type == task_type
             ),
             None,
         )

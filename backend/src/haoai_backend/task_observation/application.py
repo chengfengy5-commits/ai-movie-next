@@ -25,9 +25,11 @@ from .payload import (
     build_task_list_payload,
     build_task_request,
     find_running_batch_optimize,
+    has_frame_optimize_registration_hint,
 )
 from .ports import (
     CancellationSignalRegistry,
+    FrameOptimizeCancellationPort,
     FrameReviewCancellationPort,
     TaskCancellationWriter,
     TaskObservationUnitOfWork,
@@ -254,11 +256,16 @@ def request_batch_optimize_cancel(
     signal_registry: CancellationSignalRegistry | None,
     cancellation_writer: TaskCancellationWriter | None,
     frame_review_cancellation: FrameReviewCancellationPort | None = None,
+    frame_optimize_cancellation: FrameOptimizeCancellationPort | None = None,
 ) -> dict[str, Any]:
     """Route registered reviews through their own transaction, preserving legacy order."""
     if factory is None:
         raise TaskObservationUnavailable()
-    if cancellation_writer is None and frame_review_cancellation is None:
+    if (
+        cancellation_writer is None
+        and frame_review_cancellation is None
+        and frame_optimize_cancellation is None
+    ):
         raise TaskObservationUnavailable("任务取消服务尚未接线")
 
     def operation(uow: TaskObservationUnitOfWork) -> tuple[str, dict[str, Any]]:
@@ -281,6 +288,19 @@ def request_batch_optimize_cancel(
                     or _value(unit, "step_graph_version") == "frame-review-v1"
                 )
 
+        optimize_selected = False
+        if task_type == "batch-optimize":
+            optimize_selected = _registered_frame_optimize_candidate(request_data)
+            try:
+                units = uow.list_task_billing_units(task_id)
+            except Exception:
+                # An unreadable graph cannot safely fall back to the legacy writer.
+                optimize_selected = True
+            else:
+                optimize_selected = optimize_selected or any(
+                    _frame_optimize_unit_hint(unit) for unit in units
+                )
+
         task_snapshot = {
             "task_id": _value(task, "id"),
             "status": _value(task, "status"),
@@ -288,6 +308,8 @@ def request_batch_optimize_cancel(
         }
         if task_type == "ai-review" and selected:
             return "registered", task_snapshot
+        if optimize_selected:
+            return "frame-optimize", task_snapshot
 
         if cancellation_writer is None:
             raise TaskObservationUnavailable("任务取消服务尚未接线")
@@ -302,6 +324,19 @@ def request_batch_optimize_cancel(
     route, value = _run_read_only(factory, operation)
     if route == "legacy":
         return value
+    if route == "frame-optimize":
+        if frame_optimize_cancellation is None:
+            raise TaskObservationUnavailable("注册分镜优化取消服务尚未接线")
+        outcome = frame_optimize_cancellation.cancel_owned(actor, value["task_id"])
+        if outcome == "not_selected":
+            raise TaskObservationNotFound("任务不存在")
+        if outcome == "settled":
+            signal = signal_registry.get(value["task_id"]) if signal_registry is not None else None
+            if signal:
+                signal.set()
+        elif outcome not in {"retained"}:
+            raise TaskObservationUnavailable("任务取消状态暂时无法安全确认")
+        return {"task_id": value["task_id"], "status": "cancelling"}
     if frame_review_cancellation is None:
         raise TaskObservationUnavailable("注册分镜复核取消服务尚未接线")
 
@@ -335,6 +370,19 @@ def _registered_frame_review_candidate(
             "prepared_payload_id",
             "protected_ref",
         )
+    )
+
+
+def _registered_frame_optimize_candidate(
+    request_data: Mapping[str, Any] | None,
+) -> bool:
+    return has_frame_optimize_registration_hint(request_data)
+
+
+def _frame_optimize_unit_hint(unit: Mapping[str, Any]) -> bool:
+    return (
+        unit.get("operation") == "frame.optimize"
+        or unit.get("step_graph_version") == "frame-optimize-v1"
     )
 
 

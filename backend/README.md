@@ -16,6 +16,37 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 
 该命令是运行方式说明，不表示本次安装或生产部署。Grillme 独立审查仍待执行，本变更未归档。
 
+## 帧优化 host 与 Root 凭据登记
+
+`backend.server` 是唯一的后端启动组合根。帧优化默认关闭；只有显式设置 `FRAME_OPTIMIZE_ENABLED=true` 且提供绝对路径 `FRAME_OPTIMIZE_CREDENTIALS_FILE` 后，host 才把已验证的 Root 能力接到现有 `create_app`。`FRAME_OPTIMIZE_MAX_USER_CONCURRENCY` 为非负整数，默认值为 `1`。配置加载不读 `.env`、shell profile 或云 SDK 环境文件；不设置开关时，原应用继续不启动帧优化 worker。
+
+Root 首先在受保护的 owner-only 输入文件中明确提供 `haoai-root-enrollment-input-v1` 数据。顶层字段为 `format`、`proof_key`、`guard_key`、`aead_key` 和 `records`；三类 key 对象均包含稳定 `key_id` 与 Base64 密钥，AEAD 对象还要包含 `algorithm_version: "aes-256-gcm-v1"`。每条 record 需要 `record_id`、稳定 principal UUID、嵌套 `scope`（`source`、`row_id`、`owner_or_system`、`provider`）、`issuer_namespace`、`stable_account_subject`、`key_generation`、`material_ref`、`provider_secret`、`evidence_ref`、`evidence_version`、UTC `valid_from`、可空 `valid_until`/`revoked_at` 和 `endpoint_policy`（origin、API base path、允许的 content path 与 policy version）。可选 `rotation_attestations` 必须已经由同一 Root proof key 签名。proof/guard 密钥至少 32 字节，AES-GCM 密钥恰为 32 字节，三把密钥和 key ID 都必须互不相同。每个 scope 和材料引用须显式提供，预配工具不会扫描数据库或从模型密钥推导 principal。输入文件必须是当前用户拥有的普通文件、无硬链接、无组/其他权限，且不超过 2 MiB。
+
+从仓库根目录执行离线预配时，输入和输出都使用绝对路径。输出只能新建，权限固定为 `0600`；已有目标会拒绝覆盖。provider secret 以 AES-256-GCM 加密保存，material reference 和用途进入 AAD，proof 和 guard 各使用独立密钥。输出不含 provider secret 明文，命令只显示记录数，不回显密钥或文件内容：
+
+```sh
+python -m backend.server credential provision \
+  --input /absolute/path/root-enrollment-input.json \
+  --output /absolute/path/haoai-credential-bundle.json
+```
+
+登记命令需要显式给出 bundle、source、行 ID、owner/system、record ID、actor ID 和一次性 attempt ID。它使用同一 server host 的 Session factory 调用既有 `CredentialRegistry.stage_register_system_config` 或 `stage_register_owned_config`；数据库核验 system 管理员或 user owner，并验证模型 scope、endpoint 和原配置中的凭据。CLI 提交 caller 事务并关闭该 Session 后，使用既有 `find_confirmed_original_registration` 开新 Session 对同一个 attempt 做 fresh 确认。提交结果未知时会打印原 attempt ID 并停止，不换 attempt、不自动重放，也不改模型配置或创建 schema：
+
+```sh
+python -m backend.server credential register \
+  --credentials-file /absolute/path/haoai-credential-bundle.json \
+  --source user \
+  --row-id 20000000-0000-4000-8000-000000000001 \
+  --owner-or-system 10000000-0000-4000-8000-000000000001 \
+  --record-id root-record-id \
+  --actor-id 10000000-0000-4000-8000-000000000001 \
+  --attempt-id 40000000-0000-4000-8000-000000000001
+```
+
+生产 loader 以 no-follow 文件描述符校验 owner、模式、硬链接数、大小、重复 JSON 键、格式和签名；无效 bundle 会 fail closed。它使用现有 `LegacyFernet` 规则读取数据库里的原配置值，Root provider material 仅在显式 resolve 时解密。Registry、worker runtime、准入和取消共享同一个 Session factory、数据库 UTC clock callable 与 UUID ID callable。host 冷构造不会打开 DB Session 或网络连接；worker 只由应用 lifespan 管理。
+
+provider HTTP port 使用每请求独立的 `aiohttp.ClientSession`，关闭环境代理继承和重定向，按调用设置 timeout，流式读取响应，并在异常、超时或取消时释放响应和 session。文本优化所需的 HTTP 与凭据 resolver 已接入；未纳入本 host 的 public media、bound content、local muse、R2 与 media store 显式抛出不可用，不会返回伪成功。Root schema readiness 仍由现有路由检查；host 不执行 DDL。此组合只证明本地 host 与既有 registry/worker 的接线，不替代 PostgreSQL、真实 provider/R2、浏览器或部署接受。
+
 
 ## 第二十三批：剧集访问策略
 

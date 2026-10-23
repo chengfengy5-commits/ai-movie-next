@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
 from .domain import TeamMembershipRecord
+from .payload import has_frame_optimize_registration_hint
 from .ports import TaskObservationUnitOfWork, UnitOfWorkFactory
 from .tables import (
     ai_tasks,
@@ -149,9 +150,47 @@ class SqlAlchemyTaskObservationUnitOfWork(TaskObservationUnitOfWork):
             .where(
                 ai_tasks.c.type == "batch-optimize",
                 ai_tasks.c.user_id == actor_id,
-                ai_tasks.c.status.in_(["queued", "processing", "cancelling"]),
+                ai_tasks.c.status.in_(
+                    ["queued", "processing", "cancelling", "reconciling"]
+                ),
             )
             .order_by(ai_tasks.c.created_at.desc())
+        )
+        rows = _row_mappings(result.mappings().all())
+        reconciling = [row for row in rows if row.get("status") == "reconciling"]
+        registered_ids = {
+            str(row["id"])
+            for row in reconciling
+            if has_frame_optimize_registration_hint(row.get("request_data"))
+        }
+        unresolved_ids = [
+            str(row["id"])
+            for row in reconciling
+            if str(row["id"]) not in registered_ids
+        ]
+        if unresolved_ids:
+            unit_task_ids = self._session.execute(
+                select(billing_units.c.task_id)
+                .where(
+                    billing_units.c.task_id.in_(unresolved_ids),
+                    or_(
+                        billing_units.c.operation == "frame.optimize",
+                        billing_units.c.step_graph_version == "frame-optimize-v1",
+                    ),
+                )
+                .distinct()
+            ).scalars()
+            registered_ids.update(str(task_id) for task_id in unit_task_ids)
+
+        return [
+            row
+            for row in rows
+            if row.get("status") != "reconciling" or str(row["id"]) in registered_ids
+        ]
+
+    def list_task_billing_units(self, task_id: str) -> list[dict[str, Any]]:
+        result = self._session.execute(
+            select(billing_units).where(billing_units.c.task_id == task_id)
         )
         return _row_mappings(result.mappings().all())
 

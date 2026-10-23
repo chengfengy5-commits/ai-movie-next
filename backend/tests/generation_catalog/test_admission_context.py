@@ -321,6 +321,23 @@ def test_optimize_frame_and_concurrency_boundaries_and_duplicate_index() -> None
             )
 
 
+def test_optimize_accepts_complete_long_chapter_context_for_late_frame() -> None:
+    chapter_texts = [f"frame-{index}" for index in range(60)]
+    context = build_admission_context(
+        actor(),
+        "frame.optimize",
+        {
+            "chapter_id": "chapter-long",
+            "model_id": "text-model",
+            "frames": [{"index": 50, "text": "target-frame"}],
+            "chapter_texts": chapter_texts,
+            "concurrency": 3,
+        },
+    )
+
+    assert context.canonical_request["chapter_texts"] == tuple(chapter_texts)
+
+
 def test_stream_preserves_prompt_id_but_does_not_trust_server_fee_fields() -> None:
     context = build_admission_context(
         actor(),

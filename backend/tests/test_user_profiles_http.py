@@ -426,7 +426,7 @@ def test_create_app_registers_user_routes_without_startup_io_and_cold_app_is_una
         tmp_path / "profiles-app-composition.sqlite"
     )
     try:
-        assert len(app.routes) == 250
+        assert len(app.routes) == 252
         assert events == []
         assert auth_sessions == []
         assert business_sessions == []

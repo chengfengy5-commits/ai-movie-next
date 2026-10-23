@@ -97,7 +97,11 @@ from .chat_media_admission import ChatMediaAdmissionConfiguration
 from .chat_media_admission.http import build_chat_media_admission_router
 from .chat_text_generation import ChatTextGenerationConfiguration
 from .chat_text_generation.http import build_chat_text_generation_router
+from .frame_optimize_http import build_frame_optimize_router
 from .generation_core.admission_staging import build_media_snapshot_producer
+from .generation_core.frame_optimize_cancellation import (
+    SqlAlchemyFrameOptimizeCancellation,
+)
 from .generation_contracts.errors import GenerationError
 from .generation_runtime.assembly import (
     GenerationWorkerConfiguration,
@@ -106,6 +110,10 @@ from .generation_runtime.assembly import (
 from .generation_runtime.frame_review_assembly import (
     FrameReviewWorkerConfiguration,
     build_frame_review_worker_runtime,
+)
+from .generation_runtime.frame_optimize_assembly import (
+    FrameOptimizeWorkerConfiguration,
+    build_frame_optimize_worker_runtime,
 )
 from .generation_runtime.worker_service import GenerationWorkerService
 from .provider_status import ProviderStatusRuntime
@@ -246,8 +254,21 @@ def create_app(
     chat_text_generation_configuration: ChatTextGenerationConfiguration | None = None,
     generation_worker_configuration: GenerationWorkerConfiguration | None = None,
     frame_review_worker_configuration: FrameReviewWorkerConfiguration | None = None,
+    frame_optimize_worker_configuration: FrameOptimizeWorkerConfiguration | None = None,
 ) -> FastAPI:
     """Compose routes; explicitly configured generation workers start in lifespan."""
+    effective_session_factory = session_factory
+    if effective_session_factory is None and authentication_runtime is not None:
+        effective_session_factory = authentication_runtime.session_factory
+    frame_optimize_session_bound = _frame_optimize_session_bound(
+        frame_optimize_worker_configuration,
+        effective_session_factory,
+        authentication_runtime,
+    )
+    if frame_optimize_worker_configuration is not None and not frame_optimize_session_bound:
+        raise ValueError(
+            "frame.optimize dependencies must share the app authentication Session factory"
+        )
     generation_worker_runtime = (
         build_generation_worker_runtime(generation_worker_configuration)
         if generation_worker_configuration is not None
@@ -258,11 +279,18 @@ def create_app(
         if frame_review_worker_configuration is not None
         else None
     )
+    frame_optimize_worker_runtime = (
+        build_frame_optimize_worker_runtime(frame_optimize_worker_configuration)
+        if frame_optimize_worker_configuration is not None
+        and frame_optimize_session_bound
+        else None
+    )
 
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         worker_service: GenerationWorkerService | None = None
         frame_review_service: GenerationWorkerService | None = None
+        frame_optimize_service: GenerationWorkerService | None = None
         try:
             if (
                 generation_worker_runtime is not None
@@ -292,8 +320,30 @@ def create_app(
                 )
                 application.state.frame_review_worker_service = frame_review_service
                 frame_review_service.start()
+            if (
+                frame_optimize_worker_runtime is not None
+                and frame_optimize_worker_configuration is not None
+                and frame_optimize_worker_configuration.enabled
+            ):
+                frame_optimize_service = GenerationWorkerService(
+                    frame_optimize_worker_runtime,
+                    task_type="batch-optimize",
+                    poll_interval_seconds=_GENERATION_WORKER_POLL_INTERVAL_SECONDS,
+                    shutdown_timeout_seconds=(
+                        frame_optimize_worker_configuration.runtime.shutdown_timeout_seconds
+                    ),
+                )
+                application.state.frame_optimize_worker_service = frame_optimize_service
+                frame_optimize_service.start()
             yield
         finally:
+            if frame_optimize_service is not None:
+                receipt = await run_in_threadpool(
+                    frame_optimize_service.shutdown,
+                    "application lifespan shutdown",
+                )
+                application.state.frame_optimize_worker_shutdown = receipt
+                application.state.frame_optimize_worker_service = None
             if frame_review_service is not None:
                 receipt = await run_in_threadpool(
                     frame_review_service.shutdown,
@@ -319,6 +369,8 @@ def create_app(
     app.state.generation_worker_service = None
     app.state.frame_review_worker_runtime = frame_review_worker_runtime
     app.state.frame_review_worker_service = None
+    app.state.frame_optimize_worker_runtime = frame_optimize_worker_runtime
+    app.state.frame_optimize_worker_service = None
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
         def make_authentication_uow():
@@ -331,10 +383,6 @@ def create_app(
         authentication_runtime,
         unit_of_work_factory=authentication_uow_factory,
     )
-
-    effective_session_factory = session_factory
-    if effective_session_factory is None and authentication_runtime is not None:
-        effective_session_factory = authentication_runtime.session_factory
 
     public_site_config_uow_factory = (
         public_site_config_unit_of_work_factory(effective_session_factory)
@@ -703,6 +751,21 @@ def create_app(
                 session_factory=effective_session_factory,
                 registry_capabilities=registry_capabilities,
             )
+    frame_optimize_cancellation = None
+    if (
+        frame_optimize_worker_configuration is not None
+        and frame_optimize_session_bound
+        and effective_session_factory is not None
+    ):
+        capabilities = frame_optimize_worker_configuration.registry_capabilities
+        if capabilities.crypto is not None and capabilities.proof_authority is not None:
+            frame_optimize_cancellation = SqlAlchemyFrameOptimizeCancellation(
+                session_factory=effective_session_factory,
+                db_clock=frame_optimize_worker_configuration.runtime.db_clock,
+                id_factory=frame_optimize_worker_configuration.runtime.id_factory,
+                crypto=capabilities.crypto,
+                proof_authority=capabilities.proof_authority,
+            )
     app.include_router(
         build_task_observation_router(
             uow_factory=task_uow_factory,
@@ -711,6 +774,7 @@ def create_app(
             cancellation_signals=task_cancellation_signals,
             cancellation_writer=task_cancellation_writer,
             frame_review_cancellation=frame_review_cancellation,
+            frame_optimize_cancellation=frame_optimize_cancellation,
         )
     )
 
@@ -1093,5 +1157,34 @@ def create_app(
     app.state.chat_text_generation_execution = getattr(
         chat_text_generation_router, "chat_text_generation_execution", None
     )
+    app.include_router(
+        build_frame_optimize_router(
+            authentication_service=authentication_service,
+            session_factory=effective_session_factory,
+            configuration=(
+                frame_optimize_worker_configuration
+                if frame_optimize_session_bound
+                else None
+            ),
+        )
+    )
 
     return app
+
+
+def _frame_optimize_session_bound(
+    configuration: FrameOptimizeWorkerConfiguration | None,
+    session_factory: SessionFactory | None,
+    authentication_runtime: AuthenticationRuntime | None,
+) -> bool:
+    if configuration is None:
+        return True
+    return bool(
+        session_factory is not None
+        and configuration.runtime.session_factory is session_factory
+        and configuration.registry_capabilities.read_session_factory is session_factory
+        and (
+            authentication_runtime is None
+            or authentication_runtime.session_factory is session_factory
+        )
+    )
