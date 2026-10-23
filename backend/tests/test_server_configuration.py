@@ -55,6 +55,29 @@ def test_nonproduction_without_storage_is_explicit_and_repr_is_redacted(
     assert "synthetic-test-secret" not in repr(configuration)
     assert "server.sqlite" not in repr(configuration)
     assert "ambient-access-secret" not in repr(configuration)
+    assert configuration.frame_optimize_enabled is False
+    assert configuration.frame_optimize_credentials_file is None
+
+
+def test_frame_optimize_is_opt_in_and_requires_an_absolute_bundle_path(
+    tmp_path: Path,
+) -> None:
+    environment = _base_environment(tmp_path)
+    environment["FRAME_OPTIMIZE_ENABLED"] = "true"
+    with pytest.raises(ServerConfigurationError, match="FRAME_OPTIMIZE_CREDENTIALS_FILE"):
+        load_server_configuration(environment)
+
+    environment["FRAME_OPTIMIZE_ENABLED"] = "false"
+    environment["FRAME_OPTIMIZE_CREDENTIALS_FILE"] = "relative/bundle.json"
+    with pytest.raises(ServerConfigurationError, match="absolute path"):
+        load_server_configuration(environment)
+
+    environment["FRAME_OPTIMIZE_CREDENTIALS_FILE"] = str(tmp_path / "bundle.json")
+    environment["FRAME_OPTIMIZE_MAX_USER_CONCURRENCY"] = "0"
+    configuration = load_server_configuration(environment)
+    assert configuration.frame_optimize_enabled is False
+    assert configuration.frame_optimize_credentials_file == tmp_path / "bundle.json"
+    assert configuration.frame_optimize_max_user_concurrency == 0
 
 
 def test_r2_requires_every_named_value_and_does_not_leak_secrets(

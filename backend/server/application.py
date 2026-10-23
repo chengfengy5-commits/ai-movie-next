@@ -26,6 +26,7 @@ from haoai_backend.runtime_status import (
 )
 
 from .configuration import ServerConfiguration, ServerConfigurationError
+from .generation import build_frame_optimize_configuration
 
 
 class ServerHostAssemblyError(RuntimeError):
@@ -114,6 +115,10 @@ def create_server_host(
             expire_on_commit=False,
             future=True,
         )
+        frame_optimize_configuration = build_frame_optimize_configuration(
+            configuration,
+            session_factory=session_factory,
+        )
         authentication_runtime = _ServerAuthenticationRuntime(
             session_factory=session_factory,
             secret_key=configuration.secret_key.value,
@@ -191,10 +196,14 @@ def create_server_host(
             ),
             runtime_status_storage_probe=storage_probe,
             media_upload_application=media_application,
+            frame_optimize_worker_configuration=frame_optimize_configuration,
         )
         app.state.server_session_factory = session_factory
         app.state.server_resources = resources
         app.state.server_engine = engine
+        app.state.server_frame_optimize_worker_configuration = (
+            frame_optimize_configuration
+        )
         _compose_host_lifespan(app, resources)
         return ServerHost(
             app=app,

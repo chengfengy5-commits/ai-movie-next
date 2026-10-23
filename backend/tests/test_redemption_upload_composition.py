@@ -273,6 +273,7 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             "chat_text_generation_configuration",
             "generation_worker_configuration",
             "frame_review_worker_configuration",
+            "frame_optimize_worker_configuration",
         )
         assert inspect.signature(create_app).parameters["upload_directory"].default is None
         assert inspect.signature(create_app).parameters["provider_quota_transport"].default is None
@@ -289,6 +290,11 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
         ]
         assert frame_review_worker_parameter.default is None
         assert frame_review_worker_parameter.kind is inspect.Parameter.KEYWORD_ONLY
+        frame_optimize_worker_parameter = inspect.signature(create_app).parameters[
+            "frame_optimize_worker_configuration"
+        ]
+        assert frame_optimize_worker_parameter.default is None
+        assert frame_optimize_worker_parameter.kind is inspect.Parameter.KEYWORD_ONLY
 
         methods = {
             (method, route.path)
@@ -385,6 +391,8 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             ("POST", "/api/chat/stream", "chat_stream"),
             ("POST", "/api/chat/ai-review", "create_ai_review_task"),
             ("POST", "/api/chat/batch-optimize", "batch_optimize_background"),
+            ("GET", "/api/chat/frame-optimize/capabilities", "frame_optimize_capabilities"),
+            ("POST", "/api/chat/frame-optimize", "create_registered_frame_optimize_task"),
         }
         route_groups = (
             new_routes,
@@ -398,15 +406,15 @@ def test_create_app_composes_redemption_and_dynamic_authenticated_uploads(
             chat_media_routes,
             chat_text_routes,
         )
-        assert len(methods) == 250
-        assert len(triples) == 250
+        assert len(methods) == 252
+        assert len(triples) == 252
         assert len(new_routes) == 20
         assert len(runtime_and_maintenance_routes) == 9
         assert len(series_exchange_routes) == 5
         assert len(storyboard_save_routes) == 4
         assert len(media_upload_routes) == 5
         assert len(chat_media_routes) == 3
-        assert len(chat_text_routes) == 3
+        assert len(chat_text_routes) == 5
         assert len(fused_generation_routes) == 1
         assert len(storyboard_generation_routes) == 6
         assert len(storyboard_asset_generation_routes) == 6

@@ -17,6 +17,7 @@ from haoai_backend.generation_core.frame_optimize_execution import (
     has_any_intent,
     initial_generation_candidate,
     lock_frame_optimize_batch,
+    resume_generation_candidate,
     valid_intent_projection,
 )
 from haoai_backend.generation_core.frame_optimize_progress import lock_frame_optimize_progress
@@ -213,7 +214,10 @@ class SqlAlchemyFrameOptimizeClaims:
                     graph is None
                     or progress is None
                     or not _lease_available(graph.task, now)
-                    or not initial_generation_candidate(graph)
+                    or not (
+                        initial_generation_candidate(graph)
+                        or resume_generation_candidate(graph, progress)
+                    )
                     or not valid_intent_projection(graph)
                 ):
                     return None
@@ -362,6 +366,11 @@ class SqlAlchemyFrameOptimizeClaims:
                         proof_authority=self.proof_authority,
                     )
                     now = self._server_now()
+                    progress = (
+                        lock_frame_optimize_progress(session, graph)
+                        if graph is not None
+                        else None
+                    )
                     if (
                         graph is None
                         or graph.task.get("status") != "processing"
@@ -372,8 +381,11 @@ class SqlAlchemyFrameOptimizeClaims:
                         or not _same_time(graph.task.get("lease_until"), write.lease_until)
                         or graph.task.get("request_data") != write.request_data
                         or not _claim_live(graph.task, write.authority(signal), now)
-                        or lock_frame_optimize_progress(session, graph) is None
-                        or not initial_generation_candidate(graph)
+                        or progress is None
+                        or not (
+                            initial_generation_candidate(graph)
+                            or resume_generation_candidate(graph, progress)
+                        )
                         or not valid_intent_projection(graph)
                     ):
                         return None
@@ -514,10 +526,10 @@ def _lease_available(task, now: datetime) -> bool:
     if task.get("user_cancelled_at") is not None:
         return False
     lease = task.get("lease_until")
-    if task.get("status") == "queued":
+    if task.get("status") in {"queued", "reconciling"}:
         return lease is None or _aware_utc(lease) <= now
     return (
-        task.get("status") in {"processing", "reconciling"}
+        task.get("status") == "processing"
         and lease is not None
         and _aware_utc(lease) <= now
     )

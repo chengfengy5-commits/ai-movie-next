@@ -475,38 +475,177 @@ def test_projection_rejects_a_deadline_extended_in_both_mutable_rows(tmp_path):
         case.engine.dispose()
 
 
-def test_release_after_intent_preserves_reconciling_facts_and_cannot_reclaim(tmp_path):
+def test_release_after_intent_reclaims_only_unstarted_siblings(tmp_path):
     case = admit_batch(tmp_path, request_indexes=(2, 0, 1))
     try:
         claims = claim_adapter(case, token="opt-claim-release-after-intent")
         claim = claims.claim_next("batch-optimize", "optimize-worker")
         assert claim is not None
-        unit_id = _ordered_units(case)[1]
-        intent = intent_adapter(case).prepare(claim, unit_id)
-        assert intent.disposition == "committed"
+        ordered_units = _ordered_units(case)
+        already_submitted_unit_id = ordered_units[1]
+        first_intent = intent_adapter(case).prepare(claim, already_submitted_unit_id)
+        assert first_intent.disposition == "committed"
+        assert first_intent.intent is not None
+        before_release = rows_for(case)
         assert claims.release_claim(claim) is True
         released = rows_for(case)
         assert released["task"]["status"] == "reconciling"
         assert released["task"]["claim_token"] is None
         assert released["task"]["execution_generation"] == claim.execution_generation
         assert len(released["external"]) == 1
-        first_intent = released["units"][next(
-            index for index, unit in enumerate(released["units"])
-            if unit["id"] == unit_id
-        )]["first_intent_at"]
-        deadline = released["units"][next(
-            index for index, unit in enumerate(released["units"])
-            if unit["id"] == unit_id
-        )]["deadline_at"]
+        original_unit = next(
+            unit for unit in released["units"] if unit["id"] == already_submitted_unit_id
+        )
+        original_intent_facts = {
+            "first_intent_at": original_unit["first_intent_at"],
+            "deadline_at": original_unit["deadline_at"],
+        }
+        original_submission = dict(released["external"][0])
+        original_unit_inputs = {
+            unit["id"]: {
+                "input_digest": unit["input_digest"],
+                "candidate_digest": unit["candidate_digest"],
+            }
+            for unit in released["units"]
+        }
+        original_billing_facts = {
+            unit["id"]: {
+                name: unit[name]
+                for name in (
+                    "quoted_amount",
+                    "debited_amount",
+                    "refunded_amount",
+                    "billing_status",
+                    "result_status",
+                )
+            }
+            for unit in released["units"]
+        }
+        original_wallet = [dict(row) for row in released["wallet"]]
+        assert original_unit_inputs[already_submitted_unit_id]["input_digest"] == next(
+            unit["input_digest"]
+            for unit in before_release["units"]
+            if unit["id"] == already_submitted_unit_id
+        )
+
         case.clock[0] += timedelta(seconds=120)
-        assert claim_adapter(case, token="opt-no-reclaim-intent").claim_next(
+        next_claim = claim_adapter(case, token="opt-reclaim-unstarted-sibling").claim_next(
+            "batch-optimize", "another-worker"
+        )
+        assert next_claim is not None
+        assert next_claim.execution_generation == claim.execution_generation + 1
+        assert next_claim.token != claim.token
+
+        intents = intent_adapter(case, prefix="opt-reclaimed-intent")
+        duplicate = intents.prepare(next_claim, already_submitted_unit_id)
+        assert duplicate.disposition == "existing"
+        assert duplicate.intent is None
+        after_duplicate = rows_for(case)
+        assert after_duplicate["task"]["status"] == "processing"
+        assert after_duplicate["task"]["claim_token"] == next_claim.token
+        assert after_duplicate["task"]["execution_generation"] == next_claim.execution_generation
+        assert len(after_duplicate["external"]) == 1
+        assert dict(after_duplicate["external"][0]) == original_submission
+
+        unstarted_unit_id = ordered_units[0]
+        unstarted = next(
+            unit for unit in after_duplicate["units"] if unit["id"] == unstarted_unit_id
+        )
+        assert unstarted["first_intent_at"] is None
+        assert unstarted["deadline_at"] is None
+        prepared_sibling = intents.prepare(next_claim, unstarted_unit_id)
+        assert prepared_sibling.disposition == "committed"
+        assert prepared_sibling.intent is not None
+
+        after = rows_for(case)
+        assert len(after["external"]) == 2
+        assert next(
+            row for row in after["external"] if row["id"] == original_submission["id"]
+        ) == original_submission
+        new_submission = next(
+            row
+            for row in after["external"]
+            if row["id"] == prepared_sibling.intent.external_submission_id
+        )
+        assert new_submission["step_id"] == prepared_sibling.intent.step_id
+        assert new_submission["step_id"] != original_submission["step_id"]
+        assert next(
+            unit for unit in after["units"] if unit["id"] == already_submitted_unit_id
+        )["first_intent_at"] == original_intent_facts["first_intent_at"]
+        assert next(
+            unit for unit in after["units"] if unit["id"] == already_submitted_unit_id
+        )["deadline_at"] == original_intent_facts["deadline_at"]
+        assert {
+            unit["id"]: {
+                "input_digest": unit["input_digest"],
+                "candidate_digest": unit["candidate_digest"],
+            }
+            for unit in after["units"]
+        } == original_unit_inputs
+        assert {
+            unit["id"]: {
+                name: unit[name]
+                for name in (
+                    "quoted_amount",
+                    "debited_amount",
+                    "refunded_amount",
+                    "billing_status",
+                    "result_status",
+                )
+            }
+            for unit in after["units"]
+        } == original_billing_facts
+        assert [dict(row) for row in after["wallet"]] == original_wallet
+        assert after["creditLogs"] == []
+        assert after["fees"] == []
+        assert_only_original_graph(case, external_count=2)
+    finally:
+        case.engine.dispose()
+
+
+def test_release_after_single_unit_intent_does_not_reclaim_fully_started_batch(tmp_path):
+    case = admit_batch(tmp_path, request_indexes=(0,))
+    try:
+        claims = claim_adapter(case, token="opt-single-item-claim")
+        claim = claims.claim_next("batch-optimize", "optimize-worker")
+        assert claim is not None
+        unit_id = _ordered_units(case)[0]
+        prepared = intent_adapter(case).prepare(claim, unit_id)
+        assert prepared.disposition == "committed"
+        assert prepared.intent is not None
+        before_release = rows_for(case)
+        assert claims.release_claim(claim) is True
+        released = rows_for(case)
+        assert released["task"]["status"] == "reconciling"
+        assert released["task"]["claim_token"] is None
+        assert len(released["external"]) == 1
+        original_submission = dict(released["external"][0])
+        original_unit = next(unit for unit in released["units"] if unit["id"] == unit_id)
+        original_facts = {
+            "input_digest": original_unit["input_digest"],
+            "first_intent_at": original_unit["first_intent_at"],
+            "deadline_at": original_unit["deadline_at"],
+            "quoted_amount": original_unit["quoted_amount"],
+            "debited_amount": original_unit["debited_amount"],
+            "refunded_amount": original_unit["refunded_amount"],
+            "billing_status": original_unit["billing_status"],
+            "result_status": original_unit["result_status"],
+        }
+        assert original_facts["input_digest"] == before_release["units"][0]["input_digest"]
+
+        case.clock[0] += timedelta(seconds=120)
+        assert claim_adapter(case, token="opt-no-reclaim-fully-started").claim_next(
             "batch-optimize", "another-worker"
         ) is None
+
         after = rows_for(case)
+        assert after["task"]["status"] == "reconciling"
+        assert after["task"]["claim_token"] is None
+        assert after["task"]["execution_generation"] == claim.execution_generation
         assert len(after["external"]) == 1
-        unit_after = next(unit for unit in after["units"] if unit["id"] == unit_id)
-        assert unit_after["first_intent_at"] == first_intent
-        assert unit_after["deadline_at"] == deadline
+        assert dict(after["external"][0]) == original_submission
+        after_unit = next(unit for unit in after["units"] if unit["id"] == unit_id)
+        assert {name: after_unit[name] for name in original_facts} == original_facts
         assert_only_original_graph(case, external_count=1)
     finally:
         case.engine.dispose()

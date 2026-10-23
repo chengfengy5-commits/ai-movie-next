@@ -28,6 +28,9 @@ from haoai_backend.generation_core.frame_optimize_claims import SqlAlchemyFrameO
 from haoai_backend.generation_core.frame_optimize_execution import lock_frame_optimize_batch
 from haoai_backend.generation_core.frame_optimize_intents import SqlAlchemyFrameOptimizeIntents
 from haoai_backend.generation_core.frame_optimize_results import SqlAlchemyFrameOptimizeResults
+from haoai_backend.generation_core.frame_optimize_recovery import (
+    SqlAlchemyFrameOptimizeRecovery,
+)
 from haoai_backend.generation_core.frame_optimize_continuation_claims import (
     SqlAlchemyFrameOptimizeContinuationClaims,
 )
@@ -274,6 +277,17 @@ def cancellation_adapter(case: FrameOptimizeCase, *, prefix: str = "opt-cancel")
     )
 
 
+def recovery_adapter(case: FrameOptimizeCase):
+    return SqlAlchemyFrameOptimizeRecovery(
+        session_factory=case.sessions,
+        db_clock=lambda: case.clock[0],
+        id_factory=IdSequence("opt-recovery"),
+        crypto=case.capabilities.crypto,
+        proof_authority=case.capabilities.proof_authority,
+        cancellation=cancellation_adapter(case),
+    )
+
+
 def persist_result(case, claim, prepared, *, text: str = "optimized frame"):
     assert prepared.disposition == "committed"
     assert prepared.intent is not None
@@ -473,6 +487,7 @@ __all__ = [
     "persist_result_and_fee",
     "persist_result",
     "result_adapter",
+    "recovery_adapter",
     "reopen_batch",
     "rows_for",
 ]

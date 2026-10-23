@@ -103,7 +103,7 @@ def test_integrated_registry_has_250_methods():
         for method in route.methods
         if method not in {"HEAD", "OPTIONS"}
     }
-    assert len(registered_methods) == 250
+    assert len(registered_methods) == 252
     assert {
         (method, path)
         for path, method in (

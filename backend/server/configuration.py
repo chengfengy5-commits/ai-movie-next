@@ -30,6 +30,9 @@ class ServerConfiguration:
     r2_configuration: R2Configuration | None
     r2_access_key: SecretValue | None
     r2_secret_key: SecretValue | None
+    frame_optimize_enabled: bool = False
+    frame_optimize_credentials_file: Path | None = field(default=None, repr=False)
+    frame_optimize_max_user_concurrency: int = 1
 
 
 _R2_KEYS = (
@@ -58,6 +61,20 @@ def load_server_configuration(
         raise ServerConfigurationError("SECRET_KEY must contain at least 32 characters")
 
     allow_r2_dev = _boolean(values, "ALLOW_R2_DEV", default=False)
+    frame_optimize_enabled = _boolean(values, "FRAME_OPTIMIZE_ENABLED", default=False)
+    frame_optimize_credentials_file = _optional_absolute_path(
+        values, "FRAME_OPTIMIZE_CREDENTIALS_FILE"
+    )
+    frame_optimize_max_user_concurrency = _non_negative_integer(
+        values,
+        "FRAME_OPTIMIZE_MAX_USER_CONCURRENCY",
+        default=1,
+    )
+    if frame_optimize_enabled and frame_optimize_credentials_file is None:
+        raise ServerConfigurationError(
+            "FRAME_OPTIMIZE_CREDENTIALS_FILE is required when frame.optimize is enabled"
+        )
+
     configured = tuple(key for key in _R2_KEYS if key in values)
     if not configured:
         if environment == "production":
@@ -73,6 +90,9 @@ def load_server_configuration(
             r2_configuration=None,
             r2_access_key=None,
             r2_secret_key=None,
+            frame_optimize_enabled=frame_optimize_enabled,
+            frame_optimize_credentials_file=frame_optimize_credentials_file,
+            frame_optimize_max_user_concurrency=frame_optimize_max_user_concurrency,
         )
 
     missing = tuple(
@@ -120,6 +140,9 @@ def load_server_configuration(
         r2_configuration=r2_configuration,
         r2_access_key=SecretValue(values["OBJECT_STORAGE_ACCESS_KEY_ID"]),
         r2_secret_key=SecretValue(values["OBJECT_STORAGE_SECRET_ACCESS_KEY"]),
+        frame_optimize_enabled=frame_optimize_enabled,
+        frame_optimize_credentials_file=frame_optimize_credentials_file,
+        frame_optimize_max_user_concurrency=frame_optimize_max_user_concurrency,
     )
 
 
@@ -139,6 +162,32 @@ def _boolean(environ: Mapping[str, str], name: str, *, default: bool) -> bool:
     if value == "false":
         return False
     raise ServerConfigurationError(f"{name} must be 'true' or 'false'")
+
+
+def _optional_absolute_path(environ: Mapping[str, str], name: str) -> Path | None:
+    value = environ.get(name)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ServerConfigurationError(f"{name} must be a non-empty absolute path")
+    path = Path(value)
+    if not path.is_absolute():
+        raise ServerConfigurationError(f"{name} must be an absolute path")
+    return path
+
+
+def _non_negative_integer(
+    environ: Mapping[str, str], name: str, *, default: int
+) -> int:
+    value = environ.get(name)
+    if value is None:
+        return default
+    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
+        raise ServerConfigurationError(f"{name} must be a non-negative integer")
+    try:
+        return int(value)
+    except ValueError:
+        raise ServerConfigurationError(f"{name} must be a non-negative integer") from None
 
 
 def _validate_database_url(value: str, environment: str) -> None:

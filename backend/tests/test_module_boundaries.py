@@ -194,6 +194,8 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/chat/batch-optimize/running", frozenset({"GET"})),
         ("/api/chat/batch-optimize/{task_id}/status", frozenset({"GET"})),
         ("/api/chat/batch-optimize/{task_id}/cancel", frozenset({"POST"})),
+        ("/api/chat/frame-optimize/capabilities", frozenset({"GET"})),
+        ("/api/chat/frame-optimize", frozenset({"POST"})),
         ("/api/user/preferences", frozenset({"GET"})),
         ("/api/user/preferences", frozenset({"PUT"})),
         ("/api/tasks", frozenset({"POST"})),
@@ -297,6 +299,8 @@ def test_import_and_unwired_factory_registers_the_complete_route_surface() -> No
         ("/api/chat/stream", frozenset({"POST"})),
         ("/api/chat/ai-review", frozenset({"POST"})),
         ("/api/chat/batch-optimize", frozenset({"POST"})),
+        ("/api/chat/frame-optimize/capabilities", frozenset({"GET"})),
+        ("/api/chat/frame-optimize", frozenset({"POST"})),
         ("/api/chat/image", frozenset({"POST"})),
         ("/api/chat/video", frozenset({"POST"})),
         ("/api/chat/batch-generate-images", frozenset({"POST"})),
@@ -443,7 +447,7 @@ def test_first_full_package_import_and_factory_have_no_startup_side_effects(tmp_
             importlib.import_module(module.name)
         app_module = importlib.import_module("haoai_backend.app")
         app = app_module.create_app()
-        assert len(app.routes) == 250, [(route.path, route.methods) for route in app.routes]
+        assert len(app.routes) == 252, [(route.path, route.methods) for route in app.routes]
         assert effects == [], effects
         # Pydantic probes this optional schema flag; application modules must not read env.
         for key, caller, frames in environment_reads:

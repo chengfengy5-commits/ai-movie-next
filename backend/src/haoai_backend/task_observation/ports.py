@@ -50,6 +50,8 @@ class TaskObservationReader(Protocol):
         self, actor_id: str
     ) -> Sequence[TaskRecord | TaskRow]: ...
 
+    def list_task_billing_units(self, task_id: str) -> Sequence[TaskRow]: ...
+
 
 class TaskReceiptReader(Protocol):
     """Keep the first-unit and unique-unit receipt reads distinct."""
@@ -105,6 +107,12 @@ class TaskCancellationWriter(Protocol):
 
 class FrameReviewCancellationPort(Protocol):
     """Settle a registered review after trusted active-user authentication."""
+
+    def cancel_owned(self, actor: TrustedActor, task_id: str) -> str: ...
+
+
+class FrameOptimizeCancellationPort(Protocol):
+    """Settle a registered optimize batch in its own financial transaction."""
 
     def cancel_owned(self, actor: TrustedActor, task_id: str) -> str: ...
 

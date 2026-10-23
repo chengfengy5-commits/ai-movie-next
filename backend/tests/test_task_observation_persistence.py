@@ -5,7 +5,7 @@ from datetime import datetime
 from typing import Any
 
 import pytest
-from sqlalchemy import event, insert, update
+from sqlalchemy import event, insert, select, update
 
 from chapter_asset_replacement_support import (
     CONSERVATION_TABLES,
@@ -15,11 +15,20 @@ from chapter_asset_replacement_support import (
     create_owner_database,
 )
 from haoai_backend.task_observation.domain import TeamMembershipRecord
+from haoai_backend.shared.identity import TrustedActor
+from haoai_backend.task_observation.application import get_running_batch_optimize
+from haoai_backend.task_observation.application import request_batch_optimize_cancel
+from haoai_backend.task_observation.errors import TaskObservationUnavailable
 from haoai_backend.task_observation.persistence import (
     SqlAlchemyTaskObservationUnitOfWork,
     task_observation_unit_of_work_factory,
 )
 from haoai_backend.task_observation.tables import ai_tasks
+from haoai_backend.generation_core.base_schema import AITaskRow, BillingUnitRow
+from haoai_backend.generation_core.frame_optimize_cancellation import (
+    SqlAlchemyFrameOptimizeCancellation,
+)
+from generation_execution.frame_optimize_execution_helpers import admit_batch
 
 
 @pytest.fixture
@@ -204,6 +213,197 @@ def test_supplied_session_reads_full_owner_rows_without_business_writes(owner_da
     assert owner_database.session_factory.created[-1].close_calls == 1
     _assert_reads_only(activity)
     assert owner_database.snapshot() == before_reads
+
+
+def test_running_optimize_candidates_keep_legacy_states_and_only_registered_reconciling(
+    owner_database,
+):
+    stamp = datetime(2026, 10, 9, 13, 0, 0)
+    task_specs = (
+        ("legacy-processing", "user-a", "processing", '{"chapter_id": "chapter-a"}', 18),
+        (
+            "registered-request",
+            "user-a",
+            "reconciling",
+            json.dumps({"chapter_id": "chapter-a", "operation": "frame.optimize"}),
+            16,
+        ),
+        ("registered-unit", "user-a", "reconciling", '{"chapter_id": "chapter-a"}', 17),
+        ("legacy-reconciling", "user-a", "reconciling", '{"chapter_id": "chapter-a"}', 21),
+        ("damaged-hint", "user-a", "reconciling", '{broken json', 20),
+        (
+            "other-owner",
+            "user-b",
+            "reconciling",
+            json.dumps({"chapter_id": "chapter-a", "operation": "frame.optimize"}),
+            22,
+        ),
+        ("legacy-queued", "user-a", "queued", '{"chapter_id": "chapter-a"}', 15),
+        ("legacy-cancelling", "user-a", "cancelling", '{"chapter_id": "chapter-a"}', 14),
+    )
+    task_rows = [
+        _task_values(
+            task_id,
+            user_id=user_id,
+            task_type="batch-optimize",
+            status=status,
+            message_id=f"message-{task_id}",
+            request_data=request_data,
+            created_at=stamp.replace(minute=minute),
+        )
+        for task_id, user_id, status, request_data, minute in task_specs
+    ]
+    with owner_database.engine.begin() as connection:
+        connection.execute(insert(OWNER_TABLES["ai_tasks"]), task_rows)
+        connection.execute(
+            insert(OWNER_TABLES["billing_units"]).values(
+                id="unit-registered",
+                task_id="registered-unit",
+                item_key="frame-0",
+                operation="frame.optimize",
+                step_graph_version="frame-optimize-v1",
+                input_digest="synthetic-digest",
+                quoted_amount=3,
+                created_at=stamp,
+                updated_at=stamp,
+            )
+        )
+
+    factory = task_observation_unit_of_work_factory(owner_database.session_factory)
+    unit = factory()
+    try:
+        candidates = unit.list_running_batch_optimize_candidates("user-a")
+        assert [row["id"] for row in candidates] == [
+            "legacy-processing",
+            "registered-unit",
+            "registered-request",
+            "legacy-queued",
+            "legacy-cancelling",
+        ]
+    finally:
+        _close_uow(unit)
+
+    public_result = get_running_batch_optimize(
+        factory,
+        TrustedActor(user_id="user-a"),
+        "chapter-a",
+    )
+    assert public_result["task"]["task_id"] == "legacy-processing"
+    assert public_result["task"]["status"] == "processing"
+
+
+def test_unit_only_registered_cancel_refuses_bad_graph_without_legacy_fallback(tmp_path):
+    case = admit_batch(tmp_path, frame_count=1, request_indexes=(0,))
+    try:
+        with case.sessions.begin() as session:
+            task = session.get(AITaskRow, case.task_id)
+            assert task is not None
+            request_data = json.loads(task.request_data)
+            for name in ("operation", "mode", "graph_version", "step_graph_version"):
+                request_data.pop(name, None)
+            task.request_data = json.dumps(request_data, separators=(",", ":"))
+            unit = session.execute(
+                select(BillingUnitRow).where(BillingUnitRow.task_id == case.task_id)
+            ).scalar_one()
+            assert unit.operation == "frame.optimize"
+
+        events: list[str] = []
+
+        class LegacyWriter:
+            def request_cancel(self, task_id: str) -> bool:
+                events.append(f"legacy:{task_id}")
+                return True
+
+        with pytest.raises(TaskObservationUnavailable):
+            request_batch_optimize_cancel(
+                task_observation_unit_of_work_factory(case.sessions),
+                TrustedActor(user_id=case.actor_id),
+                case.task_id,
+                signal_registry=None,
+                cancellation_writer=LegacyWriter(),
+                frame_optimize_cancellation=SqlAlchemyFrameOptimizeCancellation(
+                    session_factory=case.sessions,
+                    db_clock=lambda: case.clock[0],
+                    id_factory=lambda: "unit-only-cancel-marker",
+                    crypto=case.capabilities.crypto,
+                    proof_authority=case.capabilities.proof_authority,
+                ),
+            )
+
+        assert events == []
+        with case.sessions() as session:
+            task = session.get(AITaskRow, case.task_id)
+            assert task is not None and task.status == "queued"
+            assert task.user_cancelled_at is None
+    finally:
+        case.engine.dispose()
+
+
+def test_public_registered_cancel_closes_read_session_and_commits_before_signal(tmp_path):
+    case = admit_batch(tmp_path, frame_count=1, request_indexes=(0,))
+    try:
+        events: list[str] = []
+        caller_sessions = 0
+
+        class ObservedUnitOfWork(SqlAlchemyTaskObservationUnitOfWork):
+            def close(self) -> None:
+                super().close()
+                events.append("caller-session-closed")
+
+        def unit_of_work_factory():
+            nonlocal caller_sessions
+            caller_sessions += 1
+            return ObservedUnitOfWork(case.sessions())
+
+        class LegacyWriter:
+            def request_cancel(self, task_id: str) -> bool:
+                raise AssertionError(f"registered task fell through to legacy writer: {task_id}")
+
+        class Signal:
+            def set(self) -> None:
+                assert events[-1] == "cancellation-committed"
+                events.append("signal-set")
+
+        class SignalRegistry:
+            def get(self, task_id: str):
+                assert task_id == case.task_id
+                return Signal()
+
+        cancellation = SqlAlchemyFrameOptimizeCancellation(
+            session_factory=case.sessions,
+            db_clock=lambda: case.clock[0],
+            id_factory=lambda: "public-cancel-marker",
+            crypto=case.capabilities.crypto,
+            proof_authority=case.capabilities.proof_authority,
+        )
+
+        class ObservedCancellation:
+            def cancel_owned(self, actor, task_id: str) -> str:
+                assert events == ["caller-session-closed"]
+                outcome = cancellation.cancel_owned(actor, task_id)
+                assert outcome == "settled"
+                with case.sessions() as session:
+                    task = session.get(AITaskRow, task_id)
+                    assert task is not None
+                    assert task.user_cancelled_at is not None
+                    assert task.cancellation_reason is not None
+                events.append("cancellation-committed")
+                return outcome
+
+        response = request_batch_optimize_cancel(
+            unit_of_work_factory,
+            TrustedActor(user_id=case.actor_id),
+            case.task_id,
+            SignalRegistry(),
+            LegacyWriter(),
+            frame_optimize_cancellation=ObservedCancellation(),
+        )
+
+        assert caller_sessions == 1
+        assert response == {"task_id": case.task_id, "status": "cancelling"}
+        assert events == ["caller-session-closed", "cancellation-committed", "signal-set"]
+    finally:
+        case.engine.dispose()
 
 
 def test_membership_cache_uses_primary_key_and_executes_each_select(owner_database):

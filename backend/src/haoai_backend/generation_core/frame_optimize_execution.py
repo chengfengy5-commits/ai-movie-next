@@ -223,6 +223,49 @@ def initial_generation_candidate(graph: LockedFrameOptimizeBatch) -> bool:
     )
 
 
+def resume_generation_candidate(graph: LockedFrameOptimizeBatch, progress) -> bool:
+    """Allow a new lease only when the authenticated graph proves a fresh sibling exists."""
+    task = graph.task
+    if (
+        task.get("status") not in {"queued", "processing", "reconciling"}
+        or task.get("user_cancelled_at") is not None
+        or progress.stopped_insufficient
+        or progress.cancellation_marker is not None
+        or progress.policy_stop_event_refs
+        or not valid_intent_projection(graph)
+    ):
+        return False
+    units = graph.units_by_id
+    steps = graph.steps_by_unit
+    external = graph.external_by_step
+    for unit_id, unit in units.items():
+        step = steps.get(unit_id)
+        if step is None:
+            return False
+        if external.get(str(step.get("id"))) is not None:
+            continue
+        if (
+            unit.get("billing_status") == "unbilled"
+            and unit.get("result_status") == "pending"
+            and unit.get("debited_amount") == 0
+            and unit.get("refunded_amount") == 0
+            and unit.get("first_intent_at") is None
+            and unit.get("deadline_at") is None
+            and unit.get("user_cancelled_at") is None
+            and step.get("step_key") == "generate"
+            and step.get("execution_status") == "prepared"
+            and unit_id not in progress.receipts_by_unit
+            and unit_id not in progress.works_by_unit
+            and unit_id not in progress.fees_by_unit
+            and unit_id not in progress.ledgers_by_unit
+            and unit_id not in progress.applications_by_unit
+            and unit_id not in progress.unstarted_insufficient_by_unit
+            and unit_id not in progress.unstarted_cancelled_by_unit
+        ):
+            return True
+    return False
+
+
 def has_any_intent(graph: LockedFrameOptimizeBatch) -> bool:
     return bool(graph.external_submissions) or any(
         unit.get("first_intent_at") is not None for unit in graph.units
@@ -423,6 +466,7 @@ __all__ = [
     "LockedFrameOptimizeBatch",
     "has_any_intent",
     "initial_generation_candidate",
+    "resume_generation_candidate",
     "intent_row_matches",
     "intent_snapshot",
     "item_for_unit",
