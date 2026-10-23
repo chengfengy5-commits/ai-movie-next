@@ -341,3 +341,7 @@ U05.4 的开发和接线状态现为 C/C，V=P、A=U。前端已接通完整素�
 Root531-03 在冻结的 5 个受影响前端测试文件上 134 项通过，TSC 与生产构建通过；验证绑定 947 backend / 312 frontend 精确源码，未声称新版全前端 1563 项结果。相关收据：`haoai-next-asset-replacement-review-530-sol-03.md` SHA-256 `ce80d3704d643d687548527c21e79198ff20b23c126f496fe3b7a5e50c6e9ba2`；`haoai-next-root-asset-replacement-frontend-531-03.json` SHA-256 `6b1ee98c8a4d2604292063b5944f8521883fc0ac76dcc9d49572b44e73ccdbe3`。HTTP、GUI 和 E2E 均未执行；用户当前只暂缓 E2E，必要的开发、单元测试、类型检查和源码复核继续，最终验收待补。
 
 当前去重后的 UI action 计数为 21 行开发、18 行接线、51 行验证/接受；A01–A39 完整矩阵接受仍为 0，A39 仍为 `OFFLINE_PENDING`。U04.2/U04.3 仍为 P/P。frame.optimize 的独立 C 分支 P5 已发布于 `5d22227`，P6 正在审修；F 播放器 539 发现的 5 项问题正在修复。以上状态不表示它们已并入 main 或完成接受。
+
+### frame.optimize React 结果 wire 修正（2026-10-23）
+
+React 消费端已按现有后端状态投影支持 processing/completed 的结果数组，以及 failed/cancelled 的 `{partial, error}` 对象；严格校验结果索引与文本，并将任务结果保持为只读展示，章节仍以新鲜真源和素材身份校验为准。前后端测试共用合成 wire fixture，后端测试调用实际 `build_batch_optimize_status` 投影函数。作者定向验证为4个前端测试文件164项、后端投影测试1项、TypeScript检查与生产构建通过；Root完整差异复核通过，并在隔离源码副本上完成8个受影响前端文件314项回归，源码与受保护文件前后一致。此项仅修正结果读取合同，不代表 U04.2/U04.3 完成，二者仍为 P/P；21/18/51 义务计数及 A01–A39 完整矩阵接受数不变，其他 family、故障/权限矩阵、浏览器与部署验收仍待完成。

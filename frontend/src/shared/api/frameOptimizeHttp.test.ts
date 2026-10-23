@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { ApiError } from "./errors";
+import frameOptimizeStatusWire from "../../testing/fixtures/frameOptimizeStatusWire.json";
 import {
   parseFrameOptimizeCancelReceipt,
   parseFrameOptimizeCapabilities,
@@ -107,6 +108,28 @@ describe("frame optimize HTTP contracts", () => {
       progress_message: "",
       result: null,
     }, "task-1")).toThrow(ApiError);
+  });
+
+  it("consumes each real batch optimize projection shape", () => {
+    const { cases } = frameOptimizeStatusWire;
+    for (const { wire } of Object.values(cases)) {
+      if (typeof wire.result === "boolean") {
+        expect(() => parseFrameOptimizeTaskStatus(wire, wire.task_id)).toThrow(ApiError);
+      } else {
+        expect(parseFrameOptimizeTaskStatus(wire, wire.task_id)).toEqual(wire);
+      }
+    }
+  });
+
+  it.each([
+    { result: [{ index: -1, optimized_text: "负索引" }] },
+    { result: [{ index: 0.5, optimized_text: "小数索引" }] },
+    { result: [{ index: 0, optimized_text: 12 }] },
+    { result: [{ index: 0, optimized_text: "重复一" }, { index: 0, optimized_text: "重复二" }] },
+    { result: [null] },
+  ])("rejects malformed batch optimize result arrays", ({ result }) => {
+    const wire = frameOptimizeStatusWire.cases.completedArray.wire;
+    expect(() => parseFrameOptimizeTaskStatus({ ...wire, result }, wire.task_id)).toThrow(ApiError);
   });
 
   it("requires the authoritative cancellation acknowledgement shape", () => {

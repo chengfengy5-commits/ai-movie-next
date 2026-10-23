@@ -1,0 +1,116 @@
+{
+  "cases": {
+    "processingArray": {
+      "task": {
+        "id": "frame-optimize-wire-task",
+        "status": "processing",
+        "progress": 45,
+        "progress_message": "已应用1项",
+        "result": "[{\"index\":0,\"optimized_text\":\"合成处理中结果\"}]"
+      },
+      "wire": {
+        "task_id": "frame-optimize-wire-task",
+        "status": "processing",
+        "progress": 45,
+        "progress_message": "已应用1项",
+        "result": [{ "index": 0, "optimized_text": "合成处理中结果" }]
+      }
+    },
+    "completedArray": {
+      "task": {
+        "id": "frame-optimize-wire-task",
+        "status": "completed",
+        "progress": 100,
+        "progress_message": "分镜优化完成（已应用 1 项）",
+        "result": "[{\"index\":0,\"optimized_text\":\"合成成功文字\"}]"
+      },
+      "wire": {
+        "task_id": "frame-optimize-wire-task",
+        "status": "completed",
+        "progress": 100,
+        "progress_message": "分镜优化完成（已应用 1 项）",
+        "result": [{ "index": 0, "optimized_text": "合成成功文字" }]
+      }
+    },
+    "failedPartial": {
+      "task": {
+        "id": "frame-optimize-wire-task",
+        "status": "failed",
+        "progress": 100,
+        "progress_message": "一个镜头失败",
+        "result": "{\"partial\":[{\"index\":0,\"optimized_text\":\"合成已应用文字\"}],\"error\":\"合成单项失败\"}"
+      },
+      "wire": {
+        "task_id": "frame-optimize-wire-task",
+        "status": "failed",
+        "progress": 100,
+        "progress_message": "一个镜头失败",
+        "result": { "partial": [{ "index": 0, "optimized_text": "合成已应用文字" }], "error": "合成单项失败" }
+      }
+    },
+    "cancelledPartial": {
+      "task": {
+        "id": "frame-optimize-wire-task",
+        "status": "cancelled",
+        "progress": 60,
+        "progress_message": "用户已停止批量优化",
+        "result": "{\"partial\":[{\"index\":0,\"optimized_text\":\"取消前已应用文字\"}],\"error\":\"用户已停止批量优化\"}"
+      },
+      "wire": {
+        "task_id": "frame-optimize-wire-task",
+        "status": "cancelled",
+        "progress": 60,
+        "progress_message": "用户已停止批量优化",
+        "result": { "partial": [{ "index": 0, "optimized_text": "取消前已应用文字" }], "error": "用户已停止批量优化" }
+      }
+    },
+    "nullResult": {
+      "task": {
+        "id": "frame-optimize-wire-task",
+        "status": "queued",
+        "progress": 0,
+        "progress_message": "等待执行",
+        "result": null
+      },
+      "wire": {
+        "task_id": "frame-optimize-wire-task",
+        "status": "queued",
+        "progress": 0,
+        "progress_message": "等待执行",
+        "result": null
+      }
+    },
+    "malformedJsonString": {
+      "task": {
+        "id": "frame-optimize-wire-task",
+        "status": "failed",
+        "progress": 100,
+        "progress_message": "结果无法解码",
+        "result": "not-json"
+      },
+      "wire": {
+        "task_id": "frame-optimize-wire-task",
+        "status": "failed",
+        "progress": 100,
+        "progress_message": "结果无法解码",
+        "result": "not-json"
+      }
+    },
+    "primitiveJsonResult": {
+      "task": {
+        "id": "frame-optimize-wire-task",
+        "status": "failed",
+        "progress": 100,
+        "progress_message": "结果不是分镜列表",
+        "result": "false"
+      },
+      "wire": {
+        "task_id": "frame-optimize-wire-task",
+        "status": "failed",
+        "progress": 100,
+        "progress_message": "结果不是分镜列表",
+        "result": false
+      }
+    }
+  }
+}

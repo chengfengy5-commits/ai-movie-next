@@ -301,7 +301,7 @@ describe("FrameOptimizeDialog", () => {
 
     expect(await dialog.findByText("终态：失败（可能含部分结果）")).toBeInTheDocument();
     expect(dialog.getByText("章节源数据已核对。")).toBeInTheDocument();
-    expect(dialog.getByRole("region", { name: "任务返回的部分分镜结果" })).toHaveTextContent("镜头 1：优化后的镜头文字");
+    expect(dialog.getByRole("region", { name: "任务返回的分镜结果" })).toHaveTextContent("镜头 1：优化后的镜头文字");
     expect(dialog.getByText("任务错误：one_item_failed")).toBeInTheDocument();
     expect(frameOptimize.submit).toHaveBeenCalledTimes(1);
     expect(frameOptimize.submit).toHaveBeenCalledWith(registeredRequest, expect.any(AbortSignal));

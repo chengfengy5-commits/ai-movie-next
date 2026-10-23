@@ -37,13 +37,18 @@ export interface FrameOptimizeRunningTask {
   created_at: string | null;
 }
 
+export interface FrameOptimizeTaskResultEntry {
+  index: number;
+  optimized_text: string;
+}
+
 export interface FrameOptimizeTaskStatus {
   task_id: string;
   status: string;
   progress: number;
   progress_message: string;
-  /** The endpoint may return an arbitrary object, null, or an invalid raw string. */
-  result: Record<string, unknown> | string | null;
+  /** The legacy endpoint returns arrays; stopped tasks can return a partial/error object. */
+  result: FrameOptimizeTaskResultEntry[] | Record<string, unknown> | string | null;
 }
 
 export interface FrameOptimizeCancelReceipt {

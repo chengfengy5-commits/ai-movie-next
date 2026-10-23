@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
 import type { CreatorPrompt } from "../../shared/api/creatorSettings";
+import frameOptimizeStatusWire from "../../testing/fixtures/frameOptimizeStatusWire.json";
 import {
   buildFrameOptimizeRequest,
   applyFrameOptimizePartialToContent,
   frameOptimizeSourceText,
   frameOptimizeChapterContentAfterWrite,
-  parseFrameOptimizePartialResult,
+  parseFrameOptimizeTaskResult,
   restoreFrameOptimizeOriginals,
   sameFrameOptimizeAssets,
   sameFrameOptimizeAssetIdentity,
@@ -136,15 +137,17 @@ describe("frame optimize content preparation", () => {
   });
 
   it("parses partial result entries conservatively and checks source asset identity", () => {
-    expect(parseFrameOptimizePartialResult({
+    expect(parseFrameOptimizeTaskResult({
       partial: [{ index: 1, optimized_text: "新文字" }],
       error: "one_item_failed",
     })).toEqual({
-      partial: [{ index: 1, optimized_text: "新文字" }],
+      results: [{ index: 1, optimized_text: "新文字" }],
       error: "one_item_failed",
       valid: true,
     });
-    expect(parseFrameOptimizePartialResult("invalid")).toMatchObject({ valid: false });
+    expect(parseFrameOptimizeTaskResult("invalid")).toMatchObject({ valid: false });
+    expect(parseFrameOptimizeTaskResult(false)).toMatchObject({ valid: false });
+    expect(parseFrameOptimizeTaskResult(null)).toEqual({ results: [], error: null, valid: true });
     const sourceContent = [
       { text: "原文", storyboard: ["asset-1"], note: "保留" },
       { text: "已有优化", original_text: "旧原文", storyboard: ["asset-2"] },
@@ -156,6 +159,9 @@ describe("frame optimize content preparation", () => {
       { text: "新优化", original_text: "原文", storyboard: ["asset-1"], note: "保留" },
       sourceContent[1],
     ]);
+    expect(applyFrameOptimizePartialToContent(sourceContent, [
+      { index: 0, text: "原文" },
+    ], [{ index: 1, optimized_text: "越界目标" }])).toBeNull();
     expect(sourceContent[0]).toEqual({ text: "原文", storyboard: ["asset-1"], note: "保留" });
     const asset = {
       id: "asset-1", series_id: "series-1", chapter_id: "chapter-1", frame_index: 0,
@@ -169,6 +175,36 @@ describe("frame optimize content preparation", () => {
     expect(sameFrameOptimizeAssets([asset], [{ ...asset, name: "其他" }], [])).toBe(false);
     expect(sameFrameOptimizeAssetIdentity([asset], [{ ...asset, description: "旧版任务新描述" }])).toBe(true);
     expect(sameFrameOptimizeAssetIdentity([asset], [{ ...asset, frame_index: 2 }])).toBe(false);
+  });
+
+  it("normalizes shared projection arrays and partial objects without changing entry order", () => {
+    const { cases } = frameOptimizeStatusWire;
+    expect(parseFrameOptimizeTaskResult(cases.processingArray.wire.result)).toEqual({
+      results: [{ index: 0, optimized_text: "合成处理中结果" }], error: null, valid: true,
+    });
+    expect(parseFrameOptimizeTaskResult(cases.completedArray.wire.result)).toEqual({
+      results: [{ index: 0, optimized_text: "合成成功文字" }], error: null, valid: true,
+    });
+    expect(parseFrameOptimizeTaskResult(cases.failedPartial.wire.result)).toEqual({
+      results: [{ index: 0, optimized_text: "合成已应用文字" }], error: "合成单项失败", valid: true,
+    });
+    expect(parseFrameOptimizeTaskResult(cases.cancelledPartial.wire.result)).toEqual({
+      results: [{ index: 0, optimized_text: "取消前已应用文字" }], error: "用户已停止批量优化", valid: true,
+    });
+    expect(parseFrameOptimizeTaskResult(cases.nullResult.wire.result)).toMatchObject({ valid: true, results: [] });
+    expect(parseFrameOptimizeTaskResult(cases.malformedJsonString.wire.result)).toMatchObject({ valid: false });
+
+    const ordered = [
+      { index: 2, optimized_text: "第三镜结果" },
+      { index: 0, optimized_text: "第一镜结果" },
+    ];
+    expect(parseFrameOptimizeTaskResult(ordered).results).toEqual(ordered);
+    expect(parseFrameOptimizeTaskResult([
+      { index: 0, optimized_text: "重复一" },
+      { index: 0, optimized_text: "重复二" },
+    ])).toMatchObject({ valid: false });
+    expect(parseFrameOptimizeTaskResult([{ index: -1, optimized_text: "负索引" }])).toMatchObject({ valid: false });
+    expect(parseFrameOptimizeTaskResult([{ index: 0, optimized_text: 1 }])).toMatchObject({ valid: false });
   });
 
   it("checks the exact asset projection produced by a chapter content write", () => {
