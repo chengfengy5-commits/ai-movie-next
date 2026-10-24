@@ -793,8 +793,20 @@ describe("read-only chapter browser", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "提取并确认素材" })).not.toBeInTheDocument());
     expect(await screen.findByText("素材、章节与逐镜绑定已重新读取并核对。" )).toBeInTheDocument();
     expect(streamSave).toHaveBeenCalledTimes(2);
-    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({ target_frames: [0, 1, 2], appearances: [name, null, ""], dry_run: true });
-    expect(streamSave.mock.calls[1]?.[1]).toMatchObject({ target_frames: [0, 1, 2], appearances: [name, null, ""], dry_run: false });
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({
+      expected_series_id: original.series_id,
+      expected_content: original.content,
+      target_frames: [0, 1, 2],
+      appearances: [name, null, ""],
+      dry_run: true,
+    });
+    expect(streamSave.mock.calls[1]?.[1]).toMatchObject({
+      expected_series_id: original.series_id,
+      expected_content: original.content,
+      target_frames: [0, 1, 2],
+      appearances: [name, null, ""],
+      dry_run: false,
+    });
     const saved = base.getCurrentChapters()[0]?.content;
     expect(saved?.map((frame) => frame.scene)).toEqual([
       [existingScene.id],
@@ -819,7 +831,11 @@ describe("read-only chapter browser", () => {
     expect(await screen.findByText(/章节文字、镜头顺序、原图或当前剧集素材目录已变化/)).toBeInTheDocument();
     expect(screen.queryByRole("dialog", { name: "提取并确认素材" })).not.toBeInTheDocument();
     expect(streamSave).toHaveBeenCalledTimes(1);
-    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({ dry_run: true });
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({
+      dry_run: true,
+      expected_content: current.content,
+      expected_series_id: current.series_id,
+    });
     expect(base.updateChapter).not.toHaveBeenCalled();
   });
 
@@ -836,6 +852,8 @@ describe("read-only chapter browser", () => {
     const finalInput = streamSave.mock.calls[1]?.[1];
     expect(finalInput).toMatchObject({
       dry_run: false,
+      expected_content: current.content,
+      expected_series_id: current.series_id,
       candidates: [{ title: "阁楼", is_existing: false, is_backfill: false }],
     });
     expect([null, undefined]).toContain(finalInput?.candidates[0]?.existing_id);

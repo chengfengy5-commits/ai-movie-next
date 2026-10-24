@@ -84,6 +84,12 @@ describe("storyboard asset wire contracts", () => {
     const candidates = parseStoryboardAssetCandidates([{ title: "夜色书房" }], "scene");
     const input = buildStoryboardAssetSaveInput("scene", "chapter-1", [1, 4], candidates, ["夜色书房", ""], true);
     expect(input).toMatchObject({ target_frames: [1, 4], appearances: ["夜色书房", ""], dry_run: true });
+
+    const source = [{ text: "原始镜头" }];
+    const guardedInput = buildStoryboardAssetSaveInput(
+      "scene", "chapter-1", [1], candidates, ["夜色书房"], true, source, "series-1",
+    );
+    expect(guardedInput).toMatchObject({ expected_content: source, expected_series_id: "series-1" });
   });
 
   it("validates the actual scene dry-run plan shape", () => {

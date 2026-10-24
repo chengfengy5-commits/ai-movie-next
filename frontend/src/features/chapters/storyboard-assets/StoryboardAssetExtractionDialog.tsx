@@ -607,11 +607,20 @@ export function StoryboardAssetExtractionDialog({
     setStep("review");
   }
 
-  function buildInput(dryRun: boolean): StoryboardAssetSaveInput {
+  function buildInput(
+    dryRun: boolean,
+    source: StoryboardAssetGenerationSnapshot,
+  ): StoryboardAssetSaveInput {
     if (!namesAreUsable) throw new ApiError("http", "候选名称必须非空且不能重复，请先修正。", 422);
     const candidatesForSave = drafts.map((draft) => draft.value);
     if (appearances.length !== selectedFrameList.length) {
       throw new ApiError("http", "逐镜出场结果与选择镜头数量不一致。", 422);
+    }
+    if (!Array.isArray(source.chapter.content)) {
+      throw new ApiError("http", "当前章节没有可核对的分镜快照，请刷新后重新打开素材流程。", 409);
+    }
+    if (typeof source.chapter.series_id !== "string" || source.chapter.series_id.trim() === "") {
+      throw new ApiError("http", "当前章节没有可核对的剧集归属，请刷新后重新打开素材流程。", 409);
     }
     const includedNames = new Set(candidatesForSave.filter((candidate) => candidate.keep).map((candidate) => candidateName(candidate, kind)));
     const sanitizedAppearances = appearances.map((entry): StoryboardAssetAppearance => {
@@ -622,11 +631,13 @@ export function StoryboardAssetExtractionDialog({
     });
     return buildStoryboardAssetSaveInput(
       kind,
-      snapshot.chapter.id,
+      source.chapter.id,
       selectedFrameList,
       candidatesForSave,
       sanitizedAppearances,
       dryRun,
+      source.chapter.content,
+      source.chapter.series_id,
     );
   }
 
@@ -634,7 +645,7 @@ export function StoryboardAssetExtractionDialog({
     await runStep("正在保存 dry-run 计划，章节不会写入…", async (source, signal) => {
       if (generation === undefined) throw new ApiError("http", "当前运行模式没有接入素材保存服务。", null);
       validateModelAndPrompt(source);
-      const input = buildInput(true);
+      const input = buildInput(true, source);
       const events = await collect(generation.streamSave(kind, input, signal));
       const complete = events.find((event) => event.type === "complete")?.data;
       if (!isRecord(complete) || complete.success !== true || complete.dry_run !== true) {
@@ -653,7 +664,7 @@ export function StoryboardAssetExtractionDialog({
     if (plan === null || !planConfirmed || planSnapshotKey !== currentPlanKey) return;
     await runStep("正在核对锁并保存确认的素材…", async (source, signal) => {
       if (generation === undefined || plan === null) throw new ApiError("http", "素材保存服务不可用。", null);
-      const input = buildInput(false);
+      const input = buildInput(false, source);
       if (planSnapshotKey !== currentPlanKey) throw new ApiError("http", "确认计划后候选或镜头绑定已变化，请重新生成 dry-run。", 409);
       const onRequestStarted = () => { saveRequestStarted.current = true; };
       await executeSaveRef.current(input, plan, signal, onRequestStarted, (event) => {

@@ -5,7 +5,11 @@ import storyboardAssetWire from "../../testing/fixtures/storyboardAssetWire.json
 import { ApiError } from "./errors";
 import { createStoryboardAssetGenerationHttpPort } from "./storyboardAssetGenerationHttp";
 import { API_TOKEN_KEY, API_USER_KEY, type StorageLike } from "./storage";
-import type { StoryboardAssetKind, StoryboardAssetStreamEvent } from "./storyboardAssetGeneration";
+import type {
+  StoryboardAssetKind,
+  StoryboardAssetSaveInput,
+  StoryboardAssetStreamEvent,
+} from "./storyboardAssetGeneration";
 
 class TestStorage implements StorageLike {
   private readonly values = new Map<string, string>();
@@ -74,6 +78,15 @@ function judgeCompleteFor(kind: StoryboardAssetKind): Record<string, unknown> {
   if (kind === "character") return storyboardAssetWire.producer.judge_complete.character;
   if (kind === "scene") return storyboardAssetWire.producer.judge_complete.scene;
   return storyboardAssetWire.producer.judge_complete.prop;
+}
+
+function saveInputFromWire(
+  kind: StoryboardAssetKind,
+  wire: Record<string, unknown>,
+): StoryboardAssetSaveInput {
+  const candidateKey = kind === "character" ? "merged_characters" : kind === "scene" ? "scenes" : "props";
+  const { [candidateKey]: candidates, ...fields } = wire;
+  return { ...fields, candidates } as StoryboardAssetSaveInput;
 }
 
 describe("storyboard asset generation HTTP", () => {
@@ -186,9 +199,12 @@ describe("storyboard asset generation HTTP", () => {
         chapter_id: "chapter-1", model_id: "model-1", prompt_id: "", enable_thinking: false, skip_merge: true,
         candidates: [{ title: "夜色书房" }], storyboard_texts: ["她推门走进书房"], frame_numbers: [2],
       }, signal));
+      const saveContract = storyboardAssetWire.save_requests.scene;
       const saved = await collect(port.streamSave("scene", {
-        chapter_id: "chapter-1", target_frames: [1], appearances: ["夜色书房"], dry_run: true,
-        candidates: [{ title: "夜色书房", is_existing: false, is_backfill: false }],
+        ...saveInputFromWire("scene", {
+          ...saveContract.wire,
+          chapter_id: "chapter-1",
+        }),
       }, signal));
 
       expect(extracted.at(-1)?.type).toBe("done");
@@ -202,14 +218,59 @@ describe("storyboard asset generation HTTP", () => {
       expect(requests.every((request) => request.authorization === "Bearer local-test-token")).toBe(true);
       expect(requests[0]?.body).toEqual({ chapter_id: "chapter-1", model_id: "model-1", prompt_id: null, enable_thinking: true, frame_indices: [0, 2] });
       expect(requests[1]?.body).toEqual({
-        chapter_id: "chapter-1", model_id: "model-1", prompt_id: "", enable_thinking: false, skip_merge: true,
-        scenes: [{ title: "夜色书房" }], storyboard_texts: ["她推门走进书房"], frame_numbers: [2],
+        chapter_id: "chapter-1",
+        model_id: "model-1",
+        prompt_id: "",
+        enable_thinking: false,
+        skip_merge: true,
+        scenes: [{ title: "夜色书房" }],
+        storyboard_texts: ["她推门走进书房"],
+        frame_numbers: [2],
       });
       expect(requests[2]?.body).toEqual({
-        chapter_id: "chapter-1", target_frames: [1], appearances: ["夜色书房"], dry_run: true,
-        scenes: [{ title: "夜色书房", is_existing: false, is_backfill: false }],
+        ...saveContract.wire,
+        chapter_id: "chapter-1",
       });
     });
+  });
+
+  it("sends all three save source snapshots from the shared request fixture", async () => {
+    const storage = new TestStorage();
+    storage.setItem(API_TOKEN_KEY, "local-test-token");
+    const requests: Array<{ url: string; body: Record<string, unknown> }> = [];
+    const kinds = ["character", "scene", "prop"] as const;
+
+    await withLoopbackServer(async (request, response) => {
+      requests.push({ url: request.url ?? "", body: await requestBody(request) });
+      const kind = kinds.find((candidateKind) => (
+        storyboardAssetWire.save_requests[candidateKind].path === request.url
+      ));
+      if (kind === undefined) throw new Error(`unexpected save route: ${request.url}`);
+      const plan = { asset_type: kind, items: [], frame_map: [] };
+      await writeEvents(response, [
+        { type: "start", message: "开始保存素材..." },
+        { type: "plan", ...plan },
+        { type: "complete", success: true, dry_run: true, plan, message: "已生成计划" },
+        { type: "done" },
+      ]);
+    }, async (baseUrl) => {
+      const port = createStoryboardAssetGenerationHttpPort(baseUrl, { storage, timeoutMs: 5_000 });
+      for (const kind of kinds) {
+        const contract = storyboardAssetWire.save_requests[kind];
+        await collect(port.streamSave(
+          kind,
+          saveInputFromWire(kind, contract.wire),
+          new AbortController().signal,
+        ));
+      }
+    });
+
+    expect(requests.map(({ url }) => url)).toEqual(
+      kinds.map((kind) => storyboardAssetWire.save_requests[kind].path),
+    );
+    expect(requests.map(({ body }) => body)).toEqual(
+      kinds.map((kind) => storyboardAssetWire.save_requests[kind].wire),
+    );
   });
 
   it("sends kind-specific judge request bodies matching the shared backend parser fixture", async () => {

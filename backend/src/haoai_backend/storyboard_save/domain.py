@@ -153,6 +153,34 @@ def parse_chapter_frames(content: object) -> list[Any]:
     return content or []
 
 
+def chapter_content_matches_expected(content: object, expected: object) -> bool:
+    """Compare a raw chapter value with a JSON frame snapshot."""
+    try:
+        current = json.loads(content) if isinstance(content, str) else content
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(current, list) or not isinstance(expected, list):
+        return False
+    return _json_values_equal(current, expected)
+
+
+def _json_values_equal(left: object, right: object) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) and isinstance(right, (int, float)):
+        return left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(
+            _json_values_equal(left[key], right[key]) for key in left
+        )
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(
+            _json_values_equal(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    return type(left) is type(right) and left == right
+
+
 def candidate_name(candidate: Mapping[str, Any], kind: AssetKind) -> str:
     return str(candidate.get(NAME_FIELDS[kind]) or "").strip()
 

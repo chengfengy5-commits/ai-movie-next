@@ -9,6 +9,7 @@ from typing import Any, Literal
 from uuid import uuid4
 
 from haoai_backend.asset_data import naming
+from haoai_backend.series_access.errors import SeriesAccessDenied, SeriesNotFound
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import (
@@ -18,6 +19,7 @@ from .domain import (
     appearance_names,
     appearance_row_to_frame,
     candidate_name,
+    chapter_content_matches_expected,
     fuzzy_match_name,
     make_frame_map,
     match_candidate_name,
@@ -26,7 +28,11 @@ from .domain import (
     resolve_target_frames,
     unique_names,
 )
-from .errors import StoryboardSaveChapterNotFound, StoryboardSaveForeignAssetReference
+from .errors import (
+    StoryboardSaveChapterNotFound,
+    StoryboardSaveForeignAssetReference,
+    StoryboardSaveSourceConflict,
+)
 from .ports import StoryboardSaveStore
 
 logger = logging.getLogger(__name__)
@@ -54,14 +60,16 @@ def save_characters_stream(
     *,
     dry_run: bool = False,
     target_frames: Sequence[object] | None = None,
+    expected_content: Sequence[object] | None = None,
+    expected_series_id: str | None = None,
 ):
     """Yield legacy character-save events while retaining its commit phases."""
+    asset_phase_committed = False
     try:
         yield {"type": "status", "message": "正在验证章节..."}
-        chapter = store.load_chapter(chapter_id)
-        if chapter is None:
-            yield {"type": "error", "message": "章节不存在"}
-            return
+        chapter = _load_save_chapter(
+            store, actor, chapter_id, expected_content, expected_series_id
+        )
         _reject_foreign_asset_references(
             store, "character", merged_characters, chapter.series_id
         )
@@ -196,6 +204,9 @@ def save_characters_stream(
 
         series_id = chapter.series_id
         yield {"type": "status", "message": "正在保存新角色数据..."}
+        _load_save_chapter(
+            store, actor, chapter_id, expected_content, expected_series_id
+        )
         character_name_to_id: dict[str, object] = {}
         for character in appeared_existing:
             character_name_to_id[character.get("name", "")] = character.get("existing_id")
@@ -207,7 +218,11 @@ def save_characters_stream(
             if (index + 1) % 5 == 0:
                 yield {"type": "status", "message": f"已保存 {index + 1}/{len(appeared_new)} 个新角色..."}
         store.commit()
+        asset_phase_committed = True
 
+        _load_save_chapter(
+            store, actor, chapter_id, expected_content, expected_series_id
+        )
         for character in merged_characters:
             original_name = str(character.get("original_name") or "").strip()
             name = str(character.get("name") or "").strip()
@@ -225,9 +240,9 @@ def save_characters_stream(
 
         yield {"type": "status", "message": "正在更新分镜角色关联..."}
         try:
-            current_chapter = store.load_chapter(chapter_id)
-            if current_chapter is None:
-                raise StoryboardSaveChapterNotFound()
+            current_chapter = _load_save_chapter(
+                store, actor, chapter_id, expected_content, expected_series_id
+            )
             frames = parse_chapter_frames(current_chapter.content)
             for appearance_index, frame_index in resolve_target_frames(frames, target_frames):
                 frame = frames[frame_index]
@@ -246,14 +261,54 @@ def save_characters_stream(
                             frame_ids.append(asset_id)
                     frame["character"] = frame_ids
             encoded = json.dumps(frames, ensure_ascii=False)
-            store.update_chapter_content(current_chapter, actor, encoded)
+            _update_chapter_content(
+                store, current_chapter, actor, encoded,
+                require_current_source=expected_content is not None,
+            )
             store.commit()
+        except StoryboardSaveSourceConflict as exc:
+            logger.info("分镜角色关联来源冲突: %s", exc)
+            store.rollback()
+            yield {
+                "type": "error",
+                "message": _save_failure_message(
+                    exc,
+                    committed_fact="已提交的素材阶段仍保留，未继续逐镜绑定。",
+                ),
+            }
+            return
+        except (SeriesAccessDenied, SeriesNotFound) as exc:
+            store.rollback()
+            yield {
+                "type": "error",
+                "message": _save_failure_message(
+                    exc,
+                    committed_fact="已提交的素材阶段仍保留，未更新逐镜绑定。",
+                ),
+            }
+            return
         except Exception:
             logger.exception("分镜角色关联保存失败")
             store.rollback()
             yield {"type": "error", "message": "更新分镜角色关联失败"}
             return
 
+        try:
+            _load_save_chapter(store, actor, chapter_id, None, expected_series_id)
+        except (StoryboardSaveSourceConflict, SeriesAccessDenied, SeriesNotFound) as exc:
+            store.rollback()
+            yield {
+                "type": "error",
+                "message": _save_failure_message(
+                    exc,
+                    committed_fact="角色素材及逐镜绑定阶段已提交，未执行可选角色清理。",
+                ),
+            }
+            return
+        except Exception as exc:
+            store.rollback()
+            yield {"type": "error", "message": str(exc)}
+            return
         yield {"type": "status", "message": "正在清理未被引用的角色..."}
         cleaned_up_count = _cleanup_unreferenced_characters(store, series_id)
         yield {
@@ -275,6 +330,14 @@ def save_characters_stream(
             "filtered_out_characters": list(filtered_out),
             "cleaned_up_count": cleaned_up_count,
         }
+    except (StoryboardSaveSourceConflict, SeriesAccessDenied, SeriesNotFound) as exc:
+        logger.info("流式第三阶段角色保存来源或权限变化: %s", exc)
+        store.rollback()
+        fact = (
+            "已提交的素材阶段仍保留，后续保存步骤已停止。"
+            if asset_phase_committed else None
+        )
+        yield {"type": "error", "message": _save_failure_message(exc, committed_fact=fact)}
     except Exception as exc:
         logger.exception("流式第三阶段角色保存异常")
         store.rollback()
@@ -290,10 +353,15 @@ def save_scenes_stream(
     *,
     dry_run: bool = False,
     target_frames: Sequence[object] | None = None,
+    expected_content: Sequence[object] | None = None,
+    expected_series_id: str | None = None,
 ):
     yield from _save_named_assets_stream(
         "scene", store, actor, chapter_id, scenes, appearances,
-        dry_run=dry_run, target_frames=target_frames,
+        dry_run=dry_run,
+        target_frames=target_frames,
+        expected_content=expected_content,
+        expected_series_id=expected_series_id,
     )
 
 
@@ -306,10 +374,15 @@ def save_props_stream(
     *,
     dry_run: bool = False,
     target_frames: Sequence[object] | None = None,
+    expected_content: Sequence[object] | None = None,
+    expected_series_id: str | None = None,
 ):
     yield from _save_named_assets_stream(
         "prop", store, actor, chapter_id, props, appearances,
-        dry_run=dry_run, target_frames=target_frames,
+        dry_run=dry_run,
+        target_frames=target_frames,
+        expected_content=expected_content,
+        expected_series_id=expected_series_id,
     )
 
 
@@ -323,6 +396,8 @@ def _save_named_assets_stream(
     *,
     dry_run: bool,
     target_frames: Sequence[object] | None,
+    expected_content: Sequence[object] | None,
+    expected_series_id: str | None,
 ):
     noun = "场景" if kind == "scene" else "道具"
     asset_type = kind
@@ -330,12 +405,12 @@ def _save_named_assets_stream(
     route_kind = "scene" if kind == "scene" else "prop"
     empty_appearances = _SCENE_EMPTY_APPEARANCES if kind == "scene" else _PROP_EMPTY_APPEARANCES
     not_adopted_reason = f"AI 判定该{noun}未在任何分镜出场"
+    asset_phase_committed = False
     try:
         yield {"type": "status", "message": "正在验证章节..."}
-        chapter = store.load_chapter(chapter_id)
-        if chapter is None:
-            yield {"type": "error", "message": "章节不存在"}
-            return
+        chapter = _load_save_chapter(
+            store, actor, chapter_id, expected_content, expected_series_id
+        )
         series_id = chapter.series_id
         _reject_foreign_asset_references(store, route_kind, candidates, series_id)
         yield {"type": "status", "message": f"找到章节: {chapter.title}"}
@@ -514,6 +589,9 @@ def _save_named_assets_stream(
             return
 
         created_count = 0
+        _load_save_chapter(
+            store, actor, chapter_id, expected_content, expected_series_id
+        )
         for candidate in new_assets:
             name = candidate_name(candidate, asset_type)
             if not name:
@@ -527,7 +605,11 @@ def _save_named_assets_stream(
             created_count += 1
             name_to_id[name] = asset_id
         store.commit()
+        asset_phase_committed = True
 
+        _load_save_chapter(
+            store, actor, chapter_id, expected_content, expected_series_id
+        )
         for candidate in candidates:
             original_name = str(candidate.get("original_name") or "").strip()
             name = candidate_name(candidate, asset_type)
@@ -547,9 +629,9 @@ def _save_named_assets_stream(
         unmatched_frames: list[int] = []
         frames_without_scene: list[int] = []
         try:
-            current_chapter = store.load_chapter(chapter_id)
-            if current_chapter is None:
-                raise StoryboardSaveChapterNotFound()
+            current_chapter = _load_save_chapter(
+                store, actor, chapter_id, expected_content, expected_series_id
+            )
             frames = parse_chapter_frames(current_chapter.content)
             targets = resolve_target_frames(frames, target_frames)
             for appearance_index, frame_index in targets:
@@ -603,8 +685,32 @@ def _save_named_assets_stream(
                     and not (frames[frame_index].get("scene") or [])
                 ]
             encoded = json.dumps(frames, ensure_ascii=False)
-            store.update_chapter_content(current_chapter, actor, encoded)
+            _update_chapter_content(
+                store, current_chapter, actor, encoded,
+                require_current_source=expected_content is not None,
+            )
             store.commit()
+        except StoryboardSaveSourceConflict as exc:
+            logger.info("分镜%s关联来源冲突: %s", noun, exc)
+            store.rollback()
+            yield {
+                "type": "error",
+                "message": _save_failure_message(
+                    exc,
+                    committed_fact="已提交的素材阶段仍保留，未继续逐镜绑定。",
+                ),
+            }
+            return
+        except (SeriesAccessDenied, SeriesNotFound) as exc:
+            store.rollback()
+            yield {
+                "type": "error",
+                "message": _save_failure_message(
+                    exc,
+                    committed_fact="已提交的素材阶段仍保留，未更新逐镜绑定。",
+                ),
+            }
+            return
         except Exception:
             logger.exception("分镜%s关联保存失败", noun)
             store.rollback()
@@ -656,10 +762,62 @@ def _save_named_assets_stream(
                 "dropped_names": dropped_names,
                 "candidate_count": len(candidates),
             }
+    except (StoryboardSaveSourceConflict, SeriesAccessDenied, SeriesNotFound) as exc:
+        logger.info("流式第三阶段%s保存来源或权限变化: %s", noun, exc)
+        store.rollback()
+        fact = (
+            "已提交的素材阶段仍保留，后续保存步骤已停止。"
+            if asset_phase_committed else None
+        )
+        yield {"type": "error", "message": _save_failure_message(exc, committed_fact=fact)}
     except Exception as exc:
         logger.exception("流式第三阶段%s保存异常", noun)
         store.rollback()
         yield {"type": "error", "message": str(exc)}
+
+
+def _load_save_chapter(
+    store: StoryboardSaveStore,
+    actor: TrustedActor,
+    chapter_id: str,
+    expected_content: Sequence[object] | None,
+    expected_series_id: str | None,
+) -> ChapterRecord:
+    chapter = store.load_chapter(chapter_id)
+    if chapter is None:
+        raise StoryboardSaveChapterNotFound()
+    store.require_access(actor, chapter.series_id)
+    if expected_series_id is not None and chapter.series_id != expected_series_id:
+        raise StoryboardSaveSourceConflict()
+    if expected_content is not None and not chapter_content_matches_expected(
+        chapter.content, expected_content
+    ):
+        raise StoryboardSaveSourceConflict()
+    return chapter
+
+
+def _save_failure_message(exc: Exception, *, committed_fact: str | None = None) -> str:
+    detail = getattr(exc, "detail", None) or str(exc)
+    return f"{detail}；{committed_fact}" if committed_fact else detail
+
+
+def _update_chapter_content(
+    store: StoryboardSaveStore,
+    chapter: ChapterRecord,
+    actor: TrustedActor,
+    content: str,
+    *,
+    require_current_source: bool,
+) -> None:
+    if require_current_source:
+        store.update_chapter_content(
+            chapter,
+            actor,
+            content,
+            require_current_source=True,
+        )
+    else:
+        store.update_chapter_content(chapter, actor, content)
 
 
 def _reject_foreign_asset_references(

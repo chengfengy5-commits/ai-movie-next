@@ -19,6 +19,7 @@ from haoai_backend.series_data.tables import chapters
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import AssetKind, AssetRecord, ChapterRecord
+from .errors import StoryboardSaveSourceConflict
 
 _ASSET_TABLES = {
     "character": (characters, "name"),
@@ -185,26 +186,40 @@ class SqlAlchemyStoryboardSaveStore:
         chapter: ChapterRecord,
         actor: TrustedActor,
         content: str,
+        *,
+        require_current_source: bool = False,
     ) -> None:
-        if content == chapter.content:
+        if content == chapter.content and not require_current_source:
             return
+        self.require_access(actor, chapter.series_id)
         # This public facade stages media and approval reconciliation in the same
         # Session; the save workflow retains ownership of commit and rollback.
-        stage_media_reconciliation(
-            self._session,
-            chapter.id,
-            chapter_content_override=content,
+        if content != chapter.content:
+            stage_media_reconciliation(
+                self._session,
+                chapter.id,
+                chapter_content_override=content,
+            )
+        source_predicate = (
+            chapters.c.content.is_(None)
+            if chapter.content is None
+            else chapters.c.content == chapter.content
         )
+        values = {"content": content}
+        if content != chapter.content:
+            values["updated_at"] = _utc_now()
         result = self._session.execute(
             update(chapters)
             .where(
                 chapters.c.id == chapter.id,
                 chapters.c.series_id == chapter.series_id,
+                source_predicate,
             )
-            .values(content=content, updated_at=_utc_now())
+            .values(**values)
         )
         if result.rowcount != 1:
-            raise RuntimeError("章节内容更新失败")
+            self._session.rollback()
+            raise StoryboardSaveSourceConflict()
 
     def list_chapters(self, series_id: str) -> list[ChapterRecord]:
         rows = self._session.execute(

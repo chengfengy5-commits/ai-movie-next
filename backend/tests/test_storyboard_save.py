@@ -44,6 +44,7 @@ from haoai_backend.storyboard_save.application import (
     save_props_stream,
     save_scenes_stream,
 )
+from haoai_backend.storyboard_save.domain import chapter_content_matches_expected
 from haoai_backend.storyboard_save import http as storyboard_save_http
 from haoai_backend.storyboard_save import persistence as storyboard_save_persistence
 from haoai_backend.storyboard_save.http import build_storyboard_save_router
@@ -53,6 +54,28 @@ from haoai_backend.personal_production.notes.facade import (
 )
 
 NOW = datetime(2026, 10, 14)
+
+
+@pytest.mark.parametrize(
+    ("content", "expected", "matches"),
+    [
+        ('[{"text":"a","extra":{"x":1,"y":[true,null]}}]',
+         [{"extra": {"y": [True, None], "x": 1.0}, "text": "a"}], True),
+        ('[{"value":true}]', [{"value": 1}], False),
+        ('[{"value":1}]', [{"value": True}], False),
+        ('[{"value":1}]', [{"value": 1.0}], True),
+        ('[{"text":"a"},{"text":"b"}]', [{"text": "b"}, {"text": "a"}], False),
+        ('[{"unknown":null,"refs":[]}]', [{"refs": [], "unknown": None}], True),
+        (None, [], False),
+        ("not-json", [], False),
+    ],
+)
+def test_expected_chapter_snapshot_uses_json_structure_semantics(
+    content: object,
+    expected: object,
+    matches: bool,
+) -> None:
+    assert chapter_content_matches_expected(content, expected) is matches
 
 
 class UnknownCommitAcknowledgement(RuntimeError):
