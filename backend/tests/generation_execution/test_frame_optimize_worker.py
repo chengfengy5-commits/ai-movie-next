@@ -321,13 +321,27 @@ def test_lost_fence_observation_expires_without_reposting_provider_intent(tmp_pa
         assert page_queries[0][1][-2:] == (recovery.page_size, 0)
         assert len(due_outcomes) == 1
         after_due = rows_for(case)
-        assert after_due["task"]["status"] == "reconciling"
+        assert after_due["task"]["status"] == "failed"
+        assert json.loads(after_due["task"]["result"]) == {
+            "partial": [],
+            "error": "frame_optimize_result_unknown_after_deadline",
+        }
         assert after_due["task"]["claim_token"] is None
         assert after_due["task"]["claimed_by"] is None
         assert after_due["task"]["lease_until"] is None
         assert after_due["external"][0]["id"] == original_submission["id"]
         assert after_due["external"][0]["request_digest"] == original_submission["request_digest"]
         assert after_due["external"][0]["deadline_at"] == original_submission["deadline_at"]
+        due_facts = [
+            evidence
+            for evidence in after_due["evidence"]
+            if evidence["evidence_kind"] == "frame_optimize_due_v1"
+        ]
+        assert len(due_facts) == 1
+        assert due_facts[0]["submission_id"] == original_submission["id"]
+        assert len(after_due["external"]) == 1
+        assert after_due["receipts"] == after_due["fees"] == []
+        assert after_due["applications"] == after_due["work"] == []
 
         assert worker.run_claimed_once("batch-optimize") in {None, "pending"}
         assert len(client.user_contents) == 1

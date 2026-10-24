@@ -98,7 +98,7 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 | U06.2 | 两步分镜生成、报价、SSE 预览和确认保存 | C | C | V=P / A=P；真实 JWT/Target API/owned SQLite + FakeRuntime 主链已通过 | 保留主链收据，补受影响的失败、断流、原 key 恢复和权限分支；FakeRuntime 不代表真实 provider。 |
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
 | U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；路由、解析和保存已有，提取 runtime 仍需注入 | 装配 StoryboardAssetRuntime，接提取结果编辑/确认和批量保存；验证失败不覆盖源内容及未知回读。 |
-| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 已有真实调度、未发兄弟接手、三阶段 Work 接续、未知观察和有限取消的 SQLite 回归，完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
+| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 原 intent 到期控制与提交边界修复已由作者合成 SQLite 回归，629 的15个受影响后端测试文件175项通过；Root独立复核与冻结门禁待进行，完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
 | U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
 
 ### U07 多节点创作画布和结果回填
@@ -345,3 +345,17 @@ Root531-03 在冻结的 5 个受影响前端测试文件上 134 项通过，TSC 
 ### frame.optimize React 结果 wire 修正（2026-10-23）
 
 React 消费端已按现有后端状态投影支持 processing/completed 的结果数组，以及 failed/cancelled 的 `{partial, error}` 对象；严格校验结果索引与文本，并将任务结果保持为只读展示，章节仍以新鲜真源和素材身份校验为准。前后端测试共用合成 wire fixture，后端测试调用实际 `build_batch_optimize_status` 投影函数。作者定向验证为4个前端测试文件164项、后端投影测试1项、TypeScript检查与生产构建通过；Root完整差异复核通过，并在隔离源码副本上完成8个受影响前端文件314项回归，源码与受保护文件前后一致。此项仅修正结果读取合同，不代表 U04.2/U04.3 完成，二者仍为 P/P；21/18/51 义务计数及 A01–A39 完整矩阵接受数不变，其他 family、故障/权限矩阵、浏览器与部署验收仍待完成。
+
+### frame.optimize 原 intent 到期恢复（2026-10-23）
+
+626/627 在 C 功能分支为已注册的 `frame.optimize` 增加逐 Unit 原期限到期控制：只为已有且超过固定两小时核验期的原 submission 写入绑定原 ID/key、请求摘要和 first-intent/deadline 的 unknown control fact；不伪造 Provider 结果、费用、扣款、退款或 Work。到期处理保持图锁、CAS 与 fresh 完整确认；到期 Unit 不得晚到回写，未发送 sibling 与既有 continuation Work 可继续，已应用/收费结果和既有 failure reason 保留。合成 SQLite 作者最终受影响集合 172 项通过；一次修正旧 lost-fence 终态预期前的集合结果为 171 通过、1 失败，原日志保留。Root 的独立源码复核和冻结门禁待进行；本结果不证明真实 PostgreSQL、Provider、整项 U06.5 或 A01–A39 接受。21/18/51 义务计数、U04.2/U04.3 的 P/P 状态、A01–A39 完整矩阵接受数 0 与 A39 `OFFLINE_PENDING` 均不变。
+
+### frame.optimize 原 intent 到期提交边界修复（2026-10-24）
+
+629 为到期投影补充提交前 fresh clock 下的 lease、claim fence 与 due fact 时间检查；ACK 丢失后的确认会逐字段比对原 due fact 指纹，合法重算 digest 也不能掩盖同 ID 内容漂移。另补到期后 fee、delivery、finalization 续作及 rescan 回归。作者在合成 SQLite 上复跑原15个受影响后端测试文件，175项通过、1条 Pydantic warning。Root 独立源码复核与冻结门禁待进行；本轮不证明真实 PostgreSQL 竞争、Provider、浏览器/E2E、部署或 U06.5 完整接受。21/18/51义务计数、U04.2/U04.3的P/P状态、A01–A39完整矩阵接受数0与A39 `OFFLINE_PENDING` 均不变。
+
+### frame.optimize 到期控制独立复核与验证（2026-10-24）
+
+Root 沿用 `36ca5b9948cb0ce8d09839e6b53f0bf77b1e6b99` 完整差异基线，对 628 两项阻断问题完成聚焦复核；DUE628-01 与 DUE628-02 均已关闭。Root630 在 1,603 项输入的私有冻结源码副本上运行原15个受影响后端测试文件及实际结果投影协议测试，16个文件共176项通过，exit 0，无超时，保留1条既有 Pydantic warning。原 Root 复现脚本再次确认提交时有效 lease 会阻止到期写入、ACK 丢失后同 ID 的合法内容漂移不会被误认作原提交，以及已有 fee、delivery、finalization 完成后 rescan 可正确聚合父任务。
+
+候选源码、main 及受保护文件、冻结输入前后一致；两个所属进程组和私有源码/TMP 均已清理。验证收据为 `haoai-next-root-frame-optimize-due-gate-630.json`，聚焦复核记录为 `haoai-next-frame-optimize-due-review-628-sol-02.md`。此结果只证明当前 frame.optimize 到期控制切片的源码和合成 SQLite 定向行为，不覆盖真实 PostgreSQL 竞争、Provider、浏览器/E2E 或部署。U04.2/U04.3、U06.5 仍为 P/P；21/18/51义务计数、A01–A39完整矩阵接受数0与A39 `OFFLINE_PENDING` 保持不变，整体改造继续。

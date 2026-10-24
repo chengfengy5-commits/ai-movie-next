@@ -21,6 +21,10 @@ from haoai_backend.generation_core.base_schema import (
     ResultEvidenceRow,
 )
 from haoai_backend.generation_core.frame_optimize_execution import LockedFrameOptimizeBatch
+from haoai_backend.generation_core.frame_optimize_due_facts import (
+    DUE_TERMINAL_ERROR,
+    lock_due_facts,
+)
 from haoai_backend.generation_core.frame_optimize_application_facts import (
     AppliedFrameOptimizeFact,
     application_fact,
@@ -57,11 +61,13 @@ class FrameOptimizeProgress:
     applied_by_unit: Mapping[str, AppliedFrameOptimizeFact]
     unstarted_insufficient_by_unit: Mapping[str, Mapping[str, object]]
     unstarted_cancelled_by_unit: Mapping[str, Mapping[str, object]]
+    due_by_unit: Mapping[str, Mapping[str, object]]
     partial_results: tuple[tuple[int, str], ...]
     stopped_insufficient: bool
     cancellation_marker: str | None
     policy_stop_event_refs: tuple[str, ...]
     terminal_error: str | None
+    all_slots_closed: bool
 
 
 def lock_frame_optimize_progress(
@@ -75,6 +81,10 @@ def lock_frame_optimize_progress(
     task_id = graph.task.get("id")
     owner_id = graph.task.get("user_id")
     if not isinstance(task_id, str) or not isinstance(owner_id, str):
+        return None
+
+    due_by_unit = lock_due_facts(session, graph)
+    if due_by_unit is None:
         return None
 
     receipt_rows = session.execute(
@@ -187,11 +197,33 @@ def lock_frame_optimize_progress(
                 work is not None
                 or ledger is not None
                 or application is not None
-                or unit.get("result_status") != "pending"
                 or unit.get("debited_amount") != 0
                 or unit.get("refunded_amount") != 0
                 or unit.get("success_confirmed_at") is not None
             ):
+                return None
+            if unit_id in due_by_unit:
+                if (
+                    unit.get("result_status") != "unknown"
+                    or step.get("execution_status") != "reconciling"
+                    or graph.external_by_step.get(str(step.get("id")), {}).get("submission_status")
+                    != "unknown"
+                ):
+                    return None
+                external_row = graph.external_by_step.get(str(step.get("id")))
+                if external_row is None:
+                    return None
+                if cancellation_marker is None:
+                    if fee is not None or unit.get("billing_status") != "unbilled":
+                        return None
+                elif fee is None or not _unstarted_cancelled_matches(
+                    fee, unit, step, external_row
+                ):
+                    return None
+                if fee is not None:
+                    unstarted_cancelled[unit_id] = fee
+                continue
+            if unit.get("result_status") != "pending":
                 return None
             if fee is not None:
                 if not _unstarted_insufficient_matches(
@@ -452,6 +484,7 @@ def lock_frame_optimize_progress(
         works,
         unstarted_insufficient,
         unstarted_cancelled,
+        due_by_unit,
         cancellation_marker=cancellation_marker,
     )
     if partial_results is None:
@@ -484,7 +517,7 @@ def lock_frame_optimize_progress(
         return None
 
     all_closed = _all_generation_slots_closed(
-        unit_ids, works, unstarted_insufficient, unstarted_cancelled
+        unit_ids, works, unstarted_insufficient, unstarted_cancelled, due_by_unit
     )
     task_status = graph.task.get("status")
     if task_status == "completed" and (
@@ -517,11 +550,13 @@ def lock_frame_optimize_progress(
         applied_by_unit=applied_by_unit,
         unstarted_insufficient_by_unit=unstarted_insufficient,
         unstarted_cancelled_by_unit=unstarted_cancelled,
+        due_by_unit=due_by_unit,
         partial_results=partial_results,
         stopped_insufficient=saw_insufficient,
         cancellation_marker=cancellation_marker,
         policy_stop_event_refs=tuple(str(row["event_id"]) for row in policy_stop_rows),
         terminal_error=terminal_error,
+        all_slots_closed=all_closed,
     )
 
 
@@ -634,7 +669,7 @@ def _cancelled_waiver_matches(fee, unit, receipt, amount) -> bool:
 
 
 def _parse_task_results(task, items_by_index, works, unstarted_insufficient,
-                        unstarted_cancelled, *, cancellation_marker):
+                        unstarted_cancelled, due_by_unit, *, cancellation_marker):
     raw = task.get("result")
     parsed = parse_partial_results(raw, items_by_index)
     if cancellation_marker is not None:
@@ -668,13 +703,14 @@ def _parse_task_results(task, items_by_index, works, unstarted_insufficient,
         return None, None
     if value.get("partial") != [] or not isinstance(value.get("error"), str):
         return None, None
-    expected = _failure_reason(works, unstarted_insufficient)
+    expected = expected_failure_reason(works, unstarted_insufficient, due_by_unit)
     if expected is None or value.get("error") != expected:
         return None, None
     return (), expected
 
 
-def _failure_reason(works, unstarted_insufficient):
+def expected_failure_reason(works, unstarted_insufficient, due_by_unit=()):
+    """Preserve an existing terminal reason before attributing an unresolved due Unit."""
     if unstarted_insufficient or any(
         work.get("phase") == "stopped_insufficient" for work in works.values()
     ):
@@ -689,10 +725,14 @@ def _failure_reason(works, unstarted_insufficient):
         return next(iter(reasons))
     if reasons:
         return "frame_optimize_results_unapplied"
+    if due_by_unit:
+        return DUE_TERMINAL_ERROR
     return None
 
 
-def _all_generation_slots_closed(unit_ids, works, unstarted_insufficient, unstarted_cancelled=()):
+def _all_generation_slots_closed(
+    unit_ids, works, unstarted_insufficient, unstarted_cancelled=(), due_by_unit=()
+):
     terminal_phases = {
         "done",
         "stopped_cancelled",
@@ -702,7 +742,7 @@ def _all_generation_slots_closed(unit_ids, works, unstarted_insufficient, unstar
     }
     closed = {
         unit_id for unit_id, work in works.items() if work.get("phase") in terminal_phases
-    } | set(unstarted_insufficient) | set(unstarted_cancelled)
+    } | set(unstarted_insufficient) | set(unstarted_cancelled) | set(due_by_unit)
     return closed == set(unit_ids) and set(works) <= set(unit_ids)
 
 
