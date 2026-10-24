@@ -97,8 +97,8 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 | U06.1 | 聊天消息、文本流与 source bubble | P | P | V=P / A=U；chat CRUD/统计、detached SSE、可选 Task 绑定和 stream 财务已有 | 配置真实 text runtime，补 React 聊天操作、断流/失败/任务回读和来源 bubble；按原协议矩阵补缺口。 |
 | U06.2 | 两步分镜生成、报价、SSE 预览和确认保存 | C | C | V=P / A=P；真实 JWT/Target API/owned SQLite + FakeRuntime 主链已通过 | 保留主链收据，补受影响的失败、断流、原 key 恢复和权限分支；FakeRuntime 不代表真实 provider。 |
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
-| U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；路由、解析和保存已有，提取 runtime 仍需注入 | 装配 StoryboardAssetRuntime，接提取结果编辑/确认和批量保存；验证失败不覆盖源内容及未知回读。 |
-| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 原 intent 到期控制与提交边界修复已由作者合成 SQLite 回归，629 的15个受影响后端测试文件175项通过；Root独立复核与冻结门禁待进行，完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
+| U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；六个提取/外观判断路由已接具体 StoryboardAssetRuntime 与 server host，本批 create_app/JWT/SQLite + fake HTTP 组合测试通过 | 接提取结果编辑/确认和批量保存，补图片/单镜/全镜生成及相应失败保护；本批不改变整行状态。 |
+| U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 原 intent 到期控制与提交边界修复已通过 Root630 独立176项后端定向测试，并由 Root631 中文提交推送至 main；完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
 | U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
 
 ### U07 多节点创作画布和结果回填
@@ -359,3 +359,13 @@ React 消费端已按现有后端状态投影支持 processing/completed 的结�
 Root 沿用 `36ca5b9948cb0ce8d09839e6b53f0bf77b1e6b99` 完整差异基线，对 628 两项阻断问题完成聚焦复核；DUE628-01 与 DUE628-02 均已关闭。Root630 在 1,603 项输入的私有冻结源码副本上运行原15个受影响后端测试文件及实际结果投影协议测试，16个文件共176项通过，exit 0，无超时，保留1条既有 Pydantic warning。原 Root 复现脚本再次确认提交时有效 lease 会阻止到期写入、ACK 丢失后同 ID 的合法内容漂移不会被误认作原提交，以及已有 fee、delivery、finalization 完成后 rescan 可正确聚合父任务。
 
 候选源码、main 及受保护文件、冻结输入前后一致；两个所属进程组和私有源码/TMP 均已清理。验证收据为 `haoai-next-root-frame-optimize-due-gate-630.json`，聚焦复核记录为 `haoai-next-frame-optimize-due-review-628-sol-02.md`。此结果只证明当前 frame.optimize 到期控制切片的源码和合成 SQLite 定向行为，不覆盖真实 PostgreSQL 竞争、Provider、浏览器/E2E 或部署。U04.2/U04.3、U06.5 仍为 P/P；21/18/51义务计数、A01–A39完整矩阵接受数0与A39 `OFFLINE_PENDING` 保持不变，整体改造继续。
+
+### Storyboard Asset Runtime 与 host 接线（2026-10-24）
+
+632 为六个角色/场景/道具提取及出场判断 POST 路由接入惰性 OpenAI-compatible stream runtime，并由 `backend.server.create_server_host` 显式注入；凭据仍由每个 owner-scoped 请求解析。保留 openai/deepseek 与 custom provider 的旧 request shape、Anthropic 流式不支持边界、首 choice 正文、内部 HTTP/公网 HTTPS URL 政策和 600 秒 asset timeout。共享 codec 的 multi-choice 默认语义不变，仅 asset runtime 请求首 choice，并读取首 choice `finish_reason` 发截断 warning。
+
+作者测试使用真实 `create_app`、JWT、owned SQLite 与 fake HTTP transport 覆盖六路结果解析、选择帧/空提取 prompt、判断 prompt 与 `skip_merge`、权限拒绝、错误/空/HTML/only-reasoning/截断、分片 UTF-8、API key 跨内容事件脱敏及关闭响应时不伪造终态。该批没有连接真实 provider、真实网络、真实数据库、R2、浏览器或前端，也未覆盖素材图片/单镜/全镜生成，因此 U06.4 仍为 P/P，21/18/51 计数及 A01–A39 完整矩阵接受数不变。最终作者门禁与证据路径记录在本批 632 收据。
+
+Root633 完整差异复核发现三处旧版兼容差异，634 已修正：custom provider 显式关闭 thinking、嵌套 max_tokens 保持原 default/value 与整数转换规则、内部 HTTP 保持原 DNS 判断。原三个问题的失败回归及作者首轮测试导入失败日志均保留；最终作者受影响组合141项通过。实际 Aiohttp 适配层的 fake 边界测试证明原300秒和资产600秒超时传入客户端，取消会关闭响应与会话且不伪造完成。
+
+Root635 在1,605项输入的私有冻结源码副本上原样重跑三类独立复现，结果与固定旧源一致；随后受影响后端组合141项通过、exit 0、无超时，保留1条既有 Pydantic warning。候选源码、main及8个受保护文件、冻结输入前后一致；两个所属进程组与私有源码/TMP已清理。最终复核为 `haoai-next-storyboard-asset-review-633-sol-02.md`，冻结验证为 `haoai-next-root-storyboard-asset-gate-635.json`。这些证据仅覆盖当前六路后端运行时和host接线；前端提取编辑/确认/保存、图片与单镜/全镜生成以及真实Provider、浏览器/E2E和部署仍待，U06.4及21/18/51统计均不提升为整项完成。

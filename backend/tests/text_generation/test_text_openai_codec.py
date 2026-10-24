@@ -1,3 +1,5 @@
+import pytest
+
 from haoai_backend.generation_providers.text.openai_codec import (
     OpenAITextStreamCodec,
     OpenAITextStreamEvent,
@@ -128,6 +130,35 @@ def test_http_200_error_after_content_remains_an_observation_not_a_terminal_fail
         ("upstream_error", "", "late provider warning"),
     ]
     assert terminal == ()
+
+
+def test_finish_reason_is_read_only_and_tracks_first_choice_without_changing_events() -> None:
+    codec = OpenAITextStreamCodec()
+    assert codec.finish_reason is None
+
+    events = codec.feed(
+        b'data: {"choices":[{"delta":{"content":"[]"},"finish_reason":"length"},'
+        b'{"delta":{"content":"ignored"},"finish_reason":"stop"}]}\n'
+    )
+
+    assert [(event.kind, event.text) for event in events] == [("content", "[]ignored")]
+    assert codec.finish_reason == "length"
+    with pytest.raises(AttributeError):
+        codec.finish_reason = "stop"
+
+
+def test_first_choice_only_mode_is_opt_in_and_preserves_default_multi_choice_behavior() -> None:
+    payload = (
+        b'data: {"choices":[{"delta":{"content":"first"},"finish_reason":"stop"},'
+        b'{"delta":{"content":"second"},"finish_reason":"length"}]}\n'
+    )
+    default_codec = OpenAITextStreamCodec()
+    first_choice_codec = OpenAITextStreamCodec(first_choice_only=True)
+
+    assert [event.text for event in default_codec.feed(payload)] == ["firstsecond"]
+    first_events = first_choice_codec.feed(payload)
+    assert [event.text for event in first_events] == ["first"]
+    assert first_choice_codec.finish_reason == "stop"
 
 
 def test_non_200_preserves_full_error_detail_separately_from_bounded_message() -> None:

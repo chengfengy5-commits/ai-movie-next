@@ -77,6 +77,11 @@ class OpenAICompatibleStoryboardRuntime:
 class AiohttpStoryboardTextTransport:
     """Lazy aiohttp transport; import and network access happen only per call."""
 
+    def __init__(self, *, timeout_seconds: float = 300) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self._timeout_seconds = timeout_seconds
+
     @asynccontextmanager
     async def open_stream(
         self,
@@ -90,7 +95,7 @@ class AiohttpStoryboardTextTransport:
         except ImportError as error:
             raise StoryboardGenerationUnavailable("AI 文本传输依赖尚未安装") from error
 
-        timeout = aiohttp.ClientTimeout(total=300)
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(url, headers=dict(headers), json=dict(json_body)) as response:
                 yield _AiohttpStoryboardResponse(response)

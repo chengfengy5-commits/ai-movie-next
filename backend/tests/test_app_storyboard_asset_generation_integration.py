@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import threading
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -42,6 +43,9 @@ from haoai_backend.shared.identity import TrustedActor
 from haoai_backend.storyboard_asset_generation.application import prepare_extract
 from haoai_backend.storyboard_asset_generation.errors import StoryboardAssetUnavailable
 from haoai_backend.storyboard_asset_generation.execution import stream_asset_events
+from haoai_backend.storyboard_asset_generation.openai_runtime import (
+    OpenAICompatibleStoryboardAssetRuntime,
+)
 from haoai_backend.storyboard_asset_generation.persistence import SqlAlchemyStoryboardAssetUnitOfWork
 from haoai_backend.storyboard_asset_generation.schemas import ExtractRequest
 from haoai_backend.teams.tables import metadata as teams_metadata, team_members, teams
@@ -94,11 +98,51 @@ class LocalAssetRuntime:
             yield value
 
 
+class _FakeProviderResponse:
+    status = 200
+
+    def __init__(self, content: str) -> None:
+        payload = {
+            "choices": [
+                {"delta": {"content": content}, "finish_reason": "stop"}
+            ]
+        }
+        self._body = f"data: {json.dumps(payload, ensure_ascii=False)}\n".encode()
+        self.closed = False
+
+    async def iter_bytes(self):
+        for offset in range(0, len(self._body), 3):
+            yield self._body[offset:offset + 3]
+
+
+class _FakeProviderTransport:
+    def __init__(self, contents: list[str]) -> None:
+        self._contents = iter(contents)
+        self.requests: list[dict[str, Any]] = []
+        self.responses: list[_FakeProviderResponse] = []
+
+    @asynccontextmanager
+    async def open_stream(self, url, *, headers, json_body):
+        self.requests.append(
+            {
+                "url": url,
+                "headers": dict(headers),
+                "json_body": dict(json_body),
+            }
+        )
+        response = _FakeProviderResponse(next(self._contents))
+        self.responses.append(response)
+        try:
+            yield response
+        finally:
+            response.closed = True
+
+
 @dataclass
 class System:
     engine: Any
     app: FastAPI
-    runtime: LocalAssetRuntime
+    runtime: Any
     business_sessions: list[ObservedSession]
     auth_sessions: list[ObservedSession]
     opened: list[tuple[str, int]]
@@ -106,7 +150,11 @@ class System:
 
 
 def _build_system(
-    path: Path, *, with_runtime: bool = True, cipher_secret_key: str | None = SECRET
+    path: Path,
+    *,
+    with_runtime: bool = True,
+    cipher_secret_key: str | None = SECRET,
+    runtime_override: Any = None,
 ) -> System:
     engine = create_engine(f"sqlite:///{path}", future=True)
     auth_metadata.create_all(engine)
@@ -320,8 +368,9 @@ def _build_system(
 
     auth_factory = make_factory("auth", auth_sessions)
     business_factory = make_factory("business", business_sessions)
-    runtime = LocalAssetRuntime()
-    runtime.business_sessions = business_sessions
+    runtime = runtime_override if runtime_override is not None else LocalAssetRuntime()
+    if isinstance(runtime, LocalAssetRuntime):
+        runtime.business_sessions = business_sessions
     auth_runtime = AuthenticationRuntime(
         session_factory=auth_factory,
         secret_key=cipher_secret_key,
@@ -443,6 +492,132 @@ def test_default_jwt_and_real_sqlite_cover_all_six_routes_without_fee_writes(sys
     with system.engine.connect() as connection:
         assert connection.execute(select(user_credits.c.credits).where(user_credits.c.user_id == "member")).scalar_one() == 73
         assert connection.execute(select(func.count()).select_from(CreditLogRow.__table__)).scalar_one() == 0
+
+
+def test_real_provider_runtime_serves_all_six_routes_through_fake_http(tmp_path: Path) -> None:
+    transport = _FakeProviderTransport(
+        [
+            '[{"name":"顾宁","gender":"女"}]',
+            '[[{"character":"顾宁"}]]',
+            '[{"name":"客厅_夜","visualPrompt":"暖光"}]',
+            '[[{"title":"客厅_夜"}]]',
+            '[{"name":"旧钥匙","visualPrompt":"铜制"}]',
+            '[[{"prop":"旧钥匙"}]]',
+        ]
+    )
+    runtime = OpenAICompatibleStoryboardAssetRuntime(transport=transport)
+    system = _build_system(
+        tmp_path / "storyboard-assets-provider.sqlite3",
+        runtime_override=runtime,
+    )
+    requests = [
+        (
+            "/api/storyboard/extract-characters-stream",
+            {
+                "chapter_id": "chapter-member",
+                "model_id": "system-model",
+                "frame_indices": [1, 0, 1],
+            },
+        ),
+        (
+            "/api/storyboard/judge-character-appearance-stream",
+            {
+                "chapter_id": "chapter-member",
+                "model_id": "system-model",
+                "prompt_id": "owned-prompt",
+                "characters": [{"name": "顾宁", "is_existing": False}],
+                "storyboard_texts": ["角色入镜"],
+                "frame_numbers": [8],
+                "skip_merge": True,
+            },
+        ),
+        (
+            "/api/storyboard/extract-scenes-stream",
+            {
+                "chapter_id": "chapter-member",
+                "model_id": "owned-model",
+                "frame_indices": [0],
+            },
+        ),
+        (
+            "/api/storyboard/judge-scene-appearance-stream",
+            {
+                "chapter_id": "chapter-member",
+                "model_id": "system-model",
+                "scenes": [{"title": "客厅_夜", "is_existing": False}],
+                "storyboard_texts": ["客厅里"],
+                "frame_numbers": [3],
+                "skip_merge": True,
+            },
+        ),
+        (
+            "/api/storyboard/extract-props-stream",
+            {
+                "chapter_id": "chapter-member",
+                "model_id": "system-model",
+                "prompt_id": "active-prompt",
+            },
+        ),
+        (
+            "/api/storyboard/judge-prop-appearance-stream",
+            {
+                "chapter_id": "chapter-member",
+                "model_id": "system-model",
+                "props": [{"name": "旧钥匙", "is_existing": False}],
+                "storyboard_texts": ["拿起钥匙"],
+                "skip_merge": True,
+            },
+        ),
+    ]
+    try:
+        denied = _post(
+            system,
+            requests[0][0],
+            user="free",
+            body={"chapter_id": "chapter-member", "model_id": "system-model"},
+        )
+        foreign = _post(
+            system,
+            requests[0][0],
+            body={"chapter_id": "chapter-peer", "model_id": "system-model"},
+        )
+        assert denied.status_code == 403
+        assert foreign.status_code == 403
+        assert transport.requests == []
+
+        completed: list[dict[str, Any]] = []
+        for path, body in requests:
+            response = _post(system, path, body=body)
+            assert response.status_code == 200, response.text
+            events = _events(response)
+            assert events[-1] == {"type": "done"}
+            complete = next(event for event in events if event.get("type") == "complete")
+            completed.append(complete)
+
+        assert [row["name"] for row in completed[0]["characters"]] == ["顾宁"]
+        assert completed[1]["appearances"] == [["顾宁"]]
+        assert completed[1]["merged_characters"] == [{"name": "顾宁", "is_existing": False}]
+        assert completed[2]["scenes"][0]["title"] == "客厅_夜"
+        assert completed[3]["appearances"] == ["客厅_夜"]
+        assert completed[3]["scenes"] == [{"title": "客厅_夜", "is_existing": False}]
+        assert completed[4]["props"][0]["name"] == "旧钥匙"
+        assert completed[5]["appearances"] == [["旧钥匙"]]
+
+        first_request = transport.requests[0]
+        assert first_request["url"] == "https://api.openai.com/v1/chat/completions"
+        assert first_request["headers"]["Authorization"] == "Bearer server-only-key"
+        assert first_request["json_body"]["messages"] == [
+            {"role": "system", "content": ""},
+            {"role": "user", "content": "\n\n第二段\n\n第一段\n\n第二段"},
+        ]
+        assert transport.requests[1]["json_body"]["messages"][0]["content"] == "selected-system"
+        assert "【分镜 8】" in transport.requests[1]["json_body"]["messages"][1]["content"]
+        assert transport.requests[2]["headers"]["Authorization"] == "Bearer member-only-key"
+        assert transport.requests[2]["json_body"]["model"] == "gpt-3.5-turbo"
+        assert len(transport.responses) == 6
+        assert all(response.closed for response in transport.responses)
+    finally:
+        system.engine.dispose()
 
 
 def test_authentication_precedes_body_validation_and_missing_runtime_writes_nothing(tmp_path: Path) -> None:
