@@ -14,6 +14,12 @@ import type {
 import type { PersonalProductionSnapshot } from "../../shared/api/personalProductionNotes";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import {
+  type StoryboardAssetKind,
+  type StoryboardAssetSaveInput,
+  type StoryboardAssetSavePlan,
+  type StoryboardAssetStreamEvent,
+} from "../../shared/api/storyboardAssetGeneration";
 import type { FrameOptimizeTaskStatus, FrameOptimizeSubmitInput } from "../../shared/api/frameOptimize";
 import {
   applyFrameOptimizePartialToContent,
@@ -76,6 +82,10 @@ import {
   type FrameStructureDraft,
 } from "./frame-structure/contract";
 import { StoryboardGenerationDialog } from "../storyboard-generation/StoryboardGenerationDialog";
+import {
+  StoryboardAssetExtractionDialog,
+  type StoryboardAssetGenerationSnapshot,
+} from "./storyboard-assets/StoryboardAssetExtractionDialog";
 import {
   buildChapterReorderInput,
   inspectStoryboardReferences,
@@ -183,6 +193,27 @@ interface FrameOptimizeDialogOwner {
   openEpoch: number;
 }
 
+interface StoryboardAssetExtractionOwner {
+  scope: ChapterBrowserScope;
+  chapter: Chapter;
+  baseDirectory: Chapter[];
+  baseAssets: StoryboardAsset[];
+  baseLibrary: {
+    characters: Character[];
+    scenes: Scene[];
+    props: Prop[];
+  };
+  baseSnapshot: StoryboardAssetGenerationSnapshot;
+  requestGeneration: number;
+  openEpoch: number;
+  sessionGeneration: number;
+  lifecycleController: AbortController;
+}
+
+interface StoryboardAssetReadSnapshot extends StoryboardAssetGenerationSnapshot {
+  directory: Chapter[];
+}
+
 interface FrameStructureEditorContext extends ChapterEditLockOwner {
   mode: FrameStructureMode;
   characters: Character[];
@@ -224,6 +255,152 @@ function sameChapterBrowserScope(left: ChapterBrowserScope, right: ChapterBrowse
   return left.userId === right.userId
     && left.services === right.services
     && left.seriesId === right.seriesId;
+}
+
+function sameAssetCatalog<T extends { id: string }>(left: T[], right: T[]): boolean {
+  const sortById = (items: T[]) => [...items].sort((first, second) => first.id.localeCompare(second.id));
+  return JSON.stringify(sortById(left)) === JSON.stringify(sortById(right));
+}
+
+function sameStoryboardAssetLibraries(
+  left: Pick<StoryboardAssetGenerationSnapshot, "characters" | "scenes" | "props">,
+  right: Pick<StoryboardAssetGenerationSnapshot, "characters" | "scenes" | "props">,
+): boolean {
+  return sameAssetCatalog(left.characters, right.characters)
+    && sameAssetCatalog(left.scenes, right.scenes)
+    && sameAssetCatalog(left.props, right.props);
+}
+
+function assetLibraryForKind(
+  snapshot: Pick<StoryboardAssetGenerationSnapshot, "characters" | "scenes" | "props">,
+  kind: StoryboardAssetKind,
+): Array<Character | Scene | Prop> {
+  if (kind === "character") return snapshot.characters;
+  if (kind === "scene") return snapshot.scenes;
+  return snapshot.props;
+}
+
+function assetLibraryName(asset: Character | Scene | Prop): string {
+  return "title" in asset ? asset.title : asset.name;
+}
+
+function saveCandidateName(candidate: Record<string, unknown>, kind: StoryboardAssetKind): string {
+  const value = kind === "scene" ? candidate.title ?? candidate.name : candidate.name;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+function frameAssetField(kind: StoryboardAssetKind): "character" | "scene" | "prop" {
+  if (kind === "character") return "character";
+  if (kind === "scene") return "scene";
+  return "prop";
+}
+
+function verifiedAssetId(
+  id: string,
+  kind: StoryboardAssetKind,
+  snapshot: StoryboardAssetGenerationSnapshot,
+): string {
+  const matches = assetLibraryForKind(snapshot, kind).filter((asset) => (
+    asset.id === id && asset.series_id === snapshot.chapter.series_id
+  ));
+  if (matches.length !== 1) {
+    throw new ApiError("http", "复用素材不属于当前剧集或目录中不唯一，已停止保存。", 409);
+  }
+  return id;
+}
+
+function verifyExistingCandidateOwnership(
+  candidates: Record<string, unknown>[],
+  kind: StoryboardAssetKind,
+  snapshot: StoryboardAssetGenerationSnapshot,
+): void {
+  const seenNames = new Set<string>();
+  for (const candidate of candidates) {
+    const name = saveCandidateName(candidate, kind);
+    if (name === "" || seenNames.has(name)) {
+      throw new ApiError("http", "保存候选名称为空或重复，已停止写入。", 409);
+    }
+    seenNames.add(name);
+    const existingId = candidate.existing_id;
+    if (existingId === undefined || existingId === null) {
+      if (candidate.is_existing === true || candidate.is_backfill === true) {
+        throw new ApiError("http", "复用候选缺少经核对的当前剧集素材 ID。", 409);
+      }
+      continue;
+    }
+    if (typeof existingId !== "string" || candidate.is_existing !== true || candidate.is_backfill !== true) {
+      throw new ApiError("http", "AI 候选携带了未经确认的素材 ID，已停止保存。", 409);
+    }
+    verifiedAssetId(existingId, kind, snapshot);
+  }
+}
+
+function resolveSavedAssetId(
+  name: string,
+  kind: StoryboardAssetKind,
+  candidates: Record<string, unknown>[],
+  plan: StoryboardAssetSavePlan,
+  snapshot: StoryboardAssetGenerationSnapshot,
+): string {
+  const matchingCandidates = candidates.filter((candidate) => saveCandidateName(candidate, kind) === name);
+  if (matchingCandidates.length !== 1) {
+    throw new ApiError("invalid-response", `保存回读时无法唯一对应候选“${name}”。`, null);
+  }
+  const existingId = matchingCandidates[0]?.existing_id;
+  if (typeof existingId === "string") return verifiedAssetId(existingId, kind, snapshot);
+
+  const planItems = plan.items.filter((item) => item.name === name);
+  if (planItems.length !== 1 || planItems[0] === undefined || planItems[0].status === "drop") {
+    throw new ApiError("invalid-response", `保存计划没有采用候选“${name}”。`, null);
+  }
+  const planItem = planItems[0];
+  if (planItem.status === "reuse") {
+    if (planItem.existing_id === null) {
+      throw new ApiError("invalid-response", `复用候选“${name}”缺少素材 ID。`, null);
+    }
+    return verifiedAssetId(planItem.existing_id, kind, snapshot);
+  }
+
+  const matches = assetLibraryForKind(snapshot, kind).filter((asset) => (
+    asset.series_id === snapshot.chapter.series_id && assetLibraryName(asset) === name
+  ));
+  if (matches.length !== 1 || matches[0] === undefined) {
+    throw new ApiError("invalid-response", `保存后无法唯一读取新素材“${name}”。`, null);
+  }
+  return matches[0].id;
+}
+
+function expectedStoryboardAssetSaveContent(
+  source: StoryboardAssetGenerationSnapshot,
+  input: StoryboardAssetSaveInput,
+  plan: StoryboardAssetSavePlan,
+): StoryboardFrame[] {
+  const content = source.chapter.content;
+  if (!Array.isArray(content) || input.target_frames.length !== input.appearances.length) {
+    throw new ApiError("invalid-response", "保存源章节与镜头选择无法对应。", null);
+  }
+  verifyExistingCandidateOwnership(input.candidates, plan.asset_type, source);
+  const expected = content.map((frame): Record<string, unknown> => ({ ...frame }));
+  const field = frameAssetField(plan.asset_type);
+  for (let slot = 0; slot < input.target_frames.length; slot += 1) {
+    const frameIndex = input.target_frames[slot];
+    const appearance = input.appearances[slot];
+    const frame = frameIndex === undefined ? undefined : expected[frameIndex];
+    if (!Number.isSafeInteger(frameIndex) || frameIndex === undefined || frameIndex < 0 || frame === undefined || appearance === undefined) {
+      throw new ApiError("invalid-response", "保存请求中的目标镜头已变化。", null);
+    }
+    if (appearance === null) continue;
+    let names: string[];
+    if (plan.asset_type === "scene") {
+      if (typeof appearance !== "string") throw new ApiError("invalid-response", "场景绑定格式无效。", null);
+      names = appearance === "" ? [] : [appearance];
+    } else {
+      if (!Array.isArray(appearance)) throw new ApiError("invalid-response", "角色或道具绑定格式无效。", null);
+      names = appearance;
+    }
+    frame[field] = names.map((name) => resolveSavedAssetId(name, plan.asset_type, input.candidates, plan, source));
+  }
+  return expected;
 }
 
 function sameStoryboardAssetPositions(left: StoryboardAsset[], right: StoryboardAsset[]): boolean {
@@ -619,6 +796,12 @@ export function ChapterBrowser({
   frameOptimizeDialogRef.current = frameOptimizeDialog;
   const frameOptimizeOpenEpoch = useRef(0);
   const [frameOptimizeOpening, setFrameOptimizeOpening] = useState(false);
+  const [storyboardAssetExtractionDialog, setStoryboardAssetExtractionDialog] = useState<StoryboardAssetExtractionOwner | null>(null);
+  const storyboardAssetExtractionDialogRef = useRef<StoryboardAssetExtractionOwner | null>(null);
+  storyboardAssetExtractionDialogRef.current = storyboardAssetExtractionDialog;
+  const storyboardAssetExtractionOpenEpoch = useRef(0);
+  const [storyboardAssetExtractionOpening, setStoryboardAssetExtractionOpening] = useState(false);
+  const storyboardAssetExtractionOpeningController = useRef<AbortController | null>(null);
   const [frameStructureEditor, setFrameStructureEditor] = useState<FrameStructureEditorContext | null>(null);
   const frameStructureEditorRef = useRef<FrameStructureEditorContext | null>(null);
   frameStructureEditorRef.current = frameStructureEditor;
@@ -683,6 +866,8 @@ export function ChapterBrowser({
   const finalizedNavigationEpochsRef = useRef(new Set<number>());
   const unauthorizedHandlerRef = useRef(onUnauthorized);
   unauthorizedHandlerRef.current = onUnauthorized;
+  const sessionGenerationRef = useRef(sessionGeneration);
+  sessionGenerationRef.current = sessionGeneration;
   const navigationConsumedHandlerRef = useRef(onNavigationConsumed);
   navigationConsumedHandlerRef.current = onNavigationConsumed;
   const navigationAbandonedHandlerRef = useRef(onNavigationAbandoned);
@@ -717,6 +902,13 @@ export function ChapterBrowser({
     frameOptimizeDialogRef.current = null;
     setFrameOptimizeDialog(null);
     setFrameOptimizeOpening(false);
+    storyboardAssetExtractionOpenEpoch.current += 1;
+    storyboardAssetExtractionOpeningController.current?.abort();
+    storyboardAssetExtractionOpeningController.current = null;
+    storyboardAssetExtractionDialogRef.current?.lifecycleController.abort();
+    storyboardAssetExtractionDialogRef.current = null;
+    setStoryboardAssetExtractionDialog(null);
+    setStoryboardAssetExtractionOpening(false);
     chapterOrderEditorRef.current = null;
     setChapterOrderEditor(null);
     invalidateFrameEditingWorkflow({ deferLockRelease: true });
@@ -938,6 +1130,12 @@ export function ChapterBrowser({
   const currentAssetResult = selectedChapter !== null && assetResult?.chapterId === selectedChapter.id
     ? assetResult
     : null;
+  useEffect(() => {
+    const owner = storyboardAssetExtractionDialogRef.current;
+    if (owner !== null && !isStoryboardAssetExtractionOwnerCurrent(owner)) {
+      closeStoryboardAssetExtractionDialog(owner);
+    }
+  }, [assetResult, selectedChapter, selectedChapterId, series.id, services, sessionGeneration, userId]);
   const frames = selectedChapter?.content ?? [];
   const personalNotesOpen = selectedChapter !== null
     && personalNotesContext !== null
@@ -2897,7 +3095,8 @@ export function ChapterBrowser({
   const chapterManagementBlocked = chapterPanelsOpen
     || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null || frameEditOpening
     || storyboardGenerationDialog !== null || frameReviewDialog !== null
-    || frameOptimizeDialog !== null || frameOptimizeOpening;
+    || frameOptimizeDialog !== null || frameOptimizeOpening
+    || storyboardAssetExtractionDialog !== null || storyboardAssetExtractionOpening;
   const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
   const canOpenCanvas = series.can_enter && services.canvasData !== undefined;
   const canEditFrameStructure = series.can_enter
@@ -2908,6 +3107,378 @@ export function ChapterBrowser({
     && services.createChapter !== undefined
     && services.updateChapter !== undefined
     && services.deleteChapter !== undefined;
+
+  function isStoryboardAssetExtractionScopeCurrent(owner: StoryboardAssetExtractionOwner): boolean {
+    return sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+      && owner.sessionGeneration === sessionGenerationRef.current;
+  }
+
+  function isStoryboardAssetExtractionOwnerCurrent(owner: StoryboardAssetExtractionOwner): boolean {
+    const directory = chapterDirectoryRef.current;
+    const matching = directory.chapters?.filter((chapter) => chapter.id === owner.chapter.id) ?? [];
+    const readyAssets = assetResultRef.current;
+    return storyboardAssetExtractionDialogRef.current === owner
+      && isStoryboardAssetExtractionScopeCurrent(owner)
+      && owner.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === owner.chapter.id
+      && sameChapterBrowserScope(directory.scope, owner.scope)
+      && directory.requestGeneration === owner.requestGeneration
+      && matching.length === 1
+      && matching[0]?.series_id === owner.scope.seriesId
+      && matching[0]?.order === owner.chapter.order
+      && sameChapterContent(matching[0]?.content ?? null, owner.chapter.content)
+      && readyAssets?.status === "ready"
+      && readyAssets.chapterId === owner.chapter.id
+      && sameFrameOptimizeAssets(owner.baseAssets, readyAssets.assets, []);
+  }
+
+  function closeStoryboardAssetExtractionDialog(expected?: StoryboardAssetExtractionOwner): void {
+    const owner = storyboardAssetExtractionDialogRef.current;
+    if (expected !== undefined && owner !== expected) return;
+    storyboardAssetExtractionOpenEpoch.current += 1;
+    owner?.lifecycleController.abort();
+    storyboardAssetExtractionDialogRef.current = null;
+    setStoryboardAssetExtractionDialog(null);
+  }
+
+  async function readStoryboardAssetSnapshot(
+    scope: ChapterBrowserScope,
+    chapterId: string,
+    signal: AbortSignal,
+  ): Promise<StoryboardAssetReadSnapshot> {
+    const creatorSettings = scope.services.creatorSettings;
+    if (creatorSettings === undefined) {
+      throw new ApiError("invalid-response", "当前服务未接入模型和提示词目录，无法安全提取素材。", null);
+    }
+    const [directory, assets, characters, scenes, props, models, prompts] = await Promise.all([
+      scope.services.listChapters(scope.seriesId, signal),
+      scope.services.listStoryboardAssets(scope.seriesId, chapterId, signal),
+      scope.services.listCharacters(scope.seriesId, signal),
+      scope.services.listScenes(scope.seriesId, signal),
+      scope.services.listProps(scope.seriesId, signal),
+      creatorSettings.listModels(undefined, signal),
+      creatorSettings.listPrompts(undefined, signal),
+    ]);
+    const matching = directory.filter((chapter) => chapter.id === chapterId);
+    const chapter = matching[0];
+    if (matching.length !== 1 || chapter === undefined || chapter.series_id !== scope.seriesId) {
+      throw new ApiError("http", "最新章节目录无法唯一确认当前章节。", 409);
+    }
+    return {
+      directory,
+      chapter,
+      assets,
+      characters: characters.filter((asset) => asset.series_id === scope.seriesId),
+      scenes: scenes.filter((asset) => asset.series_id === scope.seriesId),
+      props: props.filter((asset) => asset.series_id === scope.seriesId),
+      models,
+      prompts,
+    };
+  }
+
+  function storyboardAssetReadMatchesOwner(
+    owner: StoryboardAssetExtractionOwner,
+    source: StoryboardAssetReadSnapshot,
+  ): boolean {
+    const matches = source.directory.filter((chapter) => chapter.id === owner.chapter.id);
+    const chapter = matches[0];
+    if (matches.length !== 1 || chapter === undefined || chapter.series_id !== owner.scope.seriesId
+      || !sameChapterOrderSnapshot(owner.baseDirectory, source.directory, owner.scope.seriesId)
+      || chapter.order !== owner.chapter.order
+      || !sameChapterContent(owner.chapter.content, chapter.content)
+      || !sameFrameOptimizeAssets(owner.baseAssets, source.assets, [])
+      || !sameStoryboardAssetLibraries(owner.baseLibrary, source)) {
+      return false;
+    }
+    const references = inspectStoryboardReferences(chapter.content, source.assets, owner.scope.seriesId, owner.chapter.id);
+    return references.ok && areReferencedFrameAssetPositionsValid(chapter, source.assets, owner.scope.seriesId);
+  }
+
+  async function refreshStoryboardAssetSource(
+    owner: StoryboardAssetExtractionOwner,
+    signal: AbortSignal,
+  ): Promise<StoryboardAssetGenerationSnapshot> {
+    if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+      throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+    }
+    const source = await readStoryboardAssetSnapshot(owner.scope, owner.chapter.id, signal);
+    if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+      throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+    }
+    if (!storyboardAssetReadMatchesOwner(owner, source)) {
+      applyFreshChapterDirectory(source.directory, owner.scope);
+      refreshAssetsAfterFrameRead(owner.chapter.id, source.assets);
+      setChapterMutationNotice("章节文字、镜头顺序、原图或当前剧集素材目录已变化；页面已重新读取，请关闭并重新打开素材流程核对。");
+      closeStoryboardAssetExtractionDialog(owner);
+      throw new ApiError("http", "素材来源发生变化，未继续本次处理。", 409);
+    }
+    return source;
+  }
+
+  async function openStoryboardAssetExtraction(): Promise<void> {
+    const directoryAtOpen = chapterDirectoryRef.current;
+    if (!canEditStoryboard || services.storyboardAssetGeneration === undefined) {
+      setChapterMutationNotice("当前运行模式没有接入素材提取与保存服务。");
+      return;
+    }
+    if (chapterManagementBlocked || chapterManagement !== null || chaptersLoading
+      || chaptersError !== null || chapters === null || selectedChapter === null
+      || currentAssetResult?.status !== "ready"
+      || directoryAtOpen.chapters !== chapters
+      || !sameChapterBrowserScope(directoryAtOpen.scope, currentScope)
+      || directoryAtOpen.requestGeneration !== chapterRequestGeneration.current
+      || !isChapterSelectableFromDirectory(directoryAtOpen.chapters, selectedChapter.id, series.id)) return;
+
+    const openEpoch = ++storyboardAssetExtractionOpenEpoch.current;
+    const requestGeneration = directoryAtOpen.requestGeneration;
+    const openScope = currentScope;
+    const openChapter = selectedChapter;
+    const openDirectory = [...directoryAtOpen.chapters];
+    const openAssets = snapshotStoryboardAssetPositions(currentAssetResult.assets);
+    const controller = new AbortController();
+    storyboardAssetExtractionOpeningController.current = controller;
+    setStoryboardAssetExtractionOpening(true);
+    setChapterMutationNotice(null);
+    const isOpeningCurrent = () => storyboardAssetExtractionOpeningController.current === controller
+      && openEpoch === storyboardAssetExtractionOpenEpoch.current
+      && sameChapterBrowserScope(openScope, activeScopeRef.current)
+      && sessionGenerationRef.current === sessionGeneration
+      && chapterRequestGeneration.current === requestGeneration
+      && selectedChapterIdRef.current === openChapter.id
+      && !controller.signal.aborted;
+    try {
+      const source = await readStoryboardAssetSnapshot(openScope, openChapter.id, controller.signal);
+      if (!isOpeningCurrent()) return;
+      const latestChapter = source.chapter;
+      const sourceReferences = inspectStoryboardReferences(latestChapter.content, source.assets, series.id, latestChapter.id);
+      if (!sameChapterOrderSnapshot(openDirectory, source.directory, series.id)
+        || latestChapter.order !== openChapter.order
+        || !sameChapterContent(openChapter.content, latestChapter.content)
+        || !sameFrameOptimizeAssets(openAssets, source.assets, [])
+        || !sourceReferences.ok
+        || !areReferencedFrameAssetPositionsValid(latestChapter, source.assets, series.id)) {
+        applyFreshChapterDirectory(source.directory, openScope);
+        refreshAssetsAfterFrameRead(openChapter.id, source.assets);
+        throw new ApiError("http", sourceReferences.ok
+          ? "打开前章节文字、顺序或素材目录已变化；已重新读取，请再次打开核对。"
+          : sourceReferences.message, 409);
+      }
+      const filteredSnapshot: StoryboardAssetGenerationSnapshot = {
+        chapter: latestChapter,
+        assets: snapshotStoryboardAssetPositions(source.assets),
+        characters: source.characters,
+        scenes: source.scenes,
+        props: source.props,
+        models: source.models,
+        prompts: source.prompts,
+      };
+      const owner: StoryboardAssetExtractionOwner = {
+        scope: openScope,
+        chapter: latestChapter,
+        baseDirectory: source.directory,
+        baseAssets: snapshotStoryboardAssetPositions(source.assets),
+        baseLibrary: {
+          characters: source.characters,
+          scenes: source.scenes,
+          props: source.props,
+        },
+        baseSnapshot: filteredSnapshot,
+        requestGeneration,
+        openEpoch,
+        sessionGeneration,
+        lifecycleController: controller,
+      };
+      if (!isOpeningCurrent()) return;
+      storyboardAssetExtractionDialogRef.current = owner;
+      setStoryboardAssetExtractionDialog(owner);
+      applyFreshChapterDirectory(source.directory, openScope);
+      refreshAssetsAfterFrameRead(openChapter.id, source.assets);
+    } catch (cause) {
+      if (!isOpeningCurrent()) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      else if (error.kind !== "aborted") setChapterMutationNotice(error.detail ?? error.message);
+    } finally {
+      if (storyboardAssetExtractionOpeningController.current === controller) {
+        storyboardAssetExtractionOpeningController.current = null;
+        setStoryboardAssetExtractionOpening(false);
+      }
+    }
+  }
+
+  async function executeConfirmedStoryboardAssetSave(
+    owner: StoryboardAssetExtractionOwner,
+    input: StoryboardAssetSaveInput,
+    plan: StoryboardAssetSavePlan,
+    signal: AbortSignal,
+    onRequestStarted: () => void,
+    onEvent: (event: StoryboardAssetStreamEvent) => void,
+  ): Promise<void> {
+    const generation = owner.scope.services.storyboardAssetGeneration;
+    if (generation === undefined || input.dry_run
+      || !isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+      throw new ApiError("aborted", "当前素材流程已切换或服务不可用。", null);
+    }
+
+    let lockLease: ChapterEditLockLeaseHandle | null = null;
+    let lockIdentity: ChapterEditLockIdentity = null;
+    let newlyAcquiredLock = false;
+    let readback: StoryboardAssetReadSnapshot | null = null;
+    let releaseNotice: string | null = null;
+
+    try {
+      const beforeLock = await readStoryboardAssetSnapshot(owner.scope, owner.chapter.id, signal);
+      if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+        throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+      }
+      if (!storyboardAssetReadMatchesOwner(owner, beforeLock)) {
+        applyFreshChapterDirectory(beforeLock.directory, owner.scope);
+        refreshAssetsAfterFrameRead(owner.chapter.id, beforeLock.assets);
+        setChapterMutationNotice("保存前章节、素材或当前剧集素材库已变化；已重新读取，请关闭窗口后重新核对。");
+        throw new ApiError("http", "保存前来源发生变化，未发送最终保存请求。", 409);
+      }
+      verifyExistingCandidateOwnership(input.candidates, plan.asset_type, beforeLock);
+
+      if (typeof series.team_id === "string" && series.team_id !== "") {
+        const getLock = owner.scope.services.getChapterEditLock;
+        const acquireLock = owner.scope.services.acquireChapterEditLock;
+        if (getLock === undefined || acquireLock === undefined
+          || owner.scope.services.releaseChapterEditLock === undefined) {
+          throw new ApiError("invalid-response", "团队章节锁能力未接线，已停止保存。", null);
+        }
+        const currentLock = await getLock(owner.chapter.id, signal);
+        if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+          throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+        }
+        if (currentLock.locked) {
+          if (!validOwnedChapterLock(currentLock, owner.scope.userId)) {
+            throw new ApiError("http", currentLock.username
+              ? `当前章节由 ${currentLock.username} 编辑，不能保存素材。`
+              : "当前章节由其他创作者编辑，不能保存素材。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(currentLock);
+          if (lockIdentity === null) {
+            throw new ApiError("invalid-response", "当前编辑锁缺少稳定身份，已停止保存。", null);
+          }
+        } else {
+          const acquisition = await acquireLock(owner.chapter.id, signal);
+          lockLease = acquisition.lease;
+          newlyAcquiredLock = lockLease !== null;
+          if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+            throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+          }
+          if (!acquisition.state.locked || lockLease === null
+            || typeof acquisition.state.expires_at !== "string"
+            || utcTimestampMilliseconds(acquisition.state.expires_at) <= Date.now()) {
+            throw new ApiError("http", acquisition.state.message ?? "未取得可核对和释放的章节编辑锁，未保存素材。", 409);
+          }
+          const verified = await getLock(owner.chapter.id, signal, lockLease);
+          if (!validOwnedChapterLock(verified, owner.scope.userId)) {
+            throw new ApiError("http", "取得编辑锁后无法核对当前账号和有效期限，未保存素材。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(verified);
+          if (lockIdentity === null) {
+            throw new ApiError("invalid-response", "取得的章节锁缺少稳定身份，未保存素材。", null);
+          }
+        }
+      }
+
+      const beforeWrite = await readStoryboardAssetSnapshot(owner.scope, owner.chapter.id, signal);
+      if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+        throw new ApiError("aborted", "当前章节或登录范围已切换。", null);
+      }
+      if (!storyboardAssetReadMatchesOwner(owner, beforeWrite)) {
+        applyFreshChapterDirectory(beforeWrite.directory, owner.scope);
+        refreshAssetsAfterFrameRead(owner.chapter.id, beforeWrite.assets);
+        setChapterMutationNotice("取得编辑锁后章节、素材或当前剧集素材库已变化；最终保存未发送。");
+        throw new ApiError("http", "编辑锁后来源发生变化，未发送最终保存请求。", 409);
+      }
+      if (typeof series.team_id === "string" && series.team_id !== "") {
+        const getLock = owner.scope.services.getChapterEditLock;
+        if (getLock === undefined || lockIdentity === null) {
+          throw new ApiError("invalid-response", "团队章节锁无法再次核对，已停止保存。", null);
+        }
+        const verified = lockLease === null
+          ? await getLock(owner.chapter.id, signal)
+          : await getLock(owner.chapter.id, signal, lockLease);
+        if (!validOwnedChapterLock(verified, owner.scope.userId)
+          || !sameChapterEditLockIdentity(lockIdentity, verified)) {
+          throw new ApiError("http", "最终保存前无法再次确认当前账号仍持有同一有效编辑锁。", 409);
+        }
+      }
+
+      if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+        throw new ApiError("aborted", "最终保存前章节或登录范围已切换。", null);
+      }
+      onRequestStarted();
+      let completed = false;
+      for await (const event of generation.streamSave(plan.asset_type, { ...input, dry_run: false }, signal)) {
+        if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+          throw new ApiError("aborted", "保存期间章节或登录范围已切换；请求是否落库需要人工核对。", null);
+        }
+        if (event.type === "complete") {
+          if (event.data.success !== true || event.data.dry_run === true) {
+            throw new ApiError("invalid-response", "最终保存流没有确认成功完成。", null);
+          }
+          completed = true;
+        }
+        onEvent(event);
+      }
+      if (!completed) throw new ApiError("network", "保存流未返回可确认的完成回执。", null);
+
+      const latest = await readStoryboardAssetSnapshot(owner.scope, owner.chapter.id, signal);
+      if (!isStoryboardAssetExtractionOwnerCurrent(owner) || signal.aborted) {
+        throw new ApiError("aborted", "保存后章节或登录范围已切换；服务器结果需要人工核对。", null);
+      }
+      const matching = latest.directory.filter((chapter) => chapter.id === owner.chapter.id);
+      const latestChapter = matching[0];
+      if (matching.length !== 1 || latestChapter === undefined || latestChapter.series_id !== owner.scope.seriesId
+        || !sameChapterOrderSnapshot(owner.baseDirectory, latest.directory, owner.scope.seriesId)
+        || latestChapter.order !== owner.chapter.order
+        || !sameFrameOptimizeAssets(owner.baseAssets, latest.assets, [])) {
+        throw new ApiError("network", "保存请求已完成，但章节目录或分镜素材身份无法核对；结果尚未确认。", null);
+      }
+      const references = inspectStoryboardReferences(latestChapter.content, latest.assets, owner.scope.seriesId, owner.chapter.id);
+      if (!references.ok || !areReferencedFrameAssetPositionsValid(latestChapter, latest.assets, owner.scope.seriesId)) {
+        throw new ApiError("network", references.ok
+          ? "保存后分镜素材位置无法核对；结果尚未确认。"
+          : `保存请求已完成，但${references.message}`, null);
+      }
+      const expectedSource: StoryboardAssetGenerationSnapshot = {
+        ...latest,
+        chapter: { ...latestChapter, content: beforeWrite.chapter.content },
+      };
+      const expectedContent = expectedStoryboardAssetSaveContent(expectedSource, input, plan);
+      if (!sameChapterContent(expectedContent, latestChapter.content)) {
+        throw new ApiError("network", "保存请求已完成，但章节逐镜绑定与确认计划不一致；结果尚未确认。", null);
+      }
+      readback = latest;
+    } finally {
+      if (newlyAcquiredLock && lockLease !== null) {
+        try {
+          await owner.scope.services.releaseChapterEditLock?.(
+            owner.chapter.id,
+            new AbortController().signal,
+            lockLease,
+          );
+        } catch (cause) {
+          const error = normalizeApiError(cause);
+          if (error.status === 401 && isStoryboardAssetExtractionScopeCurrent(owner)) {
+            unauthorizedHandlerRef.current();
+          } else {
+            releaseNotice = "服务器真源已核对，但本次取得的章节锁未能确认释放";
+          }
+        }
+      }
+    }
+
+    if (readback === null || !isStoryboardAssetExtractionScopeCurrent(owner)) return;
+    closeStoryboardAssetExtractionDialog(owner);
+    applyFreshChapterDirectory(readback.directory, owner.scope);
+    refreshAssetsAfterFrameRead(owner.chapter.id, readback.assets);
+    setAssetReloadKey((current) => current + 1);
+    setChapterMutationNotice(`素材、章节与逐镜绑定已重新读取并核对。${releaseNotice === null ? "" : ` ${releaseNotice}。`}`);
+  }
 
   function closeFrameReviewDialog(expected?: FrameReviewDialogOwner): void {
     const owner = frameReviewDialogRef.current;
@@ -3922,6 +4493,19 @@ export function ChapterBrowser({
                 </div>
                 <div className="selected-chapter-actions">
                   <span className="readonly-pill">{canEditStoryboard ? "可编辑分镜文字" : "只读"}</span>
+                  {canEditStoryboard && (
+                    <button
+                      className="text-button storyboard-asset-extraction-open-button"
+                      disabled={chapterManagementBlocked || chapterManagement !== null || chaptersLoading
+                        || storyboardAssetExtractionOpening || services.storyboardAssetGeneration === undefined
+                        || currentAssetResult?.status !== "ready"}
+                      onClick={() => void openStoryboardAssetExtraction()}
+                      title={services.storyboardAssetGeneration === undefined
+                        ? "当前运行模式没有接入素材提取与保存服务"
+                        : chapterPanelsOpen ? "请先关闭当前制作记录或素材引用面板" : undefined}
+                      type="button"
+                    >{storyboardAssetExtractionOpening ? "正在核对素材目录…" : "提取并确认素材"}</button>
+                  )}
                   {canOpenCanvas && (
                     <button
                       className="text-button"
@@ -4350,6 +4934,33 @@ export function ChapterBrowser({
           }}
           onSave={saveChapterOrder}
           seriesId={chapterOrderEditor.scope.seriesId}
+        />
+      )}
+      {storyboardAssetExtractionDialog !== null
+        && isStoryboardAssetExtractionOwnerCurrent(storyboardAssetExtractionDialog) && (
+        <StoryboardAssetExtractionDialog
+          key={`${storyboardAssetExtractionDialog.scope.userId}:${storyboardAssetExtractionDialog.sessionGeneration}:${storyboardAssetExtractionDialog.scope.seriesId}:${storyboardAssetExtractionDialog.chapter.id}:${storyboardAssetExtractionDialog.requestGeneration}:${storyboardAssetExtractionDialog.openEpoch}`}
+          executeConfirmedSave={(input, plan, signal, onRequestStarted, onEvent) => executeConfirmedStoryboardAssetSave(
+            storyboardAssetExtractionDialog,
+            input,
+            plan,
+            signal,
+            onRequestStarted,
+            onEvent,
+          )}
+          isCurrent={() => isStoryboardAssetExtractionOwnerCurrent(storyboardAssetExtractionDialog)}
+          lifecycleSignal={storyboardAssetExtractionDialog.lifecycleController.signal}
+          onClose={() => closeStoryboardAssetExtractionDialog(storyboardAssetExtractionDialog)}
+          onUnauthorized={() => {
+            if (isStoryboardAssetExtractionOwnerCurrent(storyboardAssetExtractionDialog)) {
+              unauthorizedHandlerRef.current();
+            }
+          }}
+          refreshSource={(signal) => refreshStoryboardAssetSource(storyboardAssetExtractionDialog, signal)}
+          seriesId={storyboardAssetExtractionDialog.scope.seriesId}
+          services={storyboardAssetExtractionDialog.scope.services}
+          snapshot={storyboardAssetExtractionDialog.baseSnapshot}
+          userId={storyboardAssetExtractionDialog.scope.userId}
         />
       )}
       {frameReviewDialog !== null

@@ -97,7 +97,7 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 | U06.1 | 聊天消息、文本流与 source bubble | P | P | V=P / A=U；chat CRUD/统计、detached SSE、可选 Task 绑定和 stream 财务已有 | 配置真实 text runtime，补 React 聊天操作、断流/失败/任务回读和来源 bubble；按原协议矩阵补缺口。 |
 | U06.2 | 两步分镜生成、报价、SSE 预览和确认保存 | C | C | V=P / A=P；真实 JWT/Target API/owned SQLite + FakeRuntime 主链已通过 | 保留主链收据，补受影响的失败、断流、原 key 恢复和权限分支；FakeRuntime 不代表真实 provider。 |
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
-| U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；六个提取/外观判断路由已接具体 StoryboardAssetRuntime 与 server host，本批 create_app/JWT/SQLite + fake HTTP 组合测试通过 | 接提取结果编辑/确认和批量保存，补图片/单镜/全镜生成及相应失败保护；本批不改变整行状态。 |
+| U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；六个提取/外观判断路由已接 StoryboardAssetRuntime/server host；637 加入 ChapterBrowser React 操作闭环及真实 producer/shared wire、合成 SQLite、fake HTTP 定向验证 | 继续补图片/单镜/全镜生成、服务器 CAS/多阶段并发边界与完整接受；本批不改变整行状态或 21/18/51 计数。 |
 | U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 原 intent 到期控制与提交边界修复已通过 Root630 独立176项后端定向测试，并由 Root631 中文提交推送至 main；完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
 | U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
 
@@ -369,3 +369,17 @@ Root 沿用 `36ca5b9948cb0ce8d09839e6b53f0bf77b1e6b99` 完整差异基线，对 
 Root633 完整差异复核发现三处旧版兼容差异，634 已修正：custom provider 显式关闭 thinking、嵌套 max_tokens 保持原 default/value 与整数转换规则、内部 HTTP 保持原 DNS 判断。原三个问题的失败回归及作者首轮测试导入失败日志均保留；最终作者受影响组合141项通过。实际 Aiohttp 适配层的 fake 边界测试证明原300秒和资产600秒超时传入客户端，取消会关闭响应与会话且不伪造完成。
 
 Root635 在1,605项输入的私有冻结源码副本上原样重跑三类独立复现，结果与固定旧源一致；随后受影响后端组合141项通过、exit 0、无超时，保留1条既有 Pydantic warning。候选源码、main及8个受保护文件、冻结输入前后一致；两个所属进程组与私有源码/TMP已清理。最终复核为 `haoai-next-storyboard-asset-review-633-sol-02.md`，冻结验证为 `haoai-next-root-storyboard-asset-gate-635.json`。这些证据仅覆盖当前六路后端运行时和host接线；前端提取编辑/确认/保存、图片与单镜/全镜生成以及真实Provider、浏览器/E2E和部署仍待，U06.4及21/18/51统计均不提升为整项完成。
+
+### Storyboard Asset React 操作闭环（2026-10-24）
+
+637 将六路素材提取/出场判断 SSE 与三类保存 API 接入 ChapterBrowser。用户可选择角色、场景或道具，选择模型、可选提示词、思考开关及镜头，编辑候选属性、丢弃或复用当前剧集素材、手工补候选，逐镜判断并调整绑定，查看 dry-run 计划后明确确认保存。未判定镜头保持原绑定，`[]` 与场景空字符串表示明确清空；已保存内容会重新读取章节、逐镜素材和素材库并核对后刷新页面。保存前按 owner/scope 回读，团队章节通过当前锁身份和本次租约校验；源变化或锁失效会阻止最终保存。未知保存回执冻结自动重试并要求人工读真源核对。
+
+为保持真实保存行为，`storyboard_save` 对有效混合场景保存中的逐镜空选择落地空绑定；`None`、未知非空名称仍保留原绑定，未选镜头不变，原有整体无可采用候选拒绝条件保持。SSE/HTTP 及 React 组合验证使用实际 producer wire fixture、受控 loopback HTTP、合成 SQLite/JWT；未连接真实 Provider、真实数据库或 R2。来源变化、租约失效、用户主动关闭、旧 scope 迟到结果及未知保存回执不重发均有定向 UI 覆盖；当前会话/迟到 HTTP 401 与传输取消由 asset HTTP 测试覆盖。作者最终验证命令、进程和日志摘要记录在本批证据目录 `haoai-next-storyboard-asset-ui-637`。
+
+作者最终受影响集合中，后端保存/producer 集成与共享 wire 测试为 101 项通过、1 条既有 Pydantic warning；前端 ChapterBrowser、Dialog、SSE/HTTP、services 与 Workspace 组合为 6 个文件、308 项通过。独立 TypeScript 检查与 Vite production build 均通过；Vite 转换 223 个模块，报告应用 chunk 超过 500 kB 提示，另有 React act 未 await 的既有测试 warning。首轮最终 TSC 发现测试文件中的未使用 helper，删除后对前端组合和 TSC 重新验证通过。实际运行命令、日志 SHA、owned PID/PGID 与退出/超时记录见 637 历史作者收据和 639 最终修复收据。
+
+Root638 的五项前端 Important 发现按同一范围修正：judge 请求按 kind 映射到真实的 `characters`/`scenes`/`props` 字段，并由共享 wire fixture 同时验证前端请求与后端 `JudgeRequest.parse`；角色/道具的未识别名称会留下逐镜 `null` 供人工核对，显式空数组仍代表清空；迟到的锁获取先登记本次 lease 再校验 owner/scope，最终锁检查后且开始写入前再次确认 owner/signal；SSE HTTP 默认预算与 services 下限统一为 650 秒（后端运行预算 600 秒并留 50 秒余量），显式短 timeout 注入和不重试行为仍保留。后端三组保存/producer/wire 组合 101 项通过；最终前端 6 文件 308 项通过；TSC 与 Vite build 通过。首轮最终前端组合因旧 loopback 断言仍写 `candidates` 而有 1 项失败，按实际共享合同修正断言后整组通过；两次日志均保留。638/639 RED、GREEN、最终 run 元数据和日志 SHA 见 `haoai-next-storyboard-asset-review-639` 作者收据。
+
+服务器保存协议没有 expected-content CAS，保存 application 仍为多个阶段；客户端回读/租约无法证明与其他客户端之间的服务器原子竞争，因此真实并发接受仍未闭合。图片、单镜/全镜生成、真实 Provider、浏览器/E2E、部署接受仍待；U06.4 保持 P/P，V=P / A=U，21/18/51 与 A01–A39 完整矩阵接受计数均不变。
+
+Root638 沿同一固定基线完成完整本地复核，并在修复后聚焦关闭五项 Important。Root640 在1,615项输入的私有冻结源码副本独立重跑原始请求合同、未知名称和计时预算复现：三类真实 JudgeRequest 解析通过，未知/部分未知名称保留 null，实际默认预算650秒。随后后端101项、前端6文件308项、TypeScript与Vite production build全部通过；前端使用单worker，未超时。候选源码、main及8个受保护文件、冻结输入前后一致，全部所属进程组和私有源码/TMP已清理。收据为 `haoai-next-root-storyboard-asset-ui-gate-640.json`。这些是当前素材提取确认/逐镜保存切片的源码与合成验证，仍不证明服务器CAS原子性、浏览器/E2E、真实Provider/DB/R2、部署或整行接受；21/18/51义务计数保持不变。

@@ -561,6 +561,11 @@ def _save_named_assets_stream(
                 frame = frames[frame_index]
                 names = appearance_names(entry)
                 if kind == "scene":
+                    if (isinstance(entry, list) and not entry) or (
+                        isinstance(entry, str) and not entry.strip()
+                    ):
+                        frame["scene"] = []
+                        continue
                     matched_id = None
                     for raw_name in names:
                         if not isinstance(raw_name, str) or not raw_name.strip():

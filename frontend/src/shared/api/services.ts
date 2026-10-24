@@ -147,6 +147,11 @@ import type { AssetReplacementPort } from "./assetReplacement";
 import { createAssetImageUploadHttpPort } from "./assetImageUploadHttp";
 import type { AssetImageUploadPort } from "./assetImageUpload";
 import {
+  createStoryboardAssetGenerationHttpPort,
+  STORYBOARD_ASSET_STREAM_TIMEOUT_MS,
+} from "./storyboardAssetGenerationHttp";
+import type { StoryboardAssetGenerationServicePort } from "./storyboardAssetGeneration";
+import {
   parseStoryboardModels,
   parseStoryboardPrompts,
   parseTwoPassQuote,
@@ -202,6 +207,7 @@ export interface WorkspaceServices {
   readonly assetMaintenance?: AssetMaintenanceServicePort;
   readonly assetReplacement?: AssetReplacementPort;
   readonly assetImageUpload?: AssetImageUploadPort;
+  readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
@@ -2925,6 +2931,12 @@ export function createApiServices(
       storage,
       fetcher,
       timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    storyboardAssetGeneration: createStoryboardAssetGenerationHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs: Math.max(timeoutMs, STORYBOARD_ASSET_STREAM_TIMEOUT_MS),
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     creatorSettings,

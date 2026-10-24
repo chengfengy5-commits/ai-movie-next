@@ -473,6 +473,90 @@ def test_scene_candidate_canonical_match_does_not_expand_library_fuzzy_reuse(
     assert "旧宴厅" in json.loads(rows_by_id[bound_scene_id]["aliases"])
 
 
+@pytest.mark.parametrize("clear_selection", [[], "  "])
+def test_scene_explicit_empty_selection_clears_only_selected_frame_and_dry_run_is_read_only(
+    storyboard_database: StoryboardDatabase,
+    clear_selection: object,
+) -> None:
+    db = storyboard_database
+    wire_fixture = json.loads(
+        (Path(__file__).resolve().parents[2] / "frontend/src/testing/fixtures/storyboardAssetWire.json")
+        .read_text(encoding="utf-8")
+    )
+    original_content = [
+        {"text": "清空场景", "scene": ["old-clear"], "storyboard": ["story-0"]},
+        {
+            "text": "绑定有效候选",
+            "scene": ["old-valid"],
+            "storyboard": ["story-1"],
+            "camera": {"move": "dolly"},
+        },
+        {"text": "未返回判定", "scene": ["keep-null"], "storyboard": ["story-2"]},
+        {"text": "无法匹配", "scene": ["keep-unmatched"], "storyboard": ["story-3"]},
+        {"text": "未选择", "scene": ["keep-unselected"], "storyboard": ["story-4"]},
+    ]
+    _replace_chapter_content(db.engine, "chapter-private", original_content)
+    _insert_storyboard_assets(db.engine, "chapter-private", "series-private", 5)
+    body = {
+        "chapter_id": "chapter-private",
+        "scenes": [{"title": "阁楼", "description": "新确认的阁楼"}],
+        "appearances": [clear_selection, ["阁楼"], None, ["不存在的场景"]],
+        "target_frames": [0, 1, 2, 3],
+    }
+
+    dry_run_response = _request(
+        _app(db),
+        "/api/storyboard/filter-and-save-scenes-stream",
+        json_body={**body, "dry_run": True},
+    )
+
+    assert dry_run_response.status_code == 200
+    dry_run_events = _events(dry_run_response)
+    assert dry_run_events[-1] == {"type": "done"}
+    dry_run_plan = next(event for event in dry_run_events if event["type"] == "plan")
+    assert dry_run_plan == {"type": "plan", **wire_fixture["save_plan"]}
+    assert next(event for event in dry_run_events if event["type"] == "complete") == wire_fixture["save_dry_run_complete"]
+    assert db.opened_sessions[-1].commit_count == 0
+    with db.engine.connect() as connection:
+        after_dry_run = json.loads(
+            connection.execute(
+                select(chapters.c.content).where(chapters.c.id == "chapter-private")
+            ).scalar_one()
+        )
+    assert after_dry_run == original_content
+
+    response = _request(
+        _app(db),
+        "/api/storyboard/filter-and-save-scenes-stream",
+        json_body={**body, "dry_run": False},
+    )
+
+    assert response.status_code == 200
+    events = _events(response)
+    assert events[-1] == {"type": "done"}
+    complete = next(event for event in events if event["type"] == "complete")
+    assert complete["unmatched_frames"] == [4]
+    with db.engine.connect() as connection:
+        saved_content = json.loads(
+            connection.execute(
+                select(chapters.c.content).where(chapters.c.id == "chapter-private")
+            ).scalar_one()
+        )
+        attic_scene_id = connection.execute(
+            select(scenes.c.id).where(
+                scenes.c.series_id == "series-private",
+                scenes.c.title == "阁楼",
+            )
+        ).scalar_one()
+
+    assert saved_content[0]["scene"] == []
+    assert saved_content[1]["scene"] == [attic_scene_id]
+    assert saved_content[1]["camera"] == {"move": "dolly"}
+    assert saved_content[2] == original_content[2]
+    assert saved_content[3] == original_content[3]
+    assert saved_content[4] == original_content[4]
+
+
 def test_props_empty_target_list_means_all_frames_and_duplicate_candidates_keep_legacy_inserts(
     storyboard_database: StoryboardDatabase,
 ) -> None:
