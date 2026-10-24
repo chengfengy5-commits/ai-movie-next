@@ -29,16 +29,25 @@ class OpenAITextStreamCodec:
     feed emits content, reasoning, and HTTP-200 error observations as soon as
     complete lines arrive. finalize flushes an unterminated final line and emits
     either the legacy reasoning-only content fallback or a terminal no-content
-    error. An HTTP error is emitted at finalization with its full body in detail
+    error. By default content from every choice is joined; first_choice_only is
+    available for older provider contracts that consume only the first choice.
+    An HTTP error is emitted at finalization with its full body in detail
     and a bounded body excerpt in message.
 
     [DONE] and DONE are ignored markers. EOF finalization is idempotent, and
     further bytes are ignored.
     """
 
-    def __init__(self, *, status_code: int = 200, url: str = "") -> None:
+    def __init__(
+        self,
+        *,
+        status_code: int = 200,
+        url: str = "",
+        first_choice_only: bool = False,
+    ) -> None:
         self._status_code = status_code
         self._url = url
+        self._first_choice_only = first_choice_only
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="ignore")
         self._line_buffer = ""
         self._http_error_body: list[str] = []
@@ -46,7 +55,14 @@ class OpenAITextStreamCodec:
         self._reasoning_parts: list[str] = []
         self._upstream_error = ""
         self._has_content = False
+        self._finish_reason: str | None = None
         self._finished = False
+
+    @property
+    def finish_reason(self) -> str | None:
+        """Return the last reported finish reason from the first choice."""
+
+        return self._finish_reason
 
     def feed(self, chunk: bytes) -> tuple[OpenAITextStreamEvent, ...]:
         """Consume one raw response chunk and return newly parsed events."""
@@ -131,9 +147,18 @@ class OpenAITextStreamCodec:
                 )
             ]
 
+        choices = payload.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            finish_reason = choices[0].get("finish_reason")
+            if isinstance(finish_reason, str) and finish_reason:
+                self._finish_reason = finish_reason
+
         text_parts: list[str] = []
         reasoning_parts: list[str] = []
-        for choice in payload.get("choices") or []:
+        choices = payload.get("choices") or []
+        if self._first_choice_only:
+            choices = choices[:1] if isinstance(choices, list) else []
+        for choice in choices:
             if not isinstance(choice, dict):
                 continue
             delta = choice.get("delta")

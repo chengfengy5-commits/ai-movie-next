@@ -24,6 +24,9 @@ from haoai_backend.runtime_status import (
     RuntimeStatusConfiguration,
     create_generation_schema_readiness_probe,
 )
+from haoai_backend.storyboard_asset_generation.openai_runtime import (
+    OpenAICompatibleStoryboardAssetRuntime,
+)
 
 from .configuration import ServerConfiguration, ServerConfigurationError
 from .generation import build_frame_optimize_configuration
@@ -123,6 +126,7 @@ def create_server_host(
             session_factory=session_factory,
             secret_key=configuration.secret_key.value,
         )
+        storyboard_asset_generation_runtime = OpenAICompatibleStoryboardAssetRuntime()
         storage: R2MediaUploadStorage | None = None
         storage_probe = None
         media_application: MediaUploadApplication
@@ -197,6 +201,7 @@ def create_server_host(
             runtime_status_storage_probe=storage_probe,
             media_upload_application=media_application,
             frame_optimize_worker_configuration=frame_optimize_configuration,
+            storyboard_asset_generation_runtime=storyboard_asset_generation_runtime,
         )
         app.state.server_session_factory = session_factory
         app.state.server_resources = resources

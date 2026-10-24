@@ -324,6 +324,41 @@ def test_server_host_cold_composition_uses_lazy_shared_dependencies(
     assert len(tracked_engines) == 1
 
 
+def test_server_host_injects_storyboard_asset_runtime_without_startup_io(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = load_server_configuration(
+        {
+            "ENVIRONMENT": "test",
+            "DATABASE_URL": f"sqlite:///{tmp_path / 'storyboard-asset-runtime.sqlite'}",
+            "SECRET_KEY": "synthetic-server-secret",
+        }
+    )
+    from haoai_backend import app as app_module
+    from backend.server import application as server_application
+    from haoai_backend.storyboard_asset_generation.openai_runtime import (
+        OpenAICompatibleStoryboardAssetRuntime,
+    )
+
+    captured: dict[str, object] = {}
+    original_create_app = app_module.create_app
+
+    def observe_create_app(**kwargs: object):
+        captured.update(kwargs)
+        return original_create_app(**kwargs)
+
+    monkeypatch.setattr(app_module, "create_app", observe_create_app)
+    host = server_application.create_server_host(configuration)
+    try:
+        assert isinstance(
+            captured["storyboard_asset_generation_runtime"],
+            OpenAICompatibleStoryboardAssetRuntime,
+        )
+    finally:
+        host.close()
+
+
 def _register_arguments(
     bundle_path: Path,
     *,
