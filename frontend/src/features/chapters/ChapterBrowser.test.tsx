@@ -2,7 +2,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { createElement, useLayoutEffect, useState, type ComponentProps } from "react";
-import type { Character, Chapter, ChapterEditLockAcquisition, ChapterEditLockLeaseHandle, ChapterEditLockState, CreateChapterInput, Series, StoryboardAsset, UpdateChapterInput } from "../../shared/api/contracts";
+import type { Character, Chapter, ChapterEditLockAcquisition, ChapterEditLockLeaseHandle, ChapterEditLockState, CreateChapterInput, Scene, Series, StoryboardAsset, UpdateChapterInput } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import type { PersonalRoughCutFrameTarget, PersonalRoughCutReadIdentity } from "./PersonalRoughCutPanel";
@@ -12,6 +12,13 @@ import {
 } from "../../shared/api/personalProductionNotes";
 import type { WorkspaceServices } from "../../shared/api/services";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
+import type {
+  StoryboardAssetGenerationServicePort,
+  StoryboardAssetKind,
+  StoryboardAssetSaveInput,
+  StoryboardAssetStreamEvent,
+} from "../../shared/api/storyboardAssetGeneration";
+import storyboardAssetWire from "../../testing/fixtures/storyboardAssetWire.json";
 import type { FrameReviewCapabilities, FrameReviewServicePort, FrameReviewTask } from "../../shared/api/frameReview";
 import { parseFrameOptimizeTaskStatus } from "../../shared/api/frameOptimizeHttp";
 import type {
@@ -305,6 +312,114 @@ function renderBrowser(
   return { ...view, onBack, onUnauthorized };
 }
 
+async function prepareSceneAssetDialog(
+  selectedSeries: Series = series,
+  preparePlan = true,
+  forgedExistingId: string | null = null,
+) {
+  const user = userEvent.setup();
+  const current = chapter("chapter-asset-scene-boundary", "素材确认边界章节", [
+    { text: "镜头一：阁楼里有一把旧钥匙。", scene: ["original-scene"] },
+  ]);
+  const base = makeServices([current], {}, false, true);
+  const model: CreatorModel = {
+    id: "scene-boundary-model",
+    category: "text",
+    name: "场景边界模型",
+    provider: "openai",
+    params: null,
+    sort_order: 1,
+    is_system: false,
+    user_id: "demo-user",
+  };
+  const creatorSettings = {
+    listModels: vi.fn(async () => [model]),
+    listPrompts: vi.fn(async () => [] as CreatorPrompt[]),
+  } as unknown as Pick<CreatorSettingsServicePort, "listModels" | "listPrompts">;
+  const event = (type: StoryboardAssetStreamEvent["type"], data: Record<string, unknown>): StoryboardAssetStreamEvent => ({ type, data });
+  const candidate = { title: "阁楼", description: "旧屋的阁楼" };
+  const sceneLibrary: Scene[] = [];
+  const plan = {
+    ...storyboardAssetWire.save_dry_run_complete.plan,
+    items: storyboardAssetWire.save_dry_run_complete.plan.items.map((item) => ({ ...item, frames: [1] })),
+    frame_map: [{ frame: 1, candidates: [candidate.title] }],
+  };
+  const streamExtract = vi.fn(async function* () {
+    yield event("start", { type: "start", message: "开始提取场景..." });
+    yield event("complete", {
+      ...storyboardAssetWire.producer.extract_complete.scene,
+      scenes: [forgedExistingId === null
+        ? candidate
+        : { ...candidate, existing_id: forgedExistingId, is_existing: true, is_backfill: true }],
+    });
+    yield event("done", { type: "done" });
+  });
+  const streamJudge = vi.fn(async function* () {
+    yield event("start", { type: "start", message: "开始判断出场..." });
+    yield event("complete", {
+      ...storyboardAssetWire.producer.judge_complete.scene,
+      appearances: [candidate.title],
+      scenes: [candidate],
+    });
+    yield event("done", { type: "done" });
+  });
+  const streamSave = vi.fn(async function* (_kind: StoryboardAssetKind, input: StoryboardAssetSaveInput) {
+    if (input.dry_run) {
+      yield event("start", { type: "start", message: "开始预览保存..." });
+      yield event("plan", plan);
+      yield event("complete", { ...storyboardAssetWire.save_dry_run_complete, plan });
+    } else {
+      const created: Scene = {
+        id: "created-scene-boundary",
+        series_id: current.series_id,
+        title: candidate.title,
+        description: candidate.description,
+        image_url: null,
+        aliases: [],
+        canonical_key: null,
+        created_at: "2026-10-24T00:00:00Z",
+        updated_at: "2026-10-24T00:00:00Z",
+      };
+      sceneLibrary.push(created);
+      const appearanceByFrame = new Map(input.target_frames.map((frame, slot) => [frame, input.appearances[slot]]));
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => {
+        if (row.id !== current.id || row.content === null) return row;
+        return {
+          ...row,
+          content: row.content.map((frame, index) => {
+            const appearance = appearanceByFrame.get(index);
+            if (appearance === undefined || appearance === null) return frame;
+            return { ...frame, scene: appearance === candidate.title ? [created.id] : [] };
+          }),
+        };
+      }));
+      yield event("complete", { type: "complete", success: true, dry_run: false, message: "保存完成" });
+    }
+    yield event("done", { type: "done" });
+  });
+  const generation: StoryboardAssetGenerationServicePort = { streamExtract, streamJudge, streamSave };
+  const services: WorkspaceServices = {
+    ...base.services,
+    creatorSettings: creatorSettings as unknown as NonNullable<WorkspaceServices["creatorSettings"]>,
+    listScenes: vi.fn(async () => sceneLibrary),
+    storyboardAssetGeneration: generation,
+  };
+
+  const view = renderBrowser(services, vi.fn(), vi.fn(), selectedSeries);
+  await user.click(await screen.findByRole("button", { name: "提取并确认素材" }));
+  const dialog = within(await screen.findByRole("dialog", { name: "提取并确认素材" }));
+  await user.selectOptions(dialog.getByRole("combobox", { name: "素材类别" }), "scene");
+  await user.click(dialog.getByRole("button", { name: "提取场景" }));
+  await screen.findByRole("heading", { name: "编辑场景候选" });
+  if (preparePlan) {
+    await user.click(dialog.getByRole("button", { name: "判断出场并继续" }));
+    await screen.findByRole("heading", { name: "逐镜出场与绑定" });
+    await user.click(dialog.getByRole("button", { name: "生成 dry-run 保存计划" }));
+    await screen.findByRole("heading", { name: /保存计划/ });
+  }
+  return { user, base, current, dialog, sceneLibrary, streamExtract, streamJudge, streamSave, services, view };
+}
+
 function attachFrameOptimizeServices(
   services: WorkspaceServices,
   overrides: Partial<FrameOptimizeServicePort> = {},
@@ -512,6 +627,341 @@ describe("read-only chapter browser", () => {
     roughCutPanelBridge.lastTarget = null;
     roughCutPanelBridge.onFrameNavigationInvalidated = null;
     roughCutPanelBridge.lastInvalidation = null;
+  });
+
+  it("opens the chapter asset extraction and confirmation flow from the chapter page", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-asset-extraction-entry", "素材提取章节", [
+      { text: "镜头一：周晴走进旧屋。", storyboard: ["asset-extraction-entry-frame"] },
+    ]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("asset-extraction-entry-frame", current.id), frame_index: 0 }],
+    }, false, true);
+    const model: CreatorModel = {
+      id: "asset-extraction-model",
+      category: "text",
+      name: "素材提取模型",
+      provider: "openai",
+      params: null,
+      sort_order: 1,
+      is_system: false,
+      user_id: "demo-user",
+    };
+    const creatorSettings = {
+      listModels: vi.fn(async () => [model]),
+      listPrompts: vi.fn(async () => [] as CreatorPrompt[]),
+    } as unknown as Pick<CreatorSettingsServicePort, "listModels" | "listPrompts">;
+    const generation: StoryboardAssetGenerationServicePort = {
+      streamExtract: vi.fn(async function* () {}),
+      streamJudge: vi.fn(async function* () {}),
+      streamSave: vi.fn(async function* () {}),
+    };
+    Object.assign(base.services, {
+      creatorSettings,
+      storyboardAssetGeneration: generation,
+    });
+
+    renderBrowser(base.services);
+
+    await user.click(await screen.findByRole("button", { name: "提取并确认素材" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "提取并确认素材" }));
+    expect(dialog.getByRole("combobox", { name: "模型" })).toHaveValue(model.id);
+    expect(dialog.getByRole("checkbox", { name: "选择镜头 1" })).toBeChecked();
+    expect(dialog.getByText("镜头一：周晴走进旧屋。")).toBeInTheDocument();
+    expect(base.updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("saves a confirmed scene plan, preserves null bindings, clears an explicit empty choice, and reads it back", async () => {
+    const user = userEvent.setup();
+    const original = chapter("chapter-asset-scene-save", "场景素材章节", [
+      { text: "第一镜：夜色书房。", scene: ["existing-scene"] },
+      { text: "第二镜：只保留旧场景。", scene: ["preserve-selected-scene"] },
+      { text: "第三镜：明确没有场景。", scene: ["clear-this-scene"] },
+      { text: "第四镜不参与本次操作。", scene: ["keep-unselected-scene"] },
+    ]);
+    const base = makeServices([original], {}, true, true);
+    const existingScene: Scene = {
+      id: "existing-scene",
+      series_id: series.id,
+      title: "夜色书房",
+      description: "当前剧集场景",
+      image_url: null,
+      aliases: [],
+      canonical_key: null,
+      created_at: "2026-10-01T00:00:00Z",
+      updated_at: "2026-10-01T00:00:00Z",
+    };
+    const model: CreatorModel = {
+      id: "scene-extraction-model",
+      category: "text",
+      name: "场景提取模型",
+      provider: "openai",
+      params: null,
+      sort_order: 1,
+      is_system: false,
+      user_id: "demo-user",
+    };
+    const creatorSettings = {
+      listModels: vi.fn(async () => [model]),
+      listPrompts: vi.fn(async () => [] as CreatorPrompt[]),
+    } as unknown as Pick<CreatorSettingsServicePort, "listModels" | "listPrompts">;
+    const wireEvent = (type: StoryboardAssetStreamEvent["type"], data: Record<string, unknown>): StoryboardAssetStreamEvent => ({ type, data });
+    const name = "夜色书房";
+    const streamExtract = vi.fn(async function* (_kind: StoryboardAssetKind) {
+      yield wireEvent("start", { type: "start", message: "开始提取素材..." });
+      yield wireEvent("complete", storyboardAssetWire.producer.extract_complete.scene);
+      yield wireEvent("done", { type: "done" });
+    });
+    const streamJudge = vi.fn(async function* (_kind: StoryboardAssetKind) {
+      yield wireEvent("start", { type: "start", message: "开始判断出场..." });
+      yield wireEvent("complete", {
+        ...storyboardAssetWire.producer.judge_complete.scene,
+        appearances: [[name], null, [name]],
+      });
+      yield wireEvent("done", { type: "done" });
+    });
+    const streamSave = vi.fn(async function* (_kind: StoryboardAssetKind, input: StoryboardAssetSaveInput) {
+      const plan = {
+        asset_type: "scene",
+        items: [{
+          name,
+          status: "reuse",
+          reason: "",
+          frames: [1],
+          existing_id: existingScene.id,
+          existing_name: name,
+          is_existing: true,
+          is_backfill: true,
+          description: existingScene.description ?? "",
+          aliases: [],
+        }],
+        frame_map: input.target_frames.map((frame, slot) => ({
+          frame: frame + 1,
+          candidates: input.appearances[slot] === name ? [name] : [],
+        })),
+      };
+      if (input.dry_run) {
+        yield wireEvent("start", { type: "start", message: "开始预览保存..." });
+        yield wireEvent("plan", plan);
+        yield wireEvent("complete", { type: "complete", success: true, dry_run: true, plan, message: "预览完成" });
+        yield wireEvent("done", { type: "done" });
+        return;
+      }
+      const chapters = base.getCurrentChapters().map((row) => {
+        if (row.id !== original.id || row.content === null) return row;
+        const appearances = new Map(input.target_frames.map((frame, slot) => [frame, input.appearances[slot]]));
+        return {
+          ...row,
+          content: row.content.map((frame, index) => {
+            const appearance = appearances.get(index);
+            if (appearance === undefined || appearance === null) return frame;
+            const names = typeof appearance === "string" ? (appearance === "" ? [] : [appearance]) : [];
+            return { ...frame, scene: names.map(() => existingScene.id) };
+          }),
+        };
+      });
+      base.setCurrentChapters(chapters);
+      yield wireEvent("complete", { type: "complete", success: true, message: "保存完成" });
+      yield wireEvent("done", { type: "done" });
+    });
+    const generation: StoryboardAssetGenerationServicePort = { streamExtract, streamJudge, streamSave };
+    const services: WorkspaceServices = {
+      ...base.services,
+      creatorSettings: creatorSettings as unknown as NonNullable<WorkspaceServices["creatorSettings"]>,
+      listScenes: vi.fn(async () => [existingScene]),
+      storyboardAssetGeneration: generation,
+    };
+
+    renderBrowser(services);
+
+    await user.click(await screen.findByRole("button", { name: "提取并确认素材" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "提取并确认素材" }));
+    await user.selectOptions(dialog.getByRole("combobox", { name: "素材类别" }), "scene");
+    await user.click(dialog.getByRole("checkbox", { name: "选择镜头 4" }));
+    await user.click(dialog.getByRole("button", { name: "提取场景" }));
+    await screen.findByRole("heading", { name: "编辑场景候选" });
+    await user.selectOptions(dialog.getByRole("combobox", { name: "复用场景" }), existingScene.id);
+    await user.click(dialog.getByRole("button", { name: "判断出场并继续" }));
+    await screen.findByRole("heading", { name: "逐镜出场与绑定" });
+    expect(dialog.getByRole("combobox", { name: "镜头 2 场景绑定" })).toHaveValue("__preserve_original_binding__");
+    await user.selectOptions(dialog.getByRole("combobox", { name: "镜头 3 场景绑定" }), "");
+    await user.click(dialog.getByRole("button", { name: "生成 dry-run 保存计划" }));
+    await screen.findByRole("heading", { name: /保存计划/ });
+    await user.click(dialog.getByRole("checkbox", { name: /我已核对候选/ }));
+    await user.click(dialog.getByRole("button", { name: "明确确认并保存" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "提取并确认素材" })).not.toBeInTheDocument());
+    expect(await screen.findByText("素材、章节与逐镜绑定已重新读取并核对。" )).toBeInTheDocument();
+    expect(streamSave).toHaveBeenCalledTimes(2);
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({ target_frames: [0, 1, 2], appearances: [name, null, ""], dry_run: true });
+    expect(streamSave.mock.calls[1]?.[1]).toMatchObject({ target_frames: [0, 1, 2], appearances: [name, null, ""], dry_run: false });
+    const saved = base.getCurrentChapters()[0]?.content;
+    expect(saved?.map((frame) => frame.scene)).toEqual([
+      [existingScene.id],
+      ["preserve-selected-scene"],
+      [],
+      ["keep-unselected-scene"],
+    ]);
+    expect(base.updateChapter).not.toHaveBeenCalled();
+    expect(base.listChapters.mock.calls.length).toBeGreaterThan(2);
+  });
+
+  it("stops before the final save when the chapter source changes after dry-run", async () => {
+    const { user, base, current, dialog, streamSave } = await prepareSceneAssetDialog();
+    base.setCurrentChapters([{
+      ...current,
+      content: [{ text: "另一位编辑刚刚修改了这一镜。", scene: ["original-scene"] }],
+    }]);
+
+    await user.click(dialog.getByRole("checkbox", { name: /我已核对候选/ }));
+    await user.click(dialog.getByRole("button", { name: "明确确认并保存" }));
+
+    expect(await screen.findByText(/章节文字、镜头顺序、原图或当前剧集素材目录已变化/)).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "提取并确认素材" })).not.toBeInTheDocument();
+    expect(streamSave).toHaveBeenCalledTimes(1);
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({ dry_run: true });
+    expect(base.updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("ignores an AI-provided foreign scene ID and saves the candidate as newly created", async () => {
+    const forgedId = "scene-from-another-series";
+    const { user, base, current, dialog, sceneLibrary, streamSave } = await prepareSceneAssetDialog(series, true, forgedId);
+
+    await user.click(dialog.getByRole("checkbox", { name: /我已核对候选/ }));
+    await user.click(dialog.getByRole("button", { name: "明确确认并保存" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "提取并确认素材" })).not.toBeInTheDocument());
+    expect(await screen.findByText("素材、章节与逐镜绑定已重新读取并核对。")).toBeInTheDocument();
+    expect(streamSave).toHaveBeenCalledTimes(2);
+    const finalInput = streamSave.mock.calls[1]?.[1];
+    expect(finalInput).toMatchObject({
+      dry_run: false,
+      candidates: [{ title: "阁楼", is_existing: false, is_backfill: false }],
+    });
+    expect([null, undefined]).toContain(finalInput?.candidates[0]?.existing_id);
+    expect(JSON.stringify(finalInput)).not.toContain(forgedId);
+    expect(sceneLibrary).toMatchObject([{ id: "created-scene-boundary", series_id: current.series_id, title: "阁楼" }]);
+    expect(base.getCurrentChapters()[0]?.content?.[0]?.scene).toEqual(["created-scene-boundary"]);
+    expect(base.updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("does not send the final save after the acquired team lock identity is lost", async () => {
+    const teamSeries = { ...series, team_id: "team-asset-lock-boundary" };
+    const { user, base, dialog, streamSave } = await prepareSceneAssetDialog(teamSeries);
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    base.getChapterEditLock
+      .mockResolvedValueOnce({ locked: false })
+      .mockResolvedValueOnce(ownedLock)
+      .mockResolvedValueOnce({ locked: false });
+
+    await user.click(dialog.getByRole("checkbox", { name: /我已核对候选/ }));
+    await user.click(dialog.getByRole("button", { name: "明确确认并保存" }));
+
+    expect(await dialog.findByText("最终保存前无法再次确认当前账号仍持有同一有效编辑锁。")).toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "提取并确认素材" })).toBeInTheDocument();
+    expect(base.getChapterEditLock).toHaveBeenCalledTimes(3);
+    expect(base.releaseChapterEditLock).toHaveBeenCalledTimes(1);
+    expect(streamSave).toHaveBeenCalledTimes(1);
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({ dry_run: true });
+    expect(base.updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("releases a team lock acquired after the asset dialog scope has changed", async () => {
+    const teamSeries = { ...series, team_id: "team-asset-late-acquire" };
+    const { user, base, current, dialog, streamSave, services, view } = await prepareSceneAssetDialog(teamSeries);
+    const pendingAcquisition = deferred<ChapterEditLockAcquisition>();
+    const lease = {} as ChapterEditLockLeaseHandle;
+    const acquiredState: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    base.acquireChapterEditLock.mockImplementation(() => pendingAcquisition.promise);
+
+    await user.click(dialog.getByRole("checkbox", { name: /我已核对候选/ }));
+    await user.click(dialog.getByRole("button", { name: "明确确认并保存" }));
+    await waitFor(() => expect(base.acquireChapterEditLock).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={view.onBack}
+        onUnauthorized={view.onUnauthorized}
+        series={{ ...teamSeries, id: "team-asset-late-acquire-new-scope" }}
+        services={services}
+        userId="new-user-scope"
+      />,
+    );
+    await act(async () => {
+      pendingAcquisition.resolve({ state: acquiredState, lease });
+      await pendingAcquisition.promise;
+    });
+
+    await waitFor(() => expect(base.releaseChapterEditLock).toHaveBeenCalledTimes(1));
+    expect(base.releaseChapterEditLock).toHaveBeenCalledWith(current.id, expect.any(AbortSignal), lease);
+    expect(streamSave).toHaveBeenCalledTimes(1);
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({ dry_run: true });
+  });
+
+  it("does not start the final save when scope changes during the last lock read", async () => {
+    const teamSeries = { ...series, team_id: "team-asset-final-lock-read" };
+    const { user, base, dialog, streamSave, services, view } = await prepareSceneAssetDialog(teamSeries);
+    const pendingFinalCheck = deferred<ChapterEditLockState>();
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-15T10:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    base.getChapterEditLock
+      .mockResolvedValueOnce({ locked: false })
+      .mockResolvedValueOnce(ownedLock)
+      .mockImplementationOnce(() => pendingFinalCheck.promise);
+
+    await user.click(dialog.getByRole("checkbox", { name: /我已核对候选/ }));
+    await user.click(dialog.getByRole("button", { name: "明确确认并保存" }));
+    await waitFor(() => expect(base.getChapterEditLock).toHaveBeenCalledTimes(3));
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={view.onBack}
+        onUnauthorized={view.onUnauthorized}
+        series={{ ...teamSeries, id: "team-asset-final-lock-read-new-scope" }}
+        services={services}
+        userId="new-user-scope"
+      />,
+    );
+    await act(async () => {
+      pendingFinalCheck.resolve(ownedLock);
+      await pendingFinalCheck.promise;
+    });
+
+    expect(base.getChapterEditLock).toHaveBeenCalledTimes(3);
+    expect(base.releaseChapterEditLock).toHaveBeenCalledTimes(1);
+    expect(streamSave).toHaveBeenCalledTimes(1);
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({ dry_run: true });
+  });
+
+  it("stops after a user closes the extracted candidate dialog without judging or saving", async () => {
+    const { user, dialog, streamJudge, streamSave } = await prepareSceneAssetDialog(series, false);
+    expect(await screen.findByRole("heading", { name: "编辑场景候选" })).toBeInTheDocument();
+
+    await user.click(dialog.getByRole("button", { name: "关闭素材提取" }));
+
+    expect(screen.queryByRole("dialog", { name: "提取并确认素材" })).not.toBeInTheDocument();
+    expect(streamJudge).not.toHaveBeenCalled();
+    expect(streamSave).not.toHaveBeenCalled();
   });
 
   it("confirms repeated frame reviews using each admission source while preserving historic original text", async () => {

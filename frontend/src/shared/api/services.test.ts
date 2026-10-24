@@ -122,6 +122,32 @@ async function startFixture(overrides: Record<string, string> = {}): Promise<Fix
 describe("API services", () => {
   afterEach(() => vi.restoreAllMocks());
 
+  it("keeps the storyboard stream timeout above the backend runtime even when the general API timeout is short", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "fixture-demo-token");
+    const fetcher = vi.fn(async () => jsonResponse({ detail: "synthetic unauthorized" }, 401)) as typeof fetch;
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher, timeoutMs: 1 });
+    const generation = services.storyboardAssetGeneration;
+    if (generation === undefined) throw new Error("Expected the API mode storyboard generation port to be available.");
+    const timerSpy = vi.spyOn(globalThis, "setTimeout");
+
+    try {
+      const pending = (async () => {
+        for await (const _event of generation.streamExtract("character", {
+          chapter_id: "chapter-1", model_id: "model-1", prompt_id: null, enable_thinking: false, frame_indices: null,
+        }, new AbortController().signal)) {
+          // The synthetic response is unauthorized and should not emit stream events.
+        }
+      })();
+
+      await expect(pending).rejects.toMatchObject({ status: 401 });
+      expect(timerSpy.mock.calls.some(([, delay]) => Number(delay) === 650_000)).toBe(true);
+      expect(fetcher).toHaveBeenCalledTimes(1);
+    } finally {
+      timerSpy.mockRestore();
+    }
+  });
+
   it("wires read-only team reporting only in API mode", () => {
     const storage = new MemoryStorage();
     const fetcher = vi.fn(async () => jsonResponse({})) as typeof fetch;

@@ -1,0 +1,182 @@
+{
+  "judge_requests": [
+    {
+      "kind": "character",
+      "input": {
+        "chapter_id": "synthetic-chapter",
+        "model_id": "synthetic-model",
+        "prompt_id": "synthetic-prompt",
+        "enable_thinking": true,
+        "skip_merge": true,
+        "candidates": [{ "name": "顾宁", "aliases": ["宁宁"] }],
+        "storyboard_texts": ["合成镜头一", "合成镜头三"],
+        "frame_numbers": [1, 3]
+      },
+      "wire": {
+        "chapter_id": "synthetic-chapter",
+        "model_id": "synthetic-model",
+        "prompt_id": "synthetic-prompt",
+        "enable_thinking": true,
+        "skip_merge": true,
+        "characters": [{ "name": "顾宁", "aliases": ["宁宁"] }],
+        "storyboard_texts": ["合成镜头一", "合成镜头三"],
+        "frame_numbers": [1, 3]
+      }
+    },
+    {
+      "kind": "scene",
+      "input": {
+        "chapter_id": "synthetic-chapter",
+        "model_id": "synthetic-model",
+        "prompt_id": "synthetic-prompt",
+        "enable_thinking": true,
+        "skip_merge": true,
+        "candidates": [{ "title": "夜色书房", "aliases": [] }],
+        "storyboard_texts": ["合成镜头一", "合成镜头三"],
+        "frame_numbers": [1, 3]
+      },
+      "wire": {
+        "chapter_id": "synthetic-chapter",
+        "model_id": "synthetic-model",
+        "prompt_id": "synthetic-prompt",
+        "enable_thinking": true,
+        "skip_merge": true,
+        "scenes": [{ "title": "夜色书房", "aliases": [] }],
+        "storyboard_texts": ["合成镜头一", "合成镜头三"],
+        "frame_numbers": [1, 3]
+      }
+    },
+    {
+      "kind": "prop",
+      "input": {
+        "chapter_id": "synthetic-chapter",
+        "model_id": "synthetic-model",
+        "prompt_id": "synthetic-prompt",
+        "enable_thinking": true,
+        "skip_merge": true,
+        "candidates": [{ "name": "旧钥匙" }],
+        "storyboard_texts": ["合成镜头一", "合成镜头三"],
+        "frame_numbers": [1, 3]
+      },
+      "wire": {
+        "chapter_id": "synthetic-chapter",
+        "model_id": "synthetic-model",
+        "prompt_id": "synthetic-prompt",
+        "enable_thinking": true,
+        "skip_merge": true,
+        "props": [{ "name": "旧钥匙" }],
+        "storyboard_texts": ["合成镜头一", "合成镜头三"],
+        "frame_numbers": [1, 3]
+      }
+    }
+  ],
+  "producer": {
+    "runtime": {
+      "extract": {
+        "character": "[{\"name\":\"顾宁\",\"gender\":\"女\",\"age\":\"32\",\"role\":\"记者\",\"appearance\":\"短发\",\"voice_ref\":\"清冷\",\"aliases\":[\"宁宁\"]}]",
+        "scene": "[\"夜色书房\"]",
+        "prop": "[\"旧钥匙\"]"
+      },
+      "judge": {
+        "character": "[[{\"character\":\"顾宁\"}]]",
+        "scene": "[[{\"title\":\"夜色书房\"}]]",
+        "prop": "[[{\"prop\":\"旧钥匙\"}]]"
+      }
+    },
+    "extract_complete": {
+      "character": {
+        "type": "complete",
+        "characters": [{"name": "顾宁", "gender": "女", "age": "32", "role": "记者", "appearance": "短发", "voice_ref": "清冷", "aliases": ["宁宁"]}],
+        "raw_response": "[{\"name\":\"顾宁\",\"gender\":\"女\",\"age\":\"32\",\"role\":\"记者\",\"appearance\":\"短发\",\"voice_ref\":\"清冷\",\"aliases\":[\"宁宁\"]}]",
+        "character_count": 1
+      },
+      "scene": {
+        "type": "complete",
+        "scenes": [{"title": "夜色书房", "description": ""}],
+        "raw_response": "[\"夜色书房\"]",
+        "scene_count": 1
+      },
+      "prop": {
+        "type": "complete",
+        "props": [{"name": "旧钥匙", "description": ""}],
+        "raw_response": "[\"旧钥匙\"]",
+        "prop_count": 1
+      }
+    },
+    "judge_complete": {
+      "character": {
+        "type": "complete",
+        "appearances": [["顾宁"]],
+        "missing_frames": [],
+        "merged_characters": [{"name": "顾宁", "gender": "女", "aliases": ["宁宁"]}],
+        "raw_response": "[[{\"character\":\"顾宁\"}]]"
+      },
+      "scene": {
+        "type": "complete",
+        "appearances": ["夜色书房"],
+        "missing_frames": [],
+        "scenes": [{"title": "夜色书房", "description": ""}],
+        "raw_response": "[[{\"title\":\"夜色书房\"}]]"
+      },
+      "prop": {
+        "type": "complete",
+        "appearances": [["旧钥匙"]],
+        "missing_frames": [],
+        "props": [{"name": "旧钥匙", "description": ""}],
+        "raw_response": "[[{\"prop\":\"旧钥匙\"}]]"
+      }
+    }
+  },
+  "save_plan": {
+    "asset_type": "scene",
+    "items": [
+      {
+        "name": "阁楼",
+        "status": "create",
+        "reason": "",
+        "frames": [2],
+        "existing_id": null,
+        "existing_name": null,
+        "is_backfill": false,
+        "description": "新确认的阁楼"
+      }
+    ],
+    "frame_map": [
+      {"frame": 1, "candidates": []},
+      {"frame": 2, "candidates": ["阁楼"]},
+      {"frame": 4, "candidates": []}
+    ]
+  },
+  "save_dry_run_complete": {
+    "type": "complete",
+    "success": true,
+    "dry_run": true,
+    "plan": {
+      "asset_type": "scene",
+      "items": [
+        {
+          "name": "阁楼",
+          "status": "create",
+          "reason": "",
+          "frames": [2],
+          "existing_id": null,
+          "existing_name": null,
+          "is_backfill": false,
+          "description": "新确认的阁楼"
+        }
+      ],
+      "frame_map": [
+        {"frame": 1, "candidates": []},
+        {"frame": 2, "candidates": ["阁楼"]},
+        {"frame": 4, "candidates": []}
+      ]
+    },
+    "message": "已生成待确认清单：1 条候选（复用已有 0，拟新建 1）",
+    "total_count": 1,
+    "extracted_count": 1,
+    "adopted_count": 1,
+    "dropped_count": 0,
+    "dropped_names": [],
+    "candidate_count": 1
+  }
+}
