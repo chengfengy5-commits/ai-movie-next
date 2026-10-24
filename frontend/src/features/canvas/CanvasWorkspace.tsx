@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type WheelEvent } from "react";
 import type { Chapter, ChapterEditLockLeaseHandle, Series } from "../../shared/api/contracts";
-import type { CanvasDataPort } from "../../shared/api/canvasData";
+import { isRecord, type CanvasDataPort } from "../../shared/api/canvasData";
 import { ApiError } from "../../shared/api/errors";
 import {
   CANVAS_SOURCE_CAPABILITY,
@@ -36,6 +36,7 @@ import {
   patchCanvasItem,
   patchCanvasViewport,
   patchHiddenRelation,
+  hasCanvasLayout,
   patchNodeLayout,
   removeCanvasItem,
   type CanvasDocument,
@@ -92,6 +93,12 @@ interface CanvasCreationUndo {
   sourceVersion: string;
   receipt: CanvasCreationReceipt;
   label: string;
+}
+
+interface OwnedAssetPlacement {
+  ref: string;
+  x: number;
+  y: number;
 }
 
 type CanvasSourceWriteOutcome =
@@ -224,6 +231,26 @@ function itemId(): string {
     : "canvas-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2);
 }
 
+function removeOwnedAssetPlacement(document: CanvasDocument, placement: OwnedAssetPlacement): CanvasDocument | null {
+  const layouts = document.nodeLayouts;
+  if (Array.isArray(layouts)) {
+    const matches = layouts.flatMap((item, index) => isRecord(item) && item.refId === placement.ref ? [index] : []);
+    if (matches.length !== 1) return null;
+    const index = matches[0]!;
+    const layout = layouts[index];
+    if (!isRecord(layout) || Object.keys(layout).length !== 3
+      || layout.x !== placement.x || layout.y !== placement.y) return null;
+    return { ...document, nodeLayouts: layouts.filter((_item, itemIndex) => itemIndex !== index) };
+  }
+  if (!isRecord(layouts) || !Object.prototype.hasOwnProperty.call(layouts, placement.ref)) return null;
+  const layout = layouts[placement.ref];
+  if (!isRecord(layout) || Object.keys(layout).length !== 2
+    || layout.x !== placement.x || layout.y !== placement.y) return null;
+  const nextLayouts = { ...layouts };
+  delete nextLayouts[placement.ref];
+  return { ...document, nodeLayouts: nextLayouts };
+}
+
 function isTextInput(target: EventTarget | null): boolean {
   return target instanceof HTMLElement
     && (target.isContentEditable || target.matches("input, textarea, select, [contenteditable='true']"));
@@ -284,6 +311,7 @@ export function CanvasWorkspace({
   const sourceEditorRef = useRef<CanvasSourceEditor | null>(sourceEditor);
   sourceEditorRef.current = sourceEditor;
   const [creationUndos, setCreationUndos] = useState<CanvasCreationUndo[]>([]);
+  const createdAssetPlacementsRef = useRef(new Map<string, OwnedAssetPlacement>());
   const sourceOperationControllerRef = useRef<AbortController | null>(null);
   const acquiredLockLeaseRef = useRef<{
     chapterId: string;
@@ -320,6 +348,7 @@ export function CanvasWorkspace({
     setSourceReadbackPending(false);
     setSourceMutationPending(false);
     setCreationUndos([]);
+    createdAssetPlacementsRef.current.clear();
     setSourceMessage(null);
     setSelectedNode(null);
     setSelectedEdge(null);
@@ -612,12 +641,17 @@ export function CanvasWorkspace({
     applyDocument(patchHiddenRelation(documentState.document, relation, count === 0));
   }
 
-  function applySourceSnapshot(snapshot: CanvasSourceSnapshot, transition?: CanvasSourceTransition): void {
+  function applySourceSnapshot(
+    snapshot: CanvasSourceSnapshot,
+    transition?: CanvasSourceTransition,
+    transformDocument?: (document: CanvasDocument | null) => CanvasDocument | null,
+  ): void {
     const previous = sourcesRef.current;
+    const currentDocument = documentState.document;
+    let nextDocument = currentDocument;
     if (transition !== undefined && previous !== null && sourceSnapshotMatchesScope(snapshot)
       && previous.version !== snapshot.version && previous.series_id === snapshot.series_id
       && previous.chapter_id === snapshot.chapter_id) {
-      const currentDocument = documentState.document;
       const reconciledCurrent = currentDocument === null
         ? null
         : bindCanvasSourceDocumentTransition(currentDocument, previous, snapshot, transition);
@@ -633,13 +667,77 @@ export function CanvasWorkspace({
           const remapped = reconciledCurrent.document;
           if (!documentEqual(currentDocument, remapped)) {
             sourceBindingDraftRef.current = sourceBindingDraftRef.current || !documentState.dirty;
-            documentState.edit(remapped);
           }
+          nextDocument = remapped;
         }
       }
     }
+    if (transformDocument !== undefined) nextDocument = transformDocument(nextDocument);
+    if (documentState.writable && currentDocument !== null && nextDocument !== null
+      && !documentEqual(currentDocument, nextDocument)) {
+      documentState.edit(nextDocument);
+    }
     sourcesRef.current = snapshot;
     setSources(snapshot);
+  }
+
+  function canPersistAssetPlacement(): boolean {
+    const document = documentState.document;
+    return documentState.writable && document !== null
+      && (document.nodeLayouts === undefined || Array.isArray(document.nodeLayouts) || isRecord(document.nodeLayouts));
+  }
+
+  function placeConfirmedAsset(
+    command: Extract<CanvasSourceCommand, { type: "asset.create" }>,
+    snapshot: CanvasSourceSnapshot,
+    receipt: CanvasCreationReceipt | null,
+    document: CanvasDocument | null,
+  ): CanvasDocument | null {
+    if (receipt === null || receipt.kind !== command.kind || typeof receipt.target.id !== "string") return document;
+    const id = receipt.target.id;
+    const matches = assetCollection(snapshot, command.kind).filter((asset) => asset.id === id);
+    if (matches.length !== 1 || matches[0]?.series_id !== series.id) return document;
+
+    if (!documentState.writable || document === null) {
+      setSourceMessage("服务器已确认素材创建，但当前画布无法安全保存位置；未按名称或章节引用猜测布局。");
+      return document;
+    }
+
+    const ref = `${command.kind}:${id}`;
+    if (hasCanvasLayout(document, ref)) {
+      setSelectedNode(ref);
+      return document;
+    }
+
+    const kindOrder = command.kind === "character" ? 0 : command.kind === "scene" ? 1 : 2;
+    const kindCount = graph.nodes.filter((node) => node.kind === command.kind).length;
+    const placement = { ref, x: 40 + kindOrder * 300, y: 50 + kindCount * 150 };
+    try {
+      const next = patchNodeLayout(document, ref, { x: placement.x, y: placement.y });
+      if (documentEqual(document, next)) return document;
+      createdAssetPlacementsRef.current.set(receipt.token, placement);
+      setSelectedNode(ref);
+      return next;
+    } catch {
+      setSourceMessage("服务器已确认素材创建，但画布布局结构不支持安全放置；原创建回执已保留。");
+      return document;
+    }
+  }
+
+  function removeConfirmedAssetPlacement(
+    receiptToken: string,
+    receipt: CanvasCreationReceipt | null,
+    document: CanvasDocument | null,
+  ): CanvasDocument | null {
+    const placement = createdAssetPlacementsRef.current.get(receiptToken);
+    if (placement === undefined || receipt === null
+      || (receipt.kind !== "character" && receipt.kind !== "scene" && receipt.kind !== "prop")
+      || typeof receipt.target.id !== "string" || placement.ref !== `${receipt.kind}:${receipt.target.id}`) return document;
+
+    createdAssetPlacementsRef.current.delete(receiptToken);
+    if (!documentState.writable || document === null) return document;
+    const next = removeOwnedAssetPlacement(document, placement);
+    return next !== null && !documentEqual(document, next) ? next : document;
   }
 
   function editorIsCurrent(lifecycle: AbortController): boolean {
@@ -707,6 +805,11 @@ export function CanvasWorkspace({
       setSourceMessage(message);
       return { status: "conflict", message };
     }
+    if (command.type === "asset.create" && !canPersistAssetPlacement()) {
+      const message = "画布布局尚未可安全保存，未发送素材创建。请等待画布载入或使用支持受控布局保存的模式。";
+      setSourceMessage(message);
+      return { status: "conflict", message };
+    }
     const sourcePort = services.canvasSource;
     if (sourcePort === undefined) {
       throw new CanvasSourceError("unsupported", "当前服务没有接入受控章节来源，不会改用旧接口写入。");
@@ -747,7 +850,15 @@ export function CanvasWorkspace({
           ? creationUndos.find((item) => item.receipt.token === command.receipt)?.receipt ?? null
           : acknowledgement.creation_receipt,
       };
-      applySourceSnapshot(acknowledgement.snapshot, transition);
+      applySourceSnapshot(acknowledgement.snapshot, transition, (document) => {
+        if (command.type === "asset.create") {
+          return placeConfirmedAsset(command, acknowledgement.snapshot, acknowledgement.creation_receipt, document);
+        }
+        if (command.type === "creation.undo") {
+          return removeConfirmedAssetPlacement(command.receipt, transition.receipt, document);
+        }
+        return document;
+      });
       if (command.type === "creation.undo") {
         setCreationUndos((current) => current.filter((item) => item.receipt.token !== command.receipt));
       } else setCreationUndos([]);
