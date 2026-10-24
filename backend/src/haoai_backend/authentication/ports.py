@@ -105,6 +105,7 @@ class AuthenticationRuntimePort(Protocol):
     secret_key: str | None
     verification_email_sender: Callable[[str, str], bool] | None
     password_reset_sender: Callable[[str, str, str], bool] | None
+    password_reset_preflight: Callable[[], None] | None
     email_code_store: EmailCodeStore | None
     rate_limiter: FixedWindowLimiter | None
     clock: Callable[[], datetime]

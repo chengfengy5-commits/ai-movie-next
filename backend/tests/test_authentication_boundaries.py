@@ -50,6 +50,8 @@ def test_cold_app_import_and_unwired_factory_do_not_open_env_or_construct_sqlalc
         import io
         import os
         import pathlib
+        import smtplib
+        import socket
         import sqlalchemy
         import sqlalchemy.engine
         import pydantic
@@ -116,11 +118,21 @@ def test_cold_app_import_and_unwired_factory_do_not_open_env_or_construct_sqlalc
         os.environ = EnvironmentProbe()
         sqlalchemy.create_engine = forbidden('create_engine')
         sqlalchemy.engine.create_engine = forbidden('engine.create_engine')
+        socket.getaddrinfo = forbidden('DNS')
+        smtplib.SMTP = forbidden('SMTP')
+        smtplib.SMTP_SSL = forbidden('SMTP_SSL')
         MetaData.create_all = forbidden('MetaData.create_all')
         Session.__init__ = forbidden('Session.__init__')
 
         module = importlib.import_module('haoai_backend.app')
         app = module.create_app()
+        cold_runtime = module.AuthenticationRuntime(secret_key='smtp-cold-test-secret')
+        cold_smtp_app = module.create_app(authentication_runtime=cold_runtime)
+        assert len(cold_smtp_app.routes) == len(app.routes)
+        assert cold_runtime.verification_email_sender is None
+        assert cold_runtime.password_reset_sender is None
+        assert cold_runtime.frontend_url is None
+        assert cold_runtime.password_reset_preflight is None
         paths = [(route.path, route.methods) for route in app.routes]
         assert {
             ("/api/prompts", "GET"),

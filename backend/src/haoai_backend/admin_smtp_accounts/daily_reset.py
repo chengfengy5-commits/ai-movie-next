@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import date
-from threading import Lock
+from threading import RLock
 from typing import Any
 
 from sqlalchemy import update
@@ -17,7 +17,7 @@ class DailyResetState:
         self._date_clock = date_clock
         self._today = date_clock()
         self._counts: dict[str, int] = {}
-        self._lock = Lock()
+        self._lock = RLock()
 
     @property
     def today(self) -> date:
@@ -39,13 +39,13 @@ class DailyResetState:
             return value
 
     def reset_if_needed(self, reset_all: Any) -> None:
-        today = self._date_clock()
-        if today == self._today:
-            return
         with self._lock:
+            today = self._date_clock()
+            if today == self._today:
+                return
+            reset_all()
             self._counts.clear()
             self._today = today
-        reset_all()
 
 
 class SqlAlchemyDailyReset:
@@ -66,5 +66,8 @@ class SqlAlchemyDailyReset:
         try:
             session.execute(update(smtp_accounts).values(daily_sent=0))
             session.commit()
+        except BaseException:
+            session.rollback()
+            raise
         finally:
             session.close()

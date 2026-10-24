@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
@@ -66,9 +67,17 @@ from .authentication import (
     AuthenticationRuntime,
     create_task_identity_resolvers,
 )
+from .authentication.errors import unavailable
 from .authentication.http import mount_authentication_routes
 from .authentication.persistence import SqlAlchemyAuthenticationUnitOfWork
 from .authentication.ports import UnitOfWorkFactory as AuthenticationUnitOfWorkFactory
+from .smtp_delivery import (
+    SmtpDeliveryService,
+    SmtpDeliveryUnknown,
+    SmtpDeliveryUnavailable,
+    SqlAlchemySmtpDeliveryRepository,
+    StdlibSmtpTransport,
+)
 from .personal_production.notes.http import mount_personal_production_notes_routes
 from .personal_production.notes.persistence import SqlAlchemyNotesUnitOfWork
 from .personal_production.rough_cut.http import ActorResolver, mount_rough_cut_routes
@@ -257,9 +266,79 @@ def create_app(
     frame_optimize_worker_configuration: FrameOptimizeWorkerConfiguration | None = None,
 ) -> FastAPI:
     """Compose routes; explicitly configured generation workers start in lifespan."""
+    if authentication_runtime is not None:
+        authentication_runtime = replace(authentication_runtime)
     effective_session_factory = session_factory
     if effective_session_factory is None and authentication_runtime is not None:
         effective_session_factory = authentication_runtime.session_factory
+    smtp_daily_reset = (
+        SqlAlchemyDailyReset(
+            effective_session_factory,
+            state=DailyResetState(),
+        )
+        if effective_session_factory is not None
+        else None
+    )
+    smtp_delivery_service: SmtpDeliveryService | None = None
+    if authentication_runtime is not None:
+        smtp_repository = (
+            SqlAlchemySmtpDeliveryRepository(
+                effective_session_factory,
+                smtp_daily_reset,
+            )
+            if effective_session_factory is not None and smtp_daily_reset is not None
+            else None
+        )
+        smtp_delivery_service = SmtpDeliveryService(
+            smtp_repository,
+            StdlibSmtpTransport(),
+            SmtpLegacyFernet(authentication_runtime.secret_key),
+        )
+
+        if authentication_runtime.verification_email_sender is None:
+            def send_verification_email(email: str, code: str) -> bool:
+                assert smtp_delivery_service is not None
+                try:
+                    return smtp_delivery_service.send_verification_code(email, code)
+                except SmtpDeliveryUnknown:
+                    raise AuthenticationError(
+                        502,
+                        "验证码发送失败，请稍后再试",
+                    ) from None
+                except SmtpDeliveryUnavailable:
+                    raise unavailable() from None
+
+            authentication_runtime.verification_email_sender = send_verification_email
+
+        if authentication_runtime.password_reset_sender is None:
+            def send_password_reset_email(
+                email: str,
+                subject: str,
+                html_body: str,
+            ) -> bool:
+                assert smtp_delivery_service is not None
+                try:
+                    return smtp_delivery_service.send(
+                        email,
+                        subject=subject,
+                        html_body=html_body,
+                    )
+                except (SmtpDeliveryUnknown, SmtpDeliveryUnavailable):
+                    return False
+
+            authentication_runtime.password_reset_sender = send_password_reset_email
+            if authentication_runtime.frontend_url is None:
+                authentication_runtime.frontend_url = smtp_delivery_service.frontend_base_url
+            if authentication_runtime.password_reset_preflight is None:
+                def preflight_password_reset() -> None:
+                    assert smtp_delivery_service is not None
+                    try:
+                        smtp_delivery_service.ensure_sender_ready()
+                    except SmtpDeliveryUnavailable:
+                        raise unavailable() from None
+
+                authentication_runtime.password_reset_preflight = preflight_password_reset
+
     frame_optimize_session_bound = _frame_optimize_session_bound(
         frame_optimize_worker_configuration,
         effective_session_factory,
@@ -485,14 +564,6 @@ def create_app(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
         )
-    )
-    smtp_daily_reset = (
-        SqlAlchemyDailyReset(
-            effective_session_factory,
-            state=DailyResetState(),
-        )
-        if effective_session_factory is not None
-        else None
     )
     app.include_router(
         build_admin_smtp_accounts_router(
