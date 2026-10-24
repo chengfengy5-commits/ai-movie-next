@@ -43,6 +43,8 @@ class StoryboardSaveStore(Protocol):
         chapter: ChapterRecord,
         actor: TrustedActor,
         content: str,
+        *,
+        require_current_source: bool = False,
     ) -> None: ...
 
     def list_chapters(self, series_id: str) -> list[ChapterRecord]: ...

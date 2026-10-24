@@ -70,6 +70,57 @@
       }
     }
   ],
+  "save_requests": {
+    "source_content": [
+      {
+        "text": "保持该帧",
+        "storyboard": ["story-owned"],
+        "extra": { "preserved": true }
+      }
+    ],
+    "character": {
+      "path": "/api/storyboard/filter-and-save-characters-stream",
+      "wire": {
+        "chapter_id": "synthetic-chapter",
+        "expected_series_id": "series-owned",
+        "expected_content": [
+          { "text": "保持该帧", "storyboard": ["story-owned"], "extra": { "preserved": true } }
+        ],
+        "target_frames": [0],
+        "appearances": [["顾宁"]],
+        "dry_run": true,
+        "merged_characters": [{ "name": "顾宁", "appearance": "短发" }]
+      }
+    },
+    "scene": {
+      "path": "/api/storyboard/filter-and-save-scenes-stream",
+      "wire": {
+        "chapter_id": "synthetic-chapter",
+        "expected_series_id": "series-owned",
+        "expected_content": [
+          { "text": "保持该帧", "storyboard": ["story-owned"], "extra": { "preserved": true } }
+        ],
+        "target_frames": [0],
+        "appearances": ["夜色书房"],
+        "dry_run": true,
+        "scenes": [{ "title": "夜色书房" }]
+      }
+    },
+    "prop": {
+      "path": "/api/storyboard/filter-and-save-props-stream",
+      "wire": {
+        "chapter_id": "synthetic-chapter",
+        "expected_series_id": "series-owned",
+        "expected_content": [
+          { "text": "保持该帧", "storyboard": ["story-owned"], "extra": { "preserved": true } }
+        ],
+        "target_frames": [0],
+        "appearances": [["旧钥匙"]],
+        "dry_run": true,
+        "props": [{ "name": "旧钥匙" }]
+      }
+    }
+  },
   "producer": {
     "runtime": {
       "extract": {

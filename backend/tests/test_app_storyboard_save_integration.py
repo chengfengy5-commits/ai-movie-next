@@ -42,6 +42,9 @@ from haoai_backend.series_data.tables import (
     series,
     storyboard_assets,
 )
+from haoai_backend.storyboard_save.errors import StoryboardSaveSourceConflict
+from haoai_backend.storyboard_save.persistence import SqlAlchemyStoryboardSaveStore
+from haoai_backend.shared.identity import TrustedActor
 from haoai_backend.teams.tables import (
     metadata as teams_metadata,
     team_members,
@@ -49,6 +52,10 @@ from haoai_backend.teams.tables import (
 )
 
 SECRET = "storyboard-save-app-integration-synthetic-secret"
+SAVE_REQUEST_FIXTURE = json.loads(
+    (Path(__file__).resolve().parents[2] / "frontend/src/testing/fixtures/storyboardAssetWire.json")
+    .read_text(encoding="utf-8")
+)["save_requests"]
 SAVE_ROUTES = {
     ("POST", "/api/storyboard/filter-and-save-characters", "filter_and_save_characters"),
     ("POST", "/api/storyboard/filter-and-save-characters-stream", "save_stream"),
@@ -254,6 +261,19 @@ def _build_system(database_path: Path) -> AppSystem:
                     "id": "series-owned",
                     "user_id": "owner",
                     "name": "Owned series",
+                    "description": None,
+                    "image_url": None,
+                    "style_prompt_id": None,
+                    "team_id": None,
+                    "claimed_by": None,
+                    "claimed_at": None,
+                    "created_at": now - timedelta(days=3),
+                    "updated_at": now - timedelta(days=3),
+                },
+                {
+                    "id": "series-owned-alt",
+                    "user_id": "owner",
+                    "name": "Second owned series",
                     "description": None,
                     "image_url": None,
                     "style_prompt_id": None,
@@ -635,6 +655,397 @@ def test_all_save_routes_stream_and_persist_with_shared_auth_and_business_sessio
                 storyboard_media_states.c.chapter_id == "chapter-owned"
             )
         ).first() is not None
+
+
+@pytest.mark.parametrize("kind", ["character", "scene", "prop"])
+def test_save_stream_rejects_stale_expected_chapter_source_before_writing(
+    app_system: AppSystem,
+    kind: str,
+) -> None:
+    system = app_system
+    contract = SAVE_REQUEST_FIXTURE[kind]
+    with system.engine.begin() as connection:
+        expected_content = json.loads(
+            connection.execute(
+                select(chapters.c.content).where(chapters.c.id == "chapter-owned")
+            ).scalar_one()
+        )
+        current_content = [
+            {
+                **expected_content[0],
+                "text": "并发编辑后的新镜头文本",
+                "extra": {"preserved": True, "revision": "B"},
+            }
+        ]
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-owned")
+            .values(content=json.dumps(current_content, ensure_ascii=False))
+        )
+
+    response = _request(
+        system.app,
+        contract["path"],
+        token=system.token_for("owner"),
+        body={
+            **contract["wire"],
+            "chapter_id": "chapter-owned",
+            "expected_content": expected_content,
+        },
+    )
+
+    assert response.status_code == 409
+    assert not any(
+        event.get("type") == "complete" and event.get("success")
+        for event in _sse_events(response)
+    )
+    assert system.business_sessions[-1].commit_count == 0
+    with system.engine.connect() as connection:
+        assert connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-owned")
+        ).scalar_one() == json.dumps(current_content, ensure_ascii=False)
+        asset_table = {"character": characters, "scene": scenes, "prop": props}[kind]
+        assert connection.execute(
+            select(asset_table.c.id).where(asset_table.c.series_id == "series-owned")
+        ).all() == []
+
+
+def test_save_stream_rejects_chapter_moved_to_another_accessible_series_before_writing(
+    app_system: AppSystem,
+) -> None:
+    system = app_system
+    contract = SAVE_REQUEST_FIXTURE["scene"]
+    expected_content = SAVE_REQUEST_FIXTURE["source_content"]
+    with system.engine.begin() as connection:
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-owned")
+            .values(series_id="series-owned-alt")
+        )
+
+    response = _request(
+        system.app,
+        contract["path"],
+        token=system.token_for("owner"),
+        body={
+            **contract["wire"],
+            "chapter_id": "chapter-owned",
+            "expected_content": expected_content,
+            "expected_series_id": "series-owned",
+        },
+    )
+
+    assert response.status_code == 409
+    assert system.business_sessions[-1].commit_count == 0
+    assert system.business_sessions[-1].close_count == 1
+    with system.engine.connect() as connection:
+        assert connection.execute(
+            select(chapters.c.series_id).where(chapters.c.id == "chapter-owned")
+        ).scalar_one() == "series-owned-alt"
+        assert connection.execute(select(scenes.c.id)).all() == []
+
+
+@pytest.mark.parametrize("kind", ["character", "scene", "prop"])
+@pytest.mark.parametrize(
+    "expected_series_id",
+    ["series-owned", "series-peer"],
+    ids=["matches-chapter", "does-not-match-chapter"],
+)
+def test_unauthorized_actor_cannot_probe_chapter_series_with_source_guard(
+    app_system: AppSystem,
+    kind: str,
+    expected_series_id: str,
+) -> None:
+    system = app_system
+    contract = SAVE_REQUEST_FIXTURE[kind]
+    response = _request(
+        system.app,
+        contract["path"],
+        token=system.token_for("peer"),
+        body={
+            **contract["wire"],
+            "chapter_id": "chapter-owned",
+            "expected_content": SAVE_REQUEST_FIXTURE["source_content"],
+            "expected_series_id": expected_series_id,
+        },
+    )
+
+    assert response.status_code == 403
+    assert system.business_sessions[-1].commit_count == 0
+    assert system.business_sessions[-1].close_count == 1
+    asset_table = {"character": characters, "scene": scenes, "prop": props}[kind]
+    with system.engine.connect() as connection:
+        assert connection.execute(
+            select(asset_table.c.id).where(asset_table.c.series_id == "series-owned")
+        ).all() == []
+
+
+@pytest.mark.parametrize("kind", ["character", "scene", "prop"])
+def test_shared_save_request_fixture_reaches_real_route_and_dry_run_is_read_only(
+    app_system: AppSystem,
+    kind: str,
+) -> None:
+    system = app_system
+    contract = SAVE_REQUEST_FIXTURE[kind]
+    body = {**contract["wire"], "chapter_id": "chapter-owned"}
+    response = _request(
+        system.app,
+        contract["path"],
+        token=system.token_for("owner"),
+        body=body,
+    )
+
+    assert response.status_code == 200
+    events = _sse_events(response)
+    assert any(
+        event.get("type") == "complete" and event.get("success") is True
+        and event.get("dry_run") is True
+        for event in events
+    )
+    assert system.business_sessions[-1].commit_count == 0
+    with system.engine.connect() as connection:
+        assert connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-owned")
+        ).scalar_one() == json.dumps(SAVE_REQUEST_FIXTURE["source_content"], ensure_ascii=False)
+        assert connection.execute(
+            select(characters.c.id).where(characters.c.series_id == "series-owned")
+        ).all() == []
+        assert connection.execute(
+            select(scenes.c.id).where(scenes.c.series_id == "series-owned")
+        ).all() == []
+
+
+@pytest.mark.parametrize("invalid", [None, "frames", {"frame": 1}, float("nan")])
+def test_explicit_invalid_expected_content_is_422_before_business_session(
+    app_system: AppSystem,
+    invalid: Any,
+) -> None:
+    system = app_system
+    body = {
+        **SAVE_REQUEST_FIXTURE["scene"]["wire"],
+        "chapter_id": "chapter-owned",
+        "expected_content": invalid,
+    }
+
+    request_content: dict[str, Any] = {"body": body}
+    if isinstance(invalid, float) and invalid != invalid:
+        request_content = {
+            "raw_body": json.dumps(body, ensure_ascii=False, allow_nan=True).encode("utf-8")
+        }
+    response = _request(
+        system.app,
+        SAVE_REQUEST_FIXTURE["scene"]["path"],
+        token=system.token_for("owner"),
+        **request_content,
+    )
+
+    assert response.status_code == 422
+    assert system.business_sessions == []
+
+
+@pytest.mark.parametrize("invalid", [None, "", "   ", True, 1])
+def test_explicit_invalid_expected_series_id_is_422_before_business_session(
+    app_system: AppSystem,
+    invalid: Any,
+) -> None:
+    system = app_system
+    body = {
+        **SAVE_REQUEST_FIXTURE["scene"]["wire"],
+        "chapter_id": "chapter-owned",
+        "expected_series_id": invalid,
+    }
+
+    response = _request(
+        system.app,
+        SAVE_REQUEST_FIXTURE["scene"]["path"],
+        token=system.token_for("owner"),
+        body=body,
+    )
+
+    assert response.status_code == 422
+    assert system.business_sessions == []
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["content", "chapter_series", "same_access_series", "permission"],
+)
+def test_source_or_access_change_after_asset_phase_keeps_committed_asset_and_stops_binding(
+    app_system: AppSystem,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    system = app_system
+    contract = SAVE_REQUEST_FIXTURE["scene"]
+    body = {**contract["wire"], "chapter_id": "chapter-owned", "dry_run": False}
+    original_commit = SqlAlchemyStoryboardSaveStore.commit
+    changed = False
+    changed_content = [
+        {**SAVE_REQUEST_FIXTURE["source_content"][0], "text": "并发提交的版本B"}
+    ]
+
+    def commit_with_concurrent_change(store: SqlAlchemyStoryboardSaveStore) -> None:
+        nonlocal changed
+        original_commit(store)
+        if changed:
+            return
+        changed = True
+        with system.engine.begin() as connection:
+            if mutation == "content":
+                connection.execute(
+                    update(chapters)
+                    .where(chapters.c.id == "chapter-owned")
+                    .values(content=json.dumps(changed_content, ensure_ascii=False))
+                )
+            elif mutation == "chapter_series":
+                connection.execute(
+                    update(chapters)
+                    .where(chapters.c.id == "chapter-owned")
+                    .values(series_id="series-peer")
+                )
+            elif mutation == "same_access_series":
+                connection.execute(
+                    update(chapters)
+                    .where(chapters.c.id == "chapter-owned")
+                    .values(series_id="series-owned-alt")
+                )
+            else:
+                connection.execute(
+                    update(series)
+                    .where(series.c.id == "series-owned")
+                    .values(user_id="peer")
+                )
+
+    monkeypatch.setattr(SqlAlchemyStoryboardSaveStore, "commit", commit_with_concurrent_change)
+    if mutation == "same_access_series":
+        body.pop("expected_series_id", None)
+    response = _request(
+        system.app,
+        contract["path"],
+        token=system.token_for("owner"),
+        body=body,
+    )
+
+    assert changed
+    assert response.status_code == 200
+    events = _sse_events(response)
+    errors = [event for event in events if event.get("type") == "error"]
+    assert errors
+    assert not any(event.get("type") == "complete" and event.get("success") for event in events)
+    assert "已提交的素材阶段仍保留" in errors[0].get("message", "")
+    with system.engine.connect() as connection:
+        assert connection.execute(
+            select(scenes.c.id).where(
+                scenes.c.series_id == "series-owned",
+                scenes.c.title == "夜色书房",
+            )
+        ).first() is not None
+        chapter = connection.execute(
+            select(chapters.c.series_id, chapters.c.content).where(
+                chapters.c.id == "chapter-owned"
+            )
+        ).one()
+        if mutation == "content":
+            assert chapter.series_id == "series-owned"
+            assert chapter.content == json.dumps(changed_content, ensure_ascii=False)
+        elif mutation == "chapter_series":
+            assert chapter.series_id == "series-peer"
+            assert chapter.content == json.dumps(SAVE_REQUEST_FIXTURE["source_content"], ensure_ascii=False)
+        elif mutation == "same_access_series":
+            assert chapter.series_id == "series-owned-alt"
+            assert chapter.content == json.dumps(SAVE_REQUEST_FIXTURE["source_content"], ensure_ascii=False)
+        else:
+            assert chapter.series_id == "series-owned"
+            assert chapter.content == json.dumps(SAVE_REQUEST_FIXTURE["source_content"], ensure_ascii=False)
+
+
+@pytest.mark.parametrize("no_op", [False, True], ids=["changed-content", "expected-no-op"])
+def test_chapter_content_cas_rejects_stale_raw_source_and_rolls_back_reconciliation(
+    app_system: AppSystem,
+    no_op: bool,
+) -> None:
+    system = app_system
+    session = Session(system.engine, expire_on_commit=False)
+    store = SqlAlchemyStoryboardSaveStore(session)
+    chapter = store.load_chapter("chapter-owned")
+    assert chapter is not None
+    session.commit()
+    changed_content = [
+        {**SAVE_REQUEST_FIXTURE["source_content"][0], "text": "并发提交的版本B"}
+    ]
+    with system.engine.begin() as connection:
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-owned")
+            .values(content=json.dumps(changed_content, ensure_ascii=False))
+        )
+
+    content_to_write = chapter.content if no_op else json.dumps(
+        [{"text": "准备覆盖B", "storyboard": [], "extra": {"preserved": True}}],
+        ensure_ascii=False,
+    )
+    with pytest.raises(StoryboardSaveSourceConflict):
+        store.update_chapter_content(
+            chapter,
+            TrustedActor("owner"),
+            content_to_write,
+            require_current_source=True,
+        )
+    session.close()
+
+    with system.engine.connect() as connection:
+        assert connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-owned")
+        ).scalar_one() == json.dumps(changed_content, ensure_ascii=False)
+        assert connection.execute(
+            select(storyboard_media_states.c.id).where(
+                storyboard_media_states.c.chapter_id == "chapter-owned"
+            )
+        ).all() == []
+
+
+def test_chapter_content_cas_uses_is_null_for_raw_null_source(app_system: AppSystem) -> None:
+    system = app_system
+    with system.engine.begin() as connection:
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-owned")
+            .values(content=None)
+        )
+    session = Session(system.engine, expire_on_commit=False)
+    store = SqlAlchemyStoryboardSaveStore(session)
+    chapter = store.load_chapter("chapter-owned")
+    assert chapter is not None and chapter.content is None
+    session.commit()
+    changed_content = [{"text": "并发提交的版本B"}]
+    with system.engine.begin() as connection:
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-owned")
+            .values(content=json.dumps(changed_content, ensure_ascii=False))
+        )
+
+    with pytest.raises(StoryboardSaveSourceConflict):
+        store.update_chapter_content(
+            chapter,
+            TrustedActor("owner"),
+            json.dumps([{"text": "不能覆盖B"}], ensure_ascii=False),
+            require_current_source=True,
+        )
+    session.close()
+
+    with system.engine.connect() as connection:
+        assert connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-owned")
+        ).scalar_one() == json.dumps(changed_content, ensure_ascii=False)
+        assert connection.execute(
+            select(storyboard_media_states.c.id).where(
+                storyboard_media_states.c.chapter_id == "chapter-owned"
+            )
+        ).all() == []
+        assert connection.execute(
+            select(props.c.id).where(props.c.series_id == "series-owned")
+        ).all() == []
 
 
 def test_authentication_precedes_malformed_json_and_denials_never_open_business_session(

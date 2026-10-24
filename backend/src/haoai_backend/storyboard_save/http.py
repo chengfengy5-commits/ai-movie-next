@@ -12,6 +12,7 @@ from typing import Any
 from anyio import CancelScope
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from pydantic import ValidationError
 from sqlalchemy.orm import Session
 from starlette.types import Receive, Scope, Send
 
@@ -20,14 +21,17 @@ from haoai_backend.shared.errors import BusinessError
 from haoai_backend.shared.identity import TrustedActor
 
 from . import application
+from .domain import chapter_content_matches_expected
 from .errors import (
     StoryboardSaveChapterNotFound,
     StoryboardSaveForeignAssetReference,
+    StoryboardSaveSourceConflict,
     StoryboardSaveUnavailable,
 )
 from .non_stream import filter_and_save_characters as run_filter_and_save_characters
 from .persistence import SqlAlchemyStoryboardSaveStore
 from .presentation import encode_sse
+from .schemas import ExpectedChapterContentBody, ExpectedSeriesIdBody
 
 SessionFactory = Callable[[], Session]
 ActorResolver = Callable[[Request], TrustedActor | Awaitable[TrustedActor]]
@@ -246,6 +250,8 @@ def _register_save_route(
             appearances = raw_body.get("appearances", [])
             target_frames = raw_body.get("target_frames")
             dry_run = bool(raw_body.get("dry_run"))
+            expected_content = _expected_content_from_body(raw_body)
+            expected_series_id = _expected_series_id_from_body(raw_body)
             if not chapter_id:
                 raise HTTPException(status_code=400, detail="缺少章节ID")
             if not candidates:
@@ -264,6 +270,7 @@ def _register_save_route(
         loop = asyncio.get_running_loop()
         executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="storyboard-save")
         session: Session | None = None
+        authorized_series_id: str | None = None
         workflow_iterator: Iterator[dict[str, Any]] | None = None
         active_worker_futures: set[Future[Any]] = set()
         worker_futures_lock = threading.Lock()
@@ -309,10 +316,10 @@ def _register_save_route(
                     raise cancelled
                 raise cancelled
 
-        def remember_session(value: Session) -> None:
-            nonlocal session
+        def remember_authorized_session(value: tuple[Session, str]) -> None:
+            nonlocal session, authorized_series_id
             with resource_state_lock:
-                session = value
+                session, authorized_series_id = value
 
         def remember_iterator(value: Iterator[dict[str, Any]]) -> None:
             nonlocal workflow_iterator
@@ -356,13 +363,16 @@ def _register_save_route(
                 session_factory,
                 actor,
                 chapter_id,
-                on_result=remember_session,
+                expected_content,
+                expected_series_id,
+                on_result=remember_authorized_session,
             )
 
             def make_workflow() -> Iterator[dict[str, Any]]:
                 with resource_state_lock:
                     current_session = session
-                if current_session is None:
+                    current_series_id = authorized_series_id
+                if current_session is None or current_series_id is None:
                     raise RuntimeError("storyboard save Session was not initialized")
                 store = SqlAlchemyStoryboardSaveStore(current_session)
                 return workflow(
@@ -373,6 +383,8 @@ def _register_save_route(
                     appearances,
                     dry_run=dry_run,
                     target_frames=target_frames,
+                    expected_content=expected_content,
+                    expected_series_id=current_series_id,
                 )
 
             await run_worker(
@@ -415,6 +427,9 @@ def _register_save_route(
         except StoryboardSaveChapterNotFound as exc:
             await close_without_masking_failure()
             raise HTTPException(status_code=404, detail="章节不存在") from exc
+        except StoryboardSaveSourceConflict as exc:
+            await close_without_masking_failure()
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SeriesNotFound as exc:
             await close_without_masking_failure()
             raise HTTPException(status_code=404, detail=exc.args[0]) from exc
@@ -433,7 +448,9 @@ def _open_session_and_authorize(
     session_factory: SessionFactory,
     actor: TrustedActor,
     chapter_id: str,
-) -> Session:
+    expected_content: list[Any] | None = None,
+    expected_series_id: str | None = None,
+) -> tuple[Session, str]:
     session = session_factory()
     try:
         store = SqlAlchemyStoryboardSaveStore(session)
@@ -441,13 +458,47 @@ def _open_session_and_authorize(
         if chapter is None:
             raise StoryboardSaveChapterNotFound()
         store.require_access(actor, chapter.series_id)
-        return session
+        if expected_series_id is not None and chapter.series_id != expected_series_id:
+            raise StoryboardSaveSourceConflict()
+        if expected_content is not None and not chapter_content_matches_expected(
+            chapter.content, expected_content
+        ):
+            raise StoryboardSaveSourceConflict()
+        return session, chapter.series_id
     except BaseException:
         try:
             session.rollback()
         finally:
             session.close()
         raise
+
+
+def _expected_content_from_body(raw_body: Any) -> list[Any] | None:
+    if not isinstance(raw_body, dict) or "expected_content" not in raw_body:
+        return None
+    try:
+        return ExpectedChapterContentBody.model_validate(
+            {"expected_content": raw_body["expected_content"]}
+        ).expected_content
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="expected_content 必须是有效的章节分镜数组",
+        ) from exc
+
+
+def _expected_series_id_from_body(raw_body: Any) -> str | None:
+    if not isinstance(raw_body, dict) or "expected_series_id" not in raw_body:
+        return None
+    try:
+        return ExpectedSeriesIdBody.model_validate(
+            {"expected_series_id": raw_body["expected_series_id"]}
+        ).expected_series_id
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="expected_series_id 必须是非空字符串",
+        ) from exc
 
 
 def _run_non_stream_request(

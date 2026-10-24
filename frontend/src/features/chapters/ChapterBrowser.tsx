@@ -3337,6 +3337,11 @@ export function ChapterBrowser({
         setChapterMutationNotice("保存前章节、素材或当前剧集素材库已变化；已重新读取，请关闭窗口后重新核对。");
         throw new ApiError("http", "保存前来源发生变化，未发送最终保存请求。", 409);
       }
+      if (!Array.isArray(input.expected_content)
+        || !sameChapterContent(input.expected_content, beforeLock.chapter.content)
+        || input.expected_series_id !== beforeLock.chapter.series_id) {
+        throw new ApiError("http", "最终保存缺少与已核对章节一致的来源快照。", 409);
+      }
       verifyExistingCandidateOwnership(input.candidates, plan.asset_type, beforeLock);
 
       if (typeof series.team_id === "string" && series.team_id !== "") {

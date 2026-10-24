@@ -16,6 +16,13 @@ class StoryboardSaveForeignAssetReference(Exception):
         return "素材引用不属于当前剧集"
 
 
+class StoryboardSaveSourceConflict(Exception):
+    """The chapter source changed or moved while a save was being prepared."""
+
+    def __str__(self) -> str:
+        return "章节来源已变化或权限已调整，请刷新后重新确认"
+
+
 class StoryboardSaveUnavailable(BusinessError):
     """The route has no authenticated SQL persistence wiring."""
 

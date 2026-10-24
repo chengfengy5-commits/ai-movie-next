@@ -1,4 +1,5 @@
 import { ApiError } from "./errors";
+import type { StoryboardFrame } from "./contracts";
 
 export type StoryboardAssetKind = "character" | "scene" | "prop";
 export type StoryboardAssetAction = "extract" | "judge" | "save";
@@ -72,6 +73,8 @@ export interface StoryboardAssetJudgeInput {
 
 export interface StoryboardAssetSaveInput {
   chapter_id: string;
+  expected_series_id?: string;
+  expected_content?: StoryboardFrame[];
   target_frames: number[];
   appearances: StoryboardAssetAppearance[];
   dry_run: boolean;
@@ -207,6 +210,8 @@ export function buildStoryboardAssetSaveInput(
   candidates: StoryboardAssetCandidate[],
   appearances: StoryboardAssetAppearance[],
   dryRun: boolean,
+  expectedContent?: StoryboardFrame[],
+  expectedSeriesId?: string,
 ): StoryboardAssetSaveInput {
   if (selectedFrames.length === 0 || appearances.length !== selectedFrames.length) {
     throw new InvalidStoryboardAssetResponseError("保存镜头与出场数据没有一一对应。");
@@ -236,6 +241,8 @@ export function buildStoryboardAssetSaveInput(
   });
   return {
     chapter_id: chapterId,
+    ...(expectedSeriesId === undefined ? {} : { expected_series_id: expectedSeriesId }),
+    ...(expectedContent === undefined ? {} : { expected_content: expectedContent }),
     target_frames: [...selectedFrames],
     appearances: safeAppearances,
     dry_run: dryRun,

@@ -97,7 +97,7 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 | U06.1 | 聊天消息、文本流与 source bubble | P | P | V=P / A=U；chat CRUD/统计、detached SSE、可选 Task 绑定和 stream 财务已有 | 配置真实 text runtime，补 React 聊天操作、断流/失败/任务回读和来源 bubble；按原协议矩阵补缺口。 |
 | U06.2 | 两步分镜生成、报价、SSE 预览和确认保存 | C | C | V=P / A=P；真实 JWT/Target API/owned SQLite + FakeRuntime 主链已通过 | 保留主链收据，补受影响的失败、断流、原 key 恢复和权限分支；FakeRuntime 不代表真实 provider。 |
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
-| U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；六个提取/外观判断路由已接 StoryboardAssetRuntime/server host；637 加入 ChapterBrowser React 操作闭环及真实 producer/shared wire、合成 SQLite、fake HTTP 定向验证 | 继续补图片/单镜/全镜生成、服务器 CAS/多阶段并发边界与完整接受；本批不改变整行状态或 21/18/51 计数。 |
+| U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；六个提取/判断路由与React确认/逐镜保存已接入；642为三类保存增加章节内容/剧集来源、阶段权限重查及SQL CAS；Root643完整复核及修复重审通过，Root644-03按项目默认配置前端309项、类型与构建通过，精确同源后端185项与实际保存/CAS证据保留 | 继续补图片/单镜/全镜生成、跨章节清理并发及完整接受；分阶段提交不等于整请求原子性，21/18/51与整行状态保持不变。 |
 | U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 原 intent 到期控制与提交边界修复已通过 Root630 独立176项后端定向测试，并由 Root631 中文提交推送至 main；完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
 | U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
 
@@ -380,6 +380,16 @@ Root635 在1,605项输入的私有冻结源码副本上原样重跑三类独立�
 
 Root638 的五项前端 Important 发现按同一范围修正：judge 请求按 kind 映射到真实的 `characters`/`scenes`/`props` 字段，并由共享 wire fixture 同时验证前端请求与后端 `JudgeRequest.parse`；角色/道具的未识别名称会留下逐镜 `null` 供人工核对，显式空数组仍代表清空；迟到的锁获取先登记本次 lease 再校验 owner/scope，最终锁检查后且开始写入前再次确认 owner/signal；SSE HTTP 默认预算与 services 下限统一为 650 秒（后端运行预算 600 秒并留 50 秒余量），显式短 timeout 注入和不重试行为仍保留。后端三组保存/producer/wire 组合 101 项通过；最终前端 6 文件 308 项通过；TSC 与 Vite build 通过。首轮最终前端组合因旧 loopback 断言仍写 `candidates` 而有 1 项失败，按实际共享合同修正断言后整组通过；两次日志均保留。638/639 RED、GREEN、最终 run 元数据和日志 SHA 见 `haoai-next-storyboard-asset-review-639` 作者收据。
 
-服务器保存协议没有 expected-content CAS，保存 application 仍为多个阶段；客户端回读/租约无法证明与其他客户端之间的服务器原子竞争，因此真实并发接受仍未闭合。图片、单镜/全镜生成、真实 Provider、浏览器/E2E、部署接受仍待；U06.4 保持 P/P，V=P / A=U，21/18/51 与 A01–A39 完整矩阵接受计数均不变。
+637/639 时点的服务器保存协议没有 expected-content CAS，保存 application 仍为多个阶段；客户端回读/租约无法证明与其他客户端之间的服务器原子竞争，因此真实并发接受仍未闭合。图片、单镜/全镜生成、真实 Provider、浏览器/E2E、部署接受仍待；U06.4 保持 P/P，V=P / A=U，21/18/51 与 A01–A39 完整矩阵接受计数均不变。
 
 Root638 沿同一固定基线完成完整本地复核，并在修复后聚焦关闭五项 Important。Root640 在1,615项输入的私有冻结源码副本独立重跑原始请求合同、未知名称和计时预算复现：三类真实 JudgeRequest 解析通过，未知/部分未知名称保留 null，实际默认预算650秒。随后后端101项、前端6文件308项、TypeScript与Vite production build全部通过；前端使用单worker，未超时。候选源码、main及8个受保护文件、冻结输入前后一致，全部所属进程组和私有源码/TMP已清理。收据为 `haoai-next-root-storyboard-asset-ui-gate-640.json`。这些是当前素材提取确认/逐镜保存切片的源码与合成验证，仍不证明服务器CAS原子性、浏览器/E2E、真实Provider/DB/R2、部署或整行接受；21/18/51义务计数保持不变。
+
+### 素材保存章节来源与剧集身份护栏（2026-10-24）
+
+642为角色/场景/道具三类流式保存请求增加可选`expected_content`与`expected_series_id`。React从新鲜且经当前owner/source复核的章节快照，将这两个值同时带入dry-run与最终保存；服务端在打开流前核对，工作流每个素材阶段和最终绑定重新核对章节内容、剧集归属与当前访问权限。SQLite章节内容更新使用原始内容CAS，即使预期内容无需改动也验证提交前原来源；冲突不会覆盖后来提交的章节版本。旧请求不提供这些字段时保持兼容。
+
+本批保留素材分阶段提交、未知回执冻结自动重试及可选角色清理语义。阶段边界发现来源或权限变化会发出真实错误并停止后续绑定，已提交的素材阶段仍保留；本批不声称全站或全请求原子性，也未关闭清理并发的剩余义务。验证使用共享合成请求fixture、真实应用router、SQLite、第二连接并发提交与owned loopback HTTP；无真实数据库、R2、Provider、浏览器/E2E或部署验收。此切片不提升整体迁移状态：21/18/51义务计数与U06.4的P/P状态保持不变。
+
+Root643对固定基线`64d582a97ad5589dbbb27f991ee70fada0383614`的18路径作完整本地复核，发现SA643-01：来源剧集比较先于实际访问权限判断。Luna修复两个边界，三类真实HTTP的匹配/不匹配猜测在无权限时均403；有权限的陈旧来源仍409，阶段后撤权停止且保留已提交事实。作者及Root同源码后端组合185项通过；Root真实应用/JWT/合成SQLite探针确认三类实际保存、正文/未知字段保全、两连接CAS保留后来版本和媒体协调写入回滚。
+
+Root644最初额外强制非项目默认的threads池，两轮分别出现300通过/9失败及304通过/5超时，原记录保留；隔离及插桩诊断未证明产品回归，也未确认资源或异步续体根因。核对`package.json`的`vitest run`、无pool配置的Vite和安装的Vitest默认forks后，644-03移除Root额外覆盖，使用原始测试/断言/5000ms限制，六文件309项全部通过（120.308秒），TypeScript与生产构建通过。后端185项复用精确同源644结果，未将插桩结果当原始整批通过。所有冻结输入、候选/main及8个保护文件前后一致，所属进程组和私有副本已清理。最新门禁为`haoai-next-root-storyboard-save-source-gate-644-03.json`；发布事实以645收据为准。本批没有浏览器/E2E、真实Provider/DB/R2或部署证明，整体目标继续。

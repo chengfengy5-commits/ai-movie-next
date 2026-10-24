@@ -228,10 +228,17 @@ describe("StoryboardAssetExtractionDialog", () => {
   it.each(testCases)("completes the $kind candidate, per-frame plan, and confirmation workflow", async ({ kind, label }) => {
     const user = userEvent.setup();
     const source = snapshot(kind);
+    const freshSource: StoryboardAssetGenerationSnapshot = {
+      ...source,
+      chapter: {
+        ...source.chapter,
+        content: source.chapter.content?.map((frame) => ({ ...frame })) ?? null,
+      },
+    };
     const { generation, streamExtract, streamJudge, streamSave } = makeServices();
     const services: Pick<WorkspaceServices, "storyboardAssetGeneration"> = { storyboardAssetGeneration: generation };
     const lifecycle = new AbortController();
-    const refreshSource = vi.fn(async () => source);
+    const refreshSource = vi.fn(async () => freshSource);
     const executeConfirmedSave = vi.fn(async (
       _input: StoryboardAssetSaveInput,
       _plan: StoryboardAssetSavePlan,
@@ -308,6 +315,8 @@ describe("StoryboardAssetExtractionDialog", () => {
     const dryRunInput = streamSave.mock.calls[0]?.[1];
     expect(dryRunInput).toMatchObject({
       chapter_id: chapterId,
+      expected_series_id: freshSource.chapter.series_id,
+      expected_content: freshSource.chapter.content,
       target_frames: [0, 1],
       dry_run: true,
       candidates: [expect.objectContaining({ existing_id: existingId })],
@@ -321,6 +330,8 @@ describe("StoryboardAssetExtractionDialog", () => {
     expect(executeConfirmedSave).toHaveBeenCalledWith(
       expect.objectContaining({
         chapter_id: chapterId,
+        expected_series_id: freshSource.chapter.series_id,
+        expected_content: freshSource.chapter.content,
         target_frames: [0, 1],
         appearances: kind === "scene" ? [candidateNameFor(kind), ""] : [[candidateNameFor(kind)], []],
         dry_run: false,
