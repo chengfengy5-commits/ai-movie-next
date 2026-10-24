@@ -187,6 +187,8 @@ function createWorkspaceHarness(lockScenario: LockScenario, options: WorkspaceHa
     lockReads: 0,
     lockAcquired: false,
     creationToken: null as string | null,
+    createdAssetKind: null as "character" | "scene" | "prop" | null,
+    createdAssetId: null as string | null,
     loseNextSourcePostReply: options.loseNextSourcePostReply ?? false,
     sourceReadFailureStatus: options.sourceReadFailureStatus ?? null,
     sourcePostFailureStatus: options.sourcePostFailureStatus ?? null,
@@ -275,6 +277,8 @@ function createWorkspaceHarness(lockScenario: LockScenario, options: WorkspaceHa
         const insertedFrame = { ...request.command.frame, storyboard: [insertedFrameId] };
         state.chapterContent = [insertedFrame, ...(state.chapterContent ?? [])];
         state.creationToken = creationReceiptToken;
+        state.createdAssetKind = null;
+        state.createdAssetId = null;
         creationReceipt = {
           token: creationReceiptToken,
           kind: "frame",
@@ -329,6 +333,8 @@ function createWorkspaceHarness(lockScenario: LockScenario, options: WorkspaceHa
           }];
         }
         state.creationToken = `synthetic-opaque-${request.command.kind}-proof`;
+        state.createdAssetKind = request.command.kind ?? null;
+        state.createdAssetId = id;
         creationReceipt = {
           token: state.creationToken,
           kind: request.command.kind,
@@ -376,16 +382,28 @@ function createWorkspaceHarness(lockScenario: LockScenario, options: WorkspaceHa
         frames[0] = { ...current, videos };
         state.chapterContent = frames;
         state.creationToken = "synthetic-opaque-video-proof";
+        state.createdAssetKind = null;
+        state.createdAssetId = null;
         creationReceipt = {
           token: state.creationToken,
           kind: "video",
           target: { storyboard_id: "board-a", index: 0, slot, value: request.command.value },
         };
       } else if (request.command.type === "creation.undo" && request.command.receipt === state.creationToken) {
-        state.chapterContent = (state.chapterContent ?? []).filter((frame) => (
-          !Array.isArray(frame.storyboard) || !frame.storyboard.includes(insertedFrameId)
-        ));
+        if (state.createdAssetKind === "character" && state.createdAssetId !== null) {
+          state.characters = state.characters.filter((item) => item.id !== state.createdAssetId);
+        } else if (state.createdAssetKind === "scene" && state.createdAssetId !== null) {
+          state.scenes = state.scenes.filter((item) => item.id !== state.createdAssetId);
+        } else if (state.createdAssetKind === "prop" && state.createdAssetId !== null) {
+          state.props = state.props.filter((item) => item.id !== state.createdAssetId);
+        } else {
+          state.chapterContent = (state.chapterContent ?? []).filter((frame) => (
+            !Array.isArray(frame.storyboard) || !frame.storyboard.includes(insertedFrameId)
+          ));
+        }
         state.creationToken = null;
+        state.createdAssetKind = null;
+        state.createdAssetId = null;
       } else {
         return jsonResponse({ detail: "合成服务未识别此来源操作。" }, 422);
       }
@@ -512,6 +530,11 @@ function createWorkspaceHarness(lockScenario: LockScenario, options: WorkspaceHa
     if (["characters", "scenes", "props"].some((name) => url.pathname.endsWith(`/${name}`))
       && method === "GET") return jsonResponse([]);
     if (url.pathname === "/api/teams/my" && method === "GET") return jsonResponse([]);
+    if (url.pathname === "/api/chat/proxy-image" && method === "GET") {
+      return new Response(new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]), {
+        headers: { "Content-Type": "image/png", "Content-Length": "8" },
+      });
+    }
 
     throw new Error(`Unexpected request: ${method} ${url.pathname}`);
   });
@@ -706,6 +729,131 @@ describe("canvas source workspace integration", () => {
     expect(layoutSaves).toHaveLength(2);
     expect(requests.filter(({ url, method }) => method === "POST"
       && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(2);
+  });
+
+  it("composes saved media bindings with receipt-owned asset placement and undo", async () => {
+    const oldPreview = `media:${initialVersion}:frame:board-a:preview`;
+    const oldVideo0 = `media:${initialVersion}:frame:board-a:video:0`;
+    const oldVideo1 = `media:${initialVersion}:frame:board-a:video:1`;
+    const boundPreview = `canvas-source-binding:${encodeURIComponent(oldPreview)}`;
+    const boundVideo0 = `canvas-source-binding:${encodeURIComponent(oldVideo0)}`;
+    const boundVideo1 = `canvas-source-binding:${encodeURIComponent(oldVideo1)}`;
+    const chapterContent: Chapter["content"] = [{
+      ...initialChapter.content![0]!,
+      preview: "/uploads/source-preview.png",
+      videos: ["same.mp4", "same.mp4"],
+    }];
+    const initialCanvasDocument = {
+      nodeLayouts: {
+        [oldPreview]: { x: 2080, y: 340, custom: "preview-layout" },
+        [oldVideo0]: { x: 2300, y: 400, custom: "video-zero" },
+        [oldVideo1]: { x: 2600, y: 500, custom: "video-one" },
+      },
+      manualEdges: [
+        { id: "preview-to-frame", sourceRef: oldPreview, targetRef: "frame:board-a", relation: "manual", vendor: 4 },
+        { id: "video-zero-to-frame", sourceRef: oldVideo0, targetRef: "frame:board-a", relation: "manual", vendor: 5 },
+        { id: "video-one-to-frame", sourceRef: oldVideo1, targetRef: "frame:board-a", relation: "manual", vendor: 6 },
+        { id: "future-dangling", sourceRef: "removed-node", targetRef: "unknown-target", relation: "future", extra: true },
+      ],
+      notes: [],
+      cards: [],
+      hiddenRelations: [],
+      viewport: { x: 0, y: 0, zoom: 1 },
+      unknown: { preserve: true },
+    };
+    const { userEvents, requests, state } = createWorkspaceHarness("personal", {
+      chapterContent,
+      initialCanvasDocument,
+    });
+    const { canvas, dialog } = await openCanvas(userEvents);
+    expect((await canvas.findByRole("article", { name: "分镜预览" }) as HTMLElement).style.left).toBe("2080px");
+    expect((canvas.getByRole("article", { name: "视频 1" }) as HTMLElement).style.left).toBe("2300px");
+    expect((canvas.getByRole("article", { name: "视频 2" }) as HTMLElement).style.left).toBe("2600px");
+    expect(dialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+
+    await userEvents.click(canvas.getByRole("button", { name: "新增角色素材" }));
+    const editor = await screen.findByRole("dialog", { name: "新增角色" });
+    fireEvent.change(within(editor).getByLabelText(/角色名称/u), { target: { value: "绑定迁移角色" } });
+    fireEvent.change(within(editor).getByLabelText("身份"), { target: { value: "配角" } });
+    await userEvents.click(within(editor).getByRole("button", { name: "创建素材" }));
+    await canvas.findByText("服务器已确认角色素材“绑定迁移角色”创建。");
+    const createdNode = await canvas.findByRole("article", { name: "绑定迁移角色" });
+    expect(state.characters.find((item) => item.id === createdCharacterId)).toMatchObject({
+      id: createdCharacterId,
+      series_id: personalSeries.id,
+      name: "绑定迁移角色",
+    });
+
+    expect((canvas.getByRole("article", { name: "分镜预览" }) as HTMLElement).style.left).toBe("2080px");
+    expect((canvas.getByRole("article", { name: "视频 1" }) as HTMLElement).style.left).toBe("2300px");
+    expect((canvas.getByRole("article", { name: "视频 2" }) as HTMLElement).style.left).toBe("2600px");
+    expect(dialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(1));
+    await canvas.findByText("已保存");
+    expect(state.canvasDocument.nodeLayouts).toMatchObject({
+      [boundPreview]: { x: 2080, y: 340, custom: "preview-layout" },
+      [boundVideo0]: { x: 2300, y: 400, custom: "video-zero" },
+      [boundVideo1]: { x: 2600, y: 500, custom: "video-one" },
+      [`character:${createdCharacterId}`]: {
+        x: Number.parseFloat((createdNode as HTMLElement).style.left),
+        y: Number.parseFloat((createdNode as HTMLElement).style.top),
+      },
+    });
+    expect(state.canvasDocument.manualEdges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "preview-to-frame", sourceRef: boundPreview, vendor: 4 }),
+      expect.objectContaining({ id: "video-zero-to-frame", sourceRef: boundVideo0, vendor: 5 }),
+      expect.objectContaining({ id: "video-one-to-frame", sourceRef: boundVideo1, vendor: 6 }),
+      expect.objectContaining({ id: "future-dangling", extra: true }),
+    ]));
+    expect(state.canvasDocument.unknown).toEqual({ preserve: true });
+
+    await userEvents.click(canvas.getByRole("button", { name: /撤销刚创建的/u }));
+    await waitFor(() => expect(canvas.getByRole("button", { name: "保存布局" })).toBeEnabled());
+    await waitFor(() => expect(state.characters.some((item) => item.id === createdCharacterId)).toBe(false));
+    expect(canvas.queryByRole("article", { name: "绑定迁移角色" })).toBeNull();
+    expect((canvas.getByRole("article", { name: "分镜预览" }) as HTMLElement).style.left).toBe("2080px");
+    expect((canvas.getByRole("article", { name: "视频 1" }) as HTMLElement).style.left).toBe("2300px");
+    expect((canvas.getByRole("article", { name: "视频 2" }) as HTMLElement).style.left).toBe("2600px");
+    expect(dialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(2));
+    await canvas.findByText("已保存");
+    expect(state.canvasDocument.nodeLayouts).toMatchObject({
+      [boundPreview]: { x: 2080, y: 340, custom: "preview-layout" },
+      [boundVideo0]: { x: 2300, y: 400, custom: "video-zero" },
+      [boundVideo1]: { x: 2600, y: 500, custom: "video-one" },
+    });
+    expect(state.canvasDocument.nodeLayouts).not.toHaveProperty(`character:${createdCharacterId}`);
+    expect(state.canvasDocument.manualEdges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "preview-to-frame", sourceRef: boundPreview, vendor: 4 }),
+      expect.objectContaining({ id: "video-zero-to-frame", sourceRef: boundVideo0, vendor: 5 }),
+      expect.objectContaining({ id: "video-one-to-frame", sourceRef: boundVideo1, vendor: 6 }),
+      expect.objectContaining({ id: "future-dangling", extra: true }),
+    ]));
+    expect(state.canvasDocument.unknown).toEqual({ preserve: true });
+
+    await userEvents.click(canvas.getByRole("button", { name: "关闭创作画布" }));
+    const reopened = await openCanvas(userEvents);
+    expect((await reopened.canvas.findByRole("article", { name: "分镜预览" }) as HTMLElement).style.left)
+      .toBe("2080px");
+    expect((reopened.canvas.getByRole("article", { name: "视频 1" }) as HTMLElement).style.left).toBe("2300px");
+    expect((reopened.canvas.getByRole("article", { name: "视频 2" }) as HTMLElement).style.left).toBe("2600px");
+    expect(reopened.canvas.queryByRole("article", { name: "绑定迁移角色" })).toBeNull();
+    expect(reopened.dialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+    const sourcePosts = requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`);
+    expect(sourcePosts).toHaveLength(2);
+    expect(sourcePosts[0]?.body).toMatchObject({
+      command: { type: "asset.create", kind: "character" },
+    });
+    expect(sourcePosts[1]?.body).toMatchObject({
+      command: { type: "creation.undo", receipt: "synthetic-opaque-character-proof" },
+    });
   });
 
   it("edits the frozen personal chapter source, verifies the independent read, then saves layout and reopens", async () => {
@@ -929,10 +1077,52 @@ describe("canvas source workspace integration", () => {
   });
 
   it.each([
-    { kind: "character" as const, button: "新增角色素材", dialog: "新增角色", nameLabel: "角色名称", name: "小满", field: "name", id: createdCharacterId },
-    { kind: "scene" as const, button: "新增场景素材", dialog: "新增场景", nameLabel: "场景名称", name: "旧书店", field: "title", id: createdSceneId },
-    { kind: "prop" as const, button: "新增道具素材", dialog: "新增道具", nameLabel: "道具名称", name: "铜钥匙", field: "name", id: createdPropId },
-  ])("creates a $kind through the Workspace HTTP adapter and confirms its server ID", async ({
+    {
+      kind: "character" as const,
+      button: "新增角色素材",
+      dialog: "新增角色",
+      nameLabel: "角色名称",
+      name: "小满",
+      field: "name",
+      id: createdCharacterId,
+      unreferencedName: "另一章专属角色",
+      unreferenced: {
+        characters: [{ ...initialCharacter, id: "character-from-other-chapter", name: "另一章专属角色" }],
+        scenes: [],
+        props: [],
+      },
+    },
+    {
+      kind: "scene" as const,
+      button: "新增场景素材",
+      dialog: "新增场景",
+      nameLabel: "场景名称",
+      name: "旧书店",
+      field: "title",
+      id: createdSceneId,
+      unreferencedName: "另一章专属场景",
+      unreferenced: {
+        characters: [],
+        scenes: [{ ...initialScene, id: "scene-from-other-chapter", title: "另一章专属场景" }],
+        props: [],
+      },
+    },
+    {
+      kind: "prop" as const,
+      button: "新增道具素材",
+      dialog: "新增道具",
+      nameLabel: "道具名称",
+      name: "铜钥匙",
+      field: "name",
+      id: createdPropId,
+      unreferencedName: "另一章专属道具",
+      unreferenced: {
+        characters: [],
+        scenes: [],
+        props: [{ ...initialProp, id: "prop-from-other-chapter", name: "另一章专属道具" }],
+      },
+    },
+  ])("creates and places a $kind through the Workspace HTTP adapter using its confirmed ID", async ({
     kind,
     button,
     dialog: dialogName,
@@ -940,9 +1130,44 @@ describe("canvas source workspace integration", () => {
     name,
     field,
     id,
+    unreferencedName,
+    unreferenced,
   }) => {
-    const { userEvents, requests, state } = createWorkspaceHarness("personal");
-    const { canvas } = await openCanvas(userEvents);
+    const { userEvents, requests, state } = createWorkspaceHarness("personal", {
+      initialCanvasDocument: {
+        version: 1,
+        viewport: { x: 0, y: 0, zoom: 1 },
+        nodes: [],
+        edges: [],
+        notes: [],
+        nodeLayouts: { "future:unrelated": { x: 17, y: 29, vendorField: { preserve: true } } },
+        vendorDocumentField: { preserve: true },
+      },
+      characters: [
+        { ...initialCharacter, id: "character-unreferenced", name: "未引用角色" },
+        ...unreferenced.characters,
+      ],
+      scenes: [
+        { ...initialScene, id: "scene-unreferenced", title: "未引用场景" },
+        ...unreferenced.scenes,
+      ],
+      props: [
+        { ...initialProp, id: "prop-unreferenced", name: "未引用道具" },
+        ...unreferenced.props,
+      ],
+      extraStoryboardAssets: [{
+        id: "board-unreferenced-in-current-chapter",
+        series_id: personalSeries.id,
+        chapter_id: initialChapter.id,
+        frame_index: 0,
+        name: "未引用分镜素材",
+        description: null,
+        image_url: null,
+        created_at: "2026-10-01T00:00:00Z",
+        updated_at: "2026-10-01T00:00:00Z",
+      }],
+    });
+    const { canvas, dialog: canvasDialog } = await openCanvas(userEvents);
     await userEvents.click(canvas.getByRole("button", { name: button }));
     const editor = await screen.findByRole("dialog", { name: dialogName });
     fireEvent.change(within(editor).getByLabelText(new RegExp(nameLabel, "u")), { target: { value: name } });
@@ -986,6 +1211,157 @@ describe("canvas source workspace integration", () => {
       && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(2);
     expect(requests.filter(({ url, method }) => method === "POST"
       && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(1);
+    for (const hiddenName of ["未引用角色", "未引用场景", "未引用道具", "未引用分镜素材", unreferencedName]) {
+      expect(canvas.queryByRole("article", { name: hiddenName })).toBeNull();
+    }
+    const createdNode = await canvas.findByRole("article", { name });
+    const originalPosition = {
+      left: (createdNode as HTMLElement).style.left,
+      top: (createdNode as HTMLElement).style.top,
+    };
+    expect(originalPosition.left).not.toBe("");
+    expect(originalPosition.top).not.toBe("");
+    expect((createdNode as HTMLElement).className).toContain("canvas-node");
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(1));
+    await waitFor(() => expect(canvas.getByText("已保存")).toBeTruthy());
+    await userEvents.click(createdNode);
+    expect((createdNode as HTMLElement).className).toContain("is-selected");
+    const editButton = canvas.getByRole("button", { name: "编辑选中素材" });
+    expect(editButton).toBeEnabled();
+    await userEvents.click(editButton);
+    const editDialogName = kind === "character" ? "编辑角色" : kind === "scene" ? "编辑场景" : "编辑道具";
+    const editDialog = await screen.findByRole("dialog", { name: editDialogName });
+    expect(within(editDialog).getByLabelText(new RegExp(nameLabel, "u"))).toHaveValue(name);
+    await userEvents.click(within(editDialog).getByRole("button", { name: "关闭素材窗口" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: editDialogName })).toBeNull());
+
+    await userEvents.click(canvas.getByRole("button", { name: "手动连线" }));
+    await userEvents.click(canvas.getByRole("article", { name: "分镜 1" }));
+    await userEvents.click(canvas.getByRole("article", { name }));
+    expect(canvasDialog.querySelector("path.is-manual")).not.toBeNull();
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(2));
+    await waitFor(() => expect(canvas.getByText("已保存")).toBeTruthy());
+    const assetRef = `${kind}:${id}`;
+    const savedLayouts = state.canvasDocument.nodeLayouts as Record<string, { x?: unknown; y?: unknown }> | undefined;
+    expect(savedLayouts?.[assetRef]).toMatchObject({
+      x: Number.parseFloat(originalPosition.left),
+      y: Number.parseFloat(originalPosition.top),
+    });
+    expect(savedLayouts?.["future:unrelated"]).toEqual({ x: 17, y: 29, vendorField: { preserve: true } });
+    expect(state.canvasDocument.vendorDocumentField).toEqual({ preserve: true });
+    const savedEdges = state.canvasDocument.manualEdges as Array<Record<string, unknown>> | undefined;
+    expect(savedEdges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ sourceRef: "frame:board-a", targetRef: assetRef, relation: "manual" }),
+    ]));
+    await userEvents.click(canvas.getByRole("button", { name: "关闭创作画布" }));
+    await waitFor(() => expect(canvasDialog.isConnected).toBe(false));
+    const reopened = await openCanvas(userEvents);
+    const reopenedNode = await reopened.canvas.findByRole("article", { name });
+    expect((reopenedNode as HTMLElement).style.left).toBe(originalPosition.left);
+    expect((reopenedNode as HTMLElement).style.top).toBe(originalPosition.top);
+    for (const hiddenName of ["未引用角色", "未引用场景", "未引用道具", "未引用分镜素材", unreferencedName]) {
+      expect(reopened.canvas.queryByRole("article", { name: hiddenName })).toBeNull();
+    }
+    expect(reopened.dialog.querySelector("path.is-manual")).not.toBeNull();
+    expect(state.canvasDocument.nodeLayouts).toMatchObject({
+      "future:unrelated": { x: 17, y: 29, vendorField: { preserve: true } },
+    });
+    expect(requests.filter(({ url, method }) => method === "GET"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(3);
+  });
+
+  it("removes only the receipt-owned asset placement after confirmed creation undo", async () => {
+    const { userEvents, requests, state } = createWorkspaceHarness("personal", {
+      initialCanvasDocument: {
+        version: 1,
+        viewport: { x: 0, y: 0, zoom: 1 },
+        nodes: [],
+        edges: [],
+        notes: [],
+        nodeLayouts: { "future:unrelated": { x: 17, y: 29, vendorField: { preserve: true } } },
+        vendorDocumentField: { preserve: true },
+      },
+    });
+    const { canvas } = await openCanvas(userEvents);
+    await userEvents.click(canvas.getByRole("button", { name: "新增角色素材" }));
+    const editor = await screen.findByRole("dialog", { name: "新增角色" });
+    fireEvent.change(within(editor).getByLabelText(/角色名称/u), { target: { value: "回执角色" } });
+    fireEvent.change(within(editor).getByLabelText("身份"), { target: { value: "配角" } });
+    await userEvents.click(within(editor).getByRole("button", { name: "创建素材" }));
+    const createdNode = await canvas.findByRole("article", { name: "回执角色" });
+
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(1));
+    await waitFor(() => expect(canvas.getByText("已保存")).toBeTruthy());
+    expect(state.canvasDocument.nodeLayouts).toMatchObject({
+      [`character:${createdCharacterId}`]: {
+        x: Number.parseFloat((createdNode as HTMLElement).style.left),
+        y: Number.parseFloat((createdNode as HTMLElement).style.top),
+      },
+    });
+
+    await userEvents.click(canvas.getByRole("button", { name: /撤销刚创建的/u }));
+    await waitFor(() => expect(state.characters.some((item) => item.id === createdCharacterId)).toBe(false));
+    expect(canvas.queryByRole("article", { name: "回执角色" })).toBeNull();
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(2));
+    await waitFor(() => expect(canvas.getByText("已保存")).toBeTruthy());
+    expect(state.canvasDocument.nodeLayouts).toEqual({
+      "future:unrelated": { x: 17, y: 29, vendorField: { preserve: true } },
+    });
+    expect(state.canvasDocument.vendorDocumentField).toEqual({ preserve: true });
+
+    await userEvents.click(canvas.getByRole("button", { name: "关闭创作画布" }));
+    const reopened = await openCanvas(userEvents);
+    expect(reopened.canvas.queryByRole("article", { name: "回执角色" })).toBeNull();
+    expect(state.canvasDocument.nodeLayouts).toEqual({
+      "future:unrelated": { x: 17, y: 29, vendorField: { preserve: true } },
+    });
+    const sourcePosts = requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`);
+    expect(sourcePosts).toHaveLength(2);
+    expect(sourcePosts[1]?.body).toMatchObject({
+      expected_version: "6666666666666666666666666666666666666666666666666666666666666666",
+      command: { type: "creation.undo", receipt: "synthetic-opaque-character-proof" },
+    });
+  });
+
+  it("preserves a pre-existing layout for the exact server-created asset ID", async () => {
+    const assetRef = `character:${createdCharacterId}`;
+    const originalLayout = { x: 803, y: 417, vendorField: { preserve: true } };
+    const { userEvents, state } = createWorkspaceHarness("personal", {
+      initialCanvasDocument: {
+        version: 1,
+        viewport: { x: 0, y: 0, zoom: 1 },
+        nodes: [],
+        edges: [],
+        notes: [],
+        nodeLayouts: { [assetRef]: originalLayout },
+      },
+    });
+    const { canvas } = await openCanvas(userEvents);
+    await userEvents.click(canvas.getByRole("button", { name: "新增角色素材" }));
+    const editor = await screen.findByRole("dialog", { name: "新增角色" });
+    fireEvent.change(within(editor).getByLabelText(/角色名称/u), { target: { value: "既有布局角色" } });
+    fireEvent.change(within(editor).getByLabelText("身份"), { target: { value: "配角" } });
+    await userEvents.click(within(editor).getByRole("button", { name: "创建素材" }));
+
+    const createdNode = await canvas.findByRole("article", { name: "既有布局角色" });
+    expect((createdNode as HTMLElement).style.left).toBe("803px");
+    expect((createdNode as HTMLElement).style.top).toBe("417px");
+    expect(state.canvasDocument.nodeLayouts).toEqual({ [assetRef]: originalLayout });
+    await userEvents.click(canvas.getByRole("button", { name: "关闭创作画布" }));
+    const reopened = await openCanvas(userEvents);
+    const reopenedNode = await reopened.canvas.findByRole("article", { name: "既有布局角色" });
+    expect((reopenedNode as HTMLElement).style.left).toBe("803px");
+    expect((reopenedNode as HTMLElement).style.top).toBe("417px");
+    expect(state.canvasDocument.nodeLayouts).toEqual({ [assetRef]: originalLayout });
   });
 
   it.each([
