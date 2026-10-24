@@ -33,7 +33,7 @@ const storyboard: StoryboardAsset = {
   id: "storyboard-a",
   series_id: "series-a",
   chapter_id: "chapter-a",
-  frame_index: 88,
+  frame_index: 0,
   name: "夜雨构图",
   description: null,
   image_url: "/uploads/storyboard.png",
@@ -42,6 +42,66 @@ const storyboard: StoryboardAsset = {
 };
 
 describe("chapter canvas graph projection", () => {
+  it("accepts a unique first storyboard ID and exact null targets with same-index orphan rows", () => {
+    const withExtraReference = {
+      ...chapter,
+      content: [{ ...chapter.content![0], storyboard: ["storyboard-a", "legacy-reference"] }],
+    };
+    const firstIdGraph = buildCanvasGraph(withExtraReference, [storyboard], [character], [], [], {}, "version-a");
+    expect(firstIdGraph.nodes.find((node) => node.kind === "frame"))
+      .toMatchObject({ ref: "frame:storyboard-a", sourceTarget: { index: 0, storyboard_id: "storyboard-a" } });
+
+    const noIdFrame = {
+      ...chapter,
+      content: [{ ...chapter.content![0], storyboard: [null, ""] as unknown as string[] }],
+    };
+    const orphan = { ...storyboard, id: "orphan-board", frame_index: 0 };
+    const noIdGraph = buildCanvasGraph(noIdFrame, [orphan], [character], [], [], {}, "version-a");
+    expect(noIdGraph.nodes.find((node) => node.kind === "frame"))
+      .toMatchObject({ ref: "frame-index:version-a:0", sourceTarget: { index: 0, storyboard_id: null } });
+
+    for (const references of [[" "], [null, "\t"]]) {
+      const whitespaceIdentity = {
+        ...chapter,
+        content: [{ ...chapter.content![0], storyboard: references as unknown as string[] }],
+      };
+      const graph = buildCanvasGraph(whitespaceIdentity, [], [character], [], [], {}, "version-a");
+      expect(graph.nodes.find((node) => node.kind === "frame"))
+        .toMatchObject({ ref: "frame-ambiguous:version-a:0", sourceTarget: null });
+    }
+  });
+
+  it("uses only exact persisted source bindings and leaves a changed version unmatched", () => {
+    const sourceVersion = "source-version-b";
+    const boundChapter = {
+      ...chapter,
+      content: [{ ...chapter.content![0]!, videos: ["same.mp4", "other.mp4"] }],
+    };
+    const videoBinding = {
+      ref: "canvas-source-binding:video-zero",
+      seriesId: chapter.series_id,
+      chapterId: chapter.id,
+      sourceVersion,
+      sourceRef: `media:${sourceVersion}:frame:storyboard-a:video:0`,
+    };
+    const document = {
+      nodeLayouts: {
+        [videoBinding.ref]: { x: 2100, y: 320 },
+      },
+      canvasSourceBindings: [videoBinding],
+    };
+    const current = buildCanvasGraph(boundChapter, [storyboard], [character], [], [], document, sourceVersion);
+    expect(current.nodes.find((node) => node.kind === "video" && node.detail === "same.mp4"))
+      .toMatchObject({ ref: videoBinding.ref, x: 2100, y: 320 });
+
+    const externallyChanged = buildCanvasGraph({
+      ...boundChapter,
+      content: [{ ...boundChapter.content![0]!, videos: ["other.mp4", "same.mp4"] }],
+    }, [storyboard], [character], [], [], document, "source-version-c");
+    expect(externallyChanged.nodes.find((node) => node.kind === "video" && node.detail === "same.mp4"))
+      .toMatchObject({ ref: "media:source-version-c:frame:storyboard-a:video:1", x: 1540 });
+  });
+
   it("projects exact current sources and legacy index layouts without guessing identities", () => {
     const graph = buildCanvasGraph(
       chapter,
@@ -68,7 +128,8 @@ describe("chapter canvas graph projection", () => {
     expect(media?.imageUrl).toBe("/uploads/storyboard.png");
     expect(preview?.x).toBe(1100);
     expect(preview?.imageUrl).toBe("/uploads/preview.png");
-    expect(graph.nodes.some((node) => node.ref === "character:character-a")).toBe(true);
+    expect(graph.nodes.find((node) => node.ref === "character:character-a"))
+      .toMatchObject({ kind: "character", itemId: "character-a" });
     expect(graph.nodes.some((node) => node.ref === "media:0:0")).toBe(true);
     expect(graph.nodes.some((node) => node.ref === "media:0:1")).toBe(true);
     expect(graph.nodes.some((node) => node.ref === "note-a")).toBe(true);
@@ -262,5 +323,59 @@ describe("chapter canvas graph projection", () => {
       node.x + node.width <= other.x || other.x + other.width <= node.x ||
       node.y + node.height <= other.y || other.y + other.height <= node.y,
     ))).toBe(true);
+  });
+
+  it("uses source-version-bound frame and exact media-slot refs without occupying storyboard image refs", () => {
+    const sourceVersion = "8be1499c4eb8b1a1f8e20d020cd52796e938726f0a1889cfecc07641d8d28a57";
+    const sourceChapter = {
+      ...chapter,
+      content: [{ ...chapter.content![0], storyboard: ["storyboard-a"], videos: ["same.mp4", "same.mp4", "pending"] }],
+    };
+    const sourceStoryboard = { ...storyboard, frame_index: 0 };
+    const graph = buildCanvasGraph(sourceChapter, [sourceStoryboard], [character], [], [], {
+      nodeLayouts: [
+        { refId: "frame:0", x: 900, y: 0 },
+        { refId: "storyboard:storyboard-a", x: 950, y: 20 },
+        { refId: "media:0:0", x: 980, y: 40 },
+      ],
+    }, sourceVersion);
+
+    const frame = graph.nodes.find((node) => node.kind === "frame");
+    const image = graph.nodes.find((node) => node.ref === "storyboard:storyboard-a");
+    const preview = graph.nodes.find((node) => node.kind === "preview");
+    const videos = graph.nodes.filter((node) => node.kind === "video");
+    expect(frame).toMatchObject({ ref: "frame:storyboard-a", sourceTarget: { index: 0, storyboard_id: "storyboard-a" } });
+    expect(image?.ref).toBe("storyboard:storyboard-a");
+    expect(preview?.ref).toBe(`media:${sourceVersion}:frame:storyboard-a:preview`);
+    expect(videos.map((node) => node.sourceSlot)).toEqual([0, 1, 2]);
+    expect(videos.map((node) => node.ref)).toEqual([
+      `media:${sourceVersion}:frame:storyboard-a:video:0`,
+      `media:${sourceVersion}:frame:storyboard-a:video:1`,
+      `media:${sourceVersion}:frame:storyboard-a:video:2`,
+    ]);
+    expect(frame?.x).not.toBe(900);
+    expect(image?.x).toBe(950);
+  });
+
+  it("permits an explicit index target only for a truly unlinked frame and keeps ambiguous refs read-only", () => {
+    const sourceVersion = "8be1499c4eb8b1a1f8e20d020cd52796e938726f0a1889cfecc07641d8d28a57";
+    const noIdentity = { ...chapter, content: [{ text: "无分镜素材 ID", storyboard: [] }] };
+    const graph = buildCanvasGraph(noIdentity, [], [], [], [], {}, sourceVersion);
+    expect(graph.nodes.find((node) => node.kind === "frame"))
+      .toMatchObject({ ref: `frame-index:${sourceVersion}:0`, sourceTarget: { index: 0, storyboard_id: null } });
+
+    const duplicateIdentity = {
+      ...chapter,
+      content: [
+        { text: "第一镜", storyboard: ["storyboard-a"] },
+        { text: "第二镜", storyboard: ["storyboard-a"] },
+      ],
+    };
+    const duplicateAssets = [
+      { ...storyboard, frame_index: 0 },
+      { ...storyboard, frame_index: 1 },
+    ];
+    const ambiguous = buildCanvasGraph(duplicateIdentity, duplicateAssets, [], [], [], {}, sourceVersion);
+    expect(ambiguous.nodes.filter((node) => node.kind === "frame").every((node) => node.sourceTarget === null)).toBe(true);
   });
 });

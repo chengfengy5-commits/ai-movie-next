@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import type { Chapter, Character, Prop, Scene } from "../../../shared/api/contracts";
+import { CanvasSourceError } from "../../../shared/api/canvasSources";
 import { normalizeApiError } from "../../../shared/api/services";
 import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
 import type { FrameStructureDraft } from "./contract";
@@ -182,7 +183,7 @@ export function FrameStructureEditor({
     } catch (cause) {
       if (!controller.signal.aborted) {
         const error = normalizeApiError(cause);
-        setMessage(error.detail ?? error.message);
+        setMessage(cause instanceof CanvasSourceError ? cause.message : error.detail ?? error.message);
       }
     } finally {
       if (controllerRef.current === controller) {
@@ -211,7 +212,7 @@ export function FrameStructureEditor({
     } catch (cause) {
       if (!controller.signal.aborted) {
         const error = normalizeApiError(cause);
-        setMessage(error.detail ?? error.message);
+        setMessage(cause instanceof CanvasSourceError ? cause.message : error.detail ?? error.message);
       }
     } finally {
       if (controllerRef.current === controller) {

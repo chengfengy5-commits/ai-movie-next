@@ -8,6 +8,7 @@ import { ApiConfigurationError, readEnvironmentConfiguration, resolveApiBaseUrl,
 import { ApiError, isAbortError } from "./errors";
 import { createCanvasDataHttpPort } from "./canvasDataHttp";
 import { CanvasDataError, type CanvasDataPort, type CanvasEnvelope } from "./canvasData";
+import { createCanvasSourceHttpPort, type CanvasSourcePort } from "./canvasSources";
 import {
   parseAccountActionReceipt,
   parseEmailCodeReceipt,
@@ -209,6 +210,7 @@ export interface WorkspaceServices {
   readonly assetImageUpload?: AssetImageUploadPort;
   readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
+  readonly canvasSource?: CanvasSourcePort;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
@@ -2897,6 +2899,7 @@ export function createApiServices(
     mode: "api",
     apiBaseUrl,
     canvasData: createCanvasDataHttpPort(apiBaseUrl, { storage, fetcher }),
+    canvasSource: createCanvasSourceHttpPort(apiBaseUrl, { storage, fetcher, timeoutMs }),
     teamManagement: createTeamManagementHttpPort(apiBaseUrl, {
       storage,
       fetcher,

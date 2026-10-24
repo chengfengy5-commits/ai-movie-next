@@ -1,6 +1,9 @@
 import type { Character, Chapter, Prop, Scene, StoryboardAsset } from "../../shared/api/contracts";
 import { isRecord } from "../../shared/api/canvasData";
+import type { CanvasFrameTarget } from "../../shared/api/canvasSources";
+import { resolveCanvasFrameTarget } from "../../shared/api/canvasSources";
 import { canvasLayout, hasCanvasLayout, type CanvasDocument } from "./canvasDocument";
+import { resolveCanvasSourceBindingRef } from "./canvasSourceBindings";
 
 export type CanvasNodeKind = "character" | "scene" | "prop" | "frame" | "media" | "preview" | "video" | "note" | "card";
 
@@ -19,6 +22,9 @@ export interface CanvasGraphNode {
   frameIndex?: number;
   itemCollection?: "notes" | "cards";
   itemTextField?: "text" | "label";
+  sourceTarget?: CanvasFrameTarget | null;
+  sourceField?: "preview" | "video";
+  sourceSlot?: number | null;
 }
 
 export interface CanvasGraphEdge {
@@ -68,6 +74,47 @@ function storedItems(document: CanvasDocument, key: "notes" | "cards" | "manualE
   return Array.isArray(value) ? value.filter(isRecord) : [];
 }
 
+interface FrameSourceIdentity {
+  ref: string;
+  sourceRef: string;
+  target: CanvasFrameTarget | null;
+}
+
+function frameSourceIdentities(
+  chapter: Chapter,
+  storyboardAssets: StoryboardAsset[],
+  sourceVersion: string,
+  document: CanvasDocument,
+): FrameSourceIdentity[] {
+  const frames = chapter.content ?? [];
+  return frames.map((_frame, index) => {
+    const target = resolveCanvasFrameTarget(chapter, storyboardAssets, index);
+    if (target === null) {
+      const sourceRef = `frame-ambiguous:${sourceVersion}:${index}`;
+      return {
+        ref: resolveCanvasSourceBindingRef(document, {
+          series_id: chapter.series_id, chapter_id: chapter.id, version: sourceVersion,
+        }, sourceRef),
+        sourceRef,
+        target: null,
+      };
+    }
+    let sourceRef: string;
+    if (target.storyboard_id === null) {
+      sourceRef = `frame-index:${sourceVersion}:${index}`;
+    } else {
+      sourceRef = `frame:${target.storyboard_id}`;
+    }
+    return {
+      ref: resolveCanvasSourceBindingRef(document, {
+        series_id: chapter.series_id, chapter_id: chapter.id, version: sourceVersion,
+      }, sourceRef),
+      sourceRef,
+      target,
+    };
+  });
+}
+
 export function buildCanvasGraph(
   chapter: Chapter,
   storyboardAssets: StoryboardAsset[],
@@ -75,10 +122,14 @@ export function buildCanvasGraph(
   scenes: Scene[],
   props: Prop[],
   document: CanvasDocument,
+  sourceVersion?: string,
 ): CanvasGraph {
   const nodes: CanvasGraphNode[] = [];
   const edges: CanvasGraphEdge[] = [];
   const frames = chapter.content ?? [];
+  const sourceFrameIdentities = sourceVersion === undefined
+    ? null
+    : frameSourceIdentities(chapter, storyboardAssets, sourceVersion, document);
   const referenced = new Map<string, Set<string>>();
 
   for (const frame of frames) {
@@ -113,6 +164,7 @@ export function buildCanvasGraph(
         key: ref,
         ref,
         kind: source.kind,
+        itemId: id,
         title: assetLabel(source.kind, asset),
         detail: text(asset.description) || "当前剧集素材",
         x,
@@ -135,7 +187,8 @@ export function buildCanvasGraph(
   let defaultMediaLaneIndex = 0;
   frames.forEach((frame, index) => {
     if (!isRecord(frame)) return;
-    const frameRef = "frame:" + index;
+    const frameIdentity = sourceFrameIdentities?.[index];
+    const frameRef = frameIdentity?.ref ?? "frame:" + index;
     const frameLayout = canvasLayout(document, frameRef);
     const frameNode: CanvasGraphNode = {
       key: frameRef,
@@ -149,6 +202,7 @@ export function buildCanvasGraph(
       height: 145,
       imageUrl: null,
       frameIndex: index,
+      ...(sourceVersion === undefined ? {} : { sourceTarget: frameIdentity?.target ?? null }),
     };
     nodes.push(frameNode);
 
@@ -190,7 +244,14 @@ export function buildCanvasGraph(
     const previewReservesOrdinal = Boolean(preview);
     const hasPreview = typeof preview === "string" && preview.trim() !== "";
     if (hasPreview) {
-      const previewRef = "media:" + index + ":0";
+      const previewSourceRef = sourceVersion === undefined
+        ? "media:" + index + ":0"
+        : `media:${sourceVersion}:${frameIdentity?.sourceRef ?? frameRef}:preview`;
+      const previewRef = sourceVersion === undefined
+        ? previewSourceRef
+        : resolveCanvasSourceBindingRef(document, {
+          series_id: chapter.series_id, chapter_id: chapter.id, version: sourceVersion,
+        }, previewSourceRef);
       const previewLayout = canvasLayout(document, previewRef);
       nodes.push({
         key: "preview-node:" + index,
@@ -204,6 +265,11 @@ export function buildCanvasGraph(
         height: 130,
         imageUrl: /^https?:\/\//iu.test(preview) || preview.startsWith("/uploads/") ? preview : null,
         frameIndex: index,
+        ...(sourceVersion === undefined ? {} : {
+          sourceTarget: frameIdentity?.target ?? null,
+          sourceField: "preview" as const,
+          sourceSlot: null,
+        }),
       });
       edges.push({ id: "generates:" + frameRef + ":" + previewRef, sourceRef: frameRef, targetRef: previewRef, relation: "generates", manual: false });
       defaultMediaLaneIndex += 1;
@@ -221,13 +287,20 @@ export function buildCanvasGraph(
     let videoOrdinal = previewReservesOrdinal ? 1 : 0;
     let visibleVideoIndex = 0;
     const videos = Array.isArray(frame.videos) ? frame.videos : [];
-    videos.forEach((video) => {
+    videos.forEach((video, videoSlot) => {
       if (typeof video !== "string") return;
       const mediaOrdinal = videoOrdinal;
       videoOrdinal += 1;
-      if (video.trim() === "") return;
+      if (video.trim() === "" && sourceVersion === undefined) return;
 
-      const ref = "media:" + index + ":" + mediaOrdinal;
+      const sourceRef = sourceVersion === undefined
+        ? "media:" + index + ":" + mediaOrdinal
+        : `media:${sourceVersion}:${frameIdentity?.sourceRef ?? frameRef}:video:${videoSlot}`;
+      const ref = sourceVersion === undefined
+        ? sourceRef
+        : resolveCanvasSourceBindingRef(document, {
+          series_id: chapter.series_id, chapter_id: chapter.id, version: sourceVersion,
+        }, sourceRef);
       const layout = canvasLayout(document, ref);
       nodes.push({
         key: "video-node:" + index + ":" + mediaOrdinal,
@@ -241,6 +314,11 @@ export function buildCanvasGraph(
         height: 120,
         imageUrl: null,
         frameIndex: index,
+        ...(sourceVersion === undefined ? {} : {
+          sourceTarget: frameIdentity?.target ?? null,
+          sourceField: "video" as const,
+          sourceSlot: videoSlot,
+        }),
       });
       visibleVideoIndex += 1;
       defaultMediaLaneIndex += 1;
