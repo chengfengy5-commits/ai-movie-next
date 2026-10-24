@@ -427,6 +427,8 @@ def test_unwired_routes_remain_inert_and_register_exact_new_identities() -> None
     }
     expected = {
         ("GET", "/api/chat/proxy-image", "proxy_image"),
+        ("GET", "/api/chapters/{chapter_id}/canvas-source", "read_source"),
+        ("POST", "/api/chapters/{chapter_id}/canvas-source", "write_source"),
         ("GET", "/", "read_root"),
         ("GET", "/health", "health_check"),
         ("GET", "/ready", "ready_check"),
@@ -445,7 +447,7 @@ def test_unwired_routes_remain_inert_and_register_exact_new_identities() -> None
         ("POST", "/api/chat/video", "chat_video"),
         ("POST", "/api/chat/batch-generate-images", "batch_generate_images"),
     }
-    assert len(routes) == 252
+    assert len(routes) == 254
     assert expected <= routes
     series_response = _request(
         app,

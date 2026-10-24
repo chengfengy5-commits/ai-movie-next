@@ -34,6 +34,7 @@ def stage_media_reconciliation(
     new_assets: Sequence[Mapping[str, object]] = (),
     asset_image_overrides: Mapping[str, object] | None = None,
     deleted_asset_ids: set[str] | None = None,
+    preserve_unreferenced_state_ids: set[str] | None = None,
     focus_storyboard_asset_id: str | None = None,
 ) -> MediaReconciliationOutcome:
     """Stage media-state and approval changes using the caller's Session.
@@ -64,6 +65,7 @@ def stage_media_reconciliation(
         "new_assets": tuple(dict(asset) for asset in new_assets),
         "asset_image_overrides": dict(asset_image_overrides or {}),
         "deleted_asset_ids": set(deleted_asset_ids or ()),
+        "preserve_unreferenced_state_ids": set(preserve_unreferenced_state_ids or ()),
     }
     if chapter_content_override is not _UNSET:
         kwargs["chapter_content_override"] = chapter_content_override

@@ -26,6 +26,7 @@ def reconcile_chapter_media_state(
     asset_image_overrides: Mapping[str, object] | None = None,
     deleted_asset_ids: set[str] | None = None,
     new_assets: tuple[Mapping[str, object], ...] = (),
+    preserve_unreferenced_state_ids: set[str] | None = None,
 ) -> ChapterMediaSnapshot:
     """Reconcile current source/media facts in the caller's transaction.
 
@@ -95,8 +96,11 @@ def reconcile_chapter_media_state(
         )
         changed_ids.add(asset_id)
 
+    preserved_ids = (preserve_unreferenced_state_ids or set()) - (deleted_asset_ids or set())
     for asset_id, current in tuple(states.items()):
         if asset_id in target_facts:
+            continue
+        if asset_id in preserved_ids:
             continue
         invalid_facts: dict[str, object] = {
             "asset_image_digest": None,

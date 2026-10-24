@@ -54,6 +54,9 @@ from .generic_tasks.persistence import create_generic_task_uow_factory
 from .canvas_data.http import mount_canvas_data_routes
 from .canvas_data.persistence import SqlAlchemyCanvasDataUnitOfWork
 from .canvas_data.ports import UnitOfWorkFactory as CanvasDataUnitOfWorkFactory
+from .canvas_sources.http import build_canvas_sources_router
+from .canvas_sources.persistence import SqlAlchemyCanvasSourceUnitOfWork
+from .canvas_sources.ports import CanvasSourceUnitOfWorkFactory
 from .chapter_asset_replacement.http import mount_chapter_asset_replacement_routes
 from .chapter_asset_replacement.persistence import SqlAlchemyChapterAssetReplacementUnitOfWork
 from .chapter_asset_replacement.ports import UnitOfWorkFactory as ChapterAssetReplacementUnitOfWorkFactory
@@ -689,6 +692,24 @@ def create_app(
         app,
         uow_factory=asset_data_uow_factory,
         resolve_actor=effective_resolver,
+    )
+    canvas_source_uow_factory: CanvasSourceUnitOfWorkFactory | None = None
+    if effective_session_factory is not None:
+        def make_canvas_source_uow() -> SqlAlchemyCanvasSourceUnitOfWork:
+            return SqlAlchemyCanvasSourceUnitOfWork(effective_session_factory())
+
+        canvas_source_uow_factory = make_canvas_source_uow
+
+    app.include_router(
+        build_canvas_sources_router(
+            uow_factory=canvas_source_uow_factory,
+            resolve_actor=effective_resolver,
+            receipt_secret=(
+                authentication_runtime.secret_key
+                if authentication_runtime is not None
+                else None
+            ),
+        )
     )
 
     chat_data_uow_factory: ChatDataUnitOfWorkFactory | None = None
