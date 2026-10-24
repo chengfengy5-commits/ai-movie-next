@@ -37,6 +37,13 @@ function accountErrorMessage(error: unknown): string {
   return "发生意外错误，请重试。";
 }
 
+function sendCodeErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && (error.kind === "timeout" || error.kind === "network")) {
+    return "发送结果暂未确认。请先检查收件箱和垃圾邮件；如果已收到验证码，可直接填写并校验，或提交注册让服务器校验。系统不会自动重发。";
+  }
+  return accountErrorMessage(error);
+}
+
 function registrationErrorMessage(error: unknown): string {
   const uncertain = error instanceof InvalidResponseError
     || (error instanceof ApiError && (
@@ -122,12 +129,10 @@ export function RegistrationForm({ service, onDirtyChange, onRegistered }: Accou
   const [password, setPassword] = useState("");
   const [confirmation, setConfirmation] = useState("");
   const [emailCode, setEmailCode] = useState("");
-  const [codeSentTo, setCodeSentTo] = useState<string | null>(null);
   const [verifiedEmail, setVerifiedEmail] = useState<string | null>(null);
   const [pendingAction, setPendingAction] = useState<"send" | "verify" | "register" | null>(null);
   const { pending, feedback, setFeedback, run } = useAccountOperation(service);
   const emailValue = normalizedEmail(email);
-  const codeSentForCurrentEmail = codeSentTo === emailValue && emailValue !== "";
   const emailVerified = verifiedEmail === emailValue && emailValue !== "";
 
   function markDirty() {
@@ -138,7 +143,6 @@ export function RegistrationForm({ service, onDirtyChange, onRegistered }: Accou
   function handleEmailChange(value: string) {
     setEmail(value);
     setEmailCode("");
-    setCodeSentTo(null);
     setVerifiedEmail(null);
     setFeedback(null);
     markDirty();
@@ -148,27 +152,27 @@ export function RegistrationForm({ service, onDirtyChange, onRegistered }: Accou
     if (!service) {
       return;
     }
+    setVerifiedEmail(null);
     setPendingAction("send");
     try {
       await run((currentService, signal) => currentService.sendEmailCode({
         email: emailValue,
         username: username.trim(),
       }, signal), (receipt) => {
-        setCodeSentTo(emailValue);
         setVerifiedEmail(null);
         setFeedback({
           kind: "success",
           message: `接口返回“${receipt.message}”（约 ${Math.ceil(receipt.expireInSeconds / 60)} 分钟有效）。请检查收件箱和垃圾邮件；此响应不能确认邮件已送达。`,
         });
-      });
+      }, sendCodeErrorMessage);
     } finally {
       setPendingAction(null);
     }
   }
 
   async function verifyCode() {
-    if (!service || !codeSentForCurrentEmail || emailCode.trim() === "") {
-      setFeedback({ kind: "error", message: "请先发送验证码，再填写收到的验证码。" });
+    if (!service || emailValue === "" || emailCode.trim() === "") {
+      setFeedback({ kind: "error", message: "请填写邮箱和收到的验证码。" });
       return;
     }
     setPendingAction("verify");
@@ -285,7 +289,7 @@ export function RegistrationForm({ service, onDirtyChange, onRegistered }: Accou
           />
           <button
             className="secondary-button"
-            disabled={!service || pending || !codeSentForCurrentEmail || emailCode.trim() === ""}
+            disabled={!service || pending || emailValue === "" || emailCode.trim() === "" || emailVerified}
             onClick={() => { void verifyCode(); }}
             type="button"
           >
