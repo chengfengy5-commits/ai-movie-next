@@ -14,6 +14,7 @@ import {
   type SceneUpdateInput,
 } from "../../../shared/api/assetManagement";
 import { ApiError } from "../../../shared/api/errors";
+import { CanvasSourceError, type CanvasCreationReceipt } from "../../../shared/api/canvasSources";
 import { normalizeApiError, type WorkspaceServices } from "../../../shared/api/services";
 import { projectAssetFrameUsage, type AssetFrameUsageProjection } from "../assetFrameUsage";
 import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
@@ -39,16 +40,33 @@ interface AssetManagementDialogProps {
   onUnauthorized(): void;
   onDirectoryUpdated(directory: AssetDirectory): void;
   onDirectoryNeedsRefresh(): void;
+  guardedMutation?: GuardedAssetMutation;
+  onConfirmedEntity?(entity: Character | Scene | Prop, receipt: CanvasCreationReceipt | null): void;
 }
 
 interface FieldDefinition {
-  key: "name" | "title" | "gender" | "age" | "role" | "appearance" | "description";
+  key: "name" | "title" | "gender" | "age" | "role" | "appearance" | "description" | "image_url";
   label: string;
   required?: boolean;
   multiline?: boolean;
 }
 
 type FormValues = Record<FieldDefinition["key"], string>;
+
+export interface GuardedAssetMutationResult {
+  entity: Character | Scene | Prop;
+  receipt: CanvasCreationReceipt | null;
+}
+
+export interface GuardedAssetMutation {
+  save(input: {
+    mode: "create" | "edit";
+    category: AssetLibraryType;
+    item: Character | Scene | Prop | null;
+    values: Record<string, string>;
+  }, signal: AbortSignal): Promise<GuardedAssetMutationResult>;
+  verify(signal: AbortSignal): Promise<string>;
+}
 
 type WriteState =
   | { kind: "idle" }
@@ -72,29 +90,33 @@ const emptyForm: FormValues = {
   role: "",
   appearance: "",
   description: "",
+  image_url: "",
 };
 
-function fieldsFor(category: AssetLibraryType): FieldDefinition[] {
+function fieldsFor(category: AssetLibraryType, includeImageUrl = false): FieldDefinition[] {
+  const withImageUrl = (fields: FieldDefinition[]) => includeImageUrl
+    ? [...fields, { key: "image_url", label: "图片 URL" } satisfies FieldDefinition]
+    : fields;
   if (category === "characters") {
-    return [
+    return withImageUrl([
       { key: "name", label: "角色名称", required: true },
       { key: "gender", label: "性别" },
       { key: "age", label: "年龄" },
       { key: "role", label: "身份", multiline: true },
       { key: "appearance", label: "外观", multiline: true },
       { key: "description", label: "描述", multiline: true },
-    ];
+    ]);
   }
   if (category === "scenes") {
-    return [
+    return withImageUrl([
       { key: "title", label: "场景名称", required: true },
       { key: "description", label: "描述", multiline: true },
-    ];
+    ]);
   }
-  return [
+  return withImageUrl([
     { key: "name", label: "道具名称", required: true },
     { key: "description", label: "描述", multiline: true },
-  ];
+  ]);
 }
 
 function categoryLabel(category: AssetLibraryType): string {
@@ -171,8 +193,9 @@ function changedValues(
   category: AssetLibraryType,
   item: Character | Scene | Prop,
   form: FormValues,
+  includeImageUrl = false,
 ): Record<string, string> {
-  const fields = fieldsFor(category);
+  const fields = fieldsFor(category, includeImageUrl);
   const updates: Record<string, string> = {};
   for (const field of fields) {
     const value = field.required ? form[field.key].trim() : form[field.key];
@@ -290,8 +313,9 @@ function sameEditableBaseline(
   category: AssetLibraryType,
   baseline: Character | Scene | Prop,
   current: Character | Scene | Prop,
+  includeImageUrl = false,
 ): boolean {
-  return fieldsFor(category).every((field) => valueFor(baseline, field.key) === valueFor(current, field.key));
+  return fieldsFor(category, includeImageUrl).every((field) => valueFor(baseline, field.key) === valueFor(current, field.key));
 }
 
 export function AssetManagementDialog({
@@ -306,12 +330,14 @@ export function AssetManagementDialog({
   onUnauthorized,
   onDirectoryUpdated,
   onDirectoryNeedsRefresh,
+  guardedMutation,
+  onConfirmedEntity,
 }: AssetManagementDialogProps) {
   const isCurrentRef = useRef(isCurrent);
   const unauthorizedRef = useRef(onUnauthorized);
   isCurrentRef.current = isCurrent;
   unauthorizedRef.current = onUnauthorized;
-  const fields = useMemo(() => fieldsFor(category), [category]);
+  const fields = useMemo(() => fieldsFor(category, guardedMutation !== undefined), [category, guardedMutation]);
   const [form, setForm] = useState<FormValues>(() => ({
     ...emptyForm,
     ...Object.fromEntries(fields.map((field) => [field.key, valueFor(item, field.key)])),
@@ -326,7 +352,9 @@ export function AssetManagementDialog({
   const currentAssetLabel = assetLabel(category, item);
   const requiredField = fields.find((field) => field.required);
   const nameIsValid = requiredField === undefined || form[requiredField.key].trim() !== "";
-  const update = mode === "edit" && item !== null ? changedValues(category, item, form) : {};
+  const update = mode === "edit" && item !== null
+    ? changedValues(category, item, form, guardedMutation !== undefined)
+    : {};
   const canSave = mode === "create"
     ? nameIsValid
     : mode === "edit" && item !== null && nameIsValid && Object.keys(update).length > 0;
@@ -443,6 +471,31 @@ export function AssetManagementDialog({
     submittingRef.current = true;
     const previousState = writeState;
     setWriteState({ kind: "checking" });
+    if (guardedMutation !== undefined) {
+      try {
+        const message = await guardedMutation.verify(controller.signal);
+        if (controller.signal.aborted || !isCurrent()) return;
+        setWriteState({
+          kind: previousState.kind === "conflict" ? "conflict" : "unknown",
+          message,
+        });
+      } catch (cause: unknown) {
+        if (controller.signal.aborted || !isCurrent()) return;
+        if (cause instanceof CanvasSourceError) {
+          setWriteState({
+            kind: previousState.kind === "conflict" ? "conflict" : "unknown",
+            message: cause.message,
+          });
+          return;
+        }
+        const error = normalizeApiError(cause);
+        if (error.status === 401) onUnauthorized();
+        else setWriteState({ kind: "unknown", message: errorMessage(error) });
+      } finally {
+        if (isCurrent()) submittingRef.current = false;
+      }
+      return;
+    }
     const reason = previousState.kind === "saved-refresh-failed"
       ? "saved"
       : previousState.kind === "unknown" ? "unknown" : "manual";
@@ -469,22 +522,47 @@ export function AssetManagementDialog({
     let writeDispatched = false;
     try {
       if (mode === "edit" && item !== null) {
-        const fresh = await readDirectory(services, category, seriesId, controller.signal);
-        if (controller.signal.aborted || !isCurrent()) {
+        if (guardedMutation !== undefined) {
+          writeDispatched = true;
+          const result = await guardedMutation.save({ mode: "edit", category, item, values: update }, controller.signal);
+          if (controller.signal.aborted || !isCurrent()) return;
+          onConfirmedEntity?.(result.entity, result.receipt);
+          onDirectoryNeedsRefresh();
+          focus.markDismissed();
+          onClose();
           return;
+        } else {
+          const fresh = await readDirectory(services, category, seriesId, controller.signal);
+          if (controller.signal.aborted || !isCurrent()) {
+            return;
+          }
+          const current = fresh.items.find((candidate) => candidate.id === item.id && candidate.series_id === seriesId);
+          onDirectoryUpdated(fresh);
+          if (current === undefined || !sameEditableBaseline(category, item, current)) {
+            setWriteState({ kind: "conflict", message: "保存前重新读取发现素材已变化。草稿仍保留，请关闭后从最新目录重新编辑。" });
+            return;
+          }
+          if (!canUpdate(services, category)) {
+            throw new ApiError("invalid-response", "当前模式暂不支持编辑素材。");
+          }
+          writeDispatched = true;
+          await updateAsset(services, category, seriesId, item.id, update, controller.signal);
         }
-        const current = fresh.items.find((candidate) => candidate.id === item.id && candidate.series_id === seriesId);
-        onDirectoryUpdated(fresh);
-        if (current === undefined || !sameEditableBaseline(category, item, current)) {
-          setWriteState({ kind: "conflict", message: "保存前重新读取发现素材已变化。草稿已保留，请关闭后从最新目录重新编辑。" });
-          return;
-        }
-        if (!canUpdate(services, category)) {
-          throw new ApiError("invalid-response", "当前模式暂不支持编辑素材。");
-        }
-        writeDispatched = true;
-        await updateAsset(services, category, seriesId, item.id, update, controller.signal);
       } else if (mode === "create") {
+        if (guardedMutation !== undefined) {
+          writeDispatched = true;
+          const values = Object.fromEntries(fields.map((field) => [
+            field.key,
+            field.required ? form[field.key].trim() : form[field.key],
+          ]));
+          const result = await guardedMutation.save({ mode: "create", category, item: null, values }, controller.signal);
+          if (controller.signal.aborted || !isCurrent()) return;
+          onConfirmedEntity?.(result.entity, result.receipt);
+          onDirectoryNeedsRefresh();
+          focus.markDismissed();
+          onClose();
+          return;
+        }
         if (!canCreate(services, category)) {
           throw new ApiError("invalid-response", "当前模式暂不支持创建素材。");
         }
@@ -502,6 +580,29 @@ export function AssetManagementDialog({
     } catch (cause: unknown) {
       if (controller.signal.aborted || !isCurrent()) {
         return;
+      }
+      if (guardedMutation !== undefined && cause instanceof CanvasSourceError) {
+        if (cause.kind === "unknown") {
+          setWriteState({ kind: "unknown", message: cause.message });
+          return;
+        }
+        if (cause.kind === "conflict") {
+          setWriteState({ kind: "conflict", message: cause.message });
+          return;
+        }
+        setWriteState({ kind: "error", message: cause.message });
+        return;
+      }
+      if (guardedMutation !== undefined && cause instanceof Error && "kind" in cause) {
+        const kind: unknown = cause.kind;
+        if (kind === "unknown") {
+          setWriteState({ kind: "unknown", message: cause.message });
+          return;
+        }
+        if (kind === "conflict") {
+          setWriteState({ kind: "conflict", message: cause.message });
+          return;
+        }
       }
       const error = normalizeApiError(cause);
       if (error.status === 401) {
@@ -662,7 +763,9 @@ export function AssetManagementDialog({
             {fields.map(renderField)}
             {!nameIsValid && <p className="asset-management-error" role="alert">名称不能为空。</p>}
             {mode === "edit" && Object.keys(update).length === 0 && <p className="asset-management-note" role="status">没有可保存的更改。</p>}
-            <p className="asset-management-note">图片、音频、音色引用和别名不会随这些文字字段一起改写。</p>
+            <p className="asset-management-note">{guardedMutation === undefined
+              ? "图片、音频、音色引用和别名不会随这些文字字段一起改写。"
+              : "音频、音色引用和别名不会随这些字段一起改写。"}</p>
           </div>
         )}
 

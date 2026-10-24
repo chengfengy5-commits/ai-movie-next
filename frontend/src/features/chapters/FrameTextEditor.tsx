@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import type { Chapter } from "../../shared/api/contracts";
+import { CanvasSourceError } from "../../shared/api/canvasSources";
 import { normalizeApiError } from "../../shared/api/services";
 import { useSeriesDialogFocus } from "../series/useSeriesDialogFocus";
 
 export interface FrameTextSaveResult {
-  status: "saved" | "unchanged" | "conflict";
+  status: "saved" | "unchanged" | "conflict" | "unknown";
   message?: string;
   serverText?: string | null;
 }
@@ -22,6 +23,8 @@ interface FrameTextEditorProps {
     explicitOverwrite: boolean,
     expectedServerText: string | null | undefined,
   ): Promise<FrameTextSaveResult>;
+  allowOverwriteOnConflict?: boolean;
+  onVerifyUnknown?(signal: AbortSignal): Promise<string>;
 }
 
 export function FrameTextEditor({
@@ -32,12 +35,15 @@ export function FrameTextEditor({
   lifecycleSignal,
   onClose,
   onSave,
+  allowOverwriteOnConflict = true,
+  onVerifyUnknown,
 }: FrameTextEditorProps) {
   const [draft, setDraft] = useState(initialText);
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
   const [serverText, setServerText] = useState<string | null | undefined>(undefined);
   const [conflicted, setConflicted] = useState(false);
+  const [writeUnknown, setWriteUnknown] = useState(false);
   const controllerRef = useRef<AbortController | null>(null);
   const focus = useSeriesDialogFocus({ active: true, canDismiss: true, onDismiss: close });
 
@@ -59,7 +65,7 @@ export function FrameTextEditor({
   }
 
   async function submit(explicitOverwrite = false): Promise<void> {
-    if (saving) return;
+    if (saving || writeUnknown || (conflicted && !allowOverwriteOnConflict)) return;
     const controller = new AbortController();
     controllerRef.current = controller;
     setSaving(true);
@@ -78,12 +84,38 @@ export function FrameTextEditor({
         setMessage(result.message ?? "服务器中的镜头内容已变化。请查看当前值，再决定是否用草稿覆盖文字。");
         return;
       }
+      if (result.status === "unknown") {
+        setWriteUnknown(true);
+        setMessage(result.message ?? "写入结果尚未确认。请保留草稿并只读核对，不要再次提交。");
+        return;
+      }
       focus.markDismissed();
       onClose();
     } catch (cause) {
       if (!controller.signal.aborted) {
         const error = normalizeApiError(cause);
-        setMessage(error.detail ?? error.message);
+        setMessage(cause instanceof CanvasSourceError ? cause.message : error.detail ?? error.message);
+      }
+    } finally {
+      if (controllerRef.current === controller) {
+        controllerRef.current = null;
+        setSaving(false);
+      }
+    }
+  }
+
+  async function verifyUnknown(): Promise<void> {
+    if (saving || !writeUnknown || onVerifyUnknown === undefined) return;
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    setSaving(true);
+    try {
+      const verificationMessage = await onVerifyUnknown(controller.signal);
+      if (!controller.signal.aborted) setMessage(verificationMessage);
+    } catch (cause) {
+      if (!controller.signal.aborted) {
+        const error = normalizeApiError(cause);
+        setMessage(cause instanceof CanvasSourceError ? cause.message : error.detail ?? error.message);
       }
     } finally {
       if (controllerRef.current === controller) {
@@ -115,7 +147,7 @@ export function FrameTextEditor({
           镜头文字
           <textarea
             autoFocus
-            disabled={saving}
+            disabled={saving || writeUnknown || (conflicted && !allowOverwriteOnConflict)}
             onChange={(event) => {
               setDraft(event.currentTarget.value);
               setConflicted(false);
@@ -136,12 +168,17 @@ export function FrameTextEditor({
         {message !== null && <p className="series-dialog-error" role={conflicted ? "status" : "alert"}>{message}</p>}
         <div className="series-dialog-actions frame-text-editor-actions">
           <button className="secondary-button" onClick={close} type="button">取消</button>
-          {conflicted && (
+          {writeUnknown && onVerifyUnknown !== undefined && (
+            <button className="secondary-button" disabled={saving} onClick={() => void verifyUnknown()} type="button">
+              {saving ? "正在只读核对…" : "只读核对来源"}
+            </button>
+          )}
+          {conflicted && allowOverwriteOnConflict && (
             <button className="secondary-button" disabled={saving} onClick={() => void submit(true)} type="button">
               {saving ? "正在核对…" : "以草稿覆盖当前文字"}
             </button>
           )}
-          {!conflicted && (
+          {!conflicted && !writeUnknown && (
             <button className="primary-button" disabled={saving} onClick={() => void submit(false)} type="button">
               {saving ? "正在核对并保存…" : "保存文字"}
             </button>

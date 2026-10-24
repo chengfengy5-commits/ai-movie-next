@@ -102,6 +102,9 @@ describe("selected chapter to canvas integration", () => {
       const firstDialog = firstRegion.closest('[role="dialog"]');
       if (!(firstDialog instanceof HTMLElement)) throw new Error("Canvas dialog was not rendered.");
       const canvas = within(firstDialog);
+      expect(await canvas.findByRole("article", { name: "分镜 1" })).toBeTruthy();
+      fireEvent.click(canvas.getByRole("article", { name: "分镜 1" }));
+      expect(canvas.getByRole("button", { name: "编辑分镜文字" })).toBeDisabled();
       const firstGet = requests.find((request) => request.method === "GET"
         && request.url.pathname.startsWith("/api/chapters/") && request.url.pathname.endsWith("/canvas"));
       if (firstGet === undefined) throw new Error("Canvas GET was not sent.");
@@ -116,7 +119,7 @@ describe("selected chapter to canvas integration", () => {
       expect(addCardButton).not.toBeDisabled();
       fireEvent.click(addCardButton);
       fireEvent.change(await canvas.findByLabelText("文本卡片文字"), { target: { value: "保存后的章节构图说明" } });
-      fireEvent.click(canvas.getByRole("button", { name: "保存" }));
+      fireEvent.click(canvas.getByRole("button", { name: "保存布局" }));
       await waitFor(() => expect(putResponseBodyStarted).toHaveBeenCalledOnce());
       const putRequest = requests.find((request) => request.method === "PUT");
       expect(putRequest?.url.pathname).toBe(firstGet.url.pathname);

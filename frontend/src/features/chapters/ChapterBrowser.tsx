@@ -5097,6 +5097,20 @@ export function ChapterBrowser({
           series={series}
           services={services}
           sessionGeneration={sessionGeneration}
+          onSourceChanged={(chapterId) => {
+            assetCache.current.delete(chapterId);
+            if (selectedChapter?.id === chapterId) {
+              assetRequestGeneration.current += 1;
+              setAssetResult({ chapterId, status: "loading" });
+              setAssetReloadKey((key) => key + 1);
+            }
+            requestChapterDirectoryReload({
+              scope: currentScope,
+              chapterId,
+              fallbackIndex: Math.max(selectedIndex, 0),
+              message: null,
+            });
+          }}
           userId={userId}
         />
       )}
