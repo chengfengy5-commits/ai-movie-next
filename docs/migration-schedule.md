@@ -1,6 +1,6 @@
 # HaoAI-next 完整剩余工作清单与排期
 
-更新日期：2026-10-23（北京时间）
+更新日期：2026-10-24（北京时间）
 
 本文依据已确认的 main 基线、历史开发分支和已接受收据校准完整剩余范围。它是唯一的迁移清单，不是新的架构设计，也不代表整站功能已验收。
 
@@ -11,6 +11,14 @@
 固定旧源共有 248 个显式 method/path 声明；backend385 收据中的 create_app registry 为 250 个方法、36 个参数项，旧声明已登记差集为0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
 
 清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。U12.5 与 U12.7 又各完成一行开发和接线后为27、24、51。e094将 U03.1、U03.2、U03.3 各一行的开发与接线义务并入主线，计数为24、21、51；U03.4 闭合一行开发和接线后为23、20、51；U05.2闭合一行开发和接线后，计数为22、19、51；随后 U05.4 再闭合一行开发和接线义务，该时点为21、18、51；本次 U01.3 闭合开发后，当前计数为20、18、51，验证/接受仍为51。U12.6 的运行时消费者接线仍待完成。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
+
+## 当前画布来源后端交付（2026-10-24）
+
+新增独立canvas-source读取/命令协议，普通旧路由合同保持。分镜文字/插入/删除、三类素材创建/编辑、视频追加/精确槽位修改及服务器签发的创建撤销共8类命令使用单一事务、完整来源version与raw-content CAS；个人剧集延续无章节锁规则，团队剧集必须核当前本人有效锁。无稳定ID旧帧、聊天索引、未知字段和无关孤立故事板保全；显式删除仍触发媒体/认可协调。创建撤销不使用普通DELETE补偿，不按名称或URL猜对象；损坏/非有限来源、歧义身份和已被引用/修改的创建对象均拒绝。
+
+Root659在15路径完整复核后发现并修复了宽松旧JSON解析导致假空快照、跨剧集直接素材聊天引用遗漏，以及必要安全矩阵证据缺口。Root660在完整1631项输入的私有冻结副本运行27个相关后端测试文件，223项通过；涵盖真实JWT resolver、ASGI、合成SQLite、个人/团队锁入口、创建撤销、媒体/便签回滚及提交回执未知。候选源码、main和受保护文件前后一致，所属进程组和临时目录已清理；9条既有警告保留。
+
+这些证明本批后端源码与上述定向行为；不证明真实PostgreSQL并发、浏览器/E2E、外部服务或部署。前端真实Workspace消费者尚在修复/验证，U07.2仍P/P，原重叠计数保持20开发/18接线/51验证或接受。端对端测试按用户安排暂缓。
 
 ## 历史进展（2026-10-22）
 
@@ -106,7 +114,7 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 | ID | 交付内容 | 实现 | 接入 | 验证/验收 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
 | U07.1 | 图结构、缩放平移、节点/边选择和布局 | P | P | V=P / A=U；章节图、布局、缩放平移及节点/边选择已接入，完整旧行为对照和浏览器矩阵仍待 | 补齐旧图编辑行为与真实章节/素材图、多用户、键盘和窄屏浏览器验收。 |
-| U07.2 | 节点编辑、手动连线、卡片/便签和撤销重做 | P | P | V=P / A=U；本地便签、卡片、手动关系和 50 步 undo 已接入；来源 CRUD 与 CAV02 仍待 | 接来源 CRUD 与 CAV02，验编辑影响、选中状态、未知字段及撤销/重做边界。 |
+| U07.2 | 节点编辑、手动连线、卡片/便签和撤销重做 | P | P | V=P / A=U；本地便签、卡片、手动关系和 50 步 undo 已接入；CAV02 来源后端已实现 GET/POST、8类命令、事务/CAS与受控创建撤销，Root659完整复核/修复复核及Root660独立冻结27文件223项通过。React真实工作区接入仍在修复验证，未闭合整行 | 完成来源消费者、独立回读、编辑/创建/删除及受控撤销的工作区联动；继续验证选中状态、未知字段、旧布局与会话/锁边界。 |
 | U07.3 | 画布文档/视口保存、版本冲突和失败恢复 | P | P | V=P / A=U；opt-in guarded-v1 SQL id/version CAS、2 秒防抖和配对 receipt 已接入；unknown/conflict 会停止自动保存。legacy blind-writer convergence、PostgreSQL 及完整浏览器接受仍待 | 补 legacy writer 收敛、PG 并发与完整浏览器失败恢复矩阵；维持未知写入停止自动重放。 |
 | U07.4 | 画布触发生成及 owned 结果应用 | P | M | V=P / A=U；authority/result reader 与 writer 已有，CAV03 owned-result 和 CAV04 生成消费者尚未接入 | 接入并验 owner、完成任务、当前权限、稳定目标/CAS 和重复应用不增 revision。 |
 
@@ -166,11 +174,11 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 | B-SERIES | 剧集/章节/分镜来源、访问策略、章节锁和导入导出模块已按显式 UoW/HTTP 接入 | 补跨模块 PG、多用户和对应 UI 接受；不因旧排期过期而重写。 |
 | B-ASSETS | 基础素材 SQL、维护/替换模块已存在 | 接入 media upload application 与 fused runtime/storage，完成高级素材 UI 和存储链。 |
 | B-PRODUCTION | 便签、粗剪和媒体协调器已有 | 新写入者消费协调器；补真实媒体预览、字节导出/输出及多用户证据。 |
-| B-ACCOUNT | 账户、偏好、模型、提示词和兑换逻辑已有；会员批已并入 | 真实 SMTP sender 仍缺；各账户/运营工作流仍按 U01/U11/U12 补验证和 UI。 |
+| B-ACCOUNT | 账户、偏好、模型、提示词和兑换逻辑已有；会员批已并入；651/655已接真实SMTP adapter与验证码/重置密码发送、邮箱回执恢复 | 各账户/运营工作流仍按 U01/U11/U12 补验证；真实邮箱交付、浏览器与整体验收仍待，owned SMTP sink不代表真实邮箱。 |
 | B-TEAMS | 团队管理/邀请13方法与团队剧集协作7方法已随e094进入主线；reporting五个GET及成员任务、团队/剧集/模型用量和日期筛选已接入main@6ea3e6f，SpreadsheetML双sheet导出入口已接 | 补导出实际下载字节与多用户剩余异常矩阵；保留团队权限和剧集流程的完整接受缺口。 |
 | B-TASKS | 旧任务 read/status/cancel、通用/后台任务和 provider status 已有；只读全局 TaskList 页面已接入 | image.single 原 intent recovery/due 消费及 frame.review 独立后端链已实现。E179/E181/E185覆盖所列 image.single 有界范围；PG392覆盖 frame.review 的真实owned取消/重放五类场景（late正价与0价）。TaskList HTTP/浏览器、完整服务重启、其它任务家族及其 UI 仍待；不将两个局部PG范围提升为完整任务工作流接受。 |
 | B-ADMIN | 后台 API 家族已有，React 登录、仪表盘和 23/23 个旧资源视图均已实现并接入源码 | 完成全面浏览器、真实 HTTP/SQL 与跨会话/未知结果验收；剧集已有局部验收，TaskList 与 SMTP 真实 HTTP/浏览器仍待。3 个积分扩展视图独立。 |
-| B-GENERATION | 六入口准入、合同、凭据、图/计费；image.single受限runtime与recovery/due、文本SSE、两步分镜局部浏览器证据，以及 frame.review 后端链和 React 单镜头入口已接 | frame.optimize、其它 family worker 与其它 AI 入口仍需完成；metadata/准入/claim不能替代真实 producer、consumer 或完整工作流证据。 |
+| B-GENERATION | 六入口准入、合同、凭据、图/计费；image.single受限runtime与recovery/due、文本SSE、两步分镜局部浏览器证据，frame.review 后端链/React单镜头入口，以及frame.optimize显式host/React批量入口已接 | 完整Group/event N6、其它family worker、媒体生成与其余AI入口仍待；metadata/准入/claim和局部到期修复不能替代完整producer/consumer或A01–A39接受。 |
 | B-INTEGRATIONS | DB/provider/storage/quota/download/SMTP ports 与部分 adapter 已存在 | 补本地组合根和真实 caller；逐项区分 owned fake/loopback 与外部账号验收。 |
 | B-ARCH | 扫描 106 个 domain/application 文件；多数模块使用 port/UoW 边界 | 收口 aistarslab application 直连 persistence/provider、generation_credentials application 直连 SQLAlchemy/concrete repository 的边界，同时保留现有同事务/主体约束。 |
 
@@ -180,9 +188,9 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 | INT-DB | SQLAlchemy UoW、generation migration/readiness、credential migration 和 scoped owned PG 收据存在 | image.single 到期 recovery/due 的owned PG范围见E181/E185；frame.review I07的五类owned PG范围由PG392确认通过并清理。两者不覆盖完整服务/PG重启或真实数据库，不连接或写真实数据库。 |
 | INT-PROVIDERS | 部分真实 transport adapter 和显式 ports 已有 | 完成剩余 adapter、loopback/fake 协议、原 credential principal/snapshot 绑定及配置消费者；实际账号/付费调用另授权。 |
 | INT-STORAGE | 非 core 的 `backend.server` host/CLI 已消费显式 R2 配置，装配原 R2 adapter 并交给同一 `create_app`；鉴权与业务共用 Session factory。原始 `create_app` 默认 `storage=None`，缺显式配置时存储能力不可用。Root577 的 155 项定向合成 SQLite/fake SDK/in-process ASGI 检查通过，registry 250 方法/36 参数 exact，使用隔离 multipart 0.0.32；P2-576-01～03 已关闭。 | 接入四类媒体能力的其余消费者，完成 fused runtime-storage 与 MediaStore 组合，并补权限、大小/MIME、DNS、重定向、内容绑定和资源清理验证；继续补齐音视频、OSS 重试、生成历史与其它媒体引用能力，并在具备真实配置后验收 R2 行为。本批不证明真实 R2、PG、HTTP listener、部署或浏览器结果。 |
-| INT-SMTP | sender callbacks、加密 SMTP 账户配置/每日重置及后台账户管理页面已有并接入 | 先完成账户管理真实 HTTP/owned SQL 与浏览器验收；开发 sender 并用 owned SMTP sink 验输送语义。真实邮箱交付需后续适用授权，本轮不索要密钥。 |
+| INT-SMTP | 651已将SMTP adapter接到同一host、验证码与重置密码；Root650定向288项及owned TLS SMTP sink验证通过。655邮箱回执恢复经Root654前端74项、类型和构建通过 | 补账户管理的当前完整HTTP/owned SQL与浏览器验收；真实邮箱交付需适用授权，owned sink不是外部邮箱接受。旧后台密码返回合同未在本批改为服务端脱敏，前端不回填秘密。 |
 | INT-QUOTA | provider quota/balance transports 与连接测试组件已有 | 接入 Creator Settings 配额/连接/角色动作；owned transport 本地验密钥处理，真实余额查询另授权。 |
-| INT-DOWNLOAD | 兼容 GET 禁用路径和签名下载接口已有 identity resolver | 按需要实现 resolver 与本地安全下载/导出字节、命名/顺序/失败清理；链接或 200 不证明文件或可播放成片。 |
+| INT-DOWNLOAD | 兼容GET禁用路径和批量URL解析接口已有identity resolver；固定旧R2兼容签名函数也原样返回URL，signed不是权限或下载成功证明 | 接实际字节读取、章内视频选择与保存粗剪导出队列、文件命名/顺序/取消/重试及落地回执；受保护同源与匿名公开媒体分开读取。素材逐文件下载不等于U08.4单个成片。 |
 | INT-ARCHITECTURE | 106 个应用/领域文件已有静态 import 盘点 | 修复上述直接 persistence/provider 边界，并复核现有职责与同事务约束。 |
 
 ## Generation 原义务、附加义务与证据引用
