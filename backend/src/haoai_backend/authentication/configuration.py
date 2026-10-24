@@ -40,7 +40,7 @@ class AuthenticationRuntime:
     access_token_ttl_minutes: int = 14 * 24 * 60
     verification_email_sender: Callable[[str, str], bool] | None = None
     password_reset_sender: Callable[[str, str, str], bool] | None = None
-    frontend_url: str | Callable[[], str] | None = None
+    frontend_url: str | Callable[[], str | None] | None = None
     password_hasher: PasswordHasher | None = None
     token_codec: TokenCodec | None = None
     email_code_store: EmailCodeStore | None = field(default_factory=InMemoryEmailCodeStore)
@@ -49,6 +49,7 @@ class AuthenticationRuntime:
     epoch: Callable[[], float] = time.time
     code_generator: Callable[[], str] = _generate_code
     id_factory: Callable[[], str] = _new_id
+    password_reset_preflight: Callable[[], None] | None = None
 
     def get_password_hasher(self) -> PasswordHasher:
         if self.password_hasher is None:

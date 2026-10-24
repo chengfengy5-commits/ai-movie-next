@@ -49,7 +49,7 @@ def test_cipher_is_lazy_for_empty_values_and_uses_fixed_legacy_format(monkeypatc
         codec.decrypt("gAAAAA-invalid")
 
 
-def test_local_daily_state_clears_cache_before_reset_and_does_not_replay_failure():
+def test_local_daily_state_advances_only_after_a_successful_reset():
     current = [date(2026, 10, 12)]
     state = DailyResetState(lambda: current[0])
     state.increment_cached_count("smtp-id")
@@ -58,12 +58,17 @@ def test_local_daily_state_clears_cache_before_reset_and_does_not_replay_failure
     state.reset_if_needed(lambda: resets.append(state.cached_count("smtp-id")))
     assert resets == []
     current[0] += timedelta(days=1)
+    previous_day = state.today
     def failing_reset():
         resets.append(state.cached_count("smtp-id"))
         raise OSError("db unavailable")
     with pytest.raises(OSError):
         state.reset_if_needed(failing_reset)
-    assert resets == [0]
+    assert resets == [1]
+    assert state.today == previous_day
+    assert state.cached_count("smtp-id") == 1
+
+    state.reset_if_needed(lambda: resets.append(state.cached_count("smtp-id")))
+    assert resets == [1, 1]
     assert state.today == current[0]
-    state.reset_if_needed(lambda: resets.append("unexpected replay"))
-    assert resets == [0]
+    assert state.cached_count("smtp-id") == 0

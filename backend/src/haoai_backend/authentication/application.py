@@ -385,6 +385,9 @@ class AuthenticationService:
         frontend_url = runtime.frontend_base_url()
         if sender is None or frontend_url is None:
             raise unavailable()
+        preflight = getattr(runtime, "password_reset_preflight", None)
+        if callable(preflight):
+            preflight()
         username = username.strip()
         email = email.strip().lower()
         with self._unit_of_work() as unit_of_work:
