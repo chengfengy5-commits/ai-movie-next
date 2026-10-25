@@ -799,6 +799,38 @@ class MediaSnapshotProducer:
             if kind in {"frame_message", "canvas_frame_preview"}
             else None
         )
+        full_frame_digest = None
+        full_chapter_digest = target_facts.chapter_digest
+        if kind == "canvas_frame_preview":
+            frames = _parse_chapter_frames(chapter_text)
+            frame_index = target_facts.frame_index
+            if (
+                not stable_storyboard_id
+                or frames is None
+                or type(frame_index) is not int
+                or not 0 <= frame_index < len(frames)
+                or not isinstance(frames[frame_index], Mapping)
+            ):
+                raise _UnsafeSnapshot(409, "locked_frame_target_changed")
+            frame = frames[frame_index]
+            references = frame.get("storyboard")
+            stable_matches = [
+                index
+                for index, candidate in enumerate(frames)
+                if isinstance(candidate, Mapping)
+                and isinstance(candidate.get("storyboard"), list)
+                and candidate["storyboard"]
+                and candidate["storyboard"][0] == stable_storyboard_id
+            ]
+            if (
+                not isinstance(references, list)
+                or not references
+                or references[0] != stable_storyboard_id
+                or stable_matches != [frame_index]
+            ):
+                raise _UnsafeSnapshot(409, "locked_frame_target_changed")
+            full_frame_digest = _digest_canonical_json(frame)
+            full_chapter_digest = _digest_canonical_json(frames)
         snapshot = TargetSnapshot(
             kind=target_kind,
             chapter_id=chapter_id,
@@ -807,8 +839,8 @@ class MediaSnapshotProducer:
             asset_type=target_facts.asset_type,
             asset_id=target_facts.asset_id,
             compat_frame_index=target_facts.frame_index,
-            full_chapter_digest=target_facts.chapter_digest,
-            full_frame_digest=None,
+            full_chapter_digest=full_chapter_digest,
+            full_frame_digest=full_frame_digest,
             expected_asset_image_url=(
                 str(asset_values["image_url"])
                 if asset_values is not None and asset_values.get("image_url") is not None
@@ -2651,6 +2683,26 @@ def _datetime_value(value: object) -> str | None:
 
 def _digest_text(value: object) -> str:
     return _sha256(str(value or "").encode("utf-8"))
+
+
+def _parse_chapter_frames(value: object) -> list[object] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        frames = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return frames if isinstance(frames, list) else None
+
+
+def _digest_canonical_json(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return _sha256(encoded.encode("utf-8"))
 
 
 def _canonical_json(value: object) -> bytes:

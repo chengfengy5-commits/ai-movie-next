@@ -1002,6 +1002,7 @@ def _safe_target_snapshot(value: object) -> dict[str, object]:
         "notes_revision",
         "full_frame_digest",
         "full_chapter_digest",
+        "expected_asset_image_url",
         "same_series_target_digest",
     )
     return {name: getattr(value, name) for name in fields_to_keep}
