@@ -8,6 +8,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
+from haoai_backend.canvas_applications.schemas import GenerationApplicationUpdate
+
 
 class AssetNamingResponse(BaseModel):
     aliases: list[str] | None = None
@@ -37,7 +39,7 @@ class CharacterCreate(BaseModel):
     voice_ref: str | None = None
 
 
-class CharacterUpdate(BaseModel):
+class CharacterUpdate(GenerationApplicationUpdate):
     name: str | None = None
     gender: str | None = None
     age: str | None = None
@@ -74,7 +76,7 @@ class SceneCreate(BaseModel):
     image_url: str | None = None
 
 
-class SceneUpdate(BaseModel):
+class SceneUpdate(GenerationApplicationUpdate):
     title: str | None = None
     description: str | None = None
     image_url: str | None = None
@@ -99,7 +101,7 @@ class PropCreate(BaseModel):
     image_url: str | None = None
 
 
-class PropUpdate(BaseModel):
+class PropUpdate(GenerationApplicationUpdate):
     name: str | None = None
     description: str | None = None
     image_url: str | None = None

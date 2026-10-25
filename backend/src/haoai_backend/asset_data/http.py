@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Awaitable, Callable
-from typing import Any
+from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
+from haoai_backend.canvas_applications.schemas import GenerationApplicationRequest
 from haoai_backend.shared.errors import BusinessError
 from haoai_backend.shared.identity import TrustedActor
 
@@ -30,17 +33,19 @@ from .schemas import (
 )
 
 ActorResolver = Callable[[Request], TrustedActor | Awaitable[TrustedActor]]
+AssetType = Literal["character", "scene", "prop"]
 
 
 def build_asset_data_router(
     *,
     uow_factory: AssetDataUnitOfWorkFactory | None,
     resolve_actor: ActorResolver | None,
+    generation_session_factory: Callable[[], Session] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api", tags=["asset-data"])
 
     async def trusted_actor(request: Request) -> TrustedActor:
-        if uow_factory is None or resolve_actor is None:
+        if (uow_factory is None and generation_session_factory is None) or resolve_actor is None:
             error = AssetDataUnavailable()
             raise HTTPException(status_code=error.status_code, detail=error.detail)
         try:
@@ -58,6 +63,27 @@ def build_asset_data_router(
             return call(uow_factory, *args)
         except BusinessError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    def apply_generation(
+        generation_application: GenerationApplicationRequest,
+        asset_type: AssetType,
+        asset_id: str,
+        actor: TrustedActor,
+    ) -> JSONResponse:
+        try:
+            command = generation_application.to_command()
+            from haoai_backend.canvas_applications.application import apply_asset_generation
+
+            payload = apply_asset_generation(
+                generation_session_factory,
+                actor,
+                asset_type,
+                asset_id,
+                command,
+            )
+        except BusinessError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        return JSONResponse(content=payload)
 
     @router.get("/series/{series_id}/characters", response_model=list[CharacterResponse])
     def list_characters(series_id: str, actor: TrustedActor = Depends(trusted_actor)):
@@ -80,7 +106,9 @@ def build_asset_data_router(
         character_id: str,
         request: CharacterUpdate,
         actor: TrustedActor = Depends(trusted_actor),
-    ):
+    ) -> Any:
+        if request.generation_application is not None:
+            return apply_generation(request.generation_application, "character", character_id, actor)
         return invoke(application.update_asset, actor, "character", character_id, request)
 
     @router.delete("/characters/{character_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -109,7 +137,9 @@ def build_asset_data_router(
         scene_id: str,
         request: SceneUpdate,
         actor: TrustedActor = Depends(trusted_actor),
-    ):
+    ) -> Any:
+        if request.generation_application is not None:
+            return apply_generation(request.generation_application, "scene", scene_id, actor)
         return invoke(application.update_asset, actor, "scene", scene_id, request)
 
     @router.delete("/scenes/{scene_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -138,7 +168,9 @@ def build_asset_data_router(
         prop_id: str,
         request: PropUpdate,
         actor: TrustedActor = Depends(trusted_actor),
-    ):
+    ) -> Any:
+        if request.generation_application is not None:
+            return apply_generation(request.generation_application, "prop", prop_id, actor)
         return invoke(application.update_asset, actor, "prop", prop_id, request)
 
     @router.delete("/props/{prop_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -181,10 +213,12 @@ def mount_asset_data_routes(
     *,
     uow_factory: AssetDataUnitOfWorkFactory | None,
     resolve_actor: ActorResolver | None,
+    generation_session_factory: Callable[[], Session] | None = None,
 ) -> None:
     app.include_router(
         build_asset_data_router(
             uow_factory=uow_factory,
             resolve_actor=resolve_actor,
+            generation_session_factory=generation_session_factory,
         )
     )
