@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import httpx
@@ -43,8 +44,9 @@ from haoai_backend.series_access.tables import (
     team_members,
 )
 from haoai_backend.shared.identity import TrustedActor
-from haoai_backend.canvas_sources.persistence import SqlAlchemyCanvasSourceUnitOfWork
 from haoai_backend.canvas_sources import persistence as canvas_source_persistence
+from haoai_backend.canvas_sources.domain import chapter_canonical_digest
+from haoai_backend.canvas_sources.persistence import SqlAlchemyCanvasSourceUnitOfWork
 
 
 NOW = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
@@ -199,6 +201,15 @@ def test_get_canvas_source_returns_complete_authorized_snapshot(source_system) -
     assert payload["chapter_id"] == "chapter-a"
     assert payload["requires_lock"] is True
     assert len(payload["version"]) == 64
+    canonical_content = json.dumps(
+        [{"custom": "保留", "storyboard": ["board-a"], "text": "第一镜"}],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    assert payload["chapter_canonical_digest"] == hashlib.sha256(canonical_content).hexdigest()
+    assert payload["chapter_canonical_digest"] != payload["version"]
     assert payload["chapter"]["content"] == [
         {"text": "第一镜", "storyboard": ["board-a"], "custom": "保留"}
     ]
@@ -212,6 +223,98 @@ def test_get_canvas_source_returns_complete_authorized_snapshot(source_system) -
     assert payload["characters"] == []
     assert payload["scenes"] == []
     assert payload["props"] == []
+
+
+def test_chapter_canonical_digest_preserves_python_float_unicode_and_unknown_fields() -> None:
+    raw_content = '[{"vendor":{"unicode":"雪","keep":true},"number":1.0,"storyboard":[]}]'
+    canonical_content = '[{"number":1.0,"storyboard":[],"vendor":{"keep":true,"unicode":"雪"}}]'
+
+    digest = chapter_canonical_digest(raw_content)
+
+    assert digest == hashlib.sha256(canonical_content.encode("utf-8")).hexdigest()
+    assert digest != chapter_canonical_digest(raw_content.replace("1.0", "1"))
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        None,
+        [],
+        "",
+        "not-json",
+        "{}",
+        "[null]",
+        "[1]",
+        '[{"text":"first","text":"duplicate","storyboard":[]}]',
+        '[{"nested":{"key":1,"key":2},"storyboard":[]}]',
+        '[{"number":NaN,"storyboard":[]}]',
+        '[{"number":Infinity,"storyboard":[]}]',
+        '[{"number":-Infinity,"storyboard":[]}]',
+        '[{"number":1e400,"storyboard":[]}]',
+        '[{"nested":{"number":1e400},"storyboard":[]}]',
+    ],
+)
+def test_chapter_canonical_digest_is_null_for_invalid_raw_content(content: object) -> None:
+    assert chapter_canonical_digest(content) is None
+
+
+def test_get_canvas_source_keeps_duplicate_key_read_semantics_but_omits_digest(source_system) -> None:
+    app, engine = source_system
+    with engine.begin() as connection:
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-a")
+            .values(content='[{"text":"第一镜","text":"重复键保留旧解析","storyboard":["board-a"]}]'),
+        )
+
+    response = request(app, "GET", "/api/chapters/chapter-a/canvas-source")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["chapter"]["content"][0]["text"] == "重复键保留旧解析"
+    assert payload["chapter_canonical_digest"] is None
+
+
+def test_canvas_source_write_receipt_contains_digest_of_updated_raw_chapter(source_system) -> None:
+    app, engine = source_system
+    initial = request(app, "GET", "/api/chapters/chapter-a/canvas-source").json()
+
+    response = request(
+        app,
+        "POST",
+        "/api/chapters/chapter-a/canvas-source",
+        body={
+            "capability": "canvas-source-v1",
+            "request_id": "2042d4a7-08d8-42bb-9cae-c439e4ef20a1",
+            "expected_series_id": "series-a",
+            "expected_version": initial["version"],
+            "command": {
+                "type": "frame.update",
+                "target": {"index": 0, "storyboard_id": "board-a"},
+                "text": "更新后的镜头",
+            },
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    receipt = response.json()["snapshot"]
+    with engine.connect() as connection:
+        raw_content = connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-a")
+        ).scalar_one()
+    parsed_content = json.loads(raw_content)
+    canonical_content = json.dumps(
+        parsed_content,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+    assert receipt["chapter_canonical_digest"] == hashlib.sha256(canonical_content).hexdigest()
+    assert receipt["chapter_canonical_digest"] != receipt["version"]
+    assert receipt["chapter"]["content"][0]["text"] == "更新后的镜头"
+    assert receipt["chapter"]["content"][0]["custom"] == "保留"
 
 
 def test_personal_chapter_allows_unlocked_write_and_team_transition_invalidates_version(

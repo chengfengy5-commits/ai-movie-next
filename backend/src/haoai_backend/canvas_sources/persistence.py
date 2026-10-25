@@ -39,7 +39,7 @@ from haoai_backend.personal_production.notes.tables import (
 )
 from haoai_backend.shared.identity import TrustedActor
 
-from .domain import SourceRows, decode_frames, referenced_storyboard_ids
+from .domain import SourceRows, chapter_canonical_digest, decode_frames, referenced_storyboard_ids
 from .errors import CanvasSourceConflict, CanvasSourceForbidden, CanvasSourceNotFound
 from .schemas import SourceSnapshot
 
@@ -187,6 +187,7 @@ class SqlAlchemyCanvasSourceUnitOfWork:
                 "chapter_id": chapter["id"],
                 "requires_lock": rows.requires_lock,
                 "version": rows.version,
+                "chapter_canonical_digest": chapter_canonical_digest(chapter["content"]),
                 "chapter": chapter_payload(chapter_record, lock_payload),
                 "storyboard_assets": [
                     storyboard_asset_response(row) for row in rows.storyboard_assets

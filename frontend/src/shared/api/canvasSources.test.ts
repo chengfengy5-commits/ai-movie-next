@@ -3,6 +3,7 @@ import {
   CANVAS_SOURCE_CAPABILITY,
   CanvasSourceError,
   createCanvasSourceHttpPort,
+  resolveCanvasFrameGenerationDestination,
   resolveCanvasFrameTarget,
   type CanvasSourceSnapshot,
 } from "./canvasSources";
@@ -70,6 +71,19 @@ function frozenSnapshot(): CanvasSourceSnapshot {
   } as CanvasSourceSnapshot;
 }
 
+const chapterCanonicalDigest = "c".repeat(64);
+const invalidGenerationIdentifiers = [
+  { label: "empty", value: "" },
+  { label: "surrounding whitespace", value: " chapter-a " },
+  { label: "C0 control", value: "chapter\u0000a" },
+  { label: "C1 control", value: "chapter\u0085a" },
+  { label: "slash", value: "chapter/one" },
+  { label: "backslash", value: "chapter\\one" },
+  { label: "dot segment", value: "." },
+  { label: "dot-dot segment", value: ".." },
+  { label: "more than 36 code points", value: "💡".repeat(37) },
+];
+
 describe("canvas source HTTP adapter", () => {
   it.each([
     { storyboard: [], expected: { index: 0, storyboard_id: null } },
@@ -89,7 +103,9 @@ describe("canvas source HTTP adapter", () => {
   });
 
   it("reads a validated source snapshot without dropping unknown frame fields", async () => {
-    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(sourcePayload()));
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(
+      sourcePayload({ chapter_canonical_digest: chapterCanonicalDigest }),
+    ));
     const port = createCanvasSourceHttpPort("http://127.0.0.1:8000/api", {
       storage: memoryStorage(),
       fetcher,
@@ -105,6 +121,7 @@ describe("canvas source HTTP adapter", () => {
     expect(snapshot.version).toBe(sourcePayload().version);
     expect(snapshot.chapter.content?.[0]).toMatchObject({ text: "第一镜", custom: "保留" });
     expect(snapshot.requires_lock).toBe(false);
+    expect(snapshot.chapter_canonical_digest).toBe(chapterCanonicalDigest);
   });
 
   it("rejects a source snapshot without the server-derived lock requirement", async () => {
@@ -118,6 +135,193 @@ describe("canvas source HTTP adapter", () => {
       .rejects.toMatchObject({ kind: "unknown" });
   });
 
+  it("rejects a malformed server chapter digest", async () => {
+    const nullDigestFetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(
+      sourcePayload({ chapter_canonical_digest: null }),
+    ));
+    const nullDigestPort = createCanvasSourceHttpPort("http://127.0.0.1:8000/api", {
+      storage: memoryStorage(),
+      fetcher: nullDigestFetcher,
+    });
+    const nullDigestSnapshot = await nullDigestPort.read("chapter-a", new AbortController().signal);
+    expect(nullDigestSnapshot.chapter_canonical_digest).toBeNull();
+
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(
+      sourcePayload({ chapter_canonical_digest: "C".repeat(64) }),
+    ));
+    const port = createCanvasSourceHttpPort("http://127.0.0.1:8000/api", {
+      storage: memoryStorage(),
+      fetcher,
+    });
+
+    await expect(port.read("chapter-a", new AbortController().signal))
+      .rejects.toMatchObject({ kind: "unknown" });
+  });
+
+  it("returns exact stable-ID and strict no-ID generation destination wires", () => {
+    const stable = frozenSnapshot();
+    const noId: CanvasSourceSnapshot = {
+      ...stable,
+      chapter_canonical_digest: chapterCanonicalDigest,
+      chapter: {
+        ...stable.chapter,
+        content: [{ text: "无稳定 ID 的镜头", storyboard: [] }],
+      },
+      storyboard_assets: [],
+    };
+
+    expect(resolveCanvasFrameGenerationDestination(stable, 0)).toEqual({
+      kind: "frame_preview",
+      chapter_id: "chapter-a",
+      storyboard_asset_id: "board-a",
+    });
+    expect(resolveCanvasFrameGenerationDestination(noId, 0)).toEqual({
+      kind: "frame_preview",
+      chapter_id: "chapter-a",
+      identity_mode: "strict-no-id-v1",
+      frame_index: 0,
+      expected_chapter_digest: chapterCanonicalDigest,
+    });
+  });
+
+  it("keeps legacy GET snapshots compatible while denying no-ID targets without a server digest", async () => {
+    const stable = frozenSnapshot();
+    const legacyNoIdPayload = sourcePayload({
+      chapter: {
+        ...sourcePayload().chapter,
+        content: [{ text: "无稳定 ID 的镜头", storyboard: [] }],
+      },
+      storyboard_assets: [],
+    });
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(legacyNoIdPayload));
+    const port = createCanvasSourceHttpPort("http://127.0.0.1:8000/api", {
+      storage: memoryStorage(),
+      fetcher,
+    });
+    const legacyNoId = await port.read("chapter-a", new AbortController().signal);
+    const noIdWithNullDigest: CanvasSourceSnapshot = {
+      ...legacyNoId,
+      chapter_canonical_digest: null,
+    };
+
+    expect(legacyNoId).not.toHaveProperty("chapter_canonical_digest");
+    expect(resolveCanvasFrameGenerationDestination(stable, 0)).toEqual({
+      kind: "frame_preview",
+      chapter_id: "chapter-a",
+      storyboard_asset_id: "board-a",
+    });
+    expect(resolveCanvasFrameGenerationDestination(legacyNoId, 0)).toBeNull();
+    expect(resolveCanvasFrameGenerationDestination(noIdWithNullDigest, 0)).toBeNull();
+  });
+
+  it("rejects invalid frame references and mismatched direct-call identity without downgrading", () => {
+    const stable = frozenSnapshot();
+    const invalidStable: CanvasSourceSnapshot = {
+      ...stable,
+      chapter_canonical_digest: chapterCanonicalDigest,
+      chapter: {
+        ...stable.chapter,
+        content: [{ text: "无效稳定引用", storyboard: ["missing-board"] }],
+      },
+      storyboard_assets: [],
+    };
+    const duplicateStable: CanvasSourceSnapshot = {
+      ...stable,
+      chapter_canonical_digest: chapterCanonicalDigest,
+      chapter: {
+        ...stable.chapter,
+        content: [
+          { text: "第一镜", storyboard: ["board-a"] },
+          { text: "重复引用", storyboard: ["board-a"] },
+        ],
+      },
+    };
+
+    expect(resolveCanvasFrameGenerationDestination(invalidStable, 0)).toBeNull();
+    expect(resolveCanvasFrameGenerationDestination(duplicateStable, 0)).toBeNull();
+    expect(resolveCanvasFrameGenerationDestination({
+      ...stable,
+      chapter: { ...stable.chapter, id: "other-chapter" },
+    } as CanvasSourceSnapshot, 0)).toBeNull();
+    expect(resolveCanvasFrameGenerationDestination({
+      ...stable,
+      chapter: { ...stable.chapter, series_id: "other-series" },
+    } as CanvasSourceSnapshot, 0)).toBeNull();
+    expect(resolveCanvasFrameGenerationDestination(stable, -1)).toBeNull();
+    expect(resolveCanvasFrameGenerationDestination(stable, 99)).toBeNull();
+  });
+
+  it.each(invalidGenerationIdentifiers)(
+    "rejects invalid chapter and series identities for generation destinations: $label",
+    ({ value }) => {
+      const stable = frozenSnapshot();
+      const asset = stable.storyboard_assets[0]!;
+      const invalidChapter: CanvasSourceSnapshot = {
+        ...stable,
+        chapter_id: value,
+        chapter: { ...stable.chapter, id: value },
+        storyboard_assets: [{ ...asset, chapter_id: value }],
+      };
+      const invalidSeries: CanvasSourceSnapshot = {
+        ...stable,
+        series_id: value,
+        chapter: { ...stable.chapter, series_id: value },
+        storyboard_assets: [{ ...asset, series_id: value }],
+      };
+
+      expect(resolveCanvasFrameGenerationDestination(invalidChapter, 0)).toBeNull();
+      expect(resolveCanvasFrameGenerationDestination(invalidSeries, 0)).toBeNull();
+    },
+  );
+
+  it.each(invalidGenerationIdentifiers)(
+    "rejects invalid stable storyboard IDs for generation destinations: $label",
+    ({ value }) => {
+      const stable = frozenSnapshot();
+      const asset = stable.storyboard_assets[0]!;
+      const invalidStableId: CanvasSourceSnapshot = {
+        ...stable,
+        chapter: {
+          ...stable.chapter,
+          content: [{ text: "镜头", storyboard: [value] }],
+        },
+        storyboard_assets: [{ ...asset, id: value }],
+      };
+
+      expect(resolveCanvasFrameGenerationDestination(invalidStableId, 0)).toBeNull();
+    },
+  );
+
+  it("allows Unicode and plus signs in generation IDs through 36 code points", () => {
+    const stable = frozenSnapshot();
+    const chapterId = `章+${"💡".repeat(34)}`;
+    const seriesId = `系+${"💡".repeat(34)}`;
+    const storyboardId = `镜+${"💡".repeat(34)}`;
+    const valid: CanvasSourceSnapshot = {
+      ...stable,
+      chapter_id: chapterId,
+      series_id: seriesId,
+      chapter: {
+        ...stable.chapter,
+        id: chapterId,
+        series_id: seriesId,
+        content: [{ text: "镜头", storyboard: [storyboardId] }],
+      },
+      storyboard_assets: [{
+        ...stable.storyboard_assets[0]!,
+        id: storyboardId,
+        chapter_id: chapterId,
+        series_id: seriesId,
+      }],
+    };
+
+    expect(resolveCanvasFrameGenerationDestination(valid, 0)).toEqual({
+      kind: "frame_preview",
+      chapter_id: chapterId,
+      storyboard_asset_id: storyboardId,
+    });
+  });
+
   it("sends a frozen version with one request id and validates its acknowledgement", async () => {
     const snapshot = frozenSnapshot();
     const command = { type: "frame.update", target: { index: 0, storyboard_id: "board-a" }, text: "改过的镜头" } as const;
@@ -125,6 +329,7 @@ describe("canvas source HTTP adapter", () => {
       const request = JSON.parse(String(init?.body)) as { request_id: string; command: unknown };
       const nextSource = sourcePayload({
         version: "9be1499c4eb8b1a1f8e20d020cd52796e938726f0a1889cfecc07641d8d28a57",
+        chapter_canonical_digest: chapterCanonicalDigest,
         chapter: {
           ...sourcePayload().chapter,
           content: [{ text: "改过的镜头", storyboard: ["board-a"], custom: "保留" }],
@@ -158,6 +363,7 @@ describe("canvas source HTTP adapter", () => {
     expect(body.request_id).toMatch(/^[0-9a-f-]{36}$/u);
     expect(result.request_id).toBe(body.request_id);
     expect(result.snapshot.chapter.content?.[0]).toMatchObject({ text: "改过的镜头", custom: "保留" });
+    expect(result.snapshot.chapter_canonical_digest).toBe(chapterCanonicalDigest);
   });
 
   it("accepts the server-created frame ID and passes its opaque receipt only to explicit undo", async () => {
