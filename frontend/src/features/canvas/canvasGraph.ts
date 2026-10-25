@@ -10,6 +10,7 @@ export type CanvasNodeKind = "character" | "scene" | "prop" | "frame" | "media" 
 export interface CanvasGraphNode {
   key: string;
   ref: string;
+  layoutRef?: string;
   kind: CanvasNodeKind;
   title: string;
   detail: string;
@@ -126,6 +127,34 @@ export function buildCanvasGraph(
 ): CanvasGraph {
   const nodes: CanvasGraphNode[] = [];
   const edges: CanvasGraphEdge[] = [];
+  const legacyRefTargets = new Map<string, string | null>();
+  const legacyLayoutCandidates: Array<{
+    node: CanvasGraphNode;
+    ref: string;
+    point: { x: number; y: number };
+  }> = [];
+  const addLegacyRefTarget = (legacyRef: string, currentRef: string) => {
+    const existing = legacyRefTargets.get(legacyRef);
+    legacyRefTargets.set(legacyRef, existing === undefined || existing === currentRef ? currentRef : null);
+  };
+  const applySourceLayout = (
+    node: CanvasGraphNode,
+    legacyRef: string,
+    fallback: { x: number; y: number },
+  ) => {
+    const currentLayout = canvasLayout(document, node.ref);
+    if (hasCanvasLayout(document, node.ref)) {
+      node.x = currentLayout?.x ?? fallback.x;
+      node.y = currentLayout?.y ?? fallback.y;
+      return;
+    }
+    const legacyLayout = sourceVersion === undefined || legacyRef === node.ref
+      ? null
+      : canvasLayout(document, legacyRef);
+    if (legacyLayout !== null) legacyLayoutCandidates.push({ node, ref: legacyRef, point: legacyLayout });
+    node.x = fallback.x;
+    node.y = fallback.y;
+  };
   const frames = chapter.content ?? [];
   const sourceFrameIdentities = sourceVersion === undefined
     ? null
@@ -189,21 +218,28 @@ export function buildCanvasGraph(
     if (!isRecord(frame)) return;
     const frameIdentity = sourceFrameIdentities?.[index];
     const frameRef = frameIdentity?.ref ?? "frame:" + index;
-    const frameLayout = canvasLayout(document, frameRef);
+    const frameFallback = { x: 940, y: 60 + index * 190 };
     const frameNode: CanvasGraphNode = {
       key: frameRef,
       ref: frameRef,
       kind: "frame",
       title: "分镜 " + (index + 1),
       detail: text(frame.text) || text(frame.original_text) || "暂无分镜文字",
-      x: frameLayout?.x ?? 940,
-      y: frameLayout?.y ?? 60 + index * 190,
+      ...frameFallback,
       width: 270,
       height: 145,
       imageUrl: null,
       frameIndex: index,
       ...(sourceVersion === undefined ? {} : { sourceTarget: frameIdentity?.target ?? null }),
     };
+    if (sourceVersion !== undefined) {
+      addLegacyRefTarget(`frame:${index}`, frameRef);
+      applySourceLayout(frameNode, `frame:${index}`, frameFallback);
+    } else {
+      const frameLayout = canvasLayout(document, frameRef);
+      frameNode.x = frameLayout?.x ?? frameFallback.x;
+      frameNode.y = frameLayout?.y ?? frameFallback.y;
+    }
     nodes.push(frameNode);
 
     for (const kind of ["character", "scene", "prop"] as const) {
@@ -252,15 +288,14 @@ export function buildCanvasGraph(
         : resolveCanvasSourceBindingRef(document, {
           series_id: chapter.series_id, chapter_id: chapter.id, version: sourceVersion,
         }, previewSourceRef);
-      const previewLayout = canvasLayout(document, previewRef);
-      nodes.push({
+      const previewFallback = { x: 1540, y: 60 + defaultMediaLaneIndex * 180 };
+      const previewNode: CanvasGraphNode = {
         key: "preview-node:" + index,
         ref: previewRef,
         kind: "preview",
         title: "分镜预览",
         detail: preview,
-        x: previewLayout?.x ?? 1540,
-        y: previewLayout?.y ?? 60 + defaultMediaLaneIndex * 180,
+        ...previewFallback,
         width: 250,
         height: 130,
         imageUrl: /^https?:\/\//iu.test(preview) || preview.startsWith("/uploads/") ? preview : null,
@@ -270,7 +305,16 @@ export function buildCanvasGraph(
           sourceField: "preview" as const,
           sourceSlot: null,
         }),
-      });
+      };
+      nodes.push(previewNode);
+      if (sourceVersion !== undefined) {
+        addLegacyRefTarget(`media:${index}:0`, previewRef);
+        applySourceLayout(previewNode, `media:${index}:0`, previewFallback);
+      } else {
+        const previewLayout = canvasLayout(document, previewRef);
+        previewNode.x = previewLayout?.x ?? previewFallback.x;
+        previewNode.y = previewLayout?.y ?? previewFallback.y;
+      }
       edges.push({ id: "generates:" + frameRef + ":" + previewRef, sourceRef: frameRef, targetRef: previewRef, relation: "generates", manual: false });
       defaultMediaLaneIndex += 1;
       for (const kind of ["character", "scene", "prop"] as const) {
@@ -301,15 +345,14 @@ export function buildCanvasGraph(
         : resolveCanvasSourceBindingRef(document, {
           series_id: chapter.series_id, chapter_id: chapter.id, version: sourceVersion,
         }, sourceRef);
-      const layout = canvasLayout(document, ref);
-      nodes.push({
+      const mediaFallback = { x: 1540, y: 60 + defaultMediaLaneIndex * 180 };
+      const videoNode: CanvasGraphNode = {
         key: "video-node:" + index + ":" + mediaOrdinal,
         ref,
         kind: "video",
         title: "视频 " + (visibleVideoIndex + 1),
         detail: video,
-        x: layout?.x ?? 1540,
-        y: layout?.y ?? 60 + defaultMediaLaneIndex * 180,
+        ...mediaFallback,
         width: 250,
         height: 120,
         imageUrl: null,
@@ -319,7 +362,16 @@ export function buildCanvasGraph(
           sourceField: "video" as const,
           sourceSlot: videoSlot,
         }),
-      });
+      };
+      nodes.push(videoNode);
+      if (sourceVersion !== undefined) {
+        addLegacyRefTarget(`media:${index}:${mediaOrdinal}`, ref);
+        if (video.trim() !== "") applySourceLayout(videoNode, `media:${index}:${mediaOrdinal}`, mediaFallback);
+      } else {
+        const layout = canvasLayout(document, ref);
+        videoNode.x = layout?.x ?? mediaFallback.x;
+        videoNode.y = layout?.y ?? mediaFallback.y;
+      }
       visibleVideoIndex += 1;
       defaultMediaLaneIndex += 1;
     });
@@ -354,10 +406,22 @@ export function buildCanvasGraph(
   }
 
   const knownRefs = new Set(nodes.map((node) => node.ref));
+  for (const { node, ref, point } of legacyLayoutCandidates) {
+    if (knownRefs.has(ref) && ref !== node.ref) continue;
+    node.layoutRef = ref;
+    node.x = point.x;
+    node.y = point.y;
+  }
+  const projectedRef = (ref: string): string => {
+    if (knownRefs.has(ref)) return ref;
+    return legacyRefTargets.get(ref) ?? ref;
+  };
   for (const item of storedItems(document, "manualEdges")) {
     if (typeof item.id !== "string" || typeof item.sourceRef !== "string" || typeof item.targetRef !== "string") continue;
-    if (knownRefs.has(item.sourceRef) && knownRefs.has(item.targetRef)) {
-      edges.push({ id: item.id, sourceRef: item.sourceRef, targetRef: item.targetRef,
+    const sourceRef = projectedRef(item.sourceRef);
+    const targetRef = projectedRef(item.targetRef);
+    if (knownRefs.has(sourceRef) && knownRefs.has(targetRef)) {
+      edges.push({ id: item.id, sourceRef, targetRef,
         relation: typeof item.relation === "string" ? item.relation : "manual", manual: true });
     }
   }
