@@ -475,7 +475,7 @@ export function CanvasWorkspace({
     if (node.itemCollection !== undefined && node.itemId !== undefined) {
       documentState.edit(patchCanvasItem(documentState.document, node.itemCollection, node.itemId, { x, y }));
     } else {
-      documentState.edit(patchNodeLayout(documentState.document, node.ref, { x, y }));
+      documentState.edit(patchNodeLayout(documentState.document, node.layoutRef ?? node.ref, { x, y }));
     }
   }
 

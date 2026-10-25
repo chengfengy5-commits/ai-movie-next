@@ -271,6 +271,116 @@ describe("canvas source binding migration", () => {
       .toBe("media:version-b:frame:board-b:video:1");
   });
 
+  it("migrates legacy index layouts and manual edges only after a proven insertion", () => {
+    const before = snapshotFrames("version-a", [
+      { text: "A", storyboard: ["board-a"], preview: "/a.png", videos: ["same.mp4"] },
+      { text: "B", storyboard: ["board-b"], preview: "/b.png", videos: ["same.mp4", "same.mp4"] },
+    ]);
+    const insertedId = "board-new";
+    const after = snapshotFrames("version-b", [
+      { text: "A", storyboard: ["board-a"], preview: "/a.png", videos: ["same.mp4"] },
+      { text: "inserted", storyboard: [insertedId], preview: null, videos: [] },
+      { text: "B", storyboard: ["board-b"], preview: "/b.png", videos: ["same.mp4", "same.mp4"] },
+    ]);
+    const transition = {
+      command: {
+        type: "frame.insert" as const,
+        after: { index: 0, storyboard_id: "board-a" },
+        frame: { text: "inserted" },
+      },
+      receipt: {
+        token: "insert-proof",
+        kind: "frame" as const,
+        target: { id: insertedId, storyboard_id: insertedId, index: 1 },
+      },
+    };
+    const document: CanvasDocument = {
+      nodeLayouts: {
+        "frame:1": { x: 920, y: -140, custom: "legacy-frame" },
+        "media:1:0": { x: -120, y: 110, custom: "legacy-preview" },
+        "media:1:1": { x: 380, y: -20, custom: "legacy-video-zero" },
+        "media:1:2": { x: 720, y: 340, custom: "legacy-video-one" },
+        "future:unmapped": { x: 0, y: -1, custom: { preserve: true } },
+      },
+      manualEdges: [
+        { id: "frame-preview", sourceRef: "frame:1", targetRef: "media:1:0", relation: "manual", vendor: 4 },
+        { id: "video-frame", sourceRef: "media:1:2", targetRef: "frame:1", relation: "manual", vendor: 5 },
+        { id: "dangling", sourceRef: "future:source", targetRef: "future:target", relation: "future", extra: true },
+      ],
+      unknown: { preserve: true },
+    };
+    const migrated = bindCanvasSourceDocumentTransition(document, before, after, transition);
+    const frameRef = "frame:board-b";
+    const previewRef = `canvas-source-binding:${encodeURIComponent("media:version-a:frame:board-b:preview")}`;
+    const videoZeroRef = `canvas-source-binding:${encodeURIComponent("media:version-a:frame:board-b:video:0")}`;
+    const videoOneRef = `canvas-source-binding:${encodeURIComponent("media:version-a:frame:board-b:video:1")}`;
+
+    expect(migrated.document.nodeLayouts).toMatchObject({
+      [frameRef]: { x: 920, y: -140, custom: "legacy-frame" },
+      [previewRef]: { x: -120, y: 110, custom: "legacy-preview" },
+      [videoZeroRef]: { x: 380, y: -20, custom: "legacy-video-zero" },
+      [videoOneRef]: { x: 720, y: 340, custom: "legacy-video-one" },
+      "future:unmapped": { x: 0, y: -1, custom: { preserve: true } },
+    });
+    expect(migrated.document.manualEdges).toEqual([
+      { id: "frame-preview", sourceRef: frameRef, targetRef: previewRef, relation: "manual", vendor: 4 },
+      { id: "video-frame", sourceRef: videoOneRef, targetRef: frameRef, relation: "manual", vendor: 5 },
+      { id: "dangling", sourceRef: "future:source", targetRef: "future:target", relation: "future", extra: true },
+    ]);
+    expect(migrated.document.unknown).toEqual({ preserve: true });
+    expect(resolveCanvasSourceBindingRef(migrated.document, after, "frame:board-b")).toBe("frame:board-b");
+    expect(resolveCanvasSourceBindingRef(migrated.document, after, "media:version-b:frame:board-b:video:1"))
+      .toBe(videoOneRef);
+  });
+
+  it("migrates legacy index layouts for a chapter with no media", () => {
+    const before = snapshotFrames("version-a", [
+      { text: "A", storyboard: ["board-a"], preview: null, videos: [] },
+      { text: "B", storyboard: ["board-b"], preview: null, videos: [] },
+    ]);
+    const insertedId = "board-new";
+    const after = snapshotFrames("version-b", [
+      { text: "A", storyboard: ["board-a"], preview: null, videos: [] },
+      { text: "inserted", storyboard: [insertedId], preview: null, videos: [] },
+      { text: "B", storyboard: ["board-b"], preview: null, videos: [] },
+    ]);
+    const transition = {
+      command: {
+        type: "frame.insert" as const,
+        after: { index: 0, storyboard_id: "board-a" },
+        frame: { text: "inserted" },
+      },
+      receipt: {
+        token: "insert-proof-no-media",
+        kind: "frame" as const,
+        target: { id: insertedId, storyboard_id: insertedId, index: 1 },
+      },
+    };
+    const document: CanvasDocument = {
+      nodeLayouts: {
+        "frame:1": { x: 920, y: -140, custom: "legacy-board-b" },
+        "future:unmapped": { x: 0, y: -1, preserve: true },
+      },
+      manualEdges: [
+        { id: "legacy-frame-edge", sourceRef: "frame:0", targetRef: "frame:1", relation: "manual", vendor: 6 },
+        { id: "future-dangling", sourceRef: "future:source", targetRef: "future:target", relation: "future", extra: true },
+      ],
+      unknown: { preserve: true },
+    };
+    const migrated = bindCanvasSourceDocumentTransition(document, before, after, transition);
+
+    expect(migrated.document.nodeLayouts).toMatchObject({
+      "frame:board-b": { x: 920, y: -140, custom: "legacy-board-b" },
+      "future:unmapped": { x: 0, y: -1, preserve: true },
+    });
+    expect(migrated.document.manualEdges).toEqual([
+      { id: "legacy-frame-edge", sourceRef: "frame:board-a", targetRef: "frame:board-b", relation: "manual", vendor: 6 },
+      { id: "future-dangling", sourceRef: "future:source", targetRef: "future:target", relation: "future", extra: true },
+    ]);
+    expect(migrated.document.unknown).toEqual({ preserve: true });
+    expect(migrated.refs).toEqual(new Map());
+  });
+
   it("does not migrate a shifted frame slot when its videos drift during an unrelated frame deletion", () => {
     const before = snapshotFrames("version-a", [
       { text: "A", storyboard: ["board-a"], preview: null, videos: ["same.mp4"] },

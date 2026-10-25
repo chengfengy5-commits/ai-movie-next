@@ -201,6 +201,67 @@ function mappedFrameIndexes(
   return mappings;
 }
 
+function addLegacySourceRefAlias(
+  aliases: Map<string, { beforeSourceRef: string; afterFrameRef?: string } | null>,
+  legacyRef: string,
+  beforeSourceRef: string,
+  afterFrameRef?: string,
+): void {
+  if (legacyRef === beforeSourceRef) return;
+  const existing = aliases.get(legacyRef);
+  const target = { beforeSourceRef, ...(afterFrameRef === undefined ? {} : { afterFrameRef }) };
+  aliases.set(legacyRef, existing === undefined
+    || existing?.beforeSourceRef === beforeSourceRef && existing.afterFrameRef === afterFrameRef
+    ? target
+    : null);
+}
+
+function legacySourceRefAliases(
+  before: CanvasSourceSnapshot,
+  after: CanvasSourceSnapshot,
+  mappedIndexes: Map<number, number>,
+): Map<string, { beforeSourceRef: string; afterFrameRef?: string } | null> {
+  const aliases = new Map<string, { beforeSourceRef: string; afterFrameRef?: string } | null>();
+  const beforeFrames = frames(before);
+  const beforeFrameRefs = beforeFrames.map((_frame, index) => frameRef(before, index));
+  for (const [oldIndex, newIndex] of mappedIndexes) {
+    const oldFrameRef = beforeFrameRefs[oldIndex];
+    const afterFrameRef = frameRef(after, newIndex);
+    const frame = beforeFrames[oldIndex];
+    if (oldFrameRef === null || oldFrameRef === undefined || afterFrameRef === null || !isRecord(frame)) continue;
+
+    const legacyFrameRef = `frame:${oldIndex}`;
+    const frameAliasConflicts = beforeFrameRefs.some((sourceRef, index) => index !== oldIndex
+      && sourceRef === legacyFrameRef);
+    if (!frameAliasConflicts) addLegacySourceRefAlias(aliases, legacyFrameRef, oldFrameRef, afterFrameRef);
+
+    const preview = frame.preview;
+    const previewReservesOrdinal = Boolean(preview);
+    if (typeof preview === "string" && preview.trim() !== "") {
+      addLegacySourceRefAlias(
+        aliases,
+        `media:${oldIndex}:0`,
+        `media:${before.version}:${oldFrameRef}:preview`,
+      );
+    }
+
+    let videoOrdinal = previewReservesOrdinal ? 1 : 0;
+    const videos = Array.isArray(frame.videos) ? frame.videos : [];
+    videos.forEach((video, slot) => {
+      const ordinal = videoOrdinal;
+      if (typeof video === "string" && video.trim() !== "") {
+        addLegacySourceRefAlias(
+          aliases,
+          `media:${oldIndex}:${ordinal}`,
+          `media:${before.version}:${oldFrameRef}:video:${slot}`,
+        );
+      }
+      if (typeof video === "string") videoOrdinal += 1;
+    });
+  }
+  return aliases;
+}
+
 function previewWasProven(
   before: CanvasSourceSnapshot,
   after: CanvasSourceSnapshot,
@@ -413,7 +474,8 @@ export function bindCanvasSourceDocumentTransition(
   transition: CanvasSourceTransition,
 ): { document: CanvasDocument; refs: Map<string, string> } {
   const provenRefs = provenCanvasSourceRefMap(before, after, transition);
-  if (provenRefs.size === 0) return { document, refs: provenRefs };
+  const frameIndexes = mappedFrameIndexes(before, after, transition);
+  if (provenRefs.size === 0 && frameIndexes.size === 0) return { document, refs: provenRefs };
   const currentValue = document[SOURCE_BINDINGS_FIELD];
   if (currentValue !== undefined && !Array.isArray(currentValue)) return { document, refs: new Map() };
 
@@ -461,7 +523,24 @@ export function bindCanvasSourceDocumentTransition(
     changed = true;
   }
 
-  if (!changed) return { document, refs };
-  next[SOURCE_BINDINGS_FIELD] = rows;
-  return { document: remapCanvasDocumentSourceRefs(next, refs), refs };
+  if (changed) next[SOURCE_BINDINGS_FIELD] = rows;
+  const remapped = changed ? remapCanvasDocumentSourceRefs(next, refs) : next;
+  const legacyRefs = new Map<string, string>();
+  const aliases = legacySourceRefAliases(before, after, frameIndexes);
+  const bindingsValue = next[SOURCE_BINDINGS_FIELD];
+  const updatedBindings = Array.isArray(bindingsValue)
+    ? bindingsValue.map(parseSourceBinding).filter((binding): binding is CanvasSourceDocumentBinding => binding !== null)
+    : [];
+  for (const [legacyRef, alias] of aliases) {
+    if (alias === null || legacyRef === alias.beforeSourceRef || !documentUsesRef(document, legacyRef)) continue;
+    const bindingRef = refs.get(alias.beforeSourceRef)
+      ?? (alias.afterFrameRef === undefined ? undefined : resolveCanvasSourceBindingRef(next, after, alias.afterFrameRef));
+    if (bindingRef === undefined) continue;
+    const conflictingBinding = updatedBindings.some((binding) => binding.ref === legacyRef
+      && !(binding.seriesId === after.series_id && binding.chapterId === after.chapter_id
+        && binding.sourceVersion === after.version && binding.sourceRef === alias.afterFrameRef));
+    if (!conflictingBinding) legacyRefs.set(legacyRef, bindingRef);
+  }
+  if (!changed && legacyRefs.size === 0) return { document, refs };
+  return { document: remapCanvasDocumentSourceRefs(remapped, legacyRefs), refs };
 }

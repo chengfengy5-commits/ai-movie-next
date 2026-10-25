@@ -272,17 +272,22 @@ function createWorkspaceHarness(lockScenario: LockScenario, options: WorkspaceHa
         const frames = [...(state.chapterContent ?? [])];
         frames[0] = { ...frames[0]!, text: request.command.text };
         state.chapterContent = frames;
-      } else if (request.command.type === "frame.insert" && request.command.after === null
-        && request.command.frame !== undefined && state.creationToken === null) {
+      } else if (request.command.type === "frame.insert"
+        && request.command.frame !== undefined && request.command.after !== undefined
+        && state.creationToken === null
+        && (request.command.after === null
+          || request.command.after.index === 0 && request.command.after.storyboard_id === "board-a")) {
         const insertedFrame = { ...request.command.frame, storyboard: [insertedFrameId] };
-        state.chapterContent = [insertedFrame, ...(state.chapterContent ?? [])];
+        const insertIndex = request.command.after === null ? 0 : request.command.after.index + 1;
+        const frames = [...(state.chapterContent ?? [])];
+        state.chapterContent = [...frames.slice(0, insertIndex), insertedFrame, ...frames.slice(insertIndex)];
         state.creationToken = creationReceiptToken;
         state.createdAssetKind = null;
         state.createdAssetId = null;
         creationReceipt = {
           token: creationReceiptToken,
           kind: "frame",
-          target: { id: insertedFrameId, storyboard_id: insertedFrameId, index: 0 },
+          target: { id: insertedFrameId, storyboard_id: insertedFrameId, index: insertIndex },
         };
       } else if (request.command.type === "frame.delete" && request.command.target?.storyboard_id === "board-b"
         && request.command.target.index === 1) {
@@ -628,6 +633,282 @@ describe("canvas source workspace integration", () => {
       custom_frame_field: { retain: true },
       storyboard: storyboard as unknown as string[],
     });
+    expect(requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(1);
+  });
+
+  it("projects legacy index layouts and manual edges in source mode without writing until the user drags", async () => {
+    const chapterContent: Chapter["content"] = [{
+      ...initialChapter.content![0]!,
+      preview: "/uploads/legacy-preview.png",
+      videos: ["same.mp4", "same.mp4"],
+    }];
+    const initialCanvasDocument = {
+      nodeLayouts: [
+        { refId: "frame:0", x: 0, y: -80, custom: "legacy-frame" },
+        { refId: "media:0:0", x: -120, y: 110, custom: "legacy-preview" },
+        { refId: "media:0:1", x: 380, y: -20, custom: "legacy-video-zero" },
+        { refId: "media:0:2", x: 720, y: 340, custom: "legacy-video-one" },
+        { refId: "future:unmapped-layout", x: 0, y: -1, custom: { preserve: true } },
+      ],
+      manualEdges: [
+        { id: "legacy-frame-preview", sourceRef: "frame:0", targetRef: "media:0:0", relation: "manual", vendor: 4 },
+        { id: "legacy-video-zero-frame", sourceRef: "media:0:1", targetRef: "frame:0", relation: "manual", vendor: 5 },
+        { id: "legacy-video-one-frame", sourceRef: "media:0:2", targetRef: "frame:0", relation: "manual", vendor: 6 },
+        { id: "future-dangling-edge", sourceRef: "future:missing-source", targetRef: "future:missing-target", relation: "future", extra: true },
+      ],
+      notes: [],
+      cards: [],
+      hiddenRelations: [],
+      viewport: { x: 0, y: 0, zoom: 1 },
+      unknown: { preserve: true },
+    };
+    const { userEvents, requests, state } = createWorkspaceHarness("personal", {
+      chapterContent,
+      initialCanvasDocument,
+    });
+    const { canvas, dialog } = await openCanvas(userEvents);
+    const frame = await canvas.findByRole("article", { name: "分镜 1" }) as HTMLElement;
+    const preview = await canvas.findByRole("article", { name: "分镜预览" }) as HTMLElement;
+    const videoZero = await canvas.findByRole("article", { name: "视频 1" }) as HTMLElement;
+    const videoOne = await canvas.findByRole("article", { name: "视频 2" }) as HTMLElement;
+
+    expect(state.sourceVersion).toBe(initialVersion);
+    expect(initialVersion).toHaveLength(64);
+    expect(state.chapterContent?.[0]?.storyboard).toEqual(["board-a"]);
+    expect(requests.some(({ url, method }) => method === "GET"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toBe(true);
+    expect(frame.style.left).toBe("0px");
+    expect(frame.style.top).toBe("-80px");
+    expect(preview.style.left).toBe("-120px");
+    expect(preview.style.top).toBe("110px");
+    expect(videoZero.style.left).toBe("380px");
+    expect(videoZero.style.top).toBe("-20px");
+    expect(videoOne.style.left).toBe("720px");
+    expect(videoOne.style.top).toBe("340px");
+    expect(dialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+    expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(0);
+    expect(requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(0);
+    expect(canvas.getByRole("button", { name: "保存布局" })).toBeDisabled();
+
+    const viewport = canvas.getByRole("region", { name: "画布工作区" });
+    fireEvent.pointerDown(preview, { pointerId: 84, button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(viewport, { pointerId: 84, clientX: 35, clientY: 25 });
+    fireEvent.pointerUp(viewport, { pointerId: 84 });
+    await waitFor(() => {
+      expect((canvas.getByRole("article", { name: "分镜预览" }) as HTMLElement).style.left).toBe("-95px");
+      expect((canvas.getByRole("article", { name: "分镜预览" }) as HTMLElement).style.top).toBe("125px");
+    });
+
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(1));
+    await canvas.findByText("已保存");
+
+    const expectedLayouts = [
+      { refId: "frame:0", x: 0, y: -80, custom: "legacy-frame" },
+      { refId: "media:0:0", x: -95, y: 125, custom: "legacy-preview" },
+      { refId: "media:0:1", x: 380, y: -20, custom: "legacy-video-zero" },
+      { refId: "media:0:2", x: 720, y: 340, custom: "legacy-video-one" },
+      { refId: "future:unmapped-layout", x: 0, y: -1, custom: { preserve: true } },
+    ];
+    expect(state.canvasDocument.nodeLayouts).toEqual(expectedLayouts);
+    expect(state.canvasDocument.manualEdges).toEqual(initialCanvasDocument.manualEdges);
+    expect(state.canvasDocument.unknown).toEqual({ preserve: true });
+    expect(requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(0);
+
+    await userEvents.click(canvas.getByRole("article", { name: "分镜 1" }));
+    await userEvents.click(canvas.getByRole("button", { name: "编辑分镜文字" }));
+    const editor = await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    fireEvent.change(within(editor).getByLabelText("镜头文字"), { target: { value: "真实来源目标仍是稳定ID" } });
+    await userEvents.click(within(editor).getByRole("button", { name: "保存文字" }));
+    await canvas.findByText("章节来源写入已获服务器回执，独立读取也确认了同一版本。");
+    const sourcePosts = requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`);
+    expect(sourcePosts).toHaveLength(1);
+    expect(sourcePosts[0]?.body).toMatchObject({
+      expected_version: initialVersion,
+      command: { type: "frame.update", target: { index: 0, storyboard_id: "board-a" } },
+    });
+  });
+
+  it("preserves legacy media bindings only after a proven insertion and across save and reopen", async () => {
+    const chapterContent: Chapter["content"] = [
+      {
+        ...initialChapter.content![0]!,
+        text: "稳定身份的前一镜",
+        storyboard: ["board-a"],
+      },
+      {
+        text: "稳定身份的后一镜",
+        storyboard: ["board-b"],
+        preview: "/uploads/legacy-preview.png",
+        videos: ["same.mp4", "same.mp4"],
+        custom_frame_field: { retain: true },
+      },
+    ];
+    const initialCanvasDocument = {
+      nodeLayouts: [
+        { refId: "frame:0", x: 0, y: -80, custom: "legacy-first-frame" },
+        { refId: "frame:1", x: 920, y: -140, custom: "legacy-second-frame" },
+        { refId: "media:1:0", x: -120, y: 110, custom: "legacy-preview" },
+        { refId: "media:1:1", x: 380, y: -20, custom: "legacy-video-zero" },
+        { refId: "media:1:2", x: 720, y: 340, custom: "legacy-video-one" },
+        { refId: "future:unmapped-layout", x: 0, y: -1, custom: { preserve: true } },
+      ],
+      manualEdges: [
+        { id: "legacy-frame-preview", sourceRef: "frame:1", targetRef: "media:1:0", relation: "manual", vendor: 4 },
+        { id: "legacy-video-zero-frame", sourceRef: "media:1:1", targetRef: "frame:1", relation: "manual", vendor: 5 },
+        { id: "legacy-video-one-frame", sourceRef: "media:1:2", targetRef: "frame:1", relation: "manual", vendor: 6 },
+        { id: "future-dangling-edge", sourceRef: "future:missing-source", targetRef: "future:missing-target", relation: "future", extra: true },
+      ],
+      notes: [],
+      cards: [],
+      hiddenRelations: [],
+      viewport: { x: 0, y: 0, zoom: 1 },
+      vendorDocumentField: { preserve: true },
+    };
+    const { userEvents, requests, state } = createWorkspaceHarness("personal", {
+      chapterContent,
+      initialCanvasDocument,
+    });
+    const { canvas, dialog: firstDialog, region: firstRegion } = await openCanvas(userEvents);
+    const firstFrame = await canvas.findByRole("article", { name: "分镜 1" }) as HTMLElement;
+    const secondFrame = await canvas.findByRole("article", { name: "分镜 2" }) as HTMLElement;
+    const preview = await canvas.findByRole("article", { name: "分镜预览" }) as HTMLElement;
+    const videoZero = await canvas.findByRole("article", { name: "视频 1" }) as HTMLElement;
+    const videoOne = await canvas.findByRole("article", { name: "视频 2" }) as HTMLElement;
+
+    expect(firstFrame.style.left).toBe("0px");
+    expect(firstFrame.style.top).toBe("-80px");
+    expect(secondFrame.style.left).toBe("920px");
+    expect(secondFrame.style.top).toBe("-140px");
+    expect(preview.style.left).toBe("-120px");
+    expect(preview.style.top).toBe("110px");
+    expect(videoZero.style.left).toBe("380px");
+    expect(videoZero.style.top).toBe("-20px");
+    expect(videoOne.style.left).toBe("720px");
+    expect(videoOne.style.top).toBe("340px");
+    expect(firstDialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+    expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(0);
+    expect(requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(0);
+
+    await userEvents.click(firstFrame);
+    expect(firstFrame.className).toContain("is-selected");
+    await userEvents.click(canvas.getByRole("button", { name: "插入分镜" }));
+    const editor = await screen.findByRole("dialog", { name: "插入分镜" });
+    fireEvent.change(within(editor).getByLabelText("分镜文字"), {
+      target: { value: "在前镜后插入，不改写后一镜媒体" },
+    });
+    await userEvents.click(within(editor).getByRole("button", { name: "确认插入" }));
+    await canvas.findByText("章节来源写入已获服务器回执，独立读取也确认了同一版本。");
+
+    const sourcePosts = requests.filter(({ url, method }) => method === "POST"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`);
+    expect(sourcePosts).toHaveLength(1);
+    expect(sourcePosts[0]?.body).toMatchObject({
+      expected_series_id: personalSeries.id,
+      expected_version: initialVersion,
+      command: {
+        type: "frame.insert",
+        after: { index: 0, storyboard_id: "board-a" },
+        frame: { text: "在前镜后插入，不改写后一镜媒体", storyboard: [] },
+      },
+    });
+    expect(state.sourceVersion).toBe(insertedSourceVersion);
+    expect(state.chapterContent?.map((frame) => frame.storyboard)).toEqual([
+      ["board-a"], [insertedFrameId], ["board-b"],
+    ]);
+    expect(state.chapterContent?.[2]).toMatchObject({
+      preview: "/uploads/legacy-preview.png",
+      videos: ["same.mp4", "same.mp4"],
+      custom_frame_field: { retain: true },
+    });
+
+    const movedFrame = await canvas.findByRole("article", { name: "分镜 3" }) as HTMLElement;
+    const movedPreview = await canvas.findByRole("article", { name: "分镜预览" }) as HTMLElement;
+    const movedVideoZero = await canvas.findByRole("article", { name: "视频 1" }) as HTMLElement;
+    const movedVideoOne = await canvas.findByRole("article", { name: "视频 2" }) as HTMLElement;
+    expect(movedFrame.style.left).toBe("920px");
+    expect(movedFrame.style.top).toBe("-140px");
+    expect(movedPreview.style.left).toBe("-120px");
+    expect(movedPreview.style.top).toBe("110px");
+    expect(movedVideoZero.style.left).toBe("380px");
+    expect(movedVideoZero.style.top).toBe("-20px");
+    expect(movedVideoOne.style.left).toBe("720px");
+    expect(movedVideoOne.style.top).toBe("340px");
+    expect((canvas.getByRole("article", { name: "分镜 1" }) as HTMLElement).className).toContain("is-selected");
+    expect(firstDialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+
+    await userEvents.click(canvas.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(1));
+    await canvas.findByText("已保存");
+
+    const sourceBindingsValue = state.canvasDocument.canvasSourceBindings;
+    expect(Array.isArray(sourceBindingsValue)).toBe(true);
+    const sourceBindings = Array.isArray(sourceBindingsValue)
+      ? sourceBindingsValue as Array<Record<string, unknown>>
+      : [];
+    const currentBinding = (sourceRef: string) => sourceBindings.find((binding) => (
+      binding.seriesId === personalSeries.id
+      && binding.chapterId === initialChapter.id
+      && binding.sourceVersion === insertedSourceVersion
+      && binding.sourceRef === sourceRef
+    ));
+    const frameBinding = currentBinding("frame:board-b");
+    const previewBinding = currentBinding(`media:${insertedSourceVersion}:frame:board-b:preview`);
+    const videoZeroBinding = currentBinding(`media:${insertedSourceVersion}:frame:board-b:video:0`);
+    const videoOneBinding = currentBinding(`media:${insertedSourceVersion}:frame:board-b:video:1`);
+    expect(previewBinding).toBeDefined();
+    expect(videoZeroBinding).toBeDefined();
+    expect(videoOneBinding).toBeDefined();
+    const savedLayouts = state.canvasDocument.nodeLayouts;
+    const layoutForRef = (ref: string): Record<string, unknown> | undefined => {
+      if (Array.isArray(savedLayouts)) {
+        return savedLayouts.find((layout): layout is Record<string, unknown> => (
+          typeof layout === "object" && layout !== null && !Array.isArray(layout)
+          && (layout as Record<string, unknown>).refId === ref
+        ));
+      }
+      if (typeof savedLayouts === "object" && savedLayouts !== null && !Array.isArray(savedLayouts)) {
+        return (savedLayouts as Record<string, Record<string, unknown>>)[ref];
+      }
+      return undefined;
+    };
+    const layoutForBinding = (binding: Record<string, unknown> | undefined): Record<string, unknown> | undefined => {
+      if (typeof binding?.ref !== "string") return undefined;
+      return layoutForRef(binding.ref);
+    };
+    expect(layoutForRef("frame:board-b") ?? layoutForBinding(frameBinding))
+      .toMatchObject({ x: 920, y: -140, custom: "legacy-second-frame" });
+    expect(layoutForBinding(previewBinding)).toMatchObject({ x: -120, y: 110, custom: "legacy-preview" });
+    expect(layoutForBinding(videoZeroBinding)).toMatchObject({ x: 380, y: -20, custom: "legacy-video-zero" });
+    expect(layoutForBinding(videoOneBinding)).toMatchObject({ x: 720, y: 340, custom: "legacy-video-one" });
+    expect(state.canvasDocument.manualEdges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "legacy-frame-preview", relation: "manual", vendor: 4 }),
+      expect.objectContaining({ id: "legacy-video-zero-frame", relation: "manual", vendor: 5 }),
+      expect.objectContaining({ id: "legacy-video-one-frame", relation: "manual", vendor: 6 }),
+      expect.objectContaining({ id: "future-dangling-edge", relation: "future", extra: true }),
+    ]));
+    expect(state.canvasDocument.vendorDocumentField).toEqual({ preserve: true });
+
+    await userEvents.click(canvas.getByRole("button", { name: "关闭创作画布" }));
+    await waitFor(() => expect(firstDialog.isConnected).toBe(false));
+    const reopened = await openCanvas(userEvents);
+    expect(reopened.region).not.toBe(firstRegion);
+    expect((await reopened.canvas.findByRole("article", { name: "分镜 3" }) as HTMLElement).style.left).toBe("920px");
+    expect((reopened.canvas.getByRole("article", { name: "分镜预览" }) as HTMLElement).style.left).toBe("-120px");
+    expect((reopened.canvas.getByRole("article", { name: "视频 1" }) as HTMLElement).style.left).toBe("380px");
+    expect((reopened.canvas.getByRole("article", { name: "视频 2" }) as HTMLElement).style.left).toBe("720px");
+    expect(reopened.dialog.querySelectorAll("path.is-manual")).toHaveLength(3);
+    expect(requests.filter(({ url, method }) => method === "PUT"
+      && url.pathname === `/api/chapters/${initialChapter.id}/canvas`)).toHaveLength(1);
     expect(requests.filter(({ url, method }) => method === "POST"
       && url.pathname === `/api/chapters/${initialChapter.id}/canvas-source`)).toHaveLength(1);
   });
