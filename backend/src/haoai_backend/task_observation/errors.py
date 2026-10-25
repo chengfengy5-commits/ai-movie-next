@@ -29,6 +29,21 @@ class TaskObservationConflict(TaskObservationError):
         super().__init__(409, detail)
 
 
+class TaskObservationTooLarge(TaskObservationError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(413, detail)
+
+
+class TaskObservationUnsupportedMedia(TaskObservationError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(415, detail)
+
+
+class TaskObservationBadGateway(TaskObservationError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(502, detail)
+
+
 class TaskObservationIntegrityError(TaskObservationError):
     def __init__(self, detail: str) -> None:
         super().__init__(500, detail)

@@ -55,11 +55,15 @@ def test_factory_has_exact_asset_route_surface_with_canvas_methods() -> None:
         for route in app.routes
         for method in getattr(route, "methods", set())
     }
-    assert len(method_paths) == 256
+    assert len(method_paths) == 257
     assert {
         ("/api/chapters/{chapter_id}/canvas-owned-results", "GET"),
         (
             "/api/chapters/{chapter_id}/canvas-owned-results/{result_ref}/application",
+            "GET",
+        ),
+        (
+            "/api/chapters/{chapter_id}/canvas-owned-results/{result_ref}/image",
             "GET",
         ),
     } <= method_paths
@@ -112,7 +116,16 @@ app = create_app(
     resolve_actor=lambda request: TrustedActor('test-user'),
     series_access_policy=lambda session, actor, series_id: None,
 )
-assert len({(route.path, method) for route in app.routes for method in getattr(route, 'methods', set())}) == 256
+route_methods = {
+    (route.path, method)
+    for route in app.routes
+    for method in getattr(route, 'methods', set())
+}
+assert len(route_methods) == 257
+assert (
+    '/api/chapters/{chapter_id}/canvas-owned-results/{result_ref}/image',
+    'GET',
+) in route_methods
 assert calls == []
 """
     env = os.environ.copy()
