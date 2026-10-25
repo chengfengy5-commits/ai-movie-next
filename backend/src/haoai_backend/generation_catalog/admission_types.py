@@ -492,12 +492,61 @@ def _canonical_target(value: object) -> dict[str, object]:
         destination = _mapping(target.get("destination"), "target.destination")
         destination_kind = _string(destination.get("kind"), "target.destination.kind")
         if destination_kind == "frame_preview":
-            _reject_unknown_keys(destination, {"kind", "chapter_id", "storyboard_asset_id"})
-            canonical_destination = {
-                "kind": destination_kind,
-                "chapter_id": _bounded_id(destination.get("chapter_id"), "target.chapter_id"),
-                "storyboard_asset_id": _bounded_id(destination.get("storyboard_asset_id"), "target.storyboard_asset_id"),
-            }
+            if "identity_mode" in destination:
+                _reject_unknown_keys(
+                    destination,
+                    {
+                        "kind",
+                        "chapter_id",
+                        "identity_mode",
+                        "frame_index",
+                        "expected_chapter_digest",
+                    },
+                )
+                identity_mode = _string(
+                    destination.get("identity_mode"),
+                    "target.destination.identity_mode",
+                )
+                if identity_mode != "strict-no-id-v1":
+                    raise AdmissionContextError(
+                        "canvas frame identity mode is unsupported"
+                    )
+                frame_index = _integer(
+                    destination.get("frame_index"),
+                    "target.destination.frame_index",
+                    minimum=0,
+                )
+                expected_chapter_digest = _string(
+                    destination.get("expected_chapter_digest"),
+                    "target.destination.expected_chapter_digest",
+                )
+                if not _is_lower_sha256(expected_chapter_digest):
+                    raise AdmissionContextError(
+                        "expected chapter digest must be lowercase SHA-256"
+                    )
+                canonical_destination = {
+                    "kind": destination_kind,
+                    "chapter_id": _bounded_id(
+                        destination.get("chapter_id"), "target.chapter_id"
+                    ),
+                    "identity_mode": identity_mode,
+                    "frame_index": frame_index,
+                    "expected_chapter_digest": expected_chapter_digest,
+                }
+            else:
+                _reject_unknown_keys(
+                    destination, {"kind", "chapter_id", "storyboard_asset_id"}
+                )
+                canonical_destination = {
+                    "kind": destination_kind,
+                    "chapter_id": _bounded_id(
+                        destination.get("chapter_id"), "target.chapter_id"
+                    ),
+                    "storyboard_asset_id": _bounded_id(
+                        destination.get("storyboard_asset_id"),
+                        "target.storyboard_asset_id",
+                    ),
+                }
         elif destination_kind == "asset_image":
             _reject_unknown_keys(destination, {"kind", "chapter_id", "asset_type", "asset_id"})
             asset_type = _string(destination.get("asset_type"), "target.asset_type")
@@ -703,6 +752,10 @@ def _integer(
     return value
 
 
+def _is_lower_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+
 def _boolean(value: object, label: str) -> bool:
     if type(value) is not bool:
         raise AdmissionContextError(f"{label} must be a boolean")
@@ -719,6 +772,9 @@ class LockedTargetFacts:
     frame_index: int | None = None
     chapter_digest: str | None = None
     asset_digest: str | None = None
+    identity_mode: str | None = None
+    expected_chapter_digest: str | None = None
+    canonical_chapter_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

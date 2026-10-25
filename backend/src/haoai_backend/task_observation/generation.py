@@ -45,11 +45,25 @@ def target_scope_for_snapshot(target: TargetSnapshot) -> str:
     if target.kind in {"frame_text", "canvas_frame_preview", "frame_message"}:
         if not target.chapter_id:
             raise ValueError("frame application target requires a chapter id")
-        identity = (
-            f"storyboard|{target.stable_storyboard_asset_id}"
-            if target.stable_storyboard_asset_id
-            else f"index|{target.compat_frame_index}"
-        )
+        if target.kind == "canvas_frame_preview" and not target.stable_storyboard_asset_id:
+            if (
+                type(target.compat_frame_index) is not int
+                or target.compat_frame_index < 0
+                or not _is_lower_sha256(target.full_chapter_digest)
+            ):
+                raise ValueError(
+                    "no-ID canvas target requires its original chapter digest and index"
+                )
+            identity = (
+                f"strict-no-id|chapter|{target.full_chapter_digest}"
+                f"|index|{target.compat_frame_index}"
+            )
+        else:
+            identity = (
+                f"storyboard|{target.stable_storyboard_asset_id}"
+                if target.stable_storyboard_asset_id
+                else f"index|{target.compat_frame_index}"
+            )
         if identity.endswith("|None"):
             raise ValueError("frame application target requires a stable id or index")
         scope = f"{target.kind}|{target.series_id}|chapter|{target.chapter_id}|{identity}"
@@ -743,6 +757,14 @@ def _same_instant(left: datetime, right: datetime) -> bool:
 def _series_id_from_scope(scope: str) -> str | None:
     parts = scope.split("|")
     return parts[1] if len(parts) >= 3 and parts[1] else None
+
+
+def _is_lower_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
 
 
 def _has_series_access(session: Session, user_id: str, series_id: str) -> bool:

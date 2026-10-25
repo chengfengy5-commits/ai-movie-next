@@ -36,6 +36,14 @@ class FramePreviewDestination(_StrictRequest):
     storyboard_asset_id: StrictStr = Field(min_length=1, max_length=36)
 
 
+class StrictNoIdFramePreviewDestination(_StrictRequest):
+    kind: Literal["frame_preview"]
+    chapter_id: StrictStr = Field(min_length=1, max_length=36)
+    identity_mode: Literal["strict-no-id-v1"]
+    frame_index: StrictInt = Field(ge=0)
+    expected_chapter_digest: StrictStr = Field(pattern=r"^[0-9a-f]{64}$")
+
+
 class AssetImageDestination(_StrictRequest):
     kind: Literal["asset_image"]
     chapter_id: StrictStr = Field(min_length=1, max_length=36)
@@ -43,9 +51,10 @@ class AssetImageDestination(_StrictRequest):
     asset_id: StrictStr = Field(min_length=1, max_length=36)
 
 
-CanvasDestination = Annotated[
-    Union[FramePreviewDestination, AssetImageDestination],
-    Field(discriminator="kind"),
+CanvasDestination = Union[
+    FramePreviewDestination,
+    StrictNoIdFramePreviewDestination,
+    AssetImageDestination,
 ]
 
 

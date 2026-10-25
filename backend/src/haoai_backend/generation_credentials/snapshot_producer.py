@@ -802,35 +802,56 @@ class MediaSnapshotProducer:
         full_frame_digest = None
         full_chapter_digest = target_facts.chapter_digest
         if kind == "canvas_frame_preview":
-            frames = _parse_chapter_frames(chapter_text)
             frame_index = target_facts.frame_index
-            if (
-                not stable_storyboard_id
-                or frames is None
-                or type(frame_index) is not int
-                or not 0 <= frame_index < len(frames)
-                or not isinstance(frames[frame_index], Mapping)
-            ):
-                raise _UnsafeSnapshot(409, "locked_frame_target_changed")
-            frame = frames[frame_index]
-            references = frame.get("storyboard")
-            stable_matches = [
-                index
-                for index, candidate in enumerate(frames)
-                if isinstance(candidate, Mapping)
-                and isinstance(candidate.get("storyboard"), list)
-                and candidate["storyboard"]
-                and candidate["storyboard"][0] == stable_storyboard_id
-            ]
-            if (
-                not isinstance(references, list)
-                or not references
-                or references[0] != stable_storyboard_id
-                or stable_matches != [frame_index]
-            ):
-                raise _UnsafeSnapshot(409, "locked_frame_target_changed")
-            full_frame_digest = _digest_canonical_json(frame)
-            full_chapter_digest = _digest_canonical_json(frames)
+            if target_facts.identity_mode == "strict-no-id-v1":
+                canonical_frames = _parse_canonical_chapter_frames(chapter_text)
+                if canonical_frames is None:
+                    raise _UnsafeSnapshot(409, "locked_no_id_chapter_invalid")
+                frames, canonical_chapter_digest = canonical_frames
+                if (
+                    stable_storyboard_id is not None
+                    or target_facts.expected_chapter_digest
+                    != canonical_chapter_digest
+                    or target_facts.canonical_chapter_digest
+                    != canonical_chapter_digest
+                    or type(frame_index) is not int
+                    or not 0 <= frame_index < len(frames)
+                ):
+                    raise _UnsafeSnapshot(409, "locked_frame_target_changed")
+                frame = frames[frame_index]
+                if not _frame_has_no_storyboard_identity(frame):
+                    raise _UnsafeSnapshot(409, "locked_frame_target_changed")
+                full_frame_digest = _digest_canonical_json(frame)
+                full_chapter_digest = canonical_chapter_digest
+            else:
+                frames = _parse_chapter_frames(chapter_text)
+                if (
+                    not stable_storyboard_id
+                    or frames is None
+                    or type(frame_index) is not int
+                    or not 0 <= frame_index < len(frames)
+                    or not isinstance(frames[frame_index], Mapping)
+                ):
+                    raise _UnsafeSnapshot(409, "locked_frame_target_changed")
+                frame = frames[frame_index]
+                references = frame.get("storyboard")
+                stable_matches = [
+                    index
+                    for index, candidate in enumerate(frames)
+                    if isinstance(candidate, Mapping)
+                    and isinstance(candidate.get("storyboard"), list)
+                    and candidate["storyboard"]
+                    and candidate["storyboard"][0] == stable_storyboard_id
+                ]
+                if (
+                    not isinstance(references, list)
+                    or not references
+                    or references[0] != stable_storyboard_id
+                    or stable_matches != [frame_index]
+                ):
+                    raise _UnsafeSnapshot(409, "locked_frame_target_changed")
+                full_frame_digest = _digest_canonical_json(frame)
+                full_chapter_digest = _digest_canonical_json(frames)
         snapshot = TargetSnapshot(
             kind=target_kind,
             chapter_id=chapter_id,
@@ -857,6 +878,14 @@ class MediaSnapshotProducer:
             "chapter_digest": target_facts.chapter_digest,
             "asset_digest": target_facts.asset_digest,
         }
+        if target_facts.identity_mode is not None:
+            protected["identity_mode"] = target_facts.identity_mode
+            protected["expected_chapter_digest"] = (
+                target_facts.expected_chapter_digest
+            )
+            protected["canonical_chapter_digest"] = (
+                target_facts.canonical_chapter_digest
+            )
         return _FullTarget(
             snapshot=snapshot,
             protected_values=_freeze_mapping(
@@ -2693,6 +2722,54 @@ def _parse_chapter_frames(value: object) -> list[object] | None:
     except (TypeError, ValueError):
         return None
     return frames if isinstance(frames, list) else None
+
+
+def _parse_canonical_chapter_frames(
+    value: object,
+) -> tuple[list[Mapping[str, object]], str] | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        frames = json.loads(
+            value,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(frames, list) or any(
+        not isinstance(frame, Mapping) for frame in frames
+    ):
+        return None
+    try:
+        canonical_digest = _sha256(_canonical_json(frames))
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return frames, canonical_digest
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("chapter JSON contains a duplicate object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"chapter JSON contains a non-finite value: {value}")
+
+
+def _frame_has_no_storyboard_identity(value: object) -> bool:
+    if not isinstance(value, Mapping):
+        return False
+    if "storyboard" not in value:
+        return True
+    references = value["storyboard"]
+    return isinstance(references, list) and all(
+        reference is None or reference == "" for reference in references
+    )
 
 
 def _digest_canonical_json(value: object) -> str:
