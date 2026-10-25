@@ -9,6 +9,8 @@ import { ApiError, isAbortError } from "./errors";
 import { createCanvasDataHttpPort } from "./canvasDataHttp";
 import { CanvasDataError, type CanvasDataPort, type CanvasEnvelope } from "./canvasData";
 import { createCanvasSourceHttpPort, type CanvasSourcePort } from "./canvasSources";
+import { createCanvasResultApplicationsHttpPort } from "./canvasResultApplicationsHttp";
+import type { CanvasResultApplicationsPort } from "./canvasResultApplications";
 import {
   parseAccountActionReceipt,
   parseEmailCodeReceipt,
@@ -215,6 +217,7 @@ export interface WorkspaceServices {
   readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
   readonly canvasSource?: CanvasSourcePort;
+  readonly canvasResultApplications?: CanvasResultApplicationsPort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
@@ -2914,6 +2917,12 @@ export function createApiServices(
     },
     canvasData: createCanvasDataHttpPort(apiBaseUrl, { storage, fetcher }),
     canvasSource: createCanvasSourceHttpPort(apiBaseUrl, { storage, fetcher, timeoutMs }),
+    canvasResultApplications: createCanvasResultApplicationsHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
     teamManagement: createTeamManagementHttpPort(apiBaseUrl, {
       storage,
       fetcher,
