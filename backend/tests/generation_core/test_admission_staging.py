@@ -1783,6 +1783,96 @@ def test_real_public_entry_stages_actual_producer_g1_graph_and_fees(
         environment.engine.dispose()
 
 
+def test_real_canvas_asset_safe_projection_preserves_existing_image_url(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    environment = _joint_environment(
+        tmp_path,
+        model_source=ModelSource.SYSTEM,
+        operation=AdmissionOperation.IMAGE_SINGLE.value,
+    )
+    old_image_url = "https://assets.example.test/previous-image.png"
+    with environment.engine.begin() as connection:
+        connection.execute(
+            update(ASSET_TABLES["character"])
+            .where(ASSET_TABLES["character"].c.id == "joint-character-1")
+            .values(image_url=old_image_url)
+        )
+
+    caller = _joint_caller(environment.engine)
+    captured_payloads: list[SnapshotPayloadsStaged] = []
+    original_producer_stage = snapshot_producer.MediaSnapshotProducer.prepare_and_stage
+
+    def capture_producer_result(
+        producer: snapshot_producer.MediaSnapshotProducer,
+        session: Session,
+        **kwargs: Any,
+    ) -> object:
+        result = original_producer_stage(producer, session, **kwargs)
+        if isinstance(result, SnapshotPayloadsStaged):
+            captured_payloads.append(result)
+        return result
+
+    monkeypatch.setattr(
+        snapshot_producer.MediaSnapshotProducer,
+        "prepare_and_stage",
+        capture_producer_result,
+    )
+    observed = _observe_joint_public_paths(
+        monkeypatch,
+        authentication_sessions=environment.authentication_sessions,
+    )
+    request = _joint_request(AdmissionOperation.IMAGE_SINGLE.value)
+    request["target"] = {
+        "kind": "canvas_apply",
+        "destination": {
+            "kind": "asset_image",
+            "chapter_id": "joint-chapter-1",
+            "asset_type": "character",
+            "asset_id": "joint-character-1",
+        },
+    }
+
+    try:
+        staged = _joint_prepare_and_stage(
+            environment.binding,
+            caller,
+            operation=AdmissionOperation.IMAGE_SINGLE.value,
+            raw_key="joint-canvas-asset-old-image-url",
+            request=request,
+        )
+
+        assert isinstance(staged, AdmissionStaged)
+        assert observed.producer_sessions == [caller]
+        assert len(observed.a2_calls) == 1
+        assert len(captured_payloads) == 1
+        producer_target = captured_payloads[0].items[0].snapshot.target_snapshot
+        assert producer_target.kind == "canvas_asset_image"
+        assert producer_target.expected_asset_image_url == old_image_url
+
+        task_id = staged.ordered_tasks[0].task_id
+        request_data = json.loads(
+            caller.execute(
+                select(AITaskRow.__table__.c.request_data).where(
+                    AITaskRow.__table__.c.id == task_id
+                )
+            ).scalar_one()
+        )
+        safe_target = request_data["target_snapshot"]
+        assert safe_target["kind"] == producer_target.kind
+        assert safe_target["chapter_id"] == producer_target.chapter_id
+        assert safe_target["series_id"] == producer_target.series_id
+        assert safe_target["asset_type"] == producer_target.asset_type
+        assert safe_target["asset_id"] == producer_target.asset_id
+        assert safe_target["same_series_target_digest"] == producer_target.same_series_target_digest
+        assert safe_target.get("expected_asset_image_url") == old_image_url
+    finally:
+        caller.rollback()
+        caller.close()
+        environment.engine.dispose()
+
+
 def test_real_zero_quote_byok_stages_without_wallet_or_debit(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

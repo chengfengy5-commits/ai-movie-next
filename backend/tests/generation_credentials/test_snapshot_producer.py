@@ -28,6 +28,7 @@ from haoai_backend.generation_catalog.admission_types import (
     AdmissionOperation,
     AdmissionRefusal,
     AdmissionReplay,
+    LockedTargetFacts,
     build_admission_context,
 )
 from haoai_backend.generation_catalog.tables import (
@@ -36,7 +37,11 @@ from haoai_backend.generation_catalog.tables import (
     metadata as catalog_metadata,
     model_configs,
 )
-from haoai_backend.generation_contracts.types import AdmissionFingerprint, GenerationActor
+from haoai_backend.generation_contracts.types import (
+    AdmissionFingerprint,
+    GenerationActor,
+    TargetSnapshot,
+)
 from haoai_backend.generation_core.base_schema import AITaskRow, Base, BillingUnitRow, TaskSubmissionRow
 from haoai_backend.generation_core.schema import (
     GENERATION_MIGRATION_HISTORY_TABLE,
@@ -1058,6 +1063,278 @@ def _single_request(model_id: str = MODEL_ID) -> dict[str, object]:
         "size": None,
         "reference_images": ["https://ref.example.test/single?ordered=1"],
     }
+
+
+def _canonical_json_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def test_real_frame_message_accepts_stable_storyboard_after_first_reference(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    engine = _new_database(tmp_path)
+    request.addfinalizer(engine.dispose)
+    raw_chapter = (
+        '[ { "storyboard" : ["legacy-reference", "storyboard-1"], '
+        '"text" : "保留普通消息目标" } ]'
+    )
+    raw_digest = hashlib.sha256(raw_chapter.encode("utf-8")).hexdigest()
+    with engine.begin() as connection:
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-1")
+            .values(content=raw_chapter)
+        )
+        connection.execute(
+            insert(ASSET_TABLES["storyboard"]).values(
+                id="storyboard-1",
+                series_id="series-1",
+                chapter_id="chapter-1",
+                frame_index=0,
+                name="Frame one",
+                description="Fixture storyboard frame",
+                image_url=None,
+                updated_at=FIXTURE_NOW.replace(tzinfo=None),
+            )
+        )
+
+    capabilities, crypto_state = _registered_capabilities(engine)
+    authentication, authentication_sessions = _authentication_service(engine)
+    producer = _producer_for(
+        authentication,
+        capabilities,
+        operation=AdmissionOperation.IMAGE_SINGLE.value,
+    )
+    producer_callers: list[Session] = []
+    observed_admissions: list[object] = []
+    real_prepare = prepare_admission
+
+    def observe_prepare(session: Session, context: object, *, policy: object) -> object:
+        assert producer_callers and producer_callers[-1] is session
+        assert authentication_sessions[-1].closed_by_authentication
+        result = real_prepare(session, context, policy=policy)
+        observed_admissions.append(result)
+        return result
+
+    monkeypatch.setattr(
+        "haoai_backend.generation_credentials.snapshot_producer.prepare_admission",
+        observe_prepare,
+    )
+    message_request = _single_request()
+    message_request["target"] = {
+        "kind": "frame_message",
+        "chapter_id": "chapter-1",
+        "storyboard_asset_id": "storyboard-1",
+    }
+    caller = _caller_session(engine)
+    producer_callers.append(caller)
+    try:
+        staged = producer.prepare_and_stage(
+            caller,
+            authorization="Bearer fixture-token",
+            operation=AdmissionOperation.IMAGE_SINGLE.value,
+            raw_key="frame-message-nonleading-storyboard-reference",
+            request=message_request,
+        )
+
+        assert len(observed_admissions) == 1
+        admission = observed_admissions[0]
+        assert isinstance(admission, AdmissionPreparationFacts)
+        locked_target = admission.items[0].target
+        assert locked_target.kind == "frame_message"
+        assert locked_target.asset_id == "storyboard-1"
+        assert locked_target.frame_index == 0
+        assert locked_target.chapter_digest == raw_digest
+
+        assert isinstance(staged, SnapshotPayloadsStaged)
+        item = staged.items[0]
+        target = item.snapshot.target_snapshot
+        assert target.kind == "frame_message"
+        assert target.stable_storyboard_asset_id == "storyboard-1"
+        assert target.compat_frame_index == 0
+        assert target.full_frame_digest is None
+        assert target.full_chapter_digest == raw_digest
+        assert item.request_data_projection.target_snapshot == target
+
+        plaintexts = crypto_state["plaintexts"]
+        assert isinstance(plaintexts, list) and plaintexts
+        protected = json.loads(plaintexts[-1])
+        assert protected["item"]["target"]["chapter"]["content"] == raw_chapter
+        assert protected["item"]["target"]["chapter_digest"] == raw_digest
+    finally:
+        caller.rollback()
+        caller.close()
+
+
+def test_real_canvas_frame_snapshot_freezes_canonical_target_and_raw_chapter_facts(
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    tmp_path: Path,
+) -> None:
+    engine = _new_database(tmp_path)
+    request.addfinalizer(engine.dispose)
+    stamp = FIXTURE_NOW.replace(tzinfo=None)
+    target_frame = {
+        "unknown": {"nested": ["雪夜", {"enabled": True, "镜头": 2}]},
+        "text": "旧画面",
+        "storyboard": ["storyboard-1"],
+    }
+    sibling_frame = {"storyboard": ["storyboard-2"], "text": "雨天"}
+    frames = [target_frame, sibling_frame]
+    raw_chapter = (
+        '[ { "unknown" : {"nested" : ["雪夜", {"enabled": true, "镜头": 2}]}, '
+        '"text" : "旧画面", "storyboard" : ["storyboard-1"] }, '
+        '{ "storyboard" : ["storyboard-2"], "text" : "雨天" } ]'
+    )
+    with engine.begin() as connection:
+        connection.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-1")
+            .values(content=raw_chapter)
+        )
+        connection.execute(
+            insert(ASSET_TABLES["storyboard"]).values(
+                id="storyboard-1",
+                series_id="series-1",
+                chapter_id="chapter-1",
+                frame_index=0,
+                name="Frame one",
+                description="Fixture storyboard frame",
+                image_url=None,
+                updated_at=stamp,
+            )
+        )
+        connection.execute(
+            insert(ASSET_TABLES["storyboard"]).values(
+                id="storyboard-2",
+                series_id="series-1",
+                chapter_id="chapter-1",
+                frame_index=1,
+                name="Frame two",
+                description="Fixture sibling frame",
+                image_url=None,
+                updated_at=stamp,
+            )
+        )
+
+    capabilities, crypto_state = _registered_capabilities(engine)
+    authentication, authentication_sessions = _authentication_service(engine)
+    producer = _producer_for(
+        authentication,
+        capabilities,
+        operation=AdmissionOperation.IMAGE_SINGLE.value,
+    )
+    producer_callers: list[Session] = []
+    real_prepare = prepare_admission
+
+    def observe_prepare(session: Session, context: object, *, policy: object) -> object:
+        assert producer_callers and producer_callers[-1] is session
+        assert authentication_sessions[-1].closed_by_authentication
+        return real_prepare(session, context, policy=policy)
+
+    monkeypatch.setattr(
+        "haoai_backend.generation_credentials.snapshot_producer.prepare_admission",
+        observe_prepare,
+    )
+    canvas_request = _single_request()
+    canvas_request["target"] = {
+        "kind": "canvas_apply",
+        "destination": {
+            "kind": "frame_preview",
+            "chapter_id": "chapter-1",
+            "storyboard_asset_id": "storyboard-1",
+        },
+    }
+
+    def produce(
+        raw_key: str,
+        content: str,
+    ) -> tuple[TargetSnapshot, LockedTargetFacts, dict[str, object]]:
+        with engine.begin() as connection:
+            connection.execute(
+                update(chapters)
+                .where(chapters.c.id == "chapter-1")
+                .values(content=content)
+            )
+        caller = _caller_session(engine)
+        producer_callers.append(caller)
+        try:
+            staged = producer.prepare_and_stage(
+                caller,
+                authorization="Bearer fixture-token",
+                operation=AdmissionOperation.IMAGE_SINGLE.value,
+                raw_key=raw_key,
+                request=canvas_request,
+            )
+            assert isinstance(staged, SnapshotPayloadsStaged)
+            assert len(staged.preparation.items) == 1
+            item = staged.items[0]
+            assert item.snapshot.target_snapshot.kind == "canvas_frame_preview"
+            assert item.request_data_projection.target_snapshot == item.snapshot.target_snapshot
+
+            plaintexts = crypto_state["plaintexts"]
+            assert isinstance(plaintexts, list) and plaintexts
+            protected = json.loads(plaintexts[-1])
+            return (
+                item.snapshot.target_snapshot,
+                staged.preparation.items[0].target,
+                protected["item"]["target"],
+            )
+        finally:
+            caller.rollback()
+            caller.close()
+
+    raw_digest = hashlib.sha256(raw_chapter.encode("utf-8")).hexdigest()
+    first_target, first_facts, first_protected = produce("canvas-frame-original", raw_chapter)
+    assert first_target.full_frame_digest == _canonical_json_digest(target_frame)
+    assert first_target.full_chapter_digest == _canonical_json_digest(frames)
+    assert first_target.full_chapter_digest != raw_digest
+    assert first_facts.chapter_digest == raw_digest
+    assert first_protected["chapter"]["content"] == raw_chapter
+    assert first_protected["chapter_digest"] == raw_digest
+
+    reordered_frames = [sibling_frame, target_frame]
+    reordered_raw = json.dumps(reordered_frames, ensure_ascii=False, indent=2)
+    reordered_target, reordered_facts, reordered_protected = produce(
+        "canvas-frame-reordered",
+        reordered_raw,
+    )
+    assert reordered_target.compat_frame_index == 1
+    assert reordered_target.full_frame_digest == first_target.full_frame_digest
+    assert reordered_target.full_chapter_digest == _canonical_json_digest(
+        reordered_frames
+    )
+    assert reordered_target.full_chapter_digest != first_target.full_chapter_digest
+    assert reordered_facts.chapter_digest == hashlib.sha256(
+        reordered_raw.encode("utf-8")
+    ).hexdigest()
+    assert reordered_protected["chapter"]["content"] == reordered_raw
+
+    manually_changed_frame = {
+        **target_frame,
+        "text": "人工改稿",
+    }
+    manually_changed_frames = [manually_changed_frame, sibling_frame]
+    manually_changed_raw = json.dumps(
+        manually_changed_frames,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    changed_target, _changed_facts, changed_protected = produce(
+        "canvas-frame-manual-edit",
+        manually_changed_raw,
+    )
+    assert changed_target.full_frame_digest == _canonical_json_digest(manually_changed_frame)
+    assert changed_target.full_frame_digest != first_target.full_frame_digest
+    assert changed_protected["chapter"]["content"] == manually_changed_raw
 
 
 def _insert_original_single_receipt(
