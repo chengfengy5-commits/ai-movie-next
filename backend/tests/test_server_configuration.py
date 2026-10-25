@@ -57,6 +57,8 @@ def test_nonproduction_without_storage_is_explicit_and_repr_is_redacted(
     assert "ambient-access-secret" not in repr(configuration)
     assert configuration.frame_optimize_enabled is False
     assert configuration.frame_optimize_credentials_file is None
+    assert configuration.image_single_enabled is False
+    assert configuration.image_single_credentials_file is None
 
 
 def test_frame_optimize_is_opt_in_and_requires_an_absolute_bundle_path(
@@ -78,6 +80,43 @@ def test_frame_optimize_is_opt_in_and_requires_an_absolute_bundle_path(
     assert configuration.frame_optimize_enabled is False
     assert configuration.frame_optimize_credentials_file == tmp_path / "bundle.json"
     assert configuration.frame_optimize_max_user_concurrency == 0
+
+
+def test_image_single_is_opt_in_and_requires_credentials_and_complete_storage(
+    tmp_path: Path,
+) -> None:
+    environment = _base_environment(tmp_path)
+    environment["IMAGE_SINGLE_ENABLED"] = "true"
+    with pytest.raises(ServerConfigurationError, match="IMAGE_SINGLE_CREDENTIALS_FILE"):
+        load_server_configuration(environment)
+
+    environment["IMAGE_SINGLE_CREDENTIALS_FILE"] = str(tmp_path / "missing-bundle.json")
+    with pytest.raises(ServerConfigurationError, match="complete object storage"):
+        load_server_configuration(environment)
+
+    environment = _r2_environment(tmp_path)
+    environment["IMAGE_SINGLE_ENABLED"] = "true"
+    with pytest.raises(ServerConfigurationError, match="IMAGE_SINGLE_CREDENTIALS_FILE"):
+        load_server_configuration(environment)
+
+    environment["IMAGE_SINGLE_CREDENTIALS_FILE"] = str(tmp_path / "missing-bundle.json")
+    configuration = load_server_configuration(environment)
+    assert configuration.image_single_enabled is True
+    assert configuration.image_single_credentials_file == tmp_path / "missing-bundle.json"
+
+
+def test_disabled_image_single_does_not_open_configured_credentials_file(
+    tmp_path: Path,
+) -> None:
+    environment = _base_environment(tmp_path)
+    credentials_path = tmp_path / "not-present.json"
+    environment["IMAGE_SINGLE_CREDENTIALS_FILE"] = str(credentials_path)
+
+    configuration = load_server_configuration(environment)
+
+    assert configuration.image_single_enabled is False
+    assert configuration.image_single_credentials_file == credentials_path
+    assert not credentials_path.exists()
 
 
 def test_r2_requires_every_named_value_and_does_not_leak_secrets(

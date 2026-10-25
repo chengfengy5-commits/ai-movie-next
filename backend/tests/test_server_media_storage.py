@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 import importlib.util
+import json
+import os
 import socket
+import struct
 import subprocess
 import sys
 import threading
+import uuid
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 import pytest
@@ -186,6 +194,229 @@ def _sdk_factories(
     return session_factory, config_factory, state
 
 
+def _prepared_png() -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00\xff"))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _provision_image_single_bundle(tmp_path: Path) -> Path:
+    from backend.server.credentials import provision_credential_bundle
+
+    encode = lambda value: base64.b64encode(value).decode("ascii")
+    source = {
+        "format": "haoai-root-enrollment-input-v1",
+        "proof_key": {"key_id": "image-host-proof-v1", "key_base64": encode(b"p" * 32)},
+        "guard_key": {"key_id": "image-host-guard-v1", "key_base64": encode(b"g" * 32)},
+        "aead_key": {
+            "key_id": "image-host-aead-v1",
+            "algorithm_version": "aes-256-gcm-v1",
+            "key_base64": encode(b"a" * 32),
+        },
+        "records": [
+            {
+                "record_id": "image-host-record-1",
+                "principal_id": "30000000-0000-4000-8000-000000000001",
+                "scope": {
+                    "source": "user",
+                    "row_id": "20000000-0000-4000-8000-000000000001",
+                    "owner_or_system": "10000000-0000-4000-8000-000000000001",
+                    "provider": "openai",
+                },
+                "issuer_namespace": "image-host-provider-account-v1",
+                "stable_account_subject": "synthetic-image-host-subject",
+                "key_generation": "image-host-generation-1",
+                "material_ref": "synthetic://image-host/provider",
+                "provider_secret": "synthetic-image-host-provider-secret",
+                "evidence_ref": "synthetic-evidence://image-host/record-1",
+                "evidence_version": "image-host-evidence-v1",
+                "valid_from": "2026-01-01T00:00:00+00:00",
+                "valid_until": None,
+                "revoked_at": None,
+                "endpoint_policy": {
+                    "provider_origin": "https://provider.example.test",
+                    "api_base_path": "/v2",
+                    "allowed_content_paths": [],
+                    "policy_version": "image-host-endpoint-v1",
+                },
+            }
+        ],
+    }
+    input_path = tmp_path / "image-host-root-input.json"
+    bundle_path = tmp_path / "image-host-root-bundle.json"
+    descriptor = os.open(input_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(
+            descriptor,
+            json.dumps(source, ensure_ascii=False, separators=(",", ":")).encode(),
+        )
+    finally:
+        os.close(descriptor)
+    assert provision_credential_bundle(input_path, bundle_path) == 1
+    return bundle_path
+
+
+def _image_single_configuration(tmp_path: Path):
+    bundle_path = _provision_image_single_bundle(tmp_path)
+    environment = _environment(tmp_path, storage=True)
+    environment.update(
+        {
+            "IMAGE_SINGLE_ENABLED": "true",
+            "IMAGE_SINGLE_CREDENTIALS_FILE": str(bundle_path),
+        }
+    )
+    return load_server_configuration(environment)
+
+
+class _FakePublicResponse:
+    def __init__(self, library: _ControlledPublicHttpLibrary) -> None:
+        self.status = 200
+        self.headers = {
+            "content-type": "image/png",
+            "content-length": str(len(library.content)),
+        }
+        self._library = library
+        self.close_calls = 0
+
+    def iter_chunks(self, chunk_size: int):
+        assert chunk_size > 0
+
+        async def chunks():
+            yield self._library.content
+
+        return chunks()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FakePublicConnector:
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _FakePublicSession:
+    def __init__(
+        self,
+        library: _ControlledPublicHttpLibrary,
+        connector: _FakePublicConnector,
+    ) -> None:
+        self._library = library
+        self.connector = connector
+        self.close_calls = 0
+
+    async def get(
+        self,
+        target: Any,
+        *,
+        headers: Any,
+        timeout_seconds: float,
+        allow_redirects: bool,
+    ) -> _FakePublicResponse:
+        assert headers == {"Host": urlsplit(target.raw_url).netloc}
+        assert allow_redirects is False
+        self._library.begin_get(target.raw_url, timeout_seconds)
+        try:
+            while self._library.blocked and not self._library.release.wait(0):
+                await asyncio.sleep(0.005)
+            response = _FakePublicResponse(self._library)
+            self._library.responses.append(response)
+            return response
+        finally:
+            self._library.end_get()
+
+    async def close(self) -> None:
+        self.close_calls += 1
+
+
+class _ControlledPublicHttpLibrary:
+    def __init__(self, content: bytes) -> None:
+        from haoai_backend.media_storage.pinned_http import EncodedRequestTarget
+
+        self._target_type = EncodedRequestTarget
+        self.content = content
+        self.blocked = True
+        self.release = threading.Event()
+        self.first_started = threading.Event()
+        self.two_started = threading.Event()
+        self._lock = threading.Lock()
+        self.active = 0
+        self.maximum_active = 0
+        self.get_calls: list[tuple[str, float, int]] = []
+        self.connectors: list[_FakePublicConnector] = []
+        self.sessions: list[_FakePublicSession] = []
+        self.responses: list[_FakePublicResponse] = []
+
+    def encoded_url(self, raw_url: str, *, preserve_encoded: bool):
+        assert preserve_encoded is True
+        parsed = urlsplit(raw_url)
+        return self._target_type(
+            raw_url=raw_url,
+            authority=parsed.netloc,
+            tls_hostname=parsed.hostname or "",
+            encoded=True,
+        )
+
+    def connector(
+        self,
+        resolver: Any,
+        *,
+        tls_hostname: str,
+        verify_tls: bool,
+        use_dns_cache: bool,
+    ) -> _FakePublicConnector:
+        assert tls_hostname
+        assert verify_tls is True
+        assert use_dns_cache is False
+        connector = _FakePublicConnector()
+        self.connectors.append(connector)
+        return connector
+
+    def session(
+        self,
+        connector: _FakePublicConnector,
+        *,
+        trust_env: bool,
+        cookies_enabled: bool,
+        auto_decompress: bool,
+        connector_owned_by_session: bool,
+    ) -> _FakePublicSession:
+        assert trust_env is False
+        assert cookies_enabled is False
+        assert auto_decompress is True
+        assert connector_owned_by_session is False
+        session = _FakePublicSession(self, connector)
+        self.sessions.append(session)
+        return session
+
+    def begin_get(self, url: str, timeout_seconds: float) -> None:
+        with self._lock:
+            self.active += 1
+            self.maximum_active = max(self.maximum_active, self.active)
+            self.get_calls.append((url, timeout_seconds, threading.get_ident()))
+            self.first_started.set()
+            if self.active >= 2:
+                self.two_started.set()
+
+    def end_get(self) -> None:
+        with self._lock:
+            self.active -= 1
+
+
 def _apply_generation_schema(engine: Engine) -> None:
     from haoai_backend.generation_core.base_schema import FOUNDATION_TABLES
     from haoai_backend.generation_core.schema import FoundationBase
@@ -334,6 +565,360 @@ def test_host_wires_authenticated_upload_and_business_routes_to_one_factory(
     host.close()
     assert engine.pool is not original_pool
     assert sdk_state["clients"][0].close_calls == 1
+
+
+def test_image_single_media_store_uses_owned_runtime_and_generation_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration = _image_single_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: pytest.fail(
+            "image.single host media writes must not use real DNS"
+        ),
+    )
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    image_host = host.app.state.server_image_generation_configuration
+    media_runtime = image_host.media_runtime
+    worker_runtime = image_host.generation_worker_configuration.runtime
+    prepared_png = _prepared_png()
+    from haoai_backend.generation_contracts.types import ReferenceInput, StoredMedia
+
+    assert media_runtime is not None
+    assert media_runtime.state == "new"
+    assert sdk_state["clients"] == []
+
+    try:
+        store = worker_runtime.media_store_factory()
+        stored = store.store_bytes_or_provider_content(
+            ReferenceInput(
+                kind="bytes",
+                content=prepared_png,
+                media_type="image/png",
+            ),
+            {"max_bytes": len(prepared_png)},
+        )
+        assert isinstance(stored, StoredMedia)
+        assert stored.content_digest == hashlib.sha256(prepared_png).hexdigest()
+        assert stored.media_type == "image/png"
+        assert stored.size_bytes == len(prepared_png)
+        assert stored.locator.startswith("https://cdn.example.test/media/")
+        assert media_runtime.state == "running"
+        assert len(sdk_state["clients"]) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+        call = sdk_state["clients"][0].calls[0]
+        assert call["Bucket"] == "haoai-media"
+        assert call["ContentType"] == "image/png"
+        assert call["CacheControl"] == "public, max-age=31536000, immutable"
+        assert call["body_bytes"] == prepared_png
+        key = call["Key"]
+        assert key is not None
+        year, month, day, business_type, filename = key.split("/")
+        assert year.isdecimal() and len(year) == 4
+        assert month.isdecimal() and len(month) == 2
+        assert day.isdecimal() and len(day) == 2
+        assert business_type == "generation"
+        assert filename.endswith(".png")
+        assert str(uuid.UUID(filename[:-4])) == filename[:-4]
+        assert stored.locator == f"https://cdn.example.test/media/{key}"
+    finally:
+        host.close()
+
+    assert media_runtime.state == "closed"
+    owned_thread = media_runtime._thread
+    owned_executor = media_runtime._executor
+    assert owned_thread is not None and not owned_thread.is_alive()
+    assert owned_executor is not None and owned_executor._shutdown is True
+    assert all(not thread.is_alive() for thread in owned_executor._threads)
+    assert sdk_state["clients"][0].close_calls == 1
+
+
+def test_image_single_public_fetch_uses_owned_loop_shared_slots_and_safe_limits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from haoai_backend.generation_contracts.types import (
+        PreparedReference,
+        ReferenceInput,
+        TransferFailure,
+    )
+    from haoai_backend.media_storage.transfer_types import (
+        MAX_TRANSFER_BYTES,
+        MAX_TRANSFER_SECONDS,
+    )
+    from haoai_backend.media_storage.owned_media_runtime import OwnedMediaRuntime
+    import backend.server.image_generation as image_generation_module
+
+    prepared_png = _prepared_png()
+    library = _ControlledPublicHttpLibrary(prepared_png)
+    dns_observations: list[tuple[str, int, int]] = []
+    third_request_waiting_for_slot = threading.Event()
+    semaphore_capacities: list[int] = []
+    observed_semaphores: set[int] = set()
+    original_get_services = OwnedMediaRuntime._get_services
+
+    def observe_owned_services(runtime: OwnedMediaRuntime):
+        services = original_get_services(runtime)
+        semaphore = services.shared_slots
+        if id(semaphore) not in observed_semaphores:
+            observed_semaphores.add(id(semaphore))
+            semaphore_capacities.append(semaphore._value)
+            original_acquire = semaphore.acquire
+
+            async def observe_acquire() -> bool:
+                if semaphore._value == 0:
+                    third_request_waiting_for_slot.set()
+                return await original_acquire()
+
+            semaphore.acquire = observe_acquire  # type: ignore[method-assign]
+        return services
+
+    monkeypatch.setattr(
+        OwnedMediaRuntime,
+        "_get_services",
+        observe_owned_services,
+    )
+
+    async def fake_getaddrinfo(
+        host: str,
+        port: int,
+        *,
+        family: int,
+        type: int,
+    ):
+        assert family == socket.AF_UNSPEC
+        assert type == socket.SOCK_STREAM
+        dns_observations.append(
+            (host, threading.get_ident(), id(asyncio.get_running_loop()))
+        )
+        return (
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", port),
+            ),
+        )
+
+    monkeypatch.setattr(image_generation_module, "_build_http_library", lambda: library)
+    monkeypatch.setattr(image_generation_module, "_system_getaddrinfo", fake_getaddrinfo)
+    configuration = _image_single_configuration(tmp_path)
+    sdk_session, sdk_config, _sdk_state = _sdk_factories()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    image_host = host.app.state.server_image_generation_configuration
+    media_runtime = image_host.media_runtime
+    fetcher = (
+        image_host.generation_worker_configuration.runtime.public_media_fetcher_factory()
+    )
+    caller_thread = threading.get_ident()
+
+    assert media_runtime is not None
+    assert media_runtime.state == "new"
+
+    async def fetch_three() -> tuple[object, ...]:
+        for invalid_max_bytes, invalid_timeout in (
+            (MAX_TRANSFER_BYTES + 1, 2),
+            (1024, MAX_TRANSFER_SECONDS + 1),
+        ):
+            invalid_limits = await fetcher.fetch_public(
+                ReferenceInput(
+                    kind="public_http",
+                    locator="https://image.example.test/large.png",
+                ),
+                max_bytes=invalid_max_bytes,
+                timeout_seconds=invalid_timeout,
+            )
+            assert isinstance(invalid_limits, TransferFailure)
+            assert invalid_limits.code == "invalid_limits"
+        assert media_runtime.state == "new"
+
+        tasks = [
+            asyncio.create_task(
+                fetcher.fetch_public(
+                    ReferenceInput(
+                        kind="public_http",
+                        locator=f"https://image-{index}.example.test/output.png",
+                    ),
+                    max_bytes=1024,
+                    timeout_seconds=5,
+                )
+            )
+            for index in range(3)
+        ]
+        assert await asyncio.to_thread(library.two_started.wait, 2)
+        assert await asyncio.to_thread(third_request_waiting_for_slot.wait, 2)
+        assert semaphore_capacities == [2]
+        assert library.active == 2
+        assert len(library.get_calls) == 2
+        assert len(dns_observations) == 2
+        library.release.set()
+        results = await asyncio.gather(*tasks)
+        assert all(isinstance(result, PreparedReference) for result in results)
+        assert all(result.content == prepared_png for result in results)
+        assert library.maximum_active == 2
+        assert library.active == 0
+        assert len(library.get_calls) == 3
+
+        runtime_thread_id = media_runtime.owner_thread_id
+        runtime_loop_id = id(media_runtime._loop)
+        assert runtime_thread_id is not None
+        assert {thread_id for _url, _timeout, thread_id in library.get_calls} == {
+            runtime_thread_id
+        }
+        assert runtime_thread_id != caller_thread
+        assert {thread_id for _host, thread_id, _loop_id in dns_observations} == {
+            runtime_thread_id
+        }
+        assert {loop_id for _host, _thread_id, loop_id in dns_observations} == {
+            runtime_loop_id
+        }
+        assert {timeout for _url, timeout, _thread_id in library.get_calls} == {5}
+
+        get_count_before_private = len(library.get_calls)
+        dns_count_before_private = len(dns_observations)
+        private_result = await fetcher.fetch_public(
+            ReferenceInput(kind="public_http", locator="http://127.0.0.1/private.png"),
+            max_bytes=1024,
+            timeout_seconds=1,
+        )
+        assert isinstance(private_result, TransferFailure)
+        assert private_result.code == "unsafe_url"
+        assert len(library.get_calls) == get_count_before_private
+        assert len(dns_observations) == dns_count_before_private
+
+        limited_result = await fetcher.fetch_public(
+            ReferenceInput(
+                kind="public_http",
+                locator="https://limited.example.test/image.png",
+            ),
+            max_bytes=32,
+            timeout_seconds=1,
+        )
+        assert isinstance(limited_result, TransferFailure)
+        assert limited_result.code == "reference_too_large"
+
+        library.release.clear()
+        library.first_started.clear()
+        timeout_task = asyncio.create_task(
+            fetcher.fetch_public(
+                ReferenceInput(
+                    kind="public_http",
+                    locator="https://timeout.example.test/slow.png",
+                ),
+                max_bytes=1024,
+                timeout_seconds=0.25,
+            )
+        )
+        assert await asyncio.to_thread(library.first_started.wait, 2)
+        timeout_result = await timeout_task
+        assert isinstance(timeout_result, TransferFailure)
+        assert timeout_result.code == "timeout"
+        assert library.active == 0
+        assert library.get_calls[-1][1] == 0.25
+        assert library.sessions[-1].close_calls == 1
+        assert library.connectors[-1].close_calls == 1
+        return tuple(results) + (private_result, limited_result, timeout_result)
+
+    try:
+        asyncio.run(fetch_three())
+    finally:
+        library.release.set()
+        host.close()
+
+    assert media_runtime.state == "closed"
+    assert all(session.close_calls == 1 for session in library.sessions)
+    assert all(connector.close_calls == 1 for connector in library.connectors)
+    assert media_runtime._thread is not None and not media_runtime._thread.is_alive()
+    assert media_runtime._executor is not None
+    assert media_runtime._executor._shutdown is True
+
+
+def test_image_single_public_fetch_cancellation_waits_for_owned_cleanup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from haoai_backend.generation_contracts.types import ReferenceInput
+    import backend.server.image_generation as image_generation_module
+
+    library = _ControlledPublicHttpLibrary(_prepared_png())
+
+    async def fake_getaddrinfo(
+        host: str,
+        port: int,
+        *,
+        family: int,
+        type: int,
+    ):
+        assert family == socket.AF_UNSPEC
+        assert type == socket.SOCK_STREAM
+        return (
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", port),
+            ),
+        )
+
+    monkeypatch.setattr(image_generation_module, "_build_http_library", lambda: library)
+    monkeypatch.setattr(image_generation_module, "_system_getaddrinfo", fake_getaddrinfo)
+    configuration = _image_single_configuration(tmp_path)
+    sdk_session, sdk_config, _sdk_state = _sdk_factories()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    image_host = host.app.state.server_image_generation_configuration
+    media_runtime = image_host.media_runtime
+    fetcher = (
+        image_host.generation_worker_configuration.runtime.public_media_fetcher_factory()
+    )
+
+    async def cancel_and_wait() -> bool:
+        fetch = asyncio.create_task(
+            fetcher.fetch_public(
+                ReferenceInput(
+                    kind="public_http",
+                    locator="https://cancel.example.test/image.png",
+                ),
+                max_bytes=1024,
+                timeout_seconds=5,
+            )
+        )
+        assert await asyncio.to_thread(library.first_started.wait, 2)
+        fetch.cancel()
+        await asyncio.sleep(0.05)
+        remained_pending_for_cleanup = not fetch.done()
+        library.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await fetch
+        return remained_pending_for_cleanup
+
+    try:
+        assert media_runtime is not None
+        assert asyncio.run(cancel_and_wait()) is True
+        assert library.active == 0
+        assert library.sessions[-1].close_calls == 1
+        assert library.connectors[-1].close_calls == 1
+    finally:
+        library.release.set()
+        host.close()
+
+    assert media_runtime.state == "closed"
+    assert media_runtime._thread is not None and not media_runtime._thread.is_alive()
+    assert media_runtime._executor is not None
+    assert media_runtime._executor._shutdown is True
 
 
 def test_unconfigured_storage_returns_existing_upload_failure_without_sdk(
@@ -645,6 +1230,73 @@ def test_concurrent_close_waits_for_cleanup_and_does_not_report_false_success() 
     assert results["second"] is None
     assert cleanup_calls == 2
     assert dispose_calls == 1
+
+
+def test_owned_resources_close_media_runtime_then_storage_then_engine_once() -> None:
+    events: list[str] = []
+
+    class _MediaRuntime:
+        def close(self) -> None:
+            events.append("media")
+
+    class _Storage:
+        def retry_pending_cleanup(self) -> tuple[bool, ...]:
+            events.append("storage")
+            return (True,)
+
+    class _Engine:
+        def dispose(self) -> None:
+            events.append("engine")
+
+    resources = _OwnedResources(  # type: ignore[arg-type]
+        _Engine(),
+        _Storage(),
+        _MediaRuntime(),  # type: ignore[arg-type]
+    )
+
+    resources.close()
+    resources.close()
+
+    assert events == ["media", "storage", "engine"]
+
+
+def test_owned_resources_reports_media_cleanup_failure_after_other_cleanup() -> None:
+    events: list[str] = []
+
+    class _MediaRuntime:
+        attempts = 0
+
+        def close(self) -> None:
+            self.attempts += 1
+            events.append("media")
+            if self.attempts == 1:
+                raise RuntimeError("synthetic cleanup failure")
+
+    class _Storage:
+        def retry_pending_cleanup(self) -> tuple[bool, ...]:
+            events.append("storage")
+            return (True,)
+
+    class _Engine:
+        def dispose(self) -> None:
+            events.append("engine")
+
+    resources = _OwnedResources(  # type: ignore[arg-type]
+        _Engine(),
+        _Storage(),
+        _MediaRuntime(),  # type: ignore[arg-type]
+    )
+
+    with pytest.raises(RuntimeError, match="cleanup did not complete"):
+        resources.close()
+    resources.close()
+
+    assert events == [
+        "media",
+        "storage",
+        "engine",
+        "media",
+    ]
 
 
 def test_cli_surfaces_lifespan_cleanup_failure_swallowed_by_uvicorn(

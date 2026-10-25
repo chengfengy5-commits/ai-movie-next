@@ -35,8 +35,22 @@ def build_chat_media_admission_router(
     authentication_service: AuthenticationService,
     session_factory: SessionFactory | None,
     producer_binding: MediaSnapshotProducerBinding | None,
+    enabled_operations: frozenset[str] | None = None,
+    image_references_enabled: bool = True,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/chat", tags=["chat-media-admission"])
+    if enabled_operations is None:
+        allowed_operations = frozenset(
+            {"image.single", "video.single", "image.batch"}
+        )
+    else:
+        allowed_operations = frozenset(enabled_operations)
+        if not allowed_operations.issubset(
+            {"image.single", "video.single", "image.batch"}
+        ):
+            raise ValueError("enabled media operations are unsupported")
+    if type(image_references_enabled) is not bool:
+        raise TypeError("image_references_enabled must be an explicit boolean")
 
     async def account_actor(request: Request) -> TrustedActor:
         try:
@@ -69,6 +83,8 @@ def build_chat_media_admission_router(
         batch: bool = False,
     ) -> dict[str, Any]:
         actor = await account_actor(request)
+        if operation not in allowed_operations:
+            raise HTTPException(status_code=503, detail="该媒体生成操作尚未启用")
         body = await read_json_body(request)
         try:
             payload = (
@@ -81,6 +97,17 @@ def build_chat_media_admission_router(
                 status_code=error.status_code,
                 detail=str(error),
             ) from error
+
+        if operation == "image.single" and not image_references_enabled:
+            reference_image = payload.get("reference_image")
+            reference_images = payload.get("reference_images")
+            if reference_image not in (None, "") or (
+                isinstance(reference_images, list) and reference_images
+            ):
+                raise HTTPException(
+                    status_code=422,
+                    detail="当前图片生成暂不支持参考图",
+                )
 
         if session_factory is None or producer_binding is None:
             raise HTTPException(status_code=503, detail="媒体准入服务尚未接线")

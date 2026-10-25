@@ -6,6 +6,7 @@ import asyncio
 import base64
 import json
 import os
+import selectors
 import stat
 import subprocess
 import sys
@@ -164,23 +165,54 @@ from pathlib import Path
 import sys
 from backend.server.credentials import CredentialBundleError, load_root_credential_resources
 
+print("READY", flush=True)
+if sys.stdin.readline() != "GO\\n":
+    raise SystemExit("parent did not release FIFO check")
+
 try:
     load_root_credential_resources(Path(sys.argv[1]), legacy_secret_key="synthetic")
 except CredentialBundleError:
     raise SystemExit(0)
 raise SystemExit("FIFO was accepted")
 """
+    child = subprocess.Popen(
+        [sys.executable, "-B", "-c", script, str(fifo_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+    )
     try:
-        result = subprocess.run(
-            [sys.executable, "-B", "-c", script, str(fifo_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=2,
-        )
-    except subprocess.TimeoutExpired:
-        pytest.fail("FIFO credential loading blocked past the bounded child timeout")
-    assert result.returncode == 0, result.stderr
+        assert child.stdout is not None
+        with selectors.DefaultSelector() as selector:
+            selector.register(child.stdout, selectors.EVENT_READ)
+            if not selector.select(timeout=15):
+                pytest.fail("credential child did not finish cold import within 15 seconds")
+        ready_line = child.stdout.readline()
+        if ready_line != "READY\n":
+            _remaining_stdout, stderr = child.communicate(timeout=1)
+            pytest.fail(
+                "credential child exited before the FIFO check was released: "
+                + stderr
+            )
+
+        try:
+            _stdout, stderr = child.communicate(input="GO\n", timeout=2)
+        except subprocess.TimeoutExpired:
+            pytest.fail("FIFO credential loading blocked past the 2-second check deadline")
+        assert child.returncode == 0, stderr
+    finally:
+        if child.poll() is None:
+            child.kill()
+        try:
+            child.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait()
+        for stream in (child.stdin, child.stdout, child.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
 
 
 def test_bundle_rejects_symlink_duplicate_json_key_and_oversize_file(tmp_path: Path) -> None:
@@ -322,6 +354,101 @@ def test_server_host_cold_composition_uses_lazy_shared_dependencies(
         host.close()
 
     assert len(tracked_engines) == 1
+
+
+def test_server_host_opt_in_wires_image_single_admission_and_worker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transfer_dir = tmp_path / "transfer"
+    transfer_dir.mkdir()
+    _, bundle_path = _provisioned_bundle(tmp_path)
+    environment = {
+        "ENVIRONMENT": "test",
+        "DATABASE_URL": f"sqlite:///{tmp_path / 'image-single-host.sqlite'}",
+        "SECRET_KEY": "synthetic-server-secret",
+        "OBJECT_STORAGE_ENDPOINT_URL": "https://acct.r2.cloudflarestorage.com",
+        "OBJECT_STORAGE_ACCESS_KEY_ID": "synthetic-access-key",
+        "OBJECT_STORAGE_SECRET_ACCESS_KEY": "synthetic-r2-secret",
+        "OBJECT_STORAGE_BUCKET": "haoai-media",
+        "OBJECT_STORAGE_PUBLIC_BASE_URL": "https://cdn.example.test/media",
+        "TRANSFER_TMP_DIR": str(transfer_dir),
+        "IMAGE_SINGLE_ENABLED": "true",
+        "IMAGE_SINGLE_CREDENTIALS_FILE": str(bundle_path),
+    }
+    configuration = load_server_configuration(environment)
+    from haoai_backend import app as app_module
+    from backend.server import application as server_application
+    from haoai_backend.chat_media_admission import ChatMediaAdmissionConfiguration
+    from haoai_backend.generation_runtime.assembly import GenerationWorkerConfiguration
+
+    captured: dict[str, object] = {}
+    original_create_app = app_module.create_app
+
+    def observe_create_app(**kwargs: object):
+        captured.update(kwargs)
+        return original_create_app(**kwargs)
+
+    monkeypatch.setattr(app_module, "create_app", observe_create_app)
+    host = server_application.create_server_host(
+        configuration,
+        sdk_factories=(lambda **_kwargs: object(), lambda **_kwargs: object()),
+    )
+    try:
+        admission = captured.get("chat_media_admission_configuration")
+        worker = captured.get("generation_worker_configuration")
+        assert isinstance(admission, ChatMediaAdmissionConfiguration)
+        assert frozenset(admission.enabled_operations) == frozenset({"image.single"})
+        with pytest.raises(TypeError, match="image_references_enabled"):
+            replace(admission, image_references_enabled=1)  # type: ignore[arg-type]
+        assert isinstance(worker, GenerationWorkerConfiguration)
+        assert worker.runtime.session_factory is host.session_factory
+        assert worker.registry_capabilities.read_session_factory is host.session_factory
+        assert worker.runtime.db_clock is worker.registry_capabilities.db_clock
+        assert worker.runtime.id_factory is worker.registry_capabilities.id_factory
+        assert worker.registry_capabilities.enrollment_source is not None
+        image_host = host.app.state.server_image_generation_configuration
+        assert image_host is not None
+        assert image_host.media_runtime is not None
+        assert image_host.media_runtime.state == "new"
+        assert admission.image_references_enabled is False
+        assert worker.runtime.timeout_settings.public_media_fetch_seconds == 600
+        assert worker.runtime.concurrency_settings.public_media_fetches == 2
+    finally:
+        host.close()
+
+
+def test_server_host_disabled_image_single_does_not_load_bundle_or_create_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.server import application as server_application
+    from backend.server import credentials as server_credentials
+
+    credentials_path = tmp_path / "missing-image-single-bundle.json"
+    configuration = load_server_configuration(
+        {
+            "ENVIRONMENT": "test",
+            "DATABASE_URL": f"sqlite:///{tmp_path / 'image-single-disabled.sqlite'}",
+            "SECRET_KEY": "synthetic-server-secret",
+            "IMAGE_SINGLE_CREDENTIALS_FILE": str(credentials_path),
+        }
+    )
+    monkeypatch.setattr(
+        server_credentials,
+        "load_registry_capabilities",
+        lambda *_args, **_kwargs: pytest.fail(
+            "disabled image.single must not read its credentials file"
+        ),
+    )
+
+    host = server_application.create_server_host(configuration)
+    try:
+        assert host.app.state.server_image_generation_configuration is None
+        assert host.app.state.generation_worker_runtime is None
+        assert not credentials_path.exists()
+    finally:
+        host.close()
 
 
 def test_server_host_injects_storyboard_asset_runtime_without_startup_io(
