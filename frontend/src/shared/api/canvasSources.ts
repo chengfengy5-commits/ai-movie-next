@@ -22,12 +22,15 @@ import type {
 import { API_TOKEN_KEY, API_USER_KEY, clearApiSession, type StorageLike } from "./storage";
 
 export const CANVAS_SOURCE_CAPABILITY = "canvas-source-v1" as const;
+const CHAPTER_CANONICAL_DIGEST_PATTERN = /^[0-9a-f]{64}$/u;
+const GENERATION_IDENTIFIER_CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 
 export interface CanvasSourceSnapshot {
   capability: typeof CANVAS_SOURCE_CAPABILITY;
   series_id: string;
   chapter_id: string;
   version: string;
+  chapter_canonical_digest?: string | null;
   requires_lock: boolean;
   chapter: Chapter;
   storyboard_assets: StoryboardAsset[];
@@ -40,6 +43,20 @@ export interface CanvasFrameTarget {
   index: number;
   storyboard_id: string | null;
 }
+
+export type CanvasFrameGenerationDestination =
+  | {
+      kind: "frame_preview";
+      chapter_id: string;
+      storyboard_asset_id: string;
+    }
+  | {
+      kind: "frame_preview";
+      chapter_id: string;
+      identity_mode: "strict-no-id-v1";
+      frame_index: number;
+      expected_chapter_digest: string;
+    };
 
 export function resolveCanvasFrameTarget(
   chapter: Chapter,
@@ -75,6 +92,55 @@ export function resolveCanvasFrameTarget(
     return null;
   }
   return { index, storyboard_id: storyboardId };
+}
+
+function isValidGenerationIdentifier(value: unknown): value is string {
+  if (typeof value !== "string") return false;
+  const codePointLength = Array.from(value).length;
+  return codePointLength >= 1
+    && codePointLength <= 36
+    && value.trim() === value
+    && !GENERATION_IDENTIFIER_CONTROL_CHARACTERS.test(value)
+    && !value.includes("/")
+    && !value.includes("\\")
+    && value !== "."
+    && value !== "..";
+}
+
+export function resolveCanvasFrameGenerationDestination(
+  snapshot: CanvasSourceSnapshot,
+  index: number,
+): CanvasFrameGenerationDestination | null {
+  if (!isValidGenerationIdentifier(snapshot.chapter_id)
+    || !isValidGenerationIdentifier(snapshot.series_id)
+    || typeof snapshot.chapter !== "object" || snapshot.chapter === null
+    || snapshot.chapter.id !== snapshot.chapter_id
+    || snapshot.chapter.series_id !== snapshot.series_id
+    || !Array.isArray(snapshot.storyboard_assets)
+    || !snapshot.storyboard_assets.every(isRecord)) {
+    return null;
+  }
+
+  const target = resolveCanvasFrameTarget(snapshot.chapter, snapshot.storyboard_assets, index);
+  if (target === null) return null;
+  if (target.storyboard_id !== null) {
+    if (!isValidGenerationIdentifier(target.storyboard_id)) return null;
+    return {
+      kind: "frame_preview",
+      chapter_id: snapshot.chapter_id,
+      storyboard_asset_id: target.storyboard_id,
+    };
+  }
+
+  const digest = snapshot.chapter_canonical_digest;
+  if (typeof digest !== "string" || !CHAPTER_CANONICAL_DIGEST_PATTERN.test(digest)) return null;
+  return {
+    kind: "frame_preview",
+    chapter_id: snapshot.chapter_id,
+    identity_mode: "strict-no-id-v1",
+    frame_index: index,
+    expected_chapter_digest: digest,
+  };
 }
 
 export type CanvasAssetKind = "character" | "scene" | "prop";
@@ -205,6 +271,13 @@ function parseSnapshot(value: unknown, chapterId: string): CanvasSourceSnapshot 
     || typeof value.requires_lock !== "boolean") {
     throw new CanvasSourceError("unknown", "画布来源服务返回了无法确认的章节快照。");
   }
+  const hasChapterCanonicalDigest = Object.prototype.hasOwnProperty.call(value, "chapter_canonical_digest");
+  const chapterCanonicalDigest = value.chapter_canonical_digest;
+  if (hasChapterCanonicalDigest && chapterCanonicalDigest !== null
+    && (typeof chapterCanonicalDigest !== "string"
+      || !CHAPTER_CANONICAL_DIGEST_PATTERN.test(chapterCanonicalDigest))) {
+    throw new CanvasSourceError("unknown", "画布来源服务返回了无效的章节内容摘要。");
+  }
   const chapter = parseChapterResponse(value.chapter, value.series_id, chapterId);
   const storyboardAssets = parseStoryboardAssetList(value.storyboard_assets);
   const storyboardIds = new Set<string>();
@@ -222,6 +295,9 @@ function parseSnapshot(value: unknown, chapterId: string): CanvasSourceSnapshot 
       series_id: value.series_id,
       chapter_id: chapterId,
       version: value.version,
+      ...(hasChapterCanonicalDigest
+        ? { chapter_canonical_digest: chapterCanonicalDigest as string | null }
+        : {}),
       requires_lock: value.requires_lock,
       chapter,
       storyboard_assets: storyboardAssets,

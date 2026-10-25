@@ -170,6 +170,7 @@ class SourceSnapshot(BaseModel):
     chapter_id: str
     requires_lock: bool
     version: str = Field(pattern=r"^[0-9a-f]{64}$")
+    chapter_canonical_digest: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
     chapter: ChapterResponse
     storyboard_assets: list[StoryboardAssetResponse]
     characters: list[CharacterResponse]

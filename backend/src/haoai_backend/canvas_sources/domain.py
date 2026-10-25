@@ -207,6 +207,37 @@ def row_fingerprint(value: object) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def chapter_canonical_digest(content: object) -> str | None:
+    """Hash a strictly parsed chapter frame array without changing read semantics."""
+    if not isinstance(content, str):
+        return None
+    try:
+        frames = json.loads(
+            content,
+            object_pairs_hook=_object_without_duplicate_keys,
+            parse_constant=_reject_non_finite_constant,
+        )
+        if not isinstance(frames, list) or any(not isinstance(frame, dict) for frame in frames):
+            return None
+        ensure_finite_json(frames)
+        return row_fingerprint(frames)
+    except (CanvasSourceConflict, TypeError, ValueError, OverflowError, RecursionError):
+        return None
+
+
+def _object_without_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON object key")
+        result[key] = value
+    return result
+
+
+def _reject_non_finite_constant(value: str) -> Any:
+    raise ValueError(f"non-finite JSON constant: {value}")
+
+
 def _sorted_rows(rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     return sorted(
         (_jsonable(dict(row)) for row in rows),
