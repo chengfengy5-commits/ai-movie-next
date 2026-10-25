@@ -3,6 +3,13 @@ import type { Chapter, ChapterEditLockLeaseHandle, Series } from "../../shared/a
 import { isRecord, type CanvasDataPort } from "../../shared/api/canvasData";
 import { ApiError } from "../../shared/api/errors";
 import {
+  CanvasGenerationApplicationError,
+  type CanvasGenerationApplicationCandidate,
+  type CanvasGenerationApplicationDestination,
+} from "../../shared/api/canvasGenerationApplications";
+import { CanvasOwnedResultsError, type CanvasOwnedResultItem, type CanvasOwnedResultsTarget } from "../../shared/api/canvasOwnedResults";
+import { CanvasResultApplicationError, type CanvasResultApplicationLookup } from "../../shared/api/canvasResultApplications";
+import {
   CANVAS_SOURCE_CAPABILITY,
   CanvasSourceError,
   type CanvasAssetKind,
@@ -10,6 +17,7 @@ import {
   type CanvasFrameTarget,
   type CanvasSourceCommand,
   type CanvasSourceSnapshot,
+  resolveCanvasFrameGenerationDestination,
   resolveCanvasFrameTarget,
 } from "../../shared/api/canvasSources";
 import type {
@@ -27,6 +35,7 @@ import { FrameStructureEditor, type FrameStructureMode, type FrameStructureSubmi
 import type { FrameStructureDraft } from "../chapters/frame-structure/contract";
 import { AssetManagementDialog, type AssetDirectory, type GuardedAssetMutation } from "../assets/management/AssetManagementDialog";
 import { CanvasMediaSourceEditor } from "./CanvasMediaSourceEditor";
+import { CanvasGenerationResultsDialog, type PendingCanvasGenerationIntent } from "./generation-results/CanvasGenerationResultsDialog";
 import { useSeriesDialogFocus } from "../series/useSeriesDialogFocus";
 import { CanvasMediaPreview } from "./CanvasMediaPreview";
 import {
@@ -99,6 +108,55 @@ interface OwnedAssetPlacement {
   ref: string;
   x: number;
   y: number;
+}
+
+interface CanvasGenerationDialogModel {
+  id: number;
+  selectedRef: string | null;
+  target: CanvasOwnedResultsTarget;
+  targetLabel: string;
+  sourceVersion: string | null;
+  requiresLock: boolean;
+  items: readonly CanvasOwnedResultItem[];
+  cursor: string | undefined;
+  nextCursor: string | null;
+  loading: boolean;
+  error: string | null;
+  message: string | null;
+}
+
+interface WorkspaceGenerationIntent extends PendingCanvasGenerationIntent {
+  readonly actorId: string;
+  readonly seriesId: string;
+  readonly chapterId: string;
+  readonly sessionGeneration: number;
+  readonly scopeKey: string;
+  readonly workspaceEpoch: number;
+  readonly sourceEpoch: number;
+  readonly servicesIdentity: object;
+  readonly requiresLock: boolean;
+}
+
+interface GenerationWorkspaceScope {
+  readonly actorId: string;
+  readonly seriesId: string;
+  readonly chapterId: string;
+  readonly sessionGeneration: number;
+  readonly scopeKey: string;
+  readonly workspaceEpoch: number;
+  readonly sourceEpoch: number;
+  readonly servicesIdentity: object;
+  readonly dialogId?: number;
+  readonly selectedRef?: string | null;
+  readonly sourceVersion?: string;
+}
+
+interface ConfirmedGenerationProof {
+  readonly resultRef: string;
+  readonly status: "applied" | "already_applied";
+  readonly applicationRef: string;
+  readonly targetRevision: string;
+  readonly committedAt: string;
 }
 
 type CanvasSourceWriteOutcome =
@@ -204,6 +262,83 @@ function assetCategoryForKind(kind: CanvasAssetKind): AssetDirectory["category"]
 
 function sourceFrameTarget(snapshot: CanvasSourceSnapshot, index: number): CanvasFrameTarget | null {
   return resolveCanvasFrameTarget(snapshot.chapter, snapshot.storyboard_assets, index);
+}
+
+function isValidGenerationAssetId(value: string): boolean {
+  const characterCount = Array.from(value).length;
+  return characterCount >= 1 && characterCount <= 36 && value.trim() === value
+    && !/[\u0000-\u001f\u007f-\u009f]/u.test(value)
+    && !value.includes("/") && !value.includes("\\") && value !== "." && value !== "..";
+}
+
+function generationTargetForNode(
+  snapshot: CanvasSourceSnapshot,
+  node: CanvasGraphNode,
+): { target: CanvasOwnedResultsTarget; label: string } | null {
+  if (snapshot.chapter_id !== snapshot.chapter.id || snapshot.series_id !== snapshot.chapter.series_id) return null;
+
+  const frameIndex = node.frameIndex;
+  if ((node.kind === "frame" || node.kind === "preview") && frameIndex !== undefined
+    && Number.isSafeInteger(frameIndex) && frameIndex >= 0) {
+    const target = resolveCanvasFrameGenerationDestination(snapshot, frameIndex);
+    if (target === null) return null;
+    const label = node.kind === "preview"
+      ? `分镜 ${frameIndex + 1} 预览`
+      : `分镜 ${frameIndex + 1}`;
+    return { target, label };
+  }
+
+  if (node.kind !== "character" && node.kind !== "scene" && node.kind !== "prop") return null;
+  if (node.itemId === undefined || !isValidGenerationAssetId(node.itemId)) return null;
+  const matches = assetCollection(snapshot, node.kind).filter((asset) => asset.id === node.itemId
+    && asset.series_id === snapshot.series_id);
+  if (matches.length !== 1) return null;
+  return {
+    target: {
+      kind: "asset_image",
+      chapter_id: snapshot.chapter_id,
+      asset_type: node.kind,
+      asset_id: node.itemId,
+    },
+    label: node.kind === "character" ? `角色素材 · ${node.title}`
+      : node.kind === "scene" ? `场景素材 · ${node.title}` : `道具素材 · ${node.title}`,
+  };
+}
+
+function sameGenerationTarget(left: CanvasOwnedResultsTarget, right: CanvasOwnedResultsTarget): boolean {
+  if (left.kind !== right.kind || left.chapter_id !== right.chapter_id) return false;
+  if (left.kind === "asset_image" && right.kind === "asset_image") {
+    return left.asset_type === right.asset_type && left.asset_id === right.asset_id;
+  }
+  if (left.kind !== "frame_preview" || right.kind !== "frame_preview") return false;
+  if ("storyboard_asset_id" in left && "storyboard_asset_id" in right) {
+    return left.storyboard_asset_id === right.storyboard_asset_id;
+  }
+  return "identity_mode" in left && "identity_mode" in right
+    && left.identity_mode === right.identity_mode
+    && left.frame_index === right.frame_index
+    && left.expected_chapter_digest === right.expected_chapter_digest;
+}
+
+function generationTargetLabel(target: CanvasOwnedResultsTarget): string {
+  if (target.kind === "asset_image") {
+    const kind = target.asset_type === "character" ? "角色素材"
+      : target.asset_type === "scene" ? "场景素材" : "道具素材";
+    return `${kind}图片`;
+  }
+  return "分镜图片";
+}
+
+function generationOutcomeLabel(status: "applied" | "already_applied"): string {
+  return status === "applied" ? "应用成功" : "此前已应用";
+}
+
+function generationFailureMessage(cause: unknown): string {
+  if (cause instanceof CanvasOwnedResultsError || cause instanceof CanvasGenerationApplicationError
+    || cause instanceof CanvasResultApplicationError || cause instanceof CanvasSourceError || cause instanceof ApiError) {
+    return cause.message;
+  }
+  return cause instanceof Error ? cause.message : "生成图片记录操作失败。";
 }
 
 interface DragState {
@@ -321,6 +456,12 @@ export function CanvasWorkspace({
   const sourceBindingDraftRef = useRef(false);
   const [filter, setFilter] = useState<"all" | CanvasNodeKind>("all");
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
+  const selectedNodeRef = useRef<string | null>(selectedNode);
+  selectedNodeRef.current = selectedNode;
+  function selectCanvasNode(ref: string | null): void {
+    selectedNodeRef.current = ref;
+    setSelectedNode(ref);
+  }
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [connectionSource, setConnectionSource] = useState<string | null>(null);
@@ -329,6 +470,27 @@ export function CanvasWorkspace({
   const [drag, setDrag] = useState<DragState | null>(null);
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const scopeEpochRef = useRef(0);
+  const generationWorkspaceEpochRef = useRef(0);
+  const generationWorkspaceIdentityRef = useRef({ scopeKey, serviceIdentity });
+  generationWorkspaceIdentityRef.current = { scopeKey, serviceIdentity };
+  const generationDialogSequenceRef = useRef(0);
+  const [generationDialog, setGenerationDialog] = useState<CanvasGenerationDialogModel | null>(null);
+  const generationDialogRef = useRef<CanvasGenerationDialogModel | null>(generationDialog);
+  generationDialogRef.current = generationDialog;
+  const [generationIntent, setGenerationIntent] = useState<WorkspaceGenerationIntent | null>(null);
+  const generationIntentRef = useRef<WorkspaceGenerationIntent | null>(generationIntent);
+  generationIntentRef.current = generationIntent;
+  const [generationHistoryLookups, setGenerationHistoryLookups] = useState<Map<string, CanvasResultApplicationLookup>>(() => new Map());
+  const [generationBusy, setGenerationBusy] = useState(false);
+  const generationBusyRef = useRef(false);
+  const [generationLockRequired, setGenerationLockRequired] = useState(false);
+  const [generationLockUnavailable, setGenerationLockUnavailable] = useState(false);
+  const [generationLockPending, setGenerationLockPending] = useState(false);
+  const [generationLockMessage, setGenerationLockMessage] = useState<string | null>(null);
+  const [generationConfirmedProof, setGenerationConfirmedProof] = useState<ConfirmedGenerationProof | null>(null);
+  const generationPageControllerRef = useRef<AbortController | null>(null);
+  const generationActionControllerRef = useRef<AbortController | null>(null);
+  const generationMutationPendingRef = useRef(false);
   const unauthorizedRef = useRef(onUnauthorized);
   unauthorizedRef.current = onUnauthorized;
 
@@ -350,7 +512,7 @@ export function CanvasWorkspace({
     setCreationUndos([]);
     createdAssetPlacementsRef.current.clear();
     setSourceMessage(null);
-    setSelectedNode(null);
+    selectCanvasNode(null);
     setSelectedEdge(null);
     setConnectionSource(null);
     setConnecting(false);
@@ -440,7 +602,11 @@ export function CanvasWorkspace({
   const nodeByRef = new Map(graph.nodes.map((node) => [node.ref, node]));
   const viewport = canvasViewport(displayDocument);
   const closeRef = useRef<() => void>(() => undefined);
-  const focus = useSeriesDialogFocus({ active: !closePrompt && sourceEditor === null, canDismiss: true, onDismiss: () => closeRef.current() });
+  const focus = useSeriesDialogFocus({
+    active: !closePrompt && sourceEditor === null && generationDialog === null,
+    canDismiss: true,
+    onDismiss: () => closeRef.current(),
+  });
   const closePromptFocus = useSeriesDialogFocus({
     active: closePrompt,
     canDismiss: true,
@@ -448,16 +614,115 @@ export function CanvasWorkspace({
   });
 
   const sourceWritesBlocked = services.canvasSource === undefined || sourceMutationPending || sourceReadbackPending
-    || unknownSourceIntent !== null || sourceError !== null || sources === null;
-  const sourceOutcomeUnresolved = sourceMutationPending || sourceReadbackPending || unknownSourceIntent !== null;
+    || unknownSourceIntent !== null || generationBusy || generationMutationPendingRef.current || generationIntent !== null
+    || sourceError !== null || sources === null;
+  const sourceOutcomeUnresolved = sourceMutationPending || sourceReadbackPending || unknownSourceIntent !== null
+    || generationBusy || generationMutationPendingRef.current || generationIntent !== null;
 
   function sourceSnapshotMatchesScope(snapshot: CanvasSourceSnapshot): boolean {
     return snapshot.chapter_id === selectedChapter.id && snapshot.series_id === series.id
       && snapshot.chapter.id === selectedChapter.id && snapshot.chapter.series_id === series.id;
   }
 
+  function createGenerationWorkspaceScope(
+    options: Pick<GenerationWorkspaceScope, "dialogId" | "selectedRef" | "sourceVersion"> = {},
+  ): GenerationWorkspaceScope {
+    return {
+      actorId: userId,
+      seriesId: series.id,
+      chapterId: selectedChapter.id,
+      sessionGeneration,
+      scopeKey,
+      workspaceEpoch: generationWorkspaceEpochRef.current,
+      sourceEpoch: scopeEpochRef.current,
+      servicesIdentity: serviceIdentity,
+      ...options,
+    };
+  }
+
+  function isGenerationWorkspaceScopeCurrent(scope: GenerationWorkspaceScope): boolean {
+    const identity = generationWorkspaceIdentityRef.current;
+    return identity.scopeKey === scope.scopeKey
+      && identity.serviceIdentity === scope.servicesIdentity
+      && generationWorkspaceEpochRef.current === scope.workspaceEpoch
+      && scopeEpochRef.current === scope.sourceEpoch
+      && userId === scope.actorId
+      && sessionGeneration === scope.sessionGeneration
+      && series.id === scope.seriesId
+      && selectedChapter.id === scope.chapterId;
+  }
+
+  function isGenerationDialogScopeCurrent(scope: GenerationWorkspaceScope): boolean {
+    return isGenerationWorkspaceScopeCurrent(scope)
+      && scope.dialogId !== undefined
+      && generationDialogRef.current?.id === scope.dialogId
+      && (scope.selectedRef === undefined || selectedNodeRef.current === scope.selectedRef)
+      && (scope.sourceVersion === undefined || sourcesRef.current?.version === scope.sourceVersion);
+  }
+
+  function setWorkspaceGenerationIntent(intent: WorkspaceGenerationIntent | null): void {
+    generationIntentRef.current = intent;
+    setGenerationIntent(intent);
+    if (intent !== null) setGenerationConfirmedProof(null);
+  }
+
+  function closeGenerationDialog(): void {
+    generationDialogSequenceRef.current += 1;
+    generationPageControllerRef.current?.abort();
+    generationPageControllerRef.current = null;
+    generationActionControllerRef.current?.abort();
+    generationDialogRef.current = null;
+    setGenerationDialog(null);
+    setGenerationHistoryLookups(new Map());
+    setGenerationLockRequired(false);
+    setGenerationLockUnavailable(false);
+    setGenerationLockPending(false);
+    setGenerationLockMessage(null);
+  }
+
+  function setGenerationBusyState(value: boolean): void {
+    generationBusyRef.current = value;
+    setGenerationBusy(value);
+  }
+
+  useEffect(() => {
+    generationWorkspaceEpochRef.current += 1;
+    closeGenerationDialog();
+    setWorkspaceGenerationIntent(null);
+    setGenerationBusyState(false);
+    generationMutationPendingRef.current = false;
+    generationActionControllerRef.current = null;
+    sourceMutationPendingRef.current = false;
+    setSourceMutationPending(false);
+    setGenerationLockPending(false);
+    setGenerationConfirmedProof(null);
+    return () => {
+      generationWorkspaceEpochRef.current += 1;
+      generationDialogSequenceRef.current += 1;
+      generationPageControllerRef.current?.abort();
+      generationActionControllerRef.current?.abort();
+      generationPageControllerRef.current = null;
+      generationActionControllerRef.current = null;
+      generationMutationPendingRef.current = false;
+    };
+  }, [scopeKey, serviceIdentity]);
+
+  useEffect(() => {
+    const current = generationDialogRef.current;
+    if (current === null || current.selectedRef === null || current.selectedRef === selectedNode) return;
+    closeGenerationDialog();
+    setSourceMessage("选中目标已变化，已停止旧的生成记录请求。未确认的应用意图仍保留在画布中。");
+  }, [selectedNode]);
+
+  useEffect(() => {
+    const current = generationDialogRef.current;
+    if (current === null || current.sourceVersion === null || current.sourceVersion === sources?.version) return;
+    closeGenerationDialog();
+    setSourceMessage("章节来源版本已变化，已停止旧的生成记录请求。请重新选择目标后读取记录。");
+  }, [sources?.version]);
+
   const applyDocument = useCallback((next: CanvasDocument) => {
-    if (sourceOutcomeUnresolved || !documentState.writable || documentState.document === null
+    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || !documentState.writable || documentState.document === null
       || documentEqual(documentState.document, next)) return;
     sourceBindingDraftRef.current = false;
     setHistory((current) => pushCanvasHistory(current, documentState.document!));
@@ -470,7 +735,7 @@ export function CanvasWorkspace({
   }, [applyDocument, documentState.document]);
 
   function commitNodePosition(node: CanvasGraphNode, x: number, y: number): void {
-    if (sourceOutcomeUnresolved || documentState.document === null) return;
+    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || documentState.document === null) return;
     sourceBindingDraftRef.current = false;
     if (node.itemCollection !== undefined && node.itemId !== undefined) {
       documentState.edit(patchCanvasItem(documentState.document, node.itemCollection, node.itemId, { x, y }));
@@ -482,7 +747,7 @@ export function CanvasWorkspace({
   function beginDrag(event: ReactPointerEvent<HTMLElement>, node: CanvasGraphNode | null): void {
     if (node !== null) {
       event.stopPropagation();
-      setSelectedNode(node.ref);
+      selectCanvasNode(node.ref);
       if (connecting) {
         if (connectionSource === null) setConnectionSource(node.ref);
         else if (connectionSource !== node.ref) {
@@ -519,7 +784,7 @@ export function CanvasWorkspace({
   }
 
   function movePointer(event: ReactPointerEvent<HTMLElement>): void {
-    if (sourceOutcomeUnresolved || drag === null || event.pointerId !== drag.pointerId) return;
+    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || drag === null || event.pointerId !== drag.pointerId) return;
     const dx = (event.clientX - drag.startX) / (drag.node === null ? 1 : viewport.zoom);
     const dy = (event.clientY - drag.startY) / (drag.node === null ? 1 : viewport.zoom);
     if (drag.node === null) {
@@ -595,7 +860,7 @@ export function CanvasWorkspace({
       width: 230,
       height: 145,
     }));
-    setSelectedNode(collection === "notes" ? id : "card:" + id);
+    selectCanvasNode(collection === "notes" ? id : "card:" + id);
   }
 
   function removeSelected(): void {
@@ -609,12 +874,12 @@ export function CanvasWorkspace({
     const node = graph.nodes.find((candidate) => candidate.ref === selectedNode);
     if (node?.itemCollection !== undefined && node.itemId !== undefined) {
       applyDocument(removeCanvasItem(documentState.document, node.itemCollection, node.itemId));
-      setSelectedNode(null);
+      selectCanvasNode(null);
     }
   }
 
   function undo(): void {
-    if (sourceOutcomeUnresolved || documentState.document === null) return;
+    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || documentState.document === null) return;
     const result = undoCanvasHistory(history, documentState.document);
     if (result === null) return;
     sourceBindingDraftRef.current = false;
@@ -623,7 +888,7 @@ export function CanvasWorkspace({
   }
 
   function redo(): void {
-    if (sourceOutcomeUnresolved || documentState.document === null) return;
+    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || documentState.document === null) return;
     const result = redoCanvasHistory(history, documentState.document);
     if (result === null) return;
     sourceBindingDraftRef.current = false;
@@ -661,7 +926,8 @@ export function CanvasWorkspace({
           undo: current.undo.map((item) => bindCanvasSourceDocumentTransition(item, previous, snapshot, transition).document),
           redo: current.redo.map((item) => bindCanvasSourceDocumentTransition(item, previous, snapshot, transition).document),
         }));
-        setSelectedNode((current) => current === null ? null : refMap.get(current) ?? current);
+        const selected = selectedNodeRef.current;
+        selectCanvasNode(selected === null ? null : refMap.get(selected) ?? selected);
         setConnectionSource((current) => current === null ? null : refMap.get(current) ?? current);
         if (reconciledCurrent !== null && documentState.writable) {
           const remapped = reconciledCurrent.document;
@@ -705,7 +971,7 @@ export function CanvasWorkspace({
 
     const ref = `${command.kind}:${id}`;
     if (hasCanvasLayout(document, ref)) {
-      setSelectedNode(ref);
+      selectCanvasNode(ref);
       return document;
     }
 
@@ -716,7 +982,7 @@ export function CanvasWorkspace({
       const next = patchNodeLayout(document, ref, { x: placement.x, y: placement.y });
       if (documentEqual(document, next)) return document;
       createdAssetPlacementsRef.current.set(receipt.token, placement);
-      setSelectedNode(ref);
+      selectCanvasNode(ref);
       return next;
     } catch {
       setSourceMessage("服务器已确认素材创建，但画布布局结构不支持安全放置；原创建回执已保留。");
@@ -753,7 +1019,8 @@ export function CanvasWorkspace({
 
   function openSourceEditor(editor: WithoutLifecycle<CanvasSourceEditor>): void {
     if (sourceWritesBlocked || (documentState.dirty && !sourceBindingDraftRef.current) || documentState.status === "saving"
-      || documentState.status === "unknown" || documentState.status === "conflict") return;
+      || documentState.status === "unknown" || documentState.status === "conflict"
+      || generationMutationPendingRef.current) return;
     const lifecycle = new AbortController();
     setSourceMessage(null);
     setSourceEditor({ ...editor, lifecycle } as CanvasSourceEditor);
@@ -790,7 +1057,7 @@ export function CanvasWorkspace({
     requestSignal: AbortSignal,
     ownerSignal?: AbortSignal,
   ): Promise<CanvasSourceWriteOutcome> {
-    if (sourceMutationPendingRef.current || pendingSourceAcknowledgementRef.current !== null
+    if (sourceMutationPendingRef.current || generationMutationPendingRef.current || pendingSourceAcknowledgementRef.current !== null
       || unknownSourceIntentRef.current !== null || sourceReadbackPending) {
       return { status: "conflict", message: "上一项来源操作尚未核对，当前操作没有发送。" };
     }
@@ -958,7 +1225,7 @@ export function CanvasWorkspace({
   }
 
   async function verifySourceRead(signal: AbortSignal): Promise<string> {
-    if (sourceMutationPendingRef.current) return "来源操作正在进行，请等待当前状态。";
+    if (sourceMutationPendingRef.current || generationMutationPendingRef.current) return "来源操作正在进行，请等待当前状态。";
     const sourcePort = services.canvasSource;
     if (sourcePort === undefined) throw new CanvasSourceError("unsupported", "当前服务没有接入受控章节来源。");
     const epoch = scopeEpochRef.current;
@@ -1224,7 +1491,7 @@ export function CanvasWorkspace({
       const input = isTextInput(event.target);
       if (command && event.key.toLowerCase() === "s") {
         event.preventDefault();
-        if (!sourceOutcomeUnresolved) void documentState.saveNow();
+        if (!sourceOutcomeUnresolved && !generationMutationPendingRef.current) void documentState.saveNow();
         return;
       }
       if (input) return;
@@ -1245,7 +1512,8 @@ export function CanvasWorkspace({
   });
 
   const close = useCallback(() => {
-    if (documentState.hasPendingWork() || sourceOutcomeUnresolved) {
+    if (documentState.hasPendingWork() || sourceOutcomeUnresolved || generationIntentRef.current !== null
+      || generationBusyRef.current || generationMutationPendingRef.current) {
       setClosePrompt(true);
       return;
     }
@@ -1255,7 +1523,8 @@ export function CanvasWorkspace({
   closeRef.current = close;
 
   async function saveAndClose(): Promise<void> {
-    if (sourceOutcomeUnresolved) return;
+    if (sourceOutcomeUnresolved || generationIntentRef.current !== null
+      || generationBusyRef.current || generationMutationPendingRef.current) return;
     setCloseBusy(true);
     const saved = await documentState.saveNow();
     setCloseBusy(false);
@@ -1266,6 +1535,7 @@ export function CanvasWorkspace({
   }
 
   function discardAndClose(): void {
+    if (generationIntentRef.current !== null || generationBusyRef.current || generationMutationPendingRef.current) return;
     documentState.discard();
     sourceOperationControllerRef.current?.abort();
     sourceEditorRef.current?.lifecycle.abort();
@@ -1296,6 +1566,602 @@ export function CanvasWorkspace({
   const selectedFrameTarget = selectedFrameNode?.sourceTarget ?? null;
   const selectedMediaTarget = selectedMediaNode?.sourceTarget ?? null;
   const selectedFrameCount = Array.isArray(sources?.chapter.content) ? sources.chapter.content.length : 0;
+  const selectedGenerationTarget = sources !== null && selectedSourceNode !== null
+    ? generationTargetForNode(sources, selectedSourceNode)
+    : null;
+  const generationPortsAvailable = services.canvasSource !== undefined
+    && services.canvasOwnedResults !== undefined
+    && services.canvasGenerationApplications !== undefined
+    && services.canvasResultApplications !== undefined;
+  const generationEntryDisabled = !generationPortsAvailable || selectedGenerationTarget === null
+    || sourceActionDisabled || documentState.dirty || generationDialog !== null || generationMutationPendingRef.current;
+
+  function generationDialogScope(dialog: CanvasGenerationDialogModel): GenerationWorkspaceScope {
+    return createGenerationWorkspaceScope({
+      dialogId: dialog.id,
+      ...(dialog.selectedRef === null ? {} : { selectedRef: dialog.selectedRef }),
+      ...(dialog.sourceVersion === null ? {} : { sourceVersion: dialog.sourceVersion }),
+    });
+  }
+
+  function updateGenerationDialogById(
+    dialogId: number,
+    update: (current: CanvasGenerationDialogModel) => CanvasGenerationDialogModel,
+  ): void {
+    const current = generationDialogRef.current;
+    if (current === null || current.id !== dialogId) return;
+    const next = update(current);
+    generationDialogRef.current = next;
+    setGenerationDialog(next);
+  }
+
+  async function ensureFreshGenerationTarget(
+    dialog: CanvasGenerationDialogModel,
+    scope: GenerationWorkspaceScope,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    const sourcePort = services.canvasSource;
+    if (sourcePort === undefined || dialog.selectedRef === null || dialog.sourceVersion === null) return false;
+    const snapshot = await sourcePort.read(selectedChapter.id, signal);
+    if (signal.aborted || !isGenerationDialogScopeCurrent(scope)) return false;
+    if (!sourceSnapshotMatchesScope(snapshot)) {
+      updateGenerationDialogById(dialog.id, (current) => ({
+        ...current,
+        error: "章节来源响应不属于当前剧集或章节；已停止读取生成记录。",
+        loading: false,
+      }));
+      return false;
+    }
+    const selected = graph.nodes.find((node) => node.ref === dialog.selectedRef);
+    const freshTarget = selected === undefined ? null : generationTargetForNode(snapshot, selected);
+    if (snapshot.version !== dialog.sourceVersion || snapshot.requires_lock !== dialog.requiresLock || freshTarget === null
+      || !sameGenerationTarget(freshTarget.target, dialog.target)) {
+      applySourceSnapshot(snapshot);
+      selectCanvasNode(null);
+      setSourceMessage("章节来源或目标身份已变化。已只读刷新当前来源，没有把旧记录改绑到新目标；请重新选择后再读取。");
+      closeGenerationDialog();
+      return false;
+    }
+    return true;
+  }
+
+  async function loadGenerationPage(cursor: string | undefined, append: boolean): Promise<void> {
+    const dialog = generationDialogRef.current;
+    if (dialog === null || dialog.selectedRef === null || dialog.sourceVersion === null || dialog.loading
+      || generationBusyRef.current) return;
+    const scope = generationDialogScope(dialog);
+    const controller = new AbortController();
+    generationPageControllerRef.current?.abort();
+    generationPageControllerRef.current = controller;
+    updateGenerationDialogById(dialog.id, (current) => ({ ...current, loading: true, error: null, message: null }));
+    try {
+      if (!await ensureFreshGenerationTarget(dialog, scope, controller.signal)) return;
+      const port = services.canvasOwnedResults;
+      if (port === undefined) throw new CanvasOwnedResultsError("not-sent", "当前服务没有接入生成记录读取。", null);
+      const run = port.beginRun({
+        actorId: scope.actorId,
+        seriesId: scope.seriesId,
+        chapterId: scope.chapterId,
+        isContextCurrent: () => isGenerationDialogScopeCurrent(scope),
+      });
+      if (!run.isCurrent() || controller.signal.aborted) {
+        if (!controller.signal.aborted) {
+          throw new CanvasOwnedResultsError("not-sent", "登录、章节或查询上下文已变化，没有读取生成记录。", null);
+        }
+        return;
+      }
+      const page = await run.page(dialog.target, controller.signal, cursor === undefined ? undefined : { cursor });
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) return;
+      if (page.chapter_id !== scope.chapterId || !sameGenerationTarget(page.target, dialog.target)) {
+        throw new CanvasOwnedResultsError("invalid-response", "生成记录响应与当前查询目标不一致。", null);
+      }
+      updateGenerationDialogById(dialog.id, (current) => {
+        const items = append
+          ? [...current.items, ...page.items.filter((item) => !current.items.some((existing) => existing.result_ref === item.result_ref))]
+          : page.items;
+        return {
+          ...current,
+          items,
+          cursor,
+          nextCursor: page.next_cursor,
+          loading: false,
+          error: null,
+          message: null,
+        };
+      });
+    } catch (cause) {
+      if (controller.signal.aborted || !isGenerationWorkspaceScopeCurrent(scope)) return;
+      updateGenerationDialogById(dialog.id, (current) => ({
+        ...current,
+        loading: false,
+        error: generationFailureMessage(cause),
+      }));
+    } finally {
+      if (generationPageControllerRef.current === controller) generationPageControllerRef.current = null;
+      if (!controller.signal.aborted) {
+        updateGenerationDialogById(dialog.id, (current) => current.loading ? { ...current, loading: false } : current);
+      }
+    }
+  }
+
+  function openGenerationResults(): void {
+    const snapshot = sourcesRef.current;
+    const selected = selectedNodeRef.current === null
+      ? null
+      : graph.nodes.find((node) => node.ref === selectedNodeRef.current) ?? null;
+    const resolved = snapshot === null || selected === null ? null : generationTargetForNode(snapshot, selected);
+    if (!generationPortsAvailable || snapshot === null || selected === null || resolved === null || generationEntryDisabled) {
+      setSourceMessage(!generationPortsAvailable
+        ? "当前还不能读取或应用生成图片记录。"
+        : "请选择身份可确认的分镜、预览或角色/场景/道具素材；视频和无法唯一确认的目标不支持。");
+      return;
+    }
+    const dialog: CanvasGenerationDialogModel = {
+      id: ++generationDialogSequenceRef.current,
+      selectedRef: selected.ref,
+      target: resolved.target,
+      targetLabel: resolved.label,
+      sourceVersion: snapshot.version,
+      requiresLock: snapshot.requires_lock,
+      items: [],
+      cursor: undefined,
+      nextCursor: null,
+      loading: false,
+      error: null,
+      message: null,
+    };
+    generationDialogRef.current = dialog;
+    setGenerationDialog(dialog);
+    setGenerationHistoryLookups(new Map());
+    setGenerationConfirmedProof(null);
+    setGenerationLockRequired(false);
+    setGenerationLockUnavailable(false);
+    setGenerationLockPending(false);
+    setGenerationLockMessage(null);
+    void loadGenerationPage(undefined, false);
+  }
+
+  function openPendingGenerationIntent(): void {
+    const intent = generationIntentRef.current;
+    if (intent === null || generationDialogRef.current !== null) return;
+    const dialog: CanvasGenerationDialogModel = {
+      id: ++generationDialogSequenceRef.current,
+      selectedRef: null,
+      target: intent.destination,
+      targetLabel: generationTargetLabel(intent.destination),
+      sourceVersion: null,
+      requiresLock: intent.requiresLock,
+      items: [],
+      cursor: undefined,
+      nextCursor: null,
+      loading: false,
+      error: null,
+      message: null,
+    };
+    generationDialogRef.current = dialog;
+    setGenerationDialog(dialog);
+    setGenerationHistoryLookups(new Map());
+    setGenerationLockRequired(false);
+    setGenerationLockUnavailable(false);
+    setGenerationLockPending(false);
+    setGenerationLockMessage(null);
+  }
+
+  async function confirmGenerationEditLock(
+    scope: GenerationWorkspaceScope,
+    required: boolean,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (!required) return true;
+    const getLock = services.getChapterEditLock;
+    if (getLock === undefined) {
+      setGenerationLockUnavailable(true);
+      setGenerationLockRequired(true);
+      setGenerationLockMessage("当前无法确认编辑锁，暂时不能应用此结果。");
+      return false;
+    }
+    const lock = await getLock.call(services, scope.chapterId, signal);
+    if (signal.aborted || !isGenerationDialogScopeCurrent(scope)) return false;
+    if (validCurrentLock(lock, scope.actorId)) {
+      setGenerationLockRequired(false);
+      setGenerationLockUnavailable(false);
+      setGenerationLockMessage(null);
+      return true;
+    }
+    setGenerationLockRequired(true);
+    setGenerationLockUnavailable(services.acquireChapterEditLock === undefined);
+    setGenerationLockMessage(lock.locked
+      ? "章节编辑锁由其他成员持有；未应用此结果。"
+      : "当前账号尚未持有有效章节编辑锁；未应用此结果。请明确取得锁后再操作。");
+    return false;
+  }
+
+  async function acquireGenerationEditLock(): Promise<void> {
+    const dialog = generationDialogRef.current;
+    if (dialog === null || !dialog.requiresLock || generationBusyRef.current) return;
+    const getLock = services.getChapterEditLock;
+    const acquireLock = services.acquireChapterEditLock;
+    if (getLock === undefined || acquireLock === undefined) {
+      setGenerationLockUnavailable(true);
+      setGenerationLockRequired(true);
+      setGenerationLockMessage("当前无法操作章节编辑锁，没有取得锁。");
+      return;
+    }
+
+    const scope = generationDialogScope(dialog);
+    const controller = new AbortController();
+    generationActionControllerRef.current?.abort();
+    generationActionControllerRef.current = controller;
+    setGenerationBusyState(true);
+    setGenerationLockPending(true);
+    setGenerationLockMessage(null);
+    generationMutationPendingRef.current = true;
+    try {
+      let lock = await getLock.call(services, scope.chapterId, controller.signal);
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) return;
+      if (validCurrentLock(lock, scope.actorId)) {
+        setGenerationLockRequired(false);
+        setGenerationLockMessage("已核实当前账号持有有效章节编辑锁。请再明确点击应用；不会自动提交。");
+        return;
+      }
+      if (lock.locked) {
+        setGenerationLockRequired(true);
+        setGenerationLockMessage("其他成员正在编辑，未更改其锁；请稍后再试。");
+        return;
+      }
+
+      const acquired = await acquireLock.call(services, scope.chapterId, controller.signal);
+      if (acquired.lease !== null && isGenerationWorkspaceScopeCurrent(scope)) {
+        acquiredLockLeaseRef.current = { chapterId: scope.chapterId, lease: acquired.lease };
+      }
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) return;
+      lock = await getLock.call(services, scope.chapterId, controller.signal);
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) return;
+      if (!validCurrentLock(lock, scope.actorId)) {
+        setGenerationLockRequired(true);
+        setGenerationLockMessage("取得锁后仍无法确认当前账号持有锁；未应用此结果。");
+        return;
+      }
+      setGenerationLockRequired(false);
+      setGenerationLockUnavailable(false);
+      setGenerationLockMessage("已取得并核实当前章节编辑锁。请再明确点击应用；不会自动提交。");
+    } catch (cause) {
+      if (controller.signal.aborted || !isGenerationWorkspaceScopeCurrent(scope)) return;
+      updateGenerationDialogById(dialog.id, (current) => ({
+        ...current,
+        error: generationFailureMessage(cause),
+      }));
+    } finally {
+      setGenerationLockPending(false);
+      if (generationActionControllerRef.current === controller) {
+        generationActionControllerRef.current = null;
+        generationMutationPendingRef.current = false;
+        setGenerationBusyState(false);
+      }
+    }
+  }
+
+  async function refreshSourceAfterGenerationProof(
+    scope: GenerationWorkspaceScope,
+    signal: AbortSignal,
+  ): Promise<void> {
+    try {
+      onSourceChanged(scope.chapterId);
+    } catch {
+      setSourceMessage("应用记录已确认；章节刷新通知未完成，仍将重新读取当前内容。");
+    }
+    const sourcePort = services.canvasSource;
+    if (sourcePort === undefined) {
+      setSourceMessage("应用记录已确认；当前章节内容暂时无法刷新。");
+      return;
+    }
+    try {
+      const snapshot = await sourcePort.read(scope.chapterId, signal);
+      if (signal.aborted || !isGenerationWorkspaceScopeCurrent(scope)
+        || (scope.dialogId !== undefined && generationDialogRef.current?.id !== scope.dialogId)) return;
+      if (!sourceSnapshotMatchesScope(snapshot)) {
+        setSourceMessage("应用记录已确认；重新读取的内容属于其他剧集或章节，未并入当前画布。");
+        return;
+      }
+      applySourceSnapshot(snapshot);
+      setSourceError(null);
+      setSourceLoading(false);
+      setSourceMessage("应用记录已确认；当前章节内容已刷新。该记录不代表当前图像仍与当时相同。");
+    } catch (cause) {
+      if (signal.aborted || !isGenerationWorkspaceScopeCurrent(scope)
+        || (scope.dialogId !== undefined && generationDialogRef.current?.id !== scope.dialogId)) return;
+      setSourceMessage(`应用记录已确认，但当前章节内容未能刷新：${generationFailureMessage(cause)}。应用记录与当前图像状态分开显示。`);
+    }
+  }
+
+  function acceptGenerationProof(
+    resultRef: string,
+    status: "applied" | "already_applied",
+    application: { application_ref: string; target_revision: string; committed_at: string },
+  ): void {
+    setGenerationConfirmedProof({
+      resultRef,
+      status,
+      applicationRef: application.application_ref,
+      targetRevision: application.target_revision,
+      committedAt: application.committed_at,
+    });
+  }
+
+  function createUnknownGenerationIntent(
+    scope: GenerationWorkspaceScope,
+    destination: CanvasGenerationApplicationDestination,
+    candidate: CanvasGenerationApplicationCandidate,
+    sourceVersion: string,
+    requiresLock: boolean,
+  ): WorkspaceGenerationIntent {
+    return {
+      destination,
+      candidate,
+      sourceVersion,
+      state: "unknown",
+      lookup: null,
+      actorId: scope.actorId,
+      seriesId: scope.seriesId,
+      chapterId: scope.chapterId,
+      sessionGeneration: scope.sessionGeneration,
+      scopeKey: scope.scopeKey,
+      workspaceEpoch: scope.workspaceEpoch,
+      sourceEpoch: scope.sourceEpoch,
+      servicesIdentity: scope.servicesIdentity,
+      requiresLock,
+    };
+  }
+
+  async function sendGenerationApplication(
+    destination: CanvasGenerationApplicationDestination,
+    candidate: CanvasGenerationApplicationCandidate,
+    requiresLock: boolean,
+    sourceVersion: string,
+    retryIntent: WorkspaceGenerationIntent | null,
+  ): Promise<void> {
+    const dialog = generationDialogRef.current;
+    if (dialog === null || generationBusyRef.current || generationMutationPendingRef.current) return;
+    if (retryIntent === null && (dialog.selectedRef === null || dialog.sourceVersion === null
+      || !dialog.items.some((item) => item.task_id === candidate.task_id && item.result_ref === candidate.result_ref
+        && item.eligibility === "ready"))) return;
+    if (retryIntent !== null && (generationIntentRef.current !== retryIntent
+      || retryIntent.state !== "not_applied" || retryIntent.lookup?.status !== "not_applied")) return;
+
+    const scope = generationDialogScope(dialog);
+    if (!isGenerationDialogScopeCurrent(scope)) return;
+    if (destination.chapter_id !== scope.chapterId) return;
+    if (retryIntent !== null && (retryIntent.actorId !== scope.actorId
+      || retryIntent.seriesId !== scope.seriesId || retryIntent.chapterId !== scope.chapterId
+      || retryIntent.sessionGeneration !== scope.sessionGeneration || retryIntent.scopeKey !== scope.scopeKey
+      || retryIntent.workspaceEpoch !== scope.workspaceEpoch || retryIntent.sourceEpoch !== scope.sourceEpoch
+      || retryIntent.servicesIdentity !== scope.servicesIdentity)) return;
+    const controller = new AbortController();
+    generationActionControllerRef.current?.abort();
+    generationActionControllerRef.current = controller;
+    generationMutationPendingRef.current = true;
+    setGenerationBusyState(true);
+    setGenerationLockMessage(null);
+    updateGenerationDialogById(dialog.id, (current) => ({ ...current, error: null, message: null }));
+    let requestStarted = false;
+    try {
+      if (retryIntent === null && !await ensureFreshGenerationTarget(dialog, scope, controller.signal)) return;
+      let currentLockRequired = requiresLock;
+      if (retryIntent !== null) {
+        const sourcePort = services.canvasSource;
+        if (sourcePort === undefined) {
+          throw new CanvasSourceError("unsupported", "当前无法确认章节内容，未重新提交原操作。");
+        }
+        const snapshot = await sourcePort.read(scope.chapterId, controller.signal);
+        if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) return;
+        if (!sourceSnapshotMatchesScope(snapshot)) {
+          throw new CanvasSourceError("conflict", "当前章节身份无法确认，未重新提交原操作。", 409);
+        }
+        currentLockRequired = currentLockRequired || snapshot.requires_lock;
+      }
+      if (!await confirmGenerationEditLock(scope, currentLockRequired, controller.signal)) return;
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) return;
+      const port = services.canvasGenerationApplications;
+      if (port === undefined) throw new CanvasGenerationApplicationError("not-sent", "当前服务没有接入生成结果应用。", null);
+      const run = port.beginRun({
+        actorId: scope.actorId,
+        seriesId: scope.seriesId,
+        chapterId: scope.chapterId,
+        isContextCurrent: () => isGenerationDialogScopeCurrent(scope),
+      });
+      if (!run.isCurrent() || controller.signal.aborted) {
+        if (!controller.signal.aborted) {
+          throw new CanvasGenerationApplicationError("not-sent", "登录、章节或应用上下文已变化，没有发送生成结果应用。", null);
+        }
+        return;
+      }
+      requestStarted = true;
+      if (retryIntent !== null) {
+        setWorkspaceGenerationIntent({ ...retryIntent, state: "unknown", lookup: null });
+      }
+      const result = await run.apply(destination, candidate, controller.signal);
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) {
+        if (isGenerationWorkspaceScopeCurrent(scope)) {
+          setWorkspaceGenerationIntent(retryIntent === null
+            ? createUnknownGenerationIntent(scope, destination, candidate, sourceVersion, requiresLock)
+            : { ...retryIntent, state: "unknown", lookup: null });
+          setSourceMessage("应用结果在对话或目标变化后才到达，未并入当前画布。原操作已保留，请重新核对应用记录。");
+        }
+        return;
+      }
+      if (result.task_id !== candidate.task_id || result.result_ref !== candidate.result_ref) {
+        throw new CanvasGenerationApplicationError("unknown-outcome", "应用结果与原操作不一致；处理结果暂时无法确认。", null);
+      }
+      acceptGenerationProof(result.result_ref, result.status, result.application);
+      if (generationIntentRef.current !== null
+        && generationIntentRef.current.candidate.task_id === candidate.task_id
+        && generationIntentRef.current.candidate.result_ref === candidate.result_ref) {
+        setWorkspaceGenerationIntent(null);
+      }
+      updateGenerationDialogById(dialog.id, (current) => ({
+        ...current,
+        error: null,
+        message: `${generationOutcomeLabel(result.status)}。正在刷新章节内容；应用记录不代表当前图像仍与当时相同。`,
+      }));
+      await refreshSourceAfterGenerationProof(scope, controller.signal);
+    } catch (cause) {
+      if (!isGenerationWorkspaceScopeCurrent(scope)) return;
+      const knownNotSent = cause instanceof CanvasGenerationApplicationError && cause.kind === "not-sent";
+      const unknownOutcome = requestStarted && !knownNotSent
+        && (!(cause instanceof CanvasGenerationApplicationError) || cause.kind === "unknown-outcome");
+      if (retryIntent !== null && knownNotSent) {
+        setWorkspaceGenerationIntent(retryIntent);
+      } else if (unknownOutcome || (retryIntent !== null && requestStarted && !knownNotSent)) {
+        setWorkspaceGenerationIntent(retryIntent === null
+          ? createUnknownGenerationIntent(scope, destination, candidate, sourceVersion, requiresLock)
+          : { ...retryIntent, state: "unknown", lookup: null });
+        setGenerationConfirmedProof(null);
+        setSourceMessage("上次提交结果暂时无法确认。原操作已保留；请先核对应用记录，不会自动重新提交。");
+      }
+      if (isGenerationDialogScopeCurrent(scope)) {
+        updateGenerationDialogById(dialog.id, (current) => ({
+          ...current,
+          error: generationFailureMessage(cause),
+        }));
+      }
+    } finally {
+      if (generationActionControllerRef.current === controller) {
+        generationActionControllerRef.current = null;
+        generationMutationPendingRef.current = false;
+        setGenerationBusyState(false);
+      }
+    }
+  }
+
+  function applyGenerationItem(item: CanvasOwnedResultItem): void {
+    if (item.eligibility !== "ready" || item.expected_target === null || item.application_key === null) return;
+    const dialog = generationDialogRef.current;
+    if (dialog === null || dialog.selectedRef === null || dialog.sourceVersion === null) return;
+    const candidate: CanvasGenerationApplicationCandidate = {
+      task_id: item.task_id,
+      result_ref: item.result_ref,
+      expected_target: item.expected_target,
+      application_key: item.application_key,
+    };
+    void sendGenerationApplication(dialog.target, candidate, dialog.requiresLock, dialog.sourceVersion, null);
+  }
+
+  function retryPendingGenerationIntent(): void {
+    const intent = generationIntentRef.current;
+    if (intent === null || intent.state !== "not_applied" || intent.lookup?.status !== "not_applied") return;
+    void sendGenerationApplication(
+      intent.destination,
+      intent.candidate,
+      intent.requiresLock,
+      intent.sourceVersion,
+      intent,
+    );
+  }
+
+  async function lookupGenerationResult(item: CanvasOwnedResultItem): Promise<void> {
+    const dialog = generationDialogRef.current;
+    const port = services.canvasResultApplications;
+    if (dialog === null || port === undefined || generationBusyRef.current) return;
+    const scope = generationDialogScope(dialog);
+    if (!isGenerationDialogScopeCurrent(scope)) return;
+    const controller = new AbortController();
+    generationActionControllerRef.current?.abort();
+    generationActionControllerRef.current = controller;
+    setGenerationBusyState(true);
+    try {
+      const run = port.beginRun({
+        actorId: scope.actorId,
+        seriesId: scope.seriesId,
+        chapterId: scope.chapterId,
+        isContextCurrent: () => isGenerationDialogScopeCurrent(scope),
+      });
+      if (!run.isCurrent() || controller.signal.aborted) {
+        if (!controller.signal.aborted) {
+          throw new CanvasResultApplicationError("not-sent", "登录或章节状态已变化，未读取应用记录。", null);
+        }
+        return;
+      }
+      const lookup = await run.lookup({ taskId: item.task_id, resultRef: item.result_ref }, controller.signal);
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)) return;
+      setGenerationHistoryLookups((current) => new Map(current).set(item.result_ref, lookup));
+      if (lookup.status === "applied" && lookup.application !== null) {
+        acceptGenerationProof(item.result_ref, "already_applied", lookup.application);
+        updateGenerationDialogById(dialog.id, (current) => ({
+          ...current,
+          message: "此前已应用。正在刷新章节内容；应用记录不代表当前图像仍与当时相同。",
+        }));
+        await refreshSourceAfterGenerationProof(scope, controller.signal);
+      }
+    } catch (cause) {
+      if (controller.signal.aborted || !isGenerationWorkspaceScopeCurrent(scope)) return;
+      updateGenerationDialogById(dialog.id, (current) => ({ ...current, error: generationFailureMessage(cause) }));
+    } finally {
+      if (generationActionControllerRef.current === controller) {
+        generationActionControllerRef.current = null;
+        setGenerationBusyState(false);
+      }
+    }
+  }
+
+  async function lookupPendingGenerationIntent(): Promise<void> {
+    const dialog = generationDialogRef.current;
+    const intent = generationIntentRef.current;
+    const port = services.canvasResultApplications;
+    if (dialog === null || intent === null || port === undefined || generationBusyRef.current) return;
+    const scope = generationDialogScope(dialog);
+    if (!isGenerationWorkspaceScopeCurrent(scope)
+      || intent.actorId !== scope.actorId || intent.seriesId !== scope.seriesId || intent.chapterId !== scope.chapterId) return;
+    const controller = new AbortController();
+    generationActionControllerRef.current?.abort();
+    generationActionControllerRef.current = controller;
+    setGenerationBusyState(true);
+    try {
+      const run = port.beginRun({
+        actorId: intent.actorId,
+        seriesId: intent.seriesId,
+        chapterId: intent.chapterId,
+        isContextCurrent: () => isGenerationDialogScopeCurrent(scope)
+          && generationIntentRef.current?.candidate.task_id === intent.candidate.task_id
+          && generationIntentRef.current?.candidate.result_ref === intent.candidate.result_ref,
+      });
+      if (!run.isCurrent() || controller.signal.aborted) {
+        if (!controller.signal.aborted) {
+          throw new CanvasResultApplicationError("not-sent", "登录或章节状态已变化，未核对原操作。", null);
+        }
+        return;
+      }
+      const lookup = await run.lookup({
+        taskId: intent.candidate.task_id,
+        resultRef: intent.candidate.result_ref,
+      }, controller.signal);
+      if (controller.signal.aborted || !isGenerationDialogScopeCurrent(scope)
+        || generationIntentRef.current?.candidate.task_id !== intent.candidate.task_id
+        || generationIntentRef.current?.candidate.result_ref !== intent.candidate.result_ref) return;
+      if (lookup.status === "applied" && lookup.application !== null) {
+        acceptGenerationProof(lookup.result_ref, "already_applied", lookup.application);
+        setWorkspaceGenerationIntent(null);
+        updateGenerationDialogById(dialog.id, (current) => ({
+          ...current,
+          message: "此前已应用。正在刷新章节内容；应用记录不代表当前图像仍与当时相同。",
+        }));
+        await refreshSourceAfterGenerationProof(scope, controller.signal);
+      } else {
+        setWorkspaceGenerationIntent({ ...intent, state: "not_applied", lookup });
+        updateGenerationDialogById(dialog.id, (current) => ({
+          ...current,
+          message: "暂未查到应用记录，之前请求仍可能稍后完成。只有明确选择重新提交原操作时，系统才会再次提交。",
+        }));
+      }
+    } catch (cause) {
+      if (controller.signal.aborted || !isGenerationWorkspaceScopeCurrent(scope)) return;
+      updateGenerationDialogById(dialog.id, (current) => ({ ...current, error: generationFailureMessage(cause) }));
+    } finally {
+      if (generationActionControllerRef.current === controller) {
+        generationActionControllerRef.current = null;
+        setGenerationBusyState(false);
+      }
+    }
+  }
 
   return (
     <div className="canvas-dialog-backdrop">
@@ -1346,6 +2212,19 @@ export function CanvasWorkspace({
           <div className="canvas-tool-row">
             <button disabled={!documentState.writable} onClick={() => createTextItem("notes")} type="button">新增便签</button>
             <button disabled={!documentState.writable} onClick={() => createTextItem("cards")} type="button">新增文本卡片</button>
+            <button disabled={generationEntryDisabled} onClick={openGenerationResults} type="button">生成图片记录</button>
+            {generationIntent !== null && (
+              <>
+                <span className="canvas-save-status" role="alert">
+                  {generationIntent.state === "unknown"
+                    ? "上次提交结果暂时无法确认，原操作已保留。"
+                    : "暂未查到应用记录，之前请求仍可能稍后完成。"}
+                </span>
+                <button disabled={generationDialog !== null || generationBusy} onClick={openPendingGenerationIntent} type="button">
+                  继续核对原操作
+                </button>
+              </>
+            )}
             <button aria-pressed={connecting} disabled={!documentState.writable} onClick={() => {
               setConnecting((value) => !value);
               setConnectionSource(null);
@@ -1355,6 +2234,15 @@ export function CanvasWorkspace({
             <button onClick={() => changeViewport({ ...viewport, zoom: clampZoom(viewport.zoom * 1.15) })} type="button" aria-label="放大">＋</button>
             <button onClick={fitContent} type="button">适配内容</button>
             <button disabled={!documentState.writable || (selectedNode === null && selectedEdge === null)} onClick={removeSelected} type="button">删除选中</button>
+            {!generationPortsAvailable && <span className="canvas-save-status" role="status">生成记录服务未完整接入。</span>}
+            {generationPortsAvailable && selectedGenerationTarget === null && (
+              <span className="canvas-save-status" role="status">选中身份可确认的分镜、预览或角色/场景/道具素材；视频不支持。</span>
+            )}
+            {generationConfirmedProof !== null && (
+              <span className="canvas-save-status" role="status">
+                {generationOutcomeLabel(generationConfirmedProof.status)}。已找到对应记录；当前图像可能已有后续修改。
+              </span>
+            )}
           </div>
           <div aria-label="章节来源编辑" className="canvas-tool-row">
             <button disabled={sourceActionDisabled || (selectedFrameNode !== null && selectedFrameTarget === null)}
@@ -1482,7 +2370,7 @@ export function CanvasWorkspace({
                   aria-label={node.title}
                   className={"canvas-node canvas-node-" + node.kind + (selectedNode === node.ref ? " is-selected" : "") + (connecting ? " is-connectable" : "")}
                   key={node.key}
-                  onClick={() => { setSelectedNode(node.ref); setSelectedEdge(null); }}
+                  onClick={() => { selectCanvasNode(node.ref); setSelectedEdge(null); }}
                   onPointerDown={(event) => beginDrag(event, node)}
                   style={{ left: node.x, top: node.y, width: node.width, minHeight: node.height }}
                   tabIndex={0}
@@ -1573,13 +2461,49 @@ export function CanvasWorkspace({
           />
         )}
 
+        {generationDialog !== null && (
+          <CanvasGenerationResultsDialog
+            busy={generationBusy}
+            confirmedProof={generationConfirmedProof}
+            error={generationDialog.error}
+            historyLookups={generationHistoryLookups}
+            intentOnly={generationDialog.selectedRef === null}
+            items={generationDialog.items}
+            loading={generationDialog.loading}
+            lockMessage={generationLockMessage}
+            lockPending={generationLockPending}
+            lockRequired={generationLockRequired}
+            lockUnavailable={generationLockUnavailable}
+            message={generationDialog.message}
+            nextCursor={generationDialog.nextCursor}
+            onAcquireLock={() => void acquireGenerationEditLock()}
+            onApply={applyGenerationItem}
+            onClose={closeGenerationDialog}
+            onLoadMore={() => {
+              const current = generationDialogRef.current;
+              if (current?.nextCursor !== null && current?.nextCursor !== undefined) {
+                void loadGenerationPage(current.nextCursor, true);
+              }
+            }}
+            onLookupPendingIntent={() => void lookupPendingGenerationIntent()}
+            onRefresh={() => {
+              const current = generationDialogRef.current;
+              if (current !== null) void loadGenerationPage(current.cursor, false);
+            }}
+            onRetryPendingIntent={retryPendingGenerationIntent}
+            onVerify={(item) => void lookupGenerationResult(item)}
+            pendingIntent={generationIntent}
+            targetLabel={generationDialog.targetLabel}
+          />
+        )}
+
         {closePrompt && (
           <div className="canvas-confirm-backdrop">
             <section aria-labelledby="canvas-close-title" aria-modal="true" className="canvas-close-confirm"
               ref={closePromptFocus.dialogRef} role="dialog" tabIndex={-1}>
               <h3 id="canvas-close-title">关闭创作画布</h3>
               {sourceOutcomeUnresolved
-                ? <p>章节来源操作仍未完成核对。关闭画布不会撤销服务器可能已提交的内容，也不会重发原请求；打开新画布前请先明确记录当前状态。</p>
+                ? <p>应用仍未确认。关闭画布不会撤回可能已完成的操作，也不会自动重新提交；请留在当前画布核对应用记录。</p>
                 : documentState.status === "unknown"
                 ? <p>保存结果尚未确认。放弃仅清除本地草稿，之前的服务器请求仍可能已经提交。</p>
                 : documentState.status === "saving"
@@ -1587,14 +2511,20 @@ export function CanvasWorkspace({
                 : <p>还有未确认的画布编辑。保存完成后再关闭，或继续留在画布中。</p>}
               <div>
                 <button
-                  disabled={sourceOutcomeUnresolved || closeBusy || !documentState.writable || documentState.status === "unknown" || documentState.status === "conflict"}
+                  disabled={sourceOutcomeUnresolved || generationMutationPendingRef.current || closeBusy || !documentState.writable || documentState.status === "unknown" || documentState.status === "conflict"}
                   onClick={() => void saveAndClose()}
                   type="button"
                 >
                   {closeBusy ? "正在等待保存…" : "保存并关闭"}
                 </button>
                 <button onClick={() => setClosePrompt(false)} type="button">继续编辑</button>
-                <button onClick={discardAndClose} type="button">放弃本地草稿并关闭</button>
+                <button
+                  disabled={generationIntentRef.current !== null || generationBusyRef.current || generationMutationPendingRef.current}
+                  onClick={discardAndClose}
+                  type="button"
+                >
+                  放弃本地草稿并关闭
+                </button>
               </div>
             </section>
           </div>
