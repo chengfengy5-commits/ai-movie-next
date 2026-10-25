@@ -7,6 +7,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict
 
+from haoai_backend.canvas_applications.schemas import GenerationApplicationUpdate
+
 
 class SeriesCreate(BaseModel):
     name: str
@@ -59,7 +61,7 @@ class ChapterCreate(BaseModel):
     order: int = 0
 
 
-class ChapterUpdate(BaseModel):
+class ChapterUpdate(GenerationApplicationUpdate):
     title: str | None = None
     content: list[dict[str, Any]] | None = None
     order: int | None = None

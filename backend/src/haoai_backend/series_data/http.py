@@ -7,7 +7,10 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
+from haoai_backend.canvas_applications.schemas import GenerationApplicationRequest
 from haoai_backend.shared.errors import BusinessError
 from haoai_backend.shared.identity import TrustedActor
 
@@ -33,11 +36,12 @@ def build_series_data_router(
     *,
     uow_factory: UnitOfWorkFactory | None,
     resolve_actor: ActorResolver | None,
+    generation_session_factory: Callable[[], Session] | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api", tags=["series-data"])
 
     async def trusted_actor(request: Request) -> TrustedActor:
-        if uow_factory is None or resolve_actor is None:
+        if (uow_factory is None and generation_session_factory is None) or resolve_actor is None:
             error = SeriesDataUnavailable()
             raise HTTPException(status_code=error.status_code, detail=error.detail)
         try:
@@ -55,6 +59,25 @@ def build_series_data_router(
             return call(uow_factory, *args, **kwargs)
         except BusinessError as exc:
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+
+    def apply_generation(
+        generation_application: GenerationApplicationRequest,
+        chapter_id: str,
+        actor: TrustedActor,
+    ) -> JSONResponse:
+        try:
+            command = generation_application.to_command()
+            from haoai_backend.canvas_applications.application import apply_chapter_generation
+
+            payload = apply_chapter_generation(
+                generation_session_factory,
+                actor,
+                chapter_id,
+                command,
+            )
+        except BusinessError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
+        return JSONResponse(content=payload)
 
     @router.get("/series", response_model=list[SeriesResponse])
     def list_series(actor: TrustedActor = Depends(trusted_actor)) -> list[dict[str, Any]]:
@@ -90,7 +113,9 @@ def build_series_data_router(
         return invoke(application.create_chapter, actor, series_id, request)
 
     @router.put("/chapters/{chapter_id}", response_model=ChapterResponse)
-    def edit_chapter(chapter_id: str, request: ChapterUpdate, actor: TrustedActor = Depends(trusted_actor)) -> dict[str, Any]:
+    def edit_chapter(chapter_id: str, request: ChapterUpdate, actor: TrustedActor = Depends(trusted_actor)) -> Any:
+        if request.generation_application is not None:
+            return apply_generation(request.generation_application, chapter_id, actor)
         return invoke(application.update_chapter, actor, chapter_id, request)
 
     @router.put("/chapters/{chapter_id}/delete-frame", response_model=ChapterResponse)
@@ -118,5 +143,12 @@ def mount_series_data_routes(
     *,
     uow_factory: UnitOfWorkFactory | None,
     resolve_actor: ActorResolver | None,
+    generation_session_factory: Callable[[], Session] | None = None,
 ) -> None:
-    app.include_router(build_series_data_router(uow_factory=uow_factory, resolve_actor=resolve_actor))
+    app.include_router(
+        build_series_data_router(
+            uow_factory=uow_factory,
+            resolve_actor=resolve_actor,
+            generation_session_factory=generation_session_factory,
+        )
+    )

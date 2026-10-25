@@ -684,6 +684,7 @@ def create_app(
         app,
         uow_factory=series_data_uow_factory,
         resolve_actor=effective_resolver,
+        generation_session_factory=effective_session_factory,
     )
 
     asset_data_uow_factory: AssetDataUnitOfWorkFactory | None = None
@@ -696,6 +697,7 @@ def create_app(
         app,
         uow_factory=asset_data_uow_factory,
         resolve_actor=effective_resolver,
+        generation_session_factory=effective_session_factory,
     )
     canvas_source_uow_factory: CanvasSourceUnitOfWorkFactory | None = None
     if effective_session_factory is not None:
