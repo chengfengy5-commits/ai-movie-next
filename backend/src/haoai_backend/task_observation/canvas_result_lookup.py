@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import select
@@ -14,6 +15,7 @@ from haoai_backend.generation_contracts.canvas_targets import (
     is_valid_canvas_identifier,
     target_snapshot_from_request_data,
 )
+from haoai_backend.generation_contracts.records import GenerationResultReceipt
 from haoai_backend.generation_contracts.types import GenerationActor, TargetSnapshot
 from haoai_backend.generation_core.base_schema import AITaskRow
 from haoai_backend.series_access.application import require_series_access
@@ -45,6 +47,12 @@ SessionFactory = Callable[[], Session]
 _CANVAS_OPERATIONS = frozenset({"image.single", "image.batch"})
 _CANVAS_TARGET_KINDS = frozenset({"canvas_frame_preview", "canvas_asset_image"})
 _HEX = frozenset("0123456789abcdef")
+
+
+@dataclass(frozen=True, slots=True)
+class CanvasResultSourceFacts:
+    receipt: GenerationResultReceipt
+    target: TargetSnapshot
 
 
 def lookup_canvas_result_application(
@@ -98,52 +106,15 @@ def _lookup_in_session(
     result_ref: str,
     task_id: str,
 ) -> dict[str, object]:
-    owned_result: ResultLookup = load_owned_completed_result(
+    facts = load_canvas_result_source_facts(
         session,
-        GenerationActor(actor.user_id, actor),
-        task_id,
-        result_ref,
+        actor,
+        chapter_id=chapter_id,
+        result_ref=result_ref,
+        task_id=task_id,
     )
-    if owned_result == "not_found":
-        raise TaskObservationNotFound("画布生成结果不存在或无权访问")
-    if owned_result == "unready":
-        raise TaskObservationConflict("画布生成结果尚未具备可查询的规范回执")
-    if owned_result.operation not in _CANVAS_OPERATIONS:
-        raise TaskObservationConflict("该生成任务不属于受支持的画布图片操作")
-
-    request_data = session.execute(
-        select(AITaskRow.request_data).where(
-            AITaskRow.id == task_id,
-            AITaskRow.user_id == actor.user_id,
-        )
-    ).scalar_one_or_none()
-    if request_data is None:
-        raise TaskObservationConflict("画布生成结果缺少原始目标快照")
-    target = _target_snapshot_from_request_data(request_data)
-    if target.kind not in _CANVAS_TARGET_KINDS:
-        raise TaskObservationConflict("画布生成结果的原始目标类型无效")
-    if target.chapter_id != chapter_id:
-        raise TaskObservationNotFound("画布生成结果不存在或无权访问")
-    if not target.series_id or not target_matches_receipt(session, owned_result, target):
-        raise TaskObservationConflict("画布生成结果与原始目标快照不一致")
-
-    current_chapter_series_id = session.execute(
-        select(chapters.c.series_id).where(chapters.c.id == target.chapter_id)
-    ).scalar_one_or_none()
-    if current_chapter_series_id is None:
-        raise TaskObservationNotFound("画布生成结果不存在或无权访问")
-    if current_chapter_series_id != target.series_id:
-        raise TaskObservationConflict("原始章节已不属于生成时的剧集")
-    try:
-        require_series_access(
-            SqlAlchemySeriesAccessReader(session),
-            ActorIdentity(actor.user_id),
-            target.series_id,
-        )
-    except SeriesNotFound as exc:
-        raise TaskObservationNotFound("剧集不存在") from exc
-    except SeriesAccessDenied as exc:
-        raise TaskObservationForbidden("无权访问该剧集") from exc
+    owned_result = facts.receipt
+    target = facts.target
 
     try:
         target_scope = target_scope_for_snapshot(target)
@@ -208,6 +179,65 @@ def _lookup_in_session(
     }
 
 
+def load_canvas_result_source_facts(
+    session: Session,
+    actor: TrustedActor,
+    *,
+    chapter_id: str,
+    result_ref: str,
+    task_id: str,
+) -> CanvasResultSourceFacts:
+    """Bind a canonical owner receipt to its original Canvas target and access."""
+
+    owned_result: ResultLookup = load_owned_completed_result(
+        session,
+        GenerationActor(actor.user_id, actor),
+        task_id,
+        result_ref,
+    )
+    if owned_result == "not_found":
+        raise TaskObservationNotFound("画布生成结果不存在或无权访问")
+    if owned_result == "unready":
+        raise TaskObservationConflict("画布生成结果尚未具备可查询的规范回执")
+    if owned_result.operation not in _CANVAS_OPERATIONS:
+        raise TaskObservationConflict("该生成任务不属于受支持的画布图片操作")
+
+    request_data = session.execute(
+        select(AITaskRow.request_data).where(
+            AITaskRow.id == task_id,
+            AITaskRow.user_id == actor.user_id,
+        )
+    ).scalar_one_or_none()
+    if request_data is None:
+        raise TaskObservationConflict("画布生成结果缺少原始目标快照")
+    target = _target_snapshot_from_request_data(request_data)
+    if target.kind not in _CANVAS_TARGET_KINDS:
+        raise TaskObservationConflict("画布生成结果的原始目标类型无效")
+    if target.chapter_id != chapter_id:
+        raise TaskObservationNotFound("画布生成结果不存在或无权访问")
+    if not target.series_id or not target_matches_receipt(session, owned_result, target):
+        raise TaskObservationConflict("画布生成结果与原始目标快照不一致")
+
+    current_chapter_series_id = session.execute(
+        select(chapters.c.series_id).where(chapters.c.id == target.chapter_id)
+    ).scalar_one_or_none()
+    if current_chapter_series_id is None:
+        raise TaskObservationNotFound("画布生成结果不存在或无权访问")
+    if current_chapter_series_id != target.series_id:
+        raise TaskObservationConflict("原始章节已不属于生成时的剧集")
+    try:
+        require_series_access(
+            SqlAlchemySeriesAccessReader(session),
+            ActorIdentity(actor.user_id),
+            target.series_id,
+        )
+    except SeriesNotFound as exc:
+        raise TaskObservationNotFound("剧集不存在") from exc
+    except SeriesAccessDenied as exc:
+        raise TaskObservationForbidden("无权访问该剧集") from exc
+    return CanvasResultSourceFacts(owned_result, target)
+
+
 def _target_snapshot_from_request_data(request_data: object) -> TargetSnapshot:
     try:
         return target_snapshot_from_request_data(request_data)
@@ -230,4 +260,9 @@ def _is_sha256(value: object) -> bool:
     )
 
 
-__all__ = ("is_valid_canvas_identifier", "lookup_canvas_result_application")
+__all__ = (
+    "CanvasResultSourceFacts",
+    "is_valid_canvas_identifier",
+    "load_canvas_result_source_facts",
+    "lookup_canvas_result_application",
+)

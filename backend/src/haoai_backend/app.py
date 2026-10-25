@@ -258,6 +258,7 @@ def create_app(
     aistarslab_transport: AistarslabTransport | None = None,
     runtime_status_configuration: RuntimeStatusConfiguration | None = None,
     runtime_status_image_fetcher: PublicImageFetcher | None = None,
+    canvas_result_image_fetcher: PublicImageFetcher | None = None,
     resolve_runtime_status_account: CurrentUserResolver | None = None,
     runtime_status_database_probe: DatabaseReadinessProbe | None = None,
     runtime_status_storage_probe: ObjectStorageReadinessProbe | None = None,
@@ -818,6 +819,15 @@ def create_app(
 
         active_actor_resolver = resolve_configured_task_active
 
+    status_image_fetcher = runtime_status_image_fetcher
+    if status_image_fetcher is None:
+        status_image_fetcher = _LazyAiohttpPublicImageFetcher()
+    canvas_preview_fetcher = (
+        status_image_fetcher
+        if canvas_result_image_fetcher is None
+        else canvas_result_image_fetcher
+    )
+
     task_cancellation_writer = (
         SqlTaskCancellationWriter(task_cancellation_connection_factory)
         if task_cancellation_connection_factory is not None
@@ -879,6 +889,7 @@ def create_app(
         build_canvas_result_http_router(
             session_factory=effective_session_factory,
             resolve_account_actor=account_actor_resolver,
+            image_fetcher=canvas_preview_fetcher,
         )
     )
     app.include_router(
@@ -1126,10 +1137,6 @@ def create_app(
             initial_failure_backoff_seconds=1.0,
             max_failure_backoff_seconds=30.0,
         )
-
-    status_image_fetcher = runtime_status_image_fetcher
-    if status_image_fetcher is None:
-        status_image_fetcher = _LazyAiohttpPublicImageFetcher()
 
     status_account_resolver = resolve_runtime_status_account
     if status_account_resolver is None and authentication_service is not None:
