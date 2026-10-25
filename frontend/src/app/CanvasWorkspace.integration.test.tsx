@@ -30,6 +30,10 @@ interface GenerationWorkspaceHarnessOptions {
   readonly deferredNextPage?: boolean;
   readonly putReplies?: readonly { status: number; resultStatus?: "applied" | "already_applied" }[];
   readonly lookupReplies?: readonly { status: "not_applied" | "applied" }[];
+  readonly imageSubmitReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
+  readonly imageLookupReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
+  readonly deferredImageSubmit?: boolean;
+  readonly freshSourceVersion?: string;
   readonly failSourceReadAt?: number;
 }
 
@@ -198,34 +202,105 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     unknown: { preserve: true },
   };
   const originalDocumentJson = JSON.parse(JSON.stringify(documentJson)) as typeof documentJson;
-  const requests: Array<{ url: URL; method: string; body: unknown }> = [];
+  const requests: Array<{ url: URL; method: string; body: unknown; headers: Headers }> = [];
   const putReplies = [...(options.putReplies ?? [])];
   const lookupReplies = [...(options.lookupReplies ?? [])];
+  const imageSubmitReplies = [...(options.imageSubmitReplies ?? [])];
+  const imageLookupReplies = [...(options.imageLookupReplies ?? [])];
   let sourceReadCount = 0;
   let lockAcquired = false;
   let lockPostCount = 0;
+  let imageSubmissionNumber = 0;
+  let releaseDeferredImageSubmit: ((response: Response) => void) | null = null;
+  let markDeferredImageSubmitStarted: (() => void) | null = null;
+  const deferredImageSubmitStarted = new Promise<void>((resolve) => { markDeferredImageSubmitStarted = resolve; });
+  let markDeferredImageResponseHandled: (() => void) | null = null;
+  const deferredImageResponseHandled = new Promise<void>((resolve) => { markDeferredImageResponseHandled = resolve; });
   let releaseDeferredPage: ((response: Response) => void) | null = null;
   let markDeferredPageStarted: (() => void) | null = null;
   const deferredPageStarted = new Promise<void>((resolve) => { markDeferredPageStarted = resolve; });
   let deferredPageUsed = false;
+  const validLockExpiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
   const lockState = () => options.lockMode === "foreign"
-    ? { locked: true, user_id: "other-user", is_mine: false, expires_at: "2026-10-26T00:00:00Z" }
+    ? { locked: true, user_id: "other-user", is_mine: false, expires_at: validLockExpiresAt }
     : options.lockMode === "expired"
       ? { locked: true, user_id: "demo-user", is_mine: true, expires_at: "2020-01-01T00:00:00Z" }
       : lockAcquired
-        ? { locked: true, user_id: "demo-user", is_mine: true, expires_at: "2026-10-26T00:00:00Z" }
+        ? { locked: true, user_id: "demo-user", is_mine: true, expires_at: validLockExpiresAt }
         : { locked: false };
   const fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = new URL(String(input));
     const method = init?.method ?? "GET";
     const body = init?.body === undefined ? null : JSON.parse(String(init.body)) as unknown;
-    requests.push({ url, method, body });
+    const headers = new Headers(init?.headers);
+    requests.push({ url, method, body, headers });
     if (method === "GET" && url.pathname === `/api/series/${currentSeries.id}/chapters`) {
       return Response.json([currentChapter]);
+    }
+    if (method === "GET" && url.pathname === "/api/models") {
+      return Response.json([
+        {
+          id: "image-model-private-id",
+          category: "image",
+          name: "画布单图模型",
+          provider: "private-provider-value",
+          model: "private-model-value",
+          base_url: "https://private-model.example.invalid",
+          params: "private-params-value",
+          api_key: "private-api-key-value",
+          sort_order: 0,
+          is_system: false,
+          user_id: "demo-user",
+        },
+        {
+          id: "video-model-id",
+          category: "video",
+          name: "不可选的视频模型",
+          provider: "video-provider",
+          params: null,
+          sort_order: 1,
+          is_system: false,
+          user_id: "demo-user",
+        },
+      ]);
+    }
+    if (method === "POST" && url.pathname === "/api/chat/image") {
+      imageSubmissionNumber += 1;
+      if (options.deferredImageSubmit) {
+        markDeferredImageSubmitStarted?.();
+        return new Promise<Response>((resolve) => { releaseDeferredImageSubmit = resolve; });
+      }
+      const reply = imageSubmitReplies.shift() ?? { status: 200, receiptStatus: "queued" as const };
+      if (reply.status !== 200) return new Response("image task admission is not confirmed", { status: reply.status });
+      return Response.json({
+        submission_id: `image-submission-${imageSubmissionNumber}`,
+        operation: "image.single",
+        task_id: `image-task-${imageSubmissionNumber}`,
+        message_id: `image-message-${imageSubmissionNumber}`,
+        status: reply.receiptStatus ?? "queued",
+        quoted_amount: 12,
+        billing_status: "unbilled",
+      });
+    }
+    if (method === "GET" && url.pathname === "/api/submissions/image.single") {
+      const reply = imageLookupReplies.shift() ?? { status: 404 };
+      if (reply.status !== 200) return new Response("submission not observed", { status: reply.status });
+      return Response.json({
+        submission_id: "image-submission-1",
+        operation: "image.single",
+        task_id: "image-task-1",
+        message_id: "image-message-1",
+        status: reply.receiptStatus ?? "queued",
+        quoted_amount: 12,
+        billing_status: "unbilled",
+      });
     }
     if (method === "GET" && url.pathname === `/api/chapters/${currentChapter.id}/canvas-source`) {
       sourceReadCount += 1;
       if (sourceReadCount === options.failSourceReadAt) return new Response("source unavailable", { status: 503 });
+      if (sourceReadCount > 1 && options.freshSourceVersion !== undefined) {
+        return Response.json({ ...sourceSnapshot, version: options.freshSourceVersion });
+      }
       return Response.json(sourceSnapshot);
     }
     if (method === "GET" && url.pathname === `/api/chapters/${currentChapter.id}/canvas`) {
@@ -304,13 +379,14 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   });
   const services = createApiServices("http://127.0.0.1:8000/api", { storage, fetcher });
   const onSourceChanged = vi.fn();
+  const onUnauthorized = vi.fn();
   const canvasPort = services.canvasData;
   if (canvasPort === undefined) throw new Error("API services did not expose the canvas port.");
   const workspace = (sessionGeneration = 2) => (
     <CanvasWorkspace
       chapter={currentChapter}
       onClose={vi.fn()}
-      onUnauthorized={vi.fn()}
+      onUnauthorized={onUnauthorized}
       onSourceChanged={onSourceChanged}
       port={canvasPort}
       series={currentSeries}
@@ -332,7 +408,30 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     fetcher,
     services,
     onSourceChanged,
+    onUnauthorized,
+    token: () => storage.getItem(API_TOKEN_KEY),
     rerender: (sessionGeneration: number) => view.rerender(workspace(sessionGeneration)),
+    deferredImageSubmitStarted,
+    deferredImageResponseHandled,
+    resolveDeferredImageSubmit(payload: unknown) {
+      let delivered = false;
+      const body = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if (!delivered) {
+            delivered = true;
+            controller.enqueue(new TextEncoder().encode(JSON.stringify(payload)));
+            return;
+          }
+          markDeferredImageResponseHandled?.();
+          controller.close();
+        },
+        cancel() { markDeferredImageResponseHandled?.(); },
+      }, { highWaterMark: 0 });
+      releaseDeferredImageSubmit?.(new Response(body, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }));
+    },
     deferredPageStarted,
     resolveDeferredPage(payload: unknown) { releaseDeferredPage?.(Response.json(payload)); },
     lockPostCount: () => lockPostCount,
@@ -345,7 +444,319 @@ function generationResultsDialog() {
   return within(screen.getByRole("dialog", { name: "生成图片记录" }));
 }
 
+async function waitForImageModelOption(dialog: HTMLElement) {
+  const queries = within(dialog);
+  await queries.findByRole("option", { name: "画布单图模型" });
+  await waitFor(() => expect(queries.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled());
+  return queries;
+}
+
 describe("selected chapter to canvas integration", () => {
+  it("opens a single-image generation form for a selected stable frame", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    const modelReads = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/models");
+    expect(modelReads).toHaveLength(1);
+    expect(modelReads[0]?.url.searchParams.get("category")).toBe("image");
+    expect((dialogQueries.getByLabelText("图片模型") as HTMLSelectElement).value).toBe("image-model-private-id");
+    expect((dialogQueries.getByLabelText("提示词") as HTMLTextAreaElement).value).toBe("等待图像记录");
+    expect(dialog.innerHTML).not.toContain("private-provider-value");
+    expect(dialog.innerHTML).not.toContain("private-model-value");
+    expect(dialog.innerHTML).not.toContain("private-model.example.invalid");
+    expect(dialog.innerHTML).not.toContain("private-params-value");
+    expect(dialog.innerHTML).not.toContain("private-api-key-value");
+    expect(within(dialog).queryByText("不可选的视频模型")).toBeNull();
+    expect(harness.requests.filter((request) => request.method === "POST")).toHaveLength(0);
+  });
+
+  it("uses the newly selected target after a previous image task was accepted", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    let dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭生成图片" }));
+    fireEvent.click(await screen.findByRole("article", { name: "生成角色" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+
+    expect(dialog.getByText("角色素材 · 生成角色")).toBeTruthy();
+    expect(dialog.queryByText("分镜 1")).toBeNull();
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submissions).toHaveLength(2);
+    expect(submissions[0]?.body).toEqual({
+      model_id: "image-model-private-id",
+      prompt: "等待图像记录",
+      target: {
+        kind: "canvas_apply",
+        destination: {
+          kind: "frame_preview",
+          chapter_id: "generation-stable-frame-chapter",
+          storyboard_asset_id: "board-generation",
+        },
+      },
+    });
+    expect(submissions[1]?.body).toEqual({
+      model_id: "image-model-private-id",
+      prompt: "生成角色",
+      target: {
+        kind: "canvas_apply",
+        destination: {
+          kind: "asset_image",
+          chapter_id: "generation-stable-frame-chapter",
+          asset_type: "character",
+          asset_id: "character-generation",
+        },
+      },
+    });
+  });
+
+  it("requires an explicit current edit lock before submitting a single-image task", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", requiresLock: true, lockMode: "unlocked" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialogElement = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialog = await waitForImageModelOption(dialogElement);
+
+    expect(harness.requests.filter((request) => request.url.pathname.endsWith("/lock"))).toHaveLength(0);
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    expect(await dialog.findByText("当前账号尚未持有有效章节编辑锁。请明确取得锁后再次提交。")).toBeTruthy();
+    expect(harness.lockPostCount()).toBe(0);
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(0);
+
+    fireEvent.click(dialog.getByRole("button", { name: "取得编辑锁" }));
+    expect(await dialog.findByText("已取得并核实当前章节编辑锁。请再次明确提交图片任务。")).toBeTruthy();
+    expect(harness.lockPostCount()).toBe(1);
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(0);
+
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    expect(harness.lockPostCount()).toBe(1);
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+  });
+
+  it("sends only one image task when submission is activated twice synchronously", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    const submit = dialog.getByRole("button", { name: "提交单张图片任务" });
+
+    act(() => {
+      fireEvent.click(submit);
+      fireEvent.click(submit);
+    });
+
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
+  it("confirms the original image submission through an explicit lookup without resubmitting or applying it", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageSubmitReplies: [{ status: 503 }],
+      imageLookupReplies: [{ status: 200, receiptStatus: "queued" }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+    await screen.findByRole("dialog", { name: "核对原生成任务" });
+
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single")).toHaveLength(0);
+    fireEvent.click(screen.getByRole("button", { name: "继续核对原操作" }));
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText("任务状态：排队中")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
+  it("keeps a no-ID frame without a canonical server digest disabled", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "invalid-no-id" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    expect(screen.getByRole("button", { name: "生成图片" })).toBeDisabled();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(0);
+  });
+
+  it("refuses image submission after the fresh source version changes", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", freshSourceVersion: "f".repeat(64) });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    await waitFor(() => expect(harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname.endsWith("/canvas-source")).length).toBeGreaterThan(1));
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(0);
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
+  it.each([
+    ["foreign", "章节编辑锁由其他成员持有，未发送图片任务。", "其他成员正在编辑；未更改其锁，也没有发送图片任务。"],
+    ["expired", "当前账号的编辑锁已失效，请重新核对后再提交。", "当前账号的编辑锁已失效；没有自动续期或发送图片任务。"],
+  ] as const)("does not submit an image task with a %s edit lock", async (lockMode, checkMessage, acquireMessage) => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", requiresLock: true, lockMode });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    expect(await dialog.findByText(checkMessage)).toBeTruthy();
+    fireEvent.click(dialog.getByRole("button", { name: "取得编辑锁" }));
+    expect(await dialog.findByText(acquireMessage)).toBeTruthy();
+    expect(harness.lockPostCount()).toBe(0);
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(0);
+  });
+
+  it("ignores a late image receipt after closing the form and changing session scope", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", deferredImageSubmit: true });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+    await harness.deferredImageSubmitStarted;
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭生成图片" }));
+    harness.rerender(3);
+    await waitFor(() => {
+      expect(screen.queryByRole("button", { name: "继续核对原提交" })).toBeNull();
+      expect(screen.queryByText(/上次图片任务提交结果暂时无法确认/)).toBeNull();
+    });
+    expect(screen.getByRole("article", { name: "分镜 1" })).toBeTruthy();
+
+    await act(async () => {
+      harness.resolveDeferredImageSubmit({
+        submission_id: "late-image-submission",
+        operation: "image.single",
+        task_id: "late-image-task",
+        message_id: null,
+        status: "queued",
+        quoted_amount: 12,
+        billing_status: "unbilled",
+      });
+      await harness.deferredImageResponseHandled;
+      await Promise.resolve();
+    });
+
+    expect(screen.queryByRole("button", { name: "继续核对原提交" })).toBeNull();
+    expect(screen.queryByText("最近的单张图片任务已有受理记录。")).toBeNull();
+    expect(harness.token()).toBe("generation-fixture-token");
+    expect(harness.onUnauthorized).not.toHaveBeenCalled();
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
+  it.each([
+    ["no-id-frame", "分镜 1", {
+      kind: "frame_preview",
+      chapter_id: "generation-no-id-frame-chapter",
+      identity_mode: "strict-no-id-v1",
+      frame_index: 0,
+      expected_chapter_digest: "e".repeat(64),
+    }],
+    ["character", "生成角色", {
+      kind: "asset_image",
+      chapter_id: "generation-character-chapter",
+      asset_type: "character",
+      asset_id: "character-generation",
+    }],
+    ["scene", "生成场景", {
+      kind: "asset_image",
+      chapter_id: "generation-scene-chapter",
+      asset_type: "scene",
+      asset_id: "scene-generation",
+    }],
+    ["prop", "生成道具", {
+      kind: "asset_image",
+      chapter_id: "generation-prop-chapter",
+      asset_type: "prop",
+      asset_id: "prop-generation",
+    }],
+  ] as const)("submits one image task with the captured %s destination", async (targetKind, nodeName, destination) => {
+    const harness = mountGenerationWorkspace({ targetKind });
+    fireEvent.click(await screen.findByRole("article", { name: nodeName }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    expect((dialog.getByLabelText("图片模型") as HTMLSelectElement).value).toBe("image-model-private-id");
+    expect((dialog.getByLabelText("提示词") as HTMLTextAreaElement).value).toBe(targetKind === "no-id-frame" ? "等待图像记录"
+      : targetKind === "character" ? "生成角色" : targetKind === "scene" ? "生成场景" : "生成道具");
+
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]?.body).toEqual({
+      model_id: "image-model-private-id",
+      prompt: targetKind === "no-id-frame" ? "等待图像记录"
+        : targetKind === "character" ? "生成角色" : targetKind === "scene" ? "生成场景" : "生成道具",
+      target: { kind: "canvas_apply", destination },
+    });
+    expect(submissions[0]?.headers.get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/iu);
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single")).toHaveLength(0);
+  });
+
+  it("retains an uncertain admission across close and target changes, then explicitly checks and retries the exact request", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageSubmitReplies: [{ status: 503 }, { status: 200, receiptStatus: "queued" }],
+      imageLookupReplies: [{ status: 404 }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+
+    expect(await screen.findByRole("dialog", { name: "核对原生成任务" })).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single")).toHaveLength(0);
+    expect(screen.getByRole("button", { name: "新增便签" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "保存布局" })).toBeDisabled();
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭生成图片" }));
+    fireEvent.click(screen.getByRole("button", { name: "关闭创作画布" }));
+    const closePrompt = within(await screen.findByRole("dialog", { name: "关闭创作画布" }));
+    expect(closePrompt.getByText(/单张图片任务提交结果仍未确认/)).toBeTruthy();
+    expect(closePrompt.getByRole("button", { name: "放弃本地草稿并关闭" })).toBeDisabled();
+    fireEvent.click(closePrompt.getByRole("button", { name: "继续编辑" }));
+
+    fireEvent.click(await screen.findByRole("article", { name: "生成角色" }));
+    expect(screen.getByRole("button", { name: "继续核对原提交" })).toBeEnabled();
+    fireEvent.click(screen.getByRole("button", { name: "继续核对原提交" }));
+    expect(await screen.findByRole("dialog", { name: "核对原生成任务" })).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single")).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "继续核对原操作" }));
+    const pendingDialog = within(screen.getByRole("dialog", { name: "核对原生成任务" }));
+    await waitFor(() => expect(pendingDialog.getAllByText(/暂未查到任务记录。之前的请求仍可能稍后完成/)).toHaveLength(2));
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single")).toHaveLength(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "重新提交原操作" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submissions).toHaveLength(2);
+    expect(submissions[1]?.body).toEqual(submissions[0]?.body);
+    expect(submissions[1]?.headers.get("Idempotency-Key")).toBe(submissions[0]?.headers.get("Idempotency-Key"));
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
   it("exposes generation records for a selected stable frame through API Workspace services", async () => {
     const storage = memoryStorage();
     storage.setItem(API_TOKEN_KEY, "generation-fixture-token");

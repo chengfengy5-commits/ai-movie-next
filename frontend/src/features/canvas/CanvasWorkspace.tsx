@@ -36,6 +36,12 @@ import type { FrameStructureDraft } from "../chapters/frame-structure/contract";
 import { AssetManagementDialog, type AssetDirectory, type GuardedAssetMutation } from "../assets/management/AssetManagementDialog";
 import { CanvasMediaSourceEditor } from "./CanvasMediaSourceEditor";
 import { CanvasGenerationResultsDialog, type PendingCanvasGenerationIntent } from "./generation-results/CanvasGenerationResultsDialog";
+import { CanvasImageGenerationDialog } from "./image-generation/CanvasImageGenerationDialog";
+import {
+  useCanvasImageGenerationController,
+  type CanvasImageGenerationLockResult,
+  type CanvasImageGenerationTarget,
+} from "./image-generation/useCanvasImageGeneration";
 import { useSeriesDialogFocus } from "../series/useSeriesDialogFocus";
 import { CanvasMediaPreview } from "./CanvasMediaPreview";
 import {
@@ -184,8 +190,12 @@ function asCanvasSourceError(cause: unknown): CanvasSourceError {
   return new CanvasSourceError("rejected", cause instanceof Error ? cause.message : "来源操作未完成。");
 }
 
+function lockIsOwnedBy(lock: { locked: boolean; user_id?: string; is_mine?: boolean }, userId: string): boolean {
+  return lock.locked && lock.is_mine === true && lock.user_id === userId;
+}
+
 function validCurrentLock(lock: { locked: boolean; user_id?: string; is_mine?: boolean; expires_at?: string }, userId: string): boolean {
-  if (!lock.locked || lock.is_mine !== true || lock.user_id !== userId || lock.expires_at === undefined) return false;
+  if (!lockIsOwnedBy(lock, userId) || lock.expires_at === undefined) return false;
   const expiry = Date.parse(/(?:Z|[+-]\d{2}:?\d{2})$/iu.test(lock.expires_at) ? lock.expires_at : `${lock.expires_at}Z`);
   return Number.isFinite(expiry) && expiry > Date.now();
 }
@@ -303,6 +313,27 @@ function generationTargetForNode(
     label: node.kind === "character" ? `角色素材 · ${node.title}`
       : node.kind === "scene" ? `场景素材 · ${node.title}` : `道具素材 · ${node.title}`,
   };
+}
+
+function imageGenerationTargetKey(
+  selectedRef: string,
+  target: CanvasOwnedResultsTarget,
+  sourceVersion: string,
+): string {
+  return JSON.stringify([selectedRef, sourceVersion, target]);
+}
+
+function imageGenerationPromptSeed(snapshot: CanvasSourceSnapshot, node: CanvasGraphNode): string {
+  if ((node.kind === "frame" || node.kind === "preview") && node.frameIndex !== undefined) {
+    return frameText(snapshot.chapter.content?.[node.frameIndex]);
+  }
+  if ((node.kind === "character" || node.kind === "scene" || node.kind === "prop") && node.itemId !== undefined) {
+    const matches = assetCollection(snapshot, node.kind).filter((asset) => asset.id === node.itemId
+      && asset.series_id === snapshot.series_id);
+    if (matches.length !== 1) return "";
+    return matches[0]?.description?.trim() || node.title;
+  }
+  return "";
 }
 
 function sameGenerationTarget(left: CanvasOwnedResultsTarget, right: CanvasOwnedResultsTarget): boolean {
@@ -483,6 +514,11 @@ export function CanvasWorkspace({
   const [generationHistoryLookups, setGenerationHistoryLookups] = useState<Map<string, CanvasResultApplicationLookup>>(() => new Map());
   const [generationBusy, setGenerationBusy] = useState(false);
   const generationBusyRef = useRef(false);
+  const [imageGenerationBlocked, setImageGenerationBlocked] = useState(false);
+  const imageGenerationBlockedRef = useRef(false);
+  const imageGenerationModeRef = useRef(false);
+  const imageGenerationUnresolvedRef = useRef(false);
+  const imageGenerationBusyRef = useRef(false);
   const [generationLockRequired, setGenerationLockRequired] = useState(false);
   const [generationLockUnavailable, setGenerationLockUnavailable] = useState(false);
   const [generationLockPending, setGenerationLockPending] = useState(false);
@@ -493,6 +529,13 @@ export function CanvasWorkspace({
   const generationMutationPendingRef = useRef(false);
   const unauthorizedRef = useRef(onUnauthorized);
   unauthorizedRef.current = onUnauthorized;
+
+  const updateImageGenerationGuard = useCallback((blocked: boolean, unresolved: boolean, busy: boolean) => {
+    imageGenerationBlockedRef.current = blocked;
+    imageGenerationUnresolvedRef.current = unresolved;
+    imageGenerationBusyRef.current = busy;
+    setImageGenerationBlocked(blocked);
+  }, []);
 
   useEffect(() => {
     const epoch = ++scopeEpochRef.current;
@@ -602,22 +645,13 @@ export function CanvasWorkspace({
   const nodeByRef = new Map(graph.nodes.map((node) => [node.ref, node]));
   const viewport = canvasViewport(displayDocument);
   const closeRef = useRef<() => void>(() => undefined);
-  const focus = useSeriesDialogFocus({
-    active: !closePrompt && sourceEditor === null && generationDialog === null,
-    canDismiss: true,
-    onDismiss: () => closeRef.current(),
-  });
-  const closePromptFocus = useSeriesDialogFocus({
-    active: closePrompt,
-    canDismiss: true,
-    onDismiss: () => setClosePrompt(false),
-  });
 
   const sourceWritesBlocked = services.canvasSource === undefined || sourceMutationPending || sourceReadbackPending
     || unknownSourceIntent !== null || generationBusy || generationMutationPendingRef.current || generationIntent !== null
+    || imageGenerationBlocked
     || sourceError !== null || sources === null;
   const sourceOutcomeUnresolved = sourceMutationPending || sourceReadbackPending || unknownSourceIntent !== null
-    || generationBusy || generationMutationPendingRef.current || generationIntent !== null;
+    || generationBusy || generationMutationPendingRef.current || generationIntent !== null || imageGenerationBlocked;
 
   function sourceSnapshotMatchesScope(snapshot: CanvasSourceSnapshot): boolean {
     return snapshot.chapter_id === selectedChapter.id && snapshot.series_id === series.id
@@ -722,7 +756,7 @@ export function CanvasWorkspace({
   }, [sources?.version]);
 
   const applyDocument = useCallback((next: CanvasDocument) => {
-    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || !documentState.writable || documentState.document === null
+    if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || !documentState.writable || documentState.document === null
       || documentEqual(documentState.document, next)) return;
     sourceBindingDraftRef.current = false;
     setHistory((current) => pushCanvasHistory(current, documentState.document!));
@@ -735,7 +769,7 @@ export function CanvasWorkspace({
   }, [applyDocument, documentState.document]);
 
   function commitNodePosition(node: CanvasGraphNode, x: number, y: number): void {
-    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || documentState.document === null) return;
+    if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || documentState.document === null) return;
     sourceBindingDraftRef.current = false;
     if (node.itemCollection !== undefined && node.itemId !== undefined) {
       documentState.edit(patchCanvasItem(documentState.document, node.itemCollection, node.itemId, { x, y }));
@@ -784,7 +818,7 @@ export function CanvasWorkspace({
   }
 
   function movePointer(event: ReactPointerEvent<HTMLElement>): void {
-    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || drag === null || event.pointerId !== drag.pointerId) return;
+    if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || drag === null || event.pointerId !== drag.pointerId) return;
     const dx = (event.clientX - drag.startX) / (drag.node === null ? 1 : viewport.zoom);
     const dy = (event.clientY - drag.startY) / (drag.node === null ? 1 : viewport.zoom);
     if (drag.node === null) {
@@ -879,7 +913,7 @@ export function CanvasWorkspace({
   }
 
   function undo(): void {
-    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || documentState.document === null) return;
+    if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || documentState.document === null) return;
     const result = undoCanvasHistory(history, documentState.document);
     if (result === null) return;
     sourceBindingDraftRef.current = false;
@@ -888,7 +922,7 @@ export function CanvasWorkspace({
   }
 
   function redo(): void {
-    if (sourceOutcomeUnresolved || generationMutationPendingRef.current || documentState.document === null) return;
+    if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || documentState.document === null) return;
     const result = redoCanvasHistory(history, documentState.document);
     if (result === null) return;
     sourceBindingDraftRef.current = false;
@@ -1018,7 +1052,7 @@ export function CanvasWorkspace({
   }
 
   function openSourceEditor(editor: WithoutLifecycle<CanvasSourceEditor>): void {
-    if (sourceWritesBlocked || (documentState.dirty && !sourceBindingDraftRef.current) || documentState.status === "saving"
+    if (sourceWritesBlocked || imageGenerationBlockedRef.current || (documentState.dirty && !sourceBindingDraftRef.current) || documentState.status === "saving"
       || documentState.status === "unknown" || documentState.status === "conflict"
       || generationMutationPendingRef.current) return;
     const lifecycle = new AbortController();
@@ -1057,7 +1091,7 @@ export function CanvasWorkspace({
     requestSignal: AbortSignal,
     ownerSignal?: AbortSignal,
   ): Promise<CanvasSourceWriteOutcome> {
-    if (sourceMutationPendingRef.current || generationMutationPendingRef.current || pendingSourceAcknowledgementRef.current !== null
+    if (sourceMutationPendingRef.current || generationMutationPendingRef.current || imageGenerationBlockedRef.current || pendingSourceAcknowledgementRef.current !== null
       || unknownSourceIntentRef.current !== null || sourceReadbackPending) {
       return { status: "conflict", message: "上一项来源操作尚未核对，当前操作没有发送。" };
     }
@@ -1225,7 +1259,7 @@ export function CanvasWorkspace({
   }
 
   async function verifySourceRead(signal: AbortSignal): Promise<string> {
-    if (sourceMutationPendingRef.current || generationMutationPendingRef.current) return "来源操作正在进行，请等待当前状态。";
+    if (sourceMutationPendingRef.current || generationMutationPendingRef.current || imageGenerationBlockedRef.current) return "来源操作正在进行，请等待当前状态。";
     const sourcePort = services.canvasSource;
     if (sourcePort === undefined) throw new CanvasSourceError("unsupported", "当前服务没有接入受控章节来源。");
     const epoch = scopeEpochRef.current;
@@ -1474,7 +1508,7 @@ export function CanvasWorkspace({
 
   async function undoCreation(undo: CanvasCreationUndo): Promise<void> {
     const frozen = sourcesRef.current;
-    if (frozen === null || frozen.version !== undo.sourceVersion || sourceWritesBlocked) return;
+    if (frozen === null || frozen.version !== undo.sourceVersion || sourceWritesBlocked || imageGenerationBlockedRef.current) return;
     const controller = new AbortController();
     try {
       await runSourceCommand({ type: "creation.undo", receipt: undo.receipt.token }, frozen, controller.signal);
@@ -1483,47 +1517,13 @@ export function CanvasWorkspace({
     }
   }
 
-  useEffect(() => {
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (closePrompt || sourceEditor !== null || !(event.target instanceof Node)
-        || !focus.dialogRef.current?.contains(event.target)) return;
-      const command = event.metaKey || event.ctrlKey;
-      const input = isTextInput(event.target);
-      if (command && event.key.toLowerCase() === "s") {
-        event.preventDefault();
-        if (!sourceOutcomeUnresolved && !generationMutationPendingRef.current) void documentState.saveNow();
-        return;
-      }
-      if (input) return;
-      if (command && event.key.toLowerCase() === "z") {
-        event.preventDefault();
-        if (event.shiftKey) redo();
-        else undo();
-      } else if (event.key.toLowerCase() === "f") {
-        event.preventDefault();
-        fitContent();
-      } else if (event.key === "Delete" || event.key === "Backspace") {
-        event.preventDefault();
-        removeSelected();
-      }
-    };
-    document.addEventListener("keydown", onKeyDown);
-    return () => document.removeEventListener("keydown", onKeyDown);
-  });
-
-  const close = useCallback(() => {
-    if (documentState.hasPendingWork() || sourceOutcomeUnresolved || generationIntentRef.current !== null
-      || generationBusyRef.current || generationMutationPendingRef.current) {
-      setClosePrompt(true);
-      return;
-    }
-    focus.markDismissed();
-    onClose();
-  }, [documentState, focus, onClose, sourceOutcomeUnresolved]);
-  closeRef.current = close;
+  function saveLayout(): void {
+    if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current) return;
+    void documentState.saveNow();
+  }
 
   async function saveAndClose(): Promise<void> {
-    if (sourceOutcomeUnresolved || generationIntentRef.current !== null
+    if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationIntentRef.current !== null
       || generationBusyRef.current || generationMutationPendingRef.current) return;
     setCloseBusy(true);
     const saved = await documentState.saveNow();
@@ -1535,7 +1535,7 @@ export function CanvasWorkspace({
   }
 
   function discardAndClose(): void {
-    if (generationIntentRef.current !== null || generationBusyRef.current || generationMutationPendingRef.current) return;
+    if (generationIntentRef.current !== null || generationBusyRef.current || generationMutationPendingRef.current || imageGenerationBlockedRef.current) return;
     documentState.discard();
     sourceOperationControllerRef.current?.abort();
     sourceEditorRef.current?.lifecycle.abort();
@@ -1574,7 +1574,240 @@ export function CanvasWorkspace({
     && services.canvasGenerationApplications !== undefined
     && services.canvasResultApplications !== undefined;
   const generationEntryDisabled = !generationPortsAvailable || selectedGenerationTarget === null
-    || sourceActionDisabled || documentState.dirty || generationDialog !== null || generationMutationPendingRef.current;
+    || sourceActionDisabled || documentState.dirty || generationDialog !== null || generationMutationPendingRef.current
+    || imageGenerationBlockedRef.current;
+  const selectedImageGenerationTargetKey = sources !== null && selectedSourceNode !== null && selectedGenerationTarget !== null
+    ? imageGenerationTargetKey(selectedSourceNode.ref, selectedGenerationTarget.target, sources.version)
+    : null;
+  const imageGeneration = useCanvasImageGenerationController({
+    contextKey: scopeKey,
+    serviceIdentity,
+    selectedTargetKey: selectedImageGenerationTargetKey,
+    creatorSettings: services.creatorSettings,
+    port: services.canvasImageGeneration,
+    validateTarget: validateImageGenerationTarget,
+    checkEditLock: checkImageGenerationEditLock,
+    acquireEditLock: acquireImageGenerationEditLock,
+    onGuardChange: updateImageGenerationGuard,
+  });
+  imageGenerationModeRef.current = imageGeneration.state.mode !== null;
+
+  const focus = useSeriesDialogFocus({
+    active: !closePrompt && sourceEditor === null && generationDialog === null && imageGeneration.state.mode === null,
+    canDismiss: true,
+    onDismiss: () => closeRef.current(),
+  });
+  const close = useCallback(() => {
+    if (documentState.hasPendingWork() || sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationIntentRef.current !== null
+      || generationBusyRef.current || generationMutationPendingRef.current) {
+      setClosePrompt(true);
+      return;
+    }
+    focus.markDismissed();
+    onClose();
+  }, [documentState, focus, onClose, sourceOutcomeUnresolved]);
+  closeRef.current = close;
+  const closePromptFocus = useSeriesDialogFocus({
+    active: closePrompt,
+    canDismiss: true,
+    onDismiss: () => setClosePrompt(false),
+  });
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (closePrompt || sourceEditor !== null || imageGenerationModeRef.current || !(event.target instanceof Node)
+        || !focus.dialogRef.current?.contains(event.target)) return;
+      const command = event.metaKey || event.ctrlKey;
+      const input = isTextInput(event.target);
+      if (command && event.key.toLowerCase() === "s") {
+        event.preventDefault();
+        if (!sourceOutcomeUnresolved && !imageGenerationBlockedRef.current && !generationMutationPendingRef.current) void documentState.saveNow();
+        return;
+      }
+      if (input) return;
+      if (command && event.key.toLowerCase() === "z") {
+        event.preventDefault();
+        if (event.shiftKey) redo();
+        else undo();
+      } else if (event.key.toLowerCase() === "f") {
+        event.preventDefault();
+        fitContent();
+      } else if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        removeSelected();
+      }
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  });
+
+  function createImageGenerationContext() {
+    const scope = createGenerationWorkspaceScope();
+    return {
+      actorId: scope.actorId,
+      seriesId: scope.seriesId,
+      chapterId: scope.chapterId,
+      isCurrent: () => isGenerationWorkspaceScopeCurrent(scope),
+    };
+  }
+
+  async function validateImageGenerationTarget(
+    target: CanvasImageGenerationTarget,
+    signal: AbortSignal,
+    requireSelection: boolean,
+  ): Promise<boolean> {
+    const sourcePort = services.canvasSource;
+    if (sourcePort === undefined || !target.context.isCurrent()) return false;
+    if (requireSelection && selectedNodeRef.current !== target.selectedRef) return false;
+
+    const snapshot = await sourcePort.read(target.context.chapterId, signal);
+    if (signal.aborted || !target.context.isCurrent()) return false;
+    if (!sourceSnapshotMatchesScope(snapshot)) {
+      setSourceMessage("章节来源响应与当前剧集或章节不匹配，未提交图片任务。");
+      return false;
+    }
+
+    const selected = graph.nodes.find((node) => node.ref === target.selectedRef);
+    const freshTarget = selected === undefined ? null : generationTargetForNode(snapshot, selected);
+    if (snapshot.version !== target.sourceVersion || snapshot.requires_lock !== target.requiresLock
+      || freshTarget === null || !sameGenerationTarget(freshTarget.target, target.destination)) {
+      applySourceSnapshot(snapshot);
+      if (requireSelection) selectCanvasNode(null);
+      setSourceMessage("原分镜或素材来源版本已变化。已只读刷新当前来源，未创建新任务或改绑原操作。");
+      return false;
+    }
+    if (requireSelection && selectedNodeRef.current !== target.selectedRef) return false;
+    return true;
+  }
+
+  async function checkImageGenerationEditLock(
+    target: CanvasImageGenerationTarget,
+    signal: AbortSignal,
+  ): Promise<CanvasImageGenerationLockResult> {
+    if (!target.requiresLock) return { status: "ready", message: "" };
+    const getLock = services.getChapterEditLock;
+    if (getLock === undefined) {
+      return { status: "unavailable", message: "当前无法确认章节编辑锁，未发送图片任务。" };
+    }
+    const lock = await getLock.call(services, target.context.chapterId, signal);
+    if (signal.aborted || !target.context.isCurrent()) {
+      return { status: "unavailable", message: "章节或会话已变化，未发送图片任务。" };
+    }
+    if (validCurrentLock(lock, target.context.actorId)) {
+      return { status: "ready", message: "已核实当前账号持有有效章节编辑锁。" };
+    }
+    if (lock.locked) {
+      return {
+        status: "needed",
+        message: lockIsOwnedBy(lock, target.context.actorId)
+          ? "当前账号的编辑锁已失效，请重新核对后再提交。"
+          : "章节编辑锁由其他成员持有，未发送图片任务。",
+      };
+    }
+    return { status: "needed", message: "当前账号尚未持有有效章节编辑锁。请明确取得锁后再次提交。" };
+  }
+
+  async function acquireImageGenerationEditLock(
+    target: CanvasImageGenerationTarget,
+    signal: AbortSignal,
+  ): Promise<CanvasImageGenerationLockResult> {
+    if (!target.requiresLock) return { status: "ready", message: "此章节不需要额外编辑锁。" };
+    const getLock = services.getChapterEditLock;
+    const acquireLock = services.acquireChapterEditLock;
+    if (getLock === undefined || acquireLock === undefined) {
+      return { status: "unavailable", message: "当前无法操作章节编辑锁，没有发送图片任务。" };
+    }
+
+    let lock = await getLock.call(services, target.context.chapterId, signal);
+    if (signal.aborted || !target.context.isCurrent()) {
+      return { status: "unavailable", message: "章节或会话已变化，没有取得编辑锁。" };
+    }
+    if (validCurrentLock(lock, target.context.actorId)) {
+      return { status: "ready", message: "已核实当前账号持有有效章节编辑锁。请再次明确提交图片任务。" };
+    }
+    if (lock.locked) {
+      return {
+        status: "needed",
+        message: lockIsOwnedBy(lock, target.context.actorId)
+          ? "当前账号的编辑锁已失效；没有自动续期或发送图片任务。"
+          : "其他成员正在编辑；未更改其锁，也没有发送图片任务。",
+      };
+    }
+
+    const acquired = await acquireLock.call(services, target.context.chapterId, signal);
+    if (acquired.lease !== null && target.context.isCurrent()) {
+      acquiredLockLeaseRef.current = { chapterId: target.context.chapterId, lease: acquired.lease };
+    }
+    if (signal.aborted || !target.context.isCurrent()) {
+      return { status: "unavailable", message: "章节或会话已变化，没有确认编辑锁。" };
+    }
+    lock = await getLock.call(services, target.context.chapterId, signal);
+    if (signal.aborted || !target.context.isCurrent()) {
+      return { status: "unavailable", message: "章节或会话已变化，没有确认编辑锁。" };
+    }
+    return validCurrentLock(lock, target.context.actorId)
+      ? { status: "ready", message: "已取得并核实当前章节编辑锁。请再次明确提交图片任务。" }
+      : { status: "needed", message: "取得锁后仍无法确认当前账号持有编辑锁，没有发送图片任务。" };
+  }
+
+  function captureImageGenerationTarget(): CanvasImageGenerationTarget | null {
+    const snapshot = sourcesRef.current;
+    const selectedRef = selectedNodeRef.current;
+    const selected = selectedRef === null ? null : graph.nodes.find((node) => node.ref === selectedRef) ?? null;
+    const resolved = snapshot === null || selected === null ? null : generationTargetForNode(snapshot, selected);
+    if (snapshot === null || selectedRef === null || selected === null || resolved === null) return null;
+    const context = createImageGenerationContext();
+    return {
+      selectedRef,
+      targetKey: imageGenerationTargetKey(selectedRef, resolved.target, snapshot.version),
+      destination: resolved.target,
+      targetLabel: resolved.label,
+      sourceVersion: snapshot.version,
+      requiresLock: snapshot.requires_lock,
+      promptSeed: imageGenerationPromptSeed(snapshot, selected),
+      context,
+    };
+  }
+
+  function openImageGeneration(): void {
+    if (services.canvasImageGeneration === undefined || services.creatorSettings === undefined
+      || services.canvasSource === undefined || imageGenerationBlockedRef.current) {
+      setSourceMessage("当前服务暂不能提交图片任务，请检查图片模型和画布服务接入。");
+      return;
+    }
+    const target = captureImageGenerationTarget();
+    if (target === null || !imageGeneration.openNew(target)) {
+      setSourceMessage("请选择身份可确认的分镜预览或角色、场景、道具素材后再生成图片。");
+    }
+  }
+
+  function openPendingImageGeneration(): void {
+    if (!imageGeneration.openPendingIntent()) setSourceMessage("当前没有可核对的图片任务提交。");
+  }
+
+  function openImageGenerationReceipt(): void {
+    if (!imageGeneration.openReceipt()) setSourceMessage("当前没有已确认的图片任务记录。");
+  }
+
+  function startAnotherImageGeneration(): void {
+    const target = captureImageGenerationTarget();
+    if (target === null || !imageGeneration.startNewFromReceipt(target)) {
+      setSourceMessage("请重新选择可确认的分镜或素材，再创建新的图片任务。");
+    }
+  }
+
+  const imageGenerationEntryDisabled = services.canvasSource === undefined
+    || services.creatorSettings === undefined || services.canvasImageGeneration === undefined
+    || selectedGenerationTarget === null || sourceActionDisabled || documentState.dirty
+    || generationDialog !== null || imageGeneration.state.mode !== null
+    || imageGenerationBlockedRef.current;
+  const imageGenerationDialogTargetLabel = imageGeneration.state.mode === "form"
+    ? imageGeneration.state.target?.targetLabel
+    : imageGeneration.state.mode === "intent"
+      ? imageGeneration.state.intent?.targetLabel ?? imageGeneration.state.target?.targetLabel
+      : imageGeneration.state.mode === "receipt"
+        ? imageGeneration.state.receipt?.targetLabel ?? imageGeneration.state.target?.targetLabel
+        : undefined;
 
   function generationDialogScope(dialog: CanvasGenerationDialogModel): GenerationWorkspaceScope {
     return createGenerationWorkspaceScope({
@@ -2175,7 +2408,7 @@ export function CanvasWorkspace({
           <div className="canvas-header-actions">
             <button className="secondary-button" disabled={sourceOutcomeUnresolved || !documentState.writable || history.undo.length === 0} onClick={undo} type="button">撤销</button>
             <button className="secondary-button" disabled={sourceOutcomeUnresolved || !documentState.writable || history.redo.length === 0} onClick={redo} type="button">重做</button>
-            <button className="primary-button" disabled={sourceOutcomeUnresolved || !documentState.dirty || documentState.status === "saving" || documentState.status === "unknown" || documentState.status === "conflict" || !documentState.writable} onClick={() => void documentState.saveNow()} type="button">保存布局</button>
+            <button className="primary-button" disabled={sourceOutcomeUnresolved || !documentState.dirty || documentState.status === "saving" || documentState.status === "unknown" || documentState.status === "conflict" || !documentState.writable} onClick={saveLayout} type="button">保存布局</button>
             <button aria-label="关闭创作画布" className="canvas-close-button" onClick={close} type="button">关闭</button>
           </div>
         </header>
@@ -2201,7 +2434,7 @@ export function CanvasWorkspace({
               return (
                 <button
                   aria-pressed={!hidden}
-                  disabled={!documentState.writable || duplicate}
+                  disabled={!documentState.writable || sourceOutcomeUnresolved || duplicate}
                   key={relation}
                   onClick={() => toggleRelation(relation)}
                   type="button"
@@ -2210,9 +2443,34 @@ export function CanvasWorkspace({
             })}
           </div>
           <div className="canvas-tool-row">
-            <button disabled={!documentState.writable} onClick={() => createTextItem("notes")} type="button">新增便签</button>
-            <button disabled={!documentState.writable} onClick={() => createTextItem("cards")} type="button">新增文本卡片</button>
+            <button disabled={!documentState.writable || sourceOutcomeUnresolved} onClick={() => createTextItem("notes")} type="button">新增便签</button>
+            <button disabled={!documentState.writable || sourceOutcomeUnresolved} onClick={() => createTextItem("cards")} type="button">新增文本卡片</button>
+            <button disabled={imageGenerationEntryDisabled} onClick={openImageGeneration} type="button">生成图片</button>
             <button disabled={generationEntryDisabled} onClick={openGenerationResults} type="button">生成图片记录</button>
+            {imageGeneration.busy && (
+              <span className="canvas-save-status" role="status">正在确认单张图片任务状态。请等待本次操作结束。</span>
+            )}
+            {imageGeneration.intent !== null && (
+              <>
+                <span className="canvas-save-status" role="alert">
+                  {imageGeneration.intent.state === "not-found"
+                    ? "暂未查到图片任务记录，之前请求仍可能稍后完成。"
+                    : "上次图片任务提交结果暂时无法确认，原操作已保留。"}
+                </span>
+                <button disabled={imageGeneration.busy || generationDialog !== null} onClick={openPendingImageGeneration} type="button">
+                  继续核对原提交
+                </button>
+              </>
+            )}
+            {imageGeneration.receipt !== null && imageGeneration.state.mode === null && (
+              <>
+                <span className="canvas-save-status" role="status">最近的单张图片任务已有受理记录。</span>
+                <button onClick={openImageGenerationReceipt} type="button">查看生成任务状态</button>
+              </>
+            )}
+            {(services.creatorSettings === undefined || services.canvasImageGeneration === undefined) && (
+              <span className="canvas-save-status" role="status">单张图片任务服务未接入。</span>
+            )}
             {generationIntent !== null && (
               <>
                 <span className="canvas-save-status" role="alert">
@@ -2225,15 +2483,15 @@ export function CanvasWorkspace({
                 </button>
               </>
             )}
-            <button aria-pressed={connecting} disabled={!documentState.writable} onClick={() => {
+            <button aria-pressed={connecting} disabled={!documentState.writable || sourceOutcomeUnresolved} onClick={() => {
               setConnecting((value) => !value);
               setConnectionSource(null);
             }} type="button">{connecting ? "取消连线" : "手动连线"}</button>
-            <button onClick={() => changeViewport({ ...viewport, zoom: clampZoom(viewport.zoom / 1.15) })} type="button" aria-label="缩小">−</button>
+            <button disabled={sourceOutcomeUnresolved} onClick={() => changeViewport({ ...viewport, zoom: clampZoom(viewport.zoom / 1.15) })} type="button" aria-label="缩小">−</button>
             <span>{Math.round(viewport.zoom * 100)}%</span>
-            <button onClick={() => changeViewport({ ...viewport, zoom: clampZoom(viewport.zoom * 1.15) })} type="button" aria-label="放大">＋</button>
-            <button onClick={fitContent} type="button">适配内容</button>
-            <button disabled={!documentState.writable || (selectedNode === null && selectedEdge === null)} onClick={removeSelected} type="button">删除选中</button>
+            <button disabled={sourceOutcomeUnresolved} onClick={() => changeViewport({ ...viewport, zoom: clampZoom(viewport.zoom * 1.15) })} type="button" aria-label="放大">＋</button>
+            <button disabled={sourceOutcomeUnresolved} onClick={fitContent} type="button">适配内容</button>
+            <button disabled={!documentState.writable || sourceOutcomeUnresolved || (selectedNode === null && selectedEdge === null)} onClick={removeSelected} type="button">删除选中</button>
             {!generationPortsAvailable && <span className="canvas-save-status" role="status">生成记录服务未完整接入。</span>}
             {generationPortsAvailable && selectedGenerationTarget === null && (
               <span className="canvas-save-status" role="status">选中身份可确认的分镜、预览或角色/场景/道具素材；视频不支持。</span>
@@ -2497,12 +2755,44 @@ export function CanvasWorkspace({
           />
         )}
 
+        {imageGeneration.state.mode !== null && (
+          <CanvasImageGenerationDialog
+            busy={imageGeneration.state.busy}
+            error={imageGeneration.state.error}
+            lockPending={imageGeneration.state.lockPending}
+            lockReady={imageGeneration.state.lockReady}
+            lockRequired={imageGeneration.state.target?.requiresLock ?? false}
+            lockActionAvailable={services.getChapterEditLock !== undefined && services.acquireChapterEditLock !== undefined}
+            message={imageGeneration.state.lockMessage ?? imageGeneration.state.message}
+            mode={imageGeneration.state.mode}
+            models={imageGeneration.state.models}
+            modelsLoading={imageGeneration.state.modelsLoading}
+            onAcquireLock={() => void imageGeneration.acquireLock()}
+            onChangePrompt={imageGeneration.setPrompt}
+            onClose={imageGeneration.close}
+            onLookup={() => void imageGeneration.lookupPendingIntent()}
+            onRetry={() => void imageGeneration.retryOriginalIntent()}
+            onSelectModel={imageGeneration.setSelectedModelId}
+            onStartNew={startAnotherImageGeneration}
+            onSubmit={() => void imageGeneration.submitNew()}
+            pendingIntent={imageGeneration.state.intent}
+            prompt={imageGeneration.state.prompt}
+            receipt={imageGeneration.state.receipt}
+            selectedModelId={imageGeneration.state.selectedModelId}
+            targetLabel={imageGenerationDialogTargetLabel ?? "单张图片任务"}
+          />
+        )}
+
         {closePrompt && (
           <div className="canvas-confirm-backdrop">
             <section aria-labelledby="canvas-close-title" aria-modal="true" className="canvas-close-confirm"
               ref={closePromptFocus.dialogRef} role="dialog" tabIndex={-1}>
               <h3 id="canvas-close-title">关闭创作画布</h3>
-              {sourceOutcomeUnresolved
+              {imageGenerationUnresolvedRef.current
+                ? <p>单张图片任务提交结果仍未确认。关闭画布不会取消可能已经提交的任务；请留在当前画布核对原操作。</p>
+                : imageGenerationBusyRef.current
+                  ? <p>单张图片任务正在处理。等待本次提交状态确认后再关闭画布。</p>
+                : sourceOutcomeUnresolved
                 ? <p>应用仍未确认。关闭画布不会撤回可能已完成的操作，也不会自动重新提交；请留在当前画布核对应用记录。</p>
                 : documentState.status === "unknown"
                 ? <p>保存结果尚未确认。放弃仅清除本地草稿，之前的服务器请求仍可能已经提交。</p>
@@ -2511,7 +2801,7 @@ export function CanvasWorkspace({
                 : <p>还有未确认的画布编辑。保存完成后再关闭，或继续留在画布中。</p>}
               <div>
                 <button
-                  disabled={sourceOutcomeUnresolved || generationMutationPendingRef.current || closeBusy || !documentState.writable || documentState.status === "unknown" || documentState.status === "conflict"}
+                  disabled={sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || closeBusy || !documentState.writable || documentState.status === "unknown" || documentState.status === "conflict"}
                   onClick={() => void saveAndClose()}
                   type="button"
                 >
@@ -2519,7 +2809,7 @@ export function CanvasWorkspace({
                 </button>
                 <button onClick={() => setClosePrompt(false)} type="button">继续编辑</button>
                 <button
-                  disabled={generationIntentRef.current !== null || generationBusyRef.current || generationMutationPendingRef.current}
+                  disabled={generationIntentRef.current !== null || generationBusyRef.current || generationMutationPendingRef.current || imageGenerationBlockedRef.current}
                   onClick={discardAndClose}
                   type="button"
                 >
