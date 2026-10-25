@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -23,6 +25,7 @@ from haoai_backend.chat_data.tables import chat_messages
 from haoai_backend.chat_media_admission import ChatMediaAdmissionConfiguration
 from haoai_backend.generation_catalog.admission import AdmissionPolicy
 from haoai_backend.generation_catalog.domain import ModelSource
+from haoai_backend.generation_catalog.tables import chapters as catalog_chapters
 from haoai_backend.generation_catalog.tables import system_models
 from haoai_backend.generation_core.admission_receipts import (
     AdmissionCommitUnknown,
@@ -440,6 +443,285 @@ def test_real_jwt_sqlite_producer_stages_each_route_and_confirms_fresh_receipt(
         assert all(thread_id != main_thread for _label, thread_id in system.events)
         assert all(session.info["observed_closed"] for session in system.auth_sessions)
         assert all(session.info["observed_closed"] for session in system.business_sessions)
+    finally:
+        system.engine.dispose()
+
+
+_NO_ID_CANVAS_FRAMES = [
+    {"text": "未绑定分镜", "storyboard": [None, ""]},
+    {"text": "目标画面", "storyboard": []},
+]
+
+
+def _canonical_json_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _strict_no_id_canvas_body(
+    *,
+    frame_index: object = 1,
+    frames: object | None = None,
+) -> dict[str, object]:
+    expected_frames = _NO_ID_CANVAS_FRAMES if frames is None else frames
+    body = _body("image.single")
+    body["target"] = {
+        "kind": "canvas_apply",
+        "destination": {
+            "kind": "frame_preview",
+            "chapter_id": "joint-chapter-1",
+            "identity_mode": "strict-no-id-v1",
+            "frame_index": frame_index,
+            "expected_chapter_digest": _canonical_json_digest(expected_frames),
+        },
+    }
+    return body
+
+
+def test_real_http_admits_strict_no_id_canvas_frame_with_locked_canonical_facts(
+    tmp_path: Path,
+) -> None:
+    system = _build_system(tmp_path)
+    raw_content = json.dumps(
+        _NO_ID_CANVAS_FRAMES,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    try:
+        with system.engine.begin() as connection:
+            connection.execute(
+                update(catalog_chapters)
+                .where(catalog_chapters.c.id == "joint-chapter-1")
+                .values(content=raw_content)
+            )
+
+        response = _post(
+            system,
+            "/api/chat/image",
+            body=_strict_no_id_canvas_body(),
+            key="strict-no-id-canvas-admission-01",
+        )
+
+        assert response.status_code == 200, response.text
+        receipt = response.json()
+        assert receipt["operation"] == "image.single"
+        assert receipt["billing_status"] == "charged"
+
+        with system.engine.connect() as connection:
+            task = connection.execute(
+                select(AITaskRow.__table__).where(
+                    AITaskRow.__table__.c.id == receipt["task_id"]
+                )
+            ).mappings().one()
+            target = json.loads(task["request_data"])["target_snapshot"]
+            source_storyboards = connection.execute(
+                select(catalog_chapters.c.content).where(
+                    catalog_chapters.c.id == "joint-chapter-1"
+                )
+            ).scalar_one()
+
+        assert target["kind"] == "canvas_frame_preview"
+        assert target["stable_storyboard_asset_id"] is None
+        assert target["compat_frame_index"] == 1
+        assert target["full_chapter_digest"] == _canonical_json_digest(
+            _NO_ID_CANVAS_FRAMES
+        )
+        assert target["full_frame_digest"] == _canonical_json_digest(
+            _NO_ID_CANVAS_FRAMES[1]
+        )
+        assert source_storyboards == raw_content
+    finally:
+        system.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "mutated_value", "expected_status", "expected_detail"),
+    (
+        ("identity_mode", None, 422, "请求格式无效"),
+        ("identity_mode", "strict-no-id-v2", 422, "请求格式无效"),
+        ("frame_index", True, 422, "请求格式无效"),
+        ("frame_index", -1, 422, "请求格式无效"),
+        ("expected_chapter_digest", "A" * 64, 422, "请求格式无效"),
+        ("unexpected", "must-be-rejected", 422, "请求格式无效"),
+        (
+            "storyboard_asset_id",
+            "must-not-fallback-to-stable-id",
+            422,
+            "请求格式无效",
+        ),
+        ("frame_index", 2, 409, "指定分镜不再是无稳定ID目标"),
+        (
+            "expected_chapter_digest",
+            "0" * 64,
+            409,
+            "章节内容与画布目标断言不一致",
+        ),
+    ),
+)
+def test_real_http_rejects_malformed_or_mixed_strict_no_id_identity_without_writes(
+    tmp_path: Path,
+    mutation: str,
+    mutated_value: object,
+    expected_status: int,
+    expected_detail: str,
+) -> None:
+    system = _build_system(tmp_path)
+    raw_content = json.dumps(
+        _NO_ID_CANVAS_FRAMES,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    body = _strict_no_id_canvas_body()
+    destination = body["target"]["destination"]
+    if mutated_value is None:
+        destination.pop(mutation)
+    else:
+        destination[mutation] = mutated_value
+    try:
+        with system.engine.begin() as connection:
+            connection.execute(
+                update(catalog_chapters)
+                .where(catalog_chapters.c.id == "joint-chapter-1")
+                .values(content=raw_content)
+            )
+
+        response = _post(
+            system,
+            "/api/chat/image",
+            body=body,
+            key=f"strict-no-id-invalid-{mutation}",
+        )
+
+        assert response.status_code == expected_status, response.text
+        assert response.json() == {"detail": expected_detail}
+        if expected_status == 422:
+            assert system.business_sessions == []
+        with system.engine.connect() as connection:
+            assert connection.execute(select(AITaskRow.__table__)).all() == []
+            assert connection.execute(select(CreditLogRow.__table__)).all() == []
+            assert connection.execute(
+                select(UserCreditRow.__table__.c.credits)
+            ).scalar_one() == 500
+    finally:
+        system.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("chapter_content", "digest_frames", "expected_status"),
+    (
+        (
+            json.dumps(
+                [
+                    {"text": "兄弟帧", "storyboard": [None, ""]},
+                    {"text": "已绑定目标", "storyboard": ["existing-storyboard-id"]},
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            [
+                {"text": "兄弟帧", "storyboard": [None, ""]},
+                {"text": "已绑定目标", "storyboard": ["existing-storyboard-id"]},
+            ],
+            409,
+        ),
+        (
+            '[{"text":"重复键","text":"重复键覆盖"},{"text":"目标","storyboard":[]}]',
+            None,
+            422,
+        ),
+        (
+            '[{"text":"非有限值","value":NaN},{"text":"目标","storyboard":[]}]',
+            None,
+            422,
+        ),
+        ('[null,{"text":"目标","storyboard":[]}]', None, 422),
+        ('{"text":"根不是数组"}', None, 422),
+        ('not-json', None, 422),
+        (
+            json.dumps(
+                [
+                    {"text": "兄弟帧", "storyboard": [None, ""]},
+                    {"text": "重复引用", "storyboard": ["same-id", "same-id"]},
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            [
+                {"text": "兄弟帧", "storyboard": [None, ""]},
+                {"text": "重复引用", "storyboard": ["same-id", "same-id"]},
+            ],
+            409,
+        ),
+        (
+            json.dumps(
+                [
+                    {"text": "兄弟帧", "storyboard": [None, ""]},
+                    {"text": "非法空白引用", "storyboard": [" "]},
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            [
+                {"text": "兄弟帧", "storyboard": [None, ""]},
+                {"text": "非法空白引用", "storyboard": [" "]},
+            ],
+            409,
+        ),
+        (
+            json.dumps(
+                [
+                    {"text": "兄弟帧", "storyboard": [None, ""]},
+                    {"text": "非数组引用", "storyboard": "existing-storyboard-id"},
+                ],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            [
+                {"text": "兄弟帧", "storyboard": [None, ""]},
+                {"text": "非数组引用", "storyboard": "existing-storyboard-id"},
+            ],
+            409,
+        ),
+    ),
+)
+def test_real_http_rejects_existing_or_invalid_strict_no_id_chapter_without_writes(
+    tmp_path: Path,
+    chapter_content: str,
+    digest_frames: object | None,
+    expected_status: int,
+) -> None:
+    system = _build_system(tmp_path)
+    body = _strict_no_id_canvas_body(frames=digest_frames)
+    if digest_frames is None:
+        body["target"]["destination"]["expected_chapter_digest"] = "0" * 64
+    try:
+        with system.engine.begin() as connection:
+            connection.execute(
+                update(catalog_chapters)
+                .where(catalog_chapters.c.id == "joint-chapter-1")
+                .values(content=chapter_content)
+            )
+
+        response = _post(
+            system,
+            "/api/chat/image",
+            body=body,
+            key="strict-no-id-invalid-locked-chapter",
+        )
+
+        assert response.status_code == expected_status, response.text
+        with system.engine.connect() as connection:
+            assert connection.execute(select(AITaskRow.__table__)).all() == []
+            assert connection.execute(select(CreditLogRow.__table__)).all() == []
+            assert connection.execute(
+                select(UserCreditRow.__table__.c.credits)
+            ).scalar_one() == 500
     finally:
         system.engine.dispose()
 

@@ -54,6 +54,8 @@ class _TargetSpec:
     asset_id: str | None = None
     stable_storyboard: bool = False
     frame_index: int | None = None
+    identity_mode: str | None = None
+    expected_chapter_digest: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,6 +451,14 @@ def _single_target(
             raise _PreparationFailure(_refusal(422, "video_canvas_unsupported", "画布目标仅支持单图操作"))
         destination = raw["destination"]
         if destination["kind"] == "frame_preview":
+            if destination.get("identity_mode") == "strict-no-id-v1":
+                return _TargetSpec(
+                    "canvas_frame_preview",
+                    chapter_id=destination["chapter_id"],
+                    frame_index=destination["frame_index"],
+                    identity_mode="strict-no-id-v1",
+                    expected_chapter_digest=destination["expected_chapter_digest"],
+                )
             return _TargetSpec(
                 "canvas_frame_preview",
                 destination["chapter_id"],
@@ -574,6 +584,7 @@ def _locked_target_facts(
         chapter_digest = _digest_text(chapter["content"] or "")
         asset = None
         asset_digest = None
+        canonical_chapter_digest = None
         if target.asset_type and target.asset_id:
             asset = resources.asset_rows.get((target.asset_type, target.asset_id))
             if asset is None:
@@ -605,6 +616,33 @@ def _locked_target_facts(
             if len(matches) != 1:
                 return _refusal(422, "stable_storyboard_ambiguous", "分镜目标缺失或存在歧义")
             frame_index = matches[0]
+        elif target.identity_mode == "strict-no-id-v1":
+            canonical_frames = _parse_canonical_chapter_frames(chapter["content"])
+            if canonical_frames is None:
+                return _refusal(
+                    422,
+                    "canvas_chapter_invalid",
+                    "无稳定ID目标要求有效的完整章节JSON",
+                )
+            frames, canonical_chapter_digest = canonical_frames
+            if canonical_chapter_digest != target.expected_chapter_digest:
+                return _refusal(
+                    409,
+                    "canvas_chapter_changed",
+                    "章节内容与画布目标断言不一致",
+                )
+            frame_index = target.frame_index
+            if (
+                type(frame_index) is not int
+                or frame_index < 0
+                or frame_index >= len(frames)
+                or not _frame_has_no_storyboard_identity(frames[frame_index])
+            ):
+                return _refusal(
+                    409,
+                    "canvas_frame_identity_changed",
+                    "指定分镜不再是无稳定ID目标",
+                )
         elif frame_index is not None:
             frames = _chapter_frames(chapter["content"])
             if frame_index < 0 or frame_index >= len(frames):
@@ -620,6 +658,9 @@ def _locked_target_facts(
                 frame_index=frame_index,
                 chapter_digest=chapter_digest,
                 asset_digest=asset_digest,
+                identity_mode=target.identity_mode,
+                expected_chapter_digest=target.expected_chapter_digest,
+                canonical_chapter_digest=canonical_chapter_digest,
             )
         )
     return tuple(facts)
@@ -633,6 +674,51 @@ def _chapter_frames(raw_content: object) -> list[object]:
     except (TypeError, ValueError, json.JSONDecodeError):
         return []
     return value if isinstance(value, list) else []
+
+
+def _parse_canonical_chapter_frames(
+    raw_content: object,
+) -> tuple[list[Mapping[str, object]], str] | None:
+    if not isinstance(raw_content, str) or not raw_content:
+        return None
+    try:
+        frames = json.loads(
+            raw_content,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(frames, list) or any(
+        not isinstance(frame, Mapping) for frame in frames
+    ):
+        return None
+    try:
+        return frames, _digest_json(frames)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("chapter JSON contains a duplicate object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"chapter JSON contains a non-finite value: {value}")
+
+
+def _frame_has_no_storyboard_identity(frame: Mapping[str, object]) -> bool:
+    if "storyboard" not in frame:
+        return True
+    references = frame["storyboard"]
+    return isinstance(references, list) and all(
+        reference is None or reference == "" for reference in references
+    )
 
 
 def _asset_digest(asset: Mapping[str, object]) -> str:

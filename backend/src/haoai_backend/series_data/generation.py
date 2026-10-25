@@ -285,8 +285,9 @@ def _stage_frame_mutation(
         return ApplicationOutcome("write_failed", receipt.result_ref, None, None, "result owner and task do not match the authority")
     if not target.series_id or not target.chapter_id or not _has_series_access(session, actor_id, target.series_id):
         return ApplicationOutcome("write_failed", receipt.result_ref, None, None, "current series access is unavailable")
-    if preview and not target.stable_storyboard_asset_id:
-        return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "preview application requires a stable storyboard id")
+    strict_no_id_canvas = preview and _is_strict_no_id_canvas_target(target)
+    if preview and not target.stable_storyboard_asset_id and not strict_no_id_canvas:
+        return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "preview application requires a stable or strict no-ID target")
     try:
         old_digest = expected_target_digest(target)
         target_scope = target_scope_for_snapshot(target)
@@ -305,12 +306,31 @@ def _stage_frame_mutation(
     ).with_for_update()).mappings().one_or_none()
     if chapter is None:
         return ApplicationOutcome("target_deleted", receipt.result_ref, None, None, "target chapter was deleted")
-    frames = _parse_frames(chapter["content"])
-    if frames is None:
-        return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "chapter content is not a valid frame list")
-    current_identity_index = _resolve_current_frame_identity(frames, target)
-    if current_identity_index is None:
-        return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "current frame identity is missing or ambiguous")
+    if strict_no_id_canvas:
+        replay = current_target_application(session, receipt, target, old_digest)
+        if replay is not None:
+            return replay
+        canonical_chapter = _parse_canonical_chapter(chapter["content"])
+        if canonical_chapter is None:
+            return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "chapter content is not a canonical frame list")
+        frames, chapter_digest = canonical_chapter
+        if chapter_digest != target.full_chapter_digest:
+            return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "chapter changed after no-ID canvas admission")
+        current_identity_index = target.compat_frame_index
+        if (
+            type(current_identity_index) is not int
+            or current_identity_index < 0
+            or current_identity_index >= len(frames)
+            or not _frame_has_no_storyboard_identity(frames[current_identity_index])
+        ):
+            return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "no-ID canvas frame identity changed")
+    else:
+        frames = _parse_frames(chapter["content"])
+        if frames is None:
+            return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "chapter content is not a valid frame list")
+        current_identity_index = _resolve_current_frame_identity(frames, target)
+        if current_identity_index is None:
+            return ApplicationOutcome("target_conflict", receipt.result_ref, None, None, "current frame identity is missing or ambiguous")
     storyboard_id = target.stable_storyboard_asset_id
     asset = None
     if storyboard_id:
@@ -331,17 +351,18 @@ def _stage_frame_mutation(
             _local_stop_signal=local_stop_signal,
         )
 
-    replay = current_target_application(session, receipt, target, old_digest)
-    if replay is not None:
-        if isinstance(authority, (ClaimAuthority, ContinuationClaimAuthority)):
-            confirm_worker_fence_after_target_lock(
-                session,
-                authority,
-                receipt=receipt,
-                target=target,
-                _local_stop_signal=local_stop_signal,
-            )
-        return replay
+    if not strict_no_id_canvas:
+        replay = current_target_application(session, receipt, target, old_digest)
+        if replay is not None:
+            if isinstance(authority, (ClaimAuthority, ContinuationClaimAuthority)):
+                confirm_worker_fence_after_target_lock(
+                    session,
+                    authority,
+                    receipt=receipt,
+                    target=target,
+                    _local_stop_signal=local_stop_signal,
+                )
+            return replay
 
     frame_index = _resolve_frame_index(frames, target)
     if frame_index is None:
@@ -500,6 +521,82 @@ def _resolve_frame_index(frames: list[Any], target: TargetSnapshot) -> int | Non
     if 0 <= index < len(frames) and isinstance(frames[index], dict):
         return index
     return None
+
+
+def _is_strict_no_id_canvas_target(target: TargetSnapshot) -> bool:
+    return bool(
+        target.kind == "canvas_frame_preview"
+        and target.stable_storyboard_asset_id is None
+        and type(target.compat_frame_index) is int
+        and target.compat_frame_index >= 0
+        and _is_lower_sha256(target.full_chapter_digest)
+        and _is_lower_sha256(target.full_frame_digest)
+    )
+
+
+def _is_lower_sha256(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _parse_canonical_chapter(
+    content: object,
+) -> tuple[list[dict[str, Any]], str] | None:
+    if not isinstance(content, str) or not content:
+        return None
+    try:
+        frames = json.loads(
+            content,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(frames, list) or any(
+        not isinstance(frame, dict) for frame in frames
+    ):
+        return None
+    try:
+        digest = _strict_canonical_digest(frames)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return frames, digest
+
+
+def _unique_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("chapter JSON contains a duplicate object key")
+        result[key] = value
+    return result
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"chapter JSON contains a non-finite value: {value}")
+
+
+def _strict_canonical_digest(value: object) -> str:
+    encoded = json.dumps(
+        value,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _frame_has_no_storyboard_identity(frame: Mapping[str, Any]) -> bool:
+    if "storyboard" not in frame:
+        return True
+    references = frame["storyboard"]
+    return isinstance(references, list) and all(
+        reference is None or reference == "" for reference in references
+    )
 
 
 def _frame_storyboard_id(frame: dict[str, Any]) -> str | None:
