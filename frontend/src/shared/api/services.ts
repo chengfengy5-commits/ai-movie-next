@@ -11,6 +11,8 @@ import { CanvasDataError, type CanvasDataPort, type CanvasEnvelope } from "./can
 import { createCanvasSourceHttpPort, type CanvasSourcePort } from "./canvasSources";
 import { createCanvasResultApplicationsHttpPort } from "./canvasResultApplicationsHttp";
 import type { CanvasResultApplicationsPort } from "./canvasResultApplications";
+import { createCanvasOwnedResultsHttpPort } from "./canvasOwnedResultsHttp";
+import type { CanvasOwnedResultsPort } from "./canvasOwnedResults";
 import {
   parseAccountActionReceipt,
   parseEmailCodeReceipt,
@@ -218,6 +220,7 @@ export interface WorkspaceServices {
   readonly canvasData?: CanvasDataPort;
   readonly canvasSource?: CanvasSourcePort;
   readonly canvasResultApplications?: CanvasResultApplicationsPort;
+  readonly canvasOwnedResults?: CanvasOwnedResultsPort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
@@ -2918,6 +2921,12 @@ export function createApiServices(
     canvasData: createCanvasDataHttpPort(apiBaseUrl, { storage, fetcher }),
     canvasSource: createCanvasSourceHttpPort(apiBaseUrl, { storage, fetcher, timeoutMs }),
     canvasResultApplications: createCanvasResultApplicationsHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    canvasOwnedResults: createCanvasOwnedResultsHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,
