@@ -1,0 +1,225 @@
+.canvas-image-generation-backdrop {
+  position: absolute;
+  inset: 0;
+  z-index: 22;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgb(15 23 42 / 46%);
+}
+
+.canvas-image-generation-dialog {
+  display: flex;
+  width: min(680px, 100%);
+  max-height: min(720px, 100%);
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid #dbe2ea;
+  border-radius: 16px;
+  background: #fff;
+  color: #172033;
+  box-shadow: 0 24px 80px rgb(15 23 42 / 28%);
+}
+
+.canvas-image-generation-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 22px 16px;
+  border-bottom: 1px solid #e2e8f0;
+}
+
+.canvas-image-generation-heading .eyebrow {
+  margin: 0 0 4px;
+  color: #64748b;
+  font-size: 12px;
+}
+
+.canvas-image-generation-heading h2 {
+  margin: 0 0 8px;
+  font-size: 20px;
+}
+
+.canvas-image-generation-heading p:last-child {
+  margin: 0;
+  color: #64748b;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.canvas-image-generation-close,
+.canvas-image-generation-actions button,
+.canvas-image-generation-footer button,
+.canvas-image-generation-lock button {
+  min-height: 36px;
+  padding: 7px 11px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #334155;
+  font: inherit;
+  cursor: pointer;
+}
+
+.canvas-image-generation-close {
+  width: 36px;
+  padding: 0;
+  font-size: 22px;
+  line-height: 1;
+}
+
+.canvas-image-generation-dialog button:disabled,
+.canvas-image-generation-dialog select:disabled,
+.canvas-image-generation-dialog textarea:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.canvas-image-generation-form,
+.canvas-image-generation-pending,
+.canvas-image-generation-receipt {
+  display: grid;
+  gap: 14px;
+  overflow-y: auto;
+  padding: 18px 22px 22px;
+}
+
+.canvas-image-generation-form label {
+  display: grid;
+  gap: 6px;
+  color: #334155;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.canvas-image-generation-form select,
+.canvas-image-generation-form textarea {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 9px 10px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+  background: #fff;
+  color: #172033;
+  font: inherit;
+  font-weight: 400;
+}
+
+.canvas-image-generation-form textarea {
+  min-height: 130px;
+  resize: vertical;
+}
+
+.canvas-image-generation-lock,
+.canvas-image-generation-pending,
+.canvas-image-generation-receipt,
+.canvas-image-generation-message,
+.canvas-image-generation-error {
+  border: 1px solid #dbeafe;
+  border-radius: 9px;
+  background: #eff6ff;
+  color: #1e3a8a;
+  font-size: 13px;
+  line-height: 1.55;
+}
+
+.canvas-image-generation-lock {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 10px 12px;
+}
+
+.canvas-image-generation-lock p,
+.canvas-image-generation-pending p,
+.canvas-image-generation-receipt p,
+.canvas-image-generation-message,
+.canvas-image-generation-error {
+  margin: 0;
+}
+
+.canvas-image-generation-error {
+  padding: 10px 12px;
+  border-color: #fecaca;
+  background: #fef2f2;
+  color: #991b1b;
+}
+
+.canvas-image-generation-message {
+  padding: 10px 12px;
+  border-color: #e2e8f0;
+  background: #f8fafc;
+  color: #475569;
+}
+
+.canvas-image-generation-pending {
+  margin: 18px 22px 22px;
+  padding: 12px;
+}
+
+.canvas-image-generation-receipt {
+  margin: 18px 22px 22px;
+  padding: 12px;
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+  color: #166534;
+}
+
+.canvas-image-generation-details {
+  padding-top: 8px;
+  border-top: 1px solid rgb(100 116 139 / 25%);
+  overflow-wrap: anywhere;
+}
+
+.canvas-image-generation-details summary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.canvas-image-generation-details p {
+  margin: 7px 0 0;
+  color: #475569;
+}
+
+.canvas-image-generation-actions,
+.canvas-image-generation-footer {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.canvas-image-generation-footer {
+  justify-content: flex-end;
+  padding-top: 4px;
+}
+
+.canvas-image-generation-footer button:first-child,
+.canvas-image-generation-actions button:first-child,
+.canvas-image-generation-lock button {
+  border-color: #4f46e5;
+  background: #4f46e5;
+  color: #fff;
+}
+
+@media (max-width: 680px) {
+  .canvas-image-generation-backdrop {
+    padding: 10px;
+  }
+
+  .canvas-image-generation-heading,
+  .canvas-image-generation-form,
+  .canvas-image-generation-pending,
+  .canvas-image-generation-receipt {
+    padding-left: 14px;
+    padding-right: 14px;
+  }
+
+  .canvas-image-generation-pending,
+  .canvas-image-generation-receipt {
+    margin-left: 14px;
+    margin-right: 14px;
+  }
+}
