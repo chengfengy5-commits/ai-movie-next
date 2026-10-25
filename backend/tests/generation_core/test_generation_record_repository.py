@@ -1,10 +1,11 @@
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import pytest
 
-from sqlalchemy import create_engine, update
+from sqlalchemy import create_engine, event, func, select, update
 from sqlalchemy.orm import Session
 
 from haoai_backend.generation_contracts.records import (
@@ -16,6 +17,11 @@ from haoai_backend.generation_contracts.records import (
     StreamFeeRecord,
     UnitFeeDecision,
 )
+from haoai_backend.generation_contracts.canvas_targets import (
+    canonical_target_snapshot_digest,
+    target_snapshot_mapping,
+)
+from haoai_backend.generation_contracts.types import TargetSnapshot
 from haoai_backend.generation_core.base_schema import (
     AITaskRow,
     BillingUnitRow,
@@ -26,7 +32,14 @@ from haoai_backend.generation_core.base_schema import (
     UserRow,
 )
 from haoai_backend.generation_core.persistence import GenerationRecordRepository
-from haoai_backend.generation_core.schema import ApplicationRecordRow, FoundationBase, UnitFeeDecisionRow
+from haoai_backend.generation_core.schema import (
+    ApplicationRecordRow,
+    FoundationBase,
+    GenerationAuxiliaryBase,
+    GenerationResultReceiptRow,
+    GenerationResultTargetRow,
+    UnitFeeDecisionRow,
+)
 
 
 def _id() -> str:
@@ -152,6 +165,35 @@ def _receipt_for_seed(seeded: dict[str, object], *, operation: str = "video.sing
     )
 
 
+def _canvas_receipt_for_seed(
+    session: Session,
+    seeded: dict[str, object],
+    *,
+    submission_target: TargetSnapshot | None = None,
+) -> tuple[TargetSnapshot, GenerationResultReceipt]:
+    target = TargetSnapshot(
+        kind="canvas_asset_image",
+        chapter_id="chapter-canvas",
+        series_id="series-canvas",
+        asset_type="character",
+        asset_id="character-canvas",
+        same_series_target_digest="a" * 64,
+    )
+    payload = target_snapshot_mapping(target)
+    task = session.get(AITaskRow, seeded["task_id"])
+    unit = session.get(BillingUnitRow, seeded["unit_id"])
+    submission = session.get(ExternalSubmissionRow, seeded["submission_ids"][0])
+    assert task is not None and unit is not None and submission is not None
+    task.type = "image-single"
+    task.request_data = json.dumps({"target_snapshot": payload}, sort_keys=True)
+    unit.operation = "image.single"
+    submission.request_snapshot = {
+        "target_snapshot": target_snapshot_mapping(submission_target or target)
+    }
+    receipt = _receipt_for_seed(seeded, operation="image.single")
+    return target, receipt
+
+
 def _continuation_for_seed(
     seeded: dict[str, object],
     result: GenerationResultReceipt,
@@ -234,6 +276,81 @@ def test_repository_stages_valid_receipt_and_detects_natural_key_conflict() -> N
     ) == receipt
     assert session.in_transaction()
     session.rollback()
+    session.close()
+
+
+def test_new_canvas_receipt_stages_one_projection_and_replay_does_not_repair() -> None:
+    session, seeded = _seed_session()
+    GenerationAuxiliaryBase.metadata.create_all(session.get_bind())
+    target, receipt = _canvas_receipt_for_seed(session, seeded)
+    repository = GenerationRecordRepository(session)
+
+    created = repository.stage_record(receipt)
+    projection = session.get(GenerationResultTargetRow, receipt.result_ref)
+    replay = repository.stage_record(receipt)
+    projection_count = session.execute(
+        select(func.count()).select_from(GenerationResultTargetRow)
+    ).scalar_one()
+    assert projection is not None
+    assert created.status == "created"
+    assert projection.target_kind == "canvas_asset_image"
+    assert projection.target_identity == "asset|character|character-canvas"
+    assert projection.target_snapshot_digest == canonical_target_snapshot_digest(target)
+    assert replay.status == "same"
+    assert projection_count == 1
+
+    session.delete(projection)
+    session.flush()
+    assert repository.stage_record(receipt).status == "same"
+    assert session.get(GenerationResultTargetRow, receipt.result_ref) is None
+    session.rollback()
+    session.close()
+
+
+def test_canvas_receipt_with_disagreeing_original_targets_is_not_staged() -> None:
+    session, seeded = _seed_session()
+    GenerationAuxiliaryBase.metadata.create_all(session.get_bind())
+    _target, receipt = _canvas_receipt_for_seed(
+        session,
+        seeded,
+        submission_target=TargetSnapshot(
+            kind="canvas_asset_image",
+            chapter_id="chapter-canvas",
+            series_id="series-canvas",
+            asset_type="character",
+            asset_id="different-character",
+            same_series_target_digest="a" * 64,
+        ),
+    )
+    result = GenerationRecordRepository(session).stage_record(receipt)
+
+    assert result.status == "invalid_binding"
+    assert session.get(GenerationResultReceiptRow, receipt.result_ref) is None
+    assert session.execute(select(GenerationResultTargetRow)).scalars().all() == []
+    session.rollback()
+    session.close()
+
+
+def test_projection_flush_failure_leaves_no_committed_receipt_after_rollback() -> None:
+    session, seeded = _seed_session()
+    GenerationAuxiliaryBase.metadata.create_all(session.get_bind())
+    _target, receipt = _canvas_receipt_for_seed(session, seeded)
+
+    def fail_projection_flush(current_session, _flush_context, _instances) -> None:
+        if any(
+            isinstance(row, GenerationResultTargetRow)
+            for row in current_session.new
+        ):
+            raise RuntimeError("synthetic projection insert failure")
+
+    event.listen(session, "before_flush", fail_projection_flush)
+    with pytest.raises(RuntimeError, match="synthetic projection insert failure"):
+        GenerationRecordRepository(session).stage_record(receipt)
+    event.remove(session, "before_flush", fail_projection_flush)
+    session.rollback()
+
+    assert session.get(GenerationResultReceiptRow, receipt.result_ref) is None
+    assert session.execute(select(GenerationResultTargetRow)).scalars().all() == []
     session.close()
 
 

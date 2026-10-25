@@ -13,6 +13,7 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
+    Index,
     Integer,
     JSON,
     String,
@@ -55,8 +56,16 @@ from .base_schema import (
 
 GENERATION_SCHEMA_VERSION = "0001_generation_shared_records"
 GENERATION_SCHEMA_CHECKSUM = "4a5555181658fae91d035235a021d06fdbf3dde4ad0271375498fa9e57736bfa"
+CANVAS_RESULT_TARGETS_SCHEMA_VERSION = "0002_canvas_result_targets"
+CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM = "1d9482fc951fc4e13d9c0c3fe5c74fb3e605045a0427306d25906872cfda1f67"
+GENERATION_CURRENT_SCHEMA_VERSION = CANVAS_RESULT_TARGETS_SCHEMA_VERSION
+GENERATION_CURRENT_SCHEMA_CHECKSUM = CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM
 GENERATION_MIGRATION_HISTORY_TABLE = "generation_schema_migrations"
-GENERATION_SUPPORTED_VERSIONS = (GENERATION_SCHEMA_VERSION,)
+GENERATION_SUPPORTED_VERSIONS = (
+    GENERATION_SCHEMA_VERSION,
+    CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
+)
+CANVAS_RESULT_TARGETS_TABLE_NAME = "generation_result_targets"
 
 
 class UnitFeeDecisionRow(FoundationBase):
@@ -108,6 +117,40 @@ class GenerationResultReceiptRow(FoundationBase):
     late_disposition = Column(String(64), nullable=True)
     policy_stop_disposition = Column(String(64), nullable=True)
     automatic_application_allowed = Column(Boolean, nullable=False)
+
+
+GenerationAuxiliaryBase = declarative_base()
+
+
+class GenerationResultTargetRow(GenerationAuxiliaryBase):
+    """Search projection for a canonical result's immutable original target."""
+
+    __tablename__ = CANVAS_RESULT_TARGETS_TABLE_NAME
+    __table_args__ = (
+        CheckConstraint(
+            "target_kind IN ('canvas_frame_preview', 'canvas_asset_image')",
+            name="ck_generation_result_targets_kind",
+        ),
+        Index(
+            "ix_generation_result_targets_page",
+            "owner_id",
+            "chapter_id",
+            "target_kind",
+            "target_identity",
+            "generation_fulfilled_at",
+            "result_ref",
+        ),
+    )
+
+    result_ref = Column(String(36), primary_key=True)
+    owner_id = Column(String(36), nullable=False)
+    task_id = Column(String(36), nullable=False)
+    series_id = Column(String(36), nullable=False)
+    chapter_id = Column(String(36), nullable=False)
+    target_kind = Column(String(64), nullable=False)
+    target_identity = Column(String(255), nullable=False)
+    target_snapshot_digest = Column(String(64), nullable=False)
+    generation_fulfilled_at = Column(DateTime(timezone=False), nullable=False)
 
 
 class ApplicationRecordRow(FoundationBase):
@@ -363,12 +406,20 @@ class CheckRequirement:
 
 
 @dataclass(frozen=True, slots=True)
+class IndexRequirement:
+    columns: tuple[str, ...]
+    unique: bool = False
+    name: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class TableRequirement:
     columns: Mapping[str, ColumnRequirement]
     primary_key: tuple[str, ...]
     foreign_keys: tuple[ForeignKeyRequirement, ...] = ()
     unique_constraints: tuple[UniqueRequirement, ...] = ()
     checks: tuple[CheckRequirement, ...] = ()
+    indexes: tuple[IndexRequirement, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,12 +457,24 @@ class CatalogCheck:
 
 
 @dataclass(frozen=True, slots=True)
+class CatalogIndex:
+    columns: tuple[str, ...]
+    name: str | None
+    unique: bool
+    effective: bool | None = True
+    ready: bool | None = True
+    live: bool | None = True
+    predicate: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class CatalogTable:
     columns: Mapping[str, CatalogColumn]
     primary_key: tuple[str, ...]
     foreign_keys: tuple[CatalogForeignKey, ...]
     unique_constraints: tuple[CatalogUnique, ...]
     checks: tuple[CatalogCheck, ...]
+    indexes: tuple[CatalogIndex, ...] = ()
 
 
 class CatalogReader(Protocol):
@@ -495,6 +558,23 @@ class SQLAlchemyCatalog:
             return False, None
         return bool(row[0] and row[1] and row[2]), row[3]
 
+    def _index_readiness(self, table_name: str, index_name: str):
+        row = self._connection.execute(
+            text(
+                "SELECT idx.indisvalid, idx.indisready, idx.indislive, "
+                "pg_catalog.pg_get_expr(idx.indpred, idx.indrelid) "
+                "FROM pg_catalog.pg_index AS idx "
+                "JOIN pg_catalog.pg_class AS table_class ON table_class.oid = idx.indrelid "
+                "JOIN pg_catalog.pg_class AS index_class ON index_class.oid = idx.indexrelid "
+                "WHERE idx.indrelid = pg_catalog.to_regclass(:table_name) "
+                "AND index_class.relname = :index_name"
+            ),
+            {"table_name": table_name, "index_name": index_name},
+        ).one_or_none()
+        if row is None:
+            return False, False, False, None
+        return bool(row[0]), bool(row[1]), bool(row[2]), row[3]
+
     def table_names(self) -> set[str]:
         return set(self._inspector.get_table_names())
 
@@ -523,6 +603,7 @@ class SQLAlchemyCatalog:
                 )
             )
         unique_constraints = []
+        indexes = []
         for item in self._inspector.get_unique_constraints(name):
             state = self._constraint_state(name, item.get("name"), "u") if self._connection.dialect.name == "postgresql" else None
             index_name = None if state is None else state[2]
@@ -543,28 +624,44 @@ class SQLAlchemyCatalog:
                 )
             )
         for item in self._inspector.get_indexes(name):
-            if not item.get("unique"):
-                continue
             index_name = str(item.get("name") or "")
             if self._connection.dialect.name == "postgresql":
-                effective, predicate = self._index_state(name, index_name)
-                validated = effective
+                effective, ready, live, predicate = self._index_readiness(
+                    name, index_name
+                )
             elif self._connection.dialect.name == "sqlite":
                 dialect_options = item.get("dialect_options") or {}
                 predicate_value = dialect_options.get("sqlite_where")
                 predicate = None if predicate_value is None else str(predicate_value)
-                effective, validated = True, True
+                effective, ready, live = True, True, True
             else:
-                effective, validated, predicate = None, None, None
-            unique_constraints.append(
-                CatalogUnique(
+                effective, ready, live, predicate = None, None, None, None
+            indexes.append(
+                CatalogIndex(
                     tuple(item.get("column_names") or ()),
                     item.get("name"),
+                    bool(item.get("unique")),
                     effective,
-                    validated,
+                    ready,
+                    live,
                     predicate,
                 )
             )
+            if item.get("unique"):
+                index_ready = (
+                    None
+                    if None in (effective, ready, live)
+                    else bool(effective and ready and live)
+                )
+                unique_constraints.append(
+                    CatalogUnique(
+                        tuple(item.get("column_names") or ()),
+                        item.get("name"),
+                        index_ready,
+                        index_ready,
+                        predicate,
+                    )
+                )
         checks = (
             list(_sqlite_check_constraints(self._connection, name))
             if self._connection.dialect.name == "sqlite"
@@ -591,6 +688,7 @@ class SQLAlchemyCatalog:
             foreign_keys=tuple(foreign_keys),
             unique_constraints=tuple(unique_constraints),
             checks=tuple(checks),
+            indexes=tuple(indexes),
         )
 
 
@@ -899,13 +997,52 @@ def _table_requirement(table) -> TableRequirement:
         for constraint in table.constraints
         if isinstance(constraint, CheckConstraint)
     )
+    indexes = tuple(
+        IndexRequirement(
+            tuple(column.name for column in index.columns),
+            bool(index.unique),
+            index.name,
+        )
+        for index in table.indexes
+    )
     primary_key = tuple(column.name for column in table.primary_key.columns)
-    return TableRequirement(columns, primary_key, foreign_keys, unique_constraints, checks)
+    return TableRequirement(
+        columns,
+        primary_key,
+        foreign_keys,
+        unique_constraints,
+        checks,
+        indexes,
+    )
 
 
 GENERATION_RECORD_REQUIREMENTS = {
     name: _table_requirement(FoundationBase.metadata.tables[name])
     for name in GENERATION_RECORD_TABLE_NAMES
+}
+_canvas_target_table = GenerationResultTargetRow.__table__
+_canvas_target_model_requirement = _table_requirement(_canvas_target_table)
+CANVAS_RESULT_TARGET_REQUIREMENTS = {
+    CANVAS_RESULT_TARGETS_TABLE_NAME: TableRequirement(
+        columns=_canvas_target_model_requirement.columns,
+        primary_key=_canvas_target_model_requirement.primary_key,
+        foreign_keys=(
+            _fk("result_ref", "generation_result_receipts", "result_ref"),
+            _fk("owner_id", "users"),
+            _fk("task_id", "ai_tasks"),
+        ),
+        unique_constraints=_canvas_target_model_requirement.unique_constraints,
+        checks=_canvas_target_model_requirement.checks,
+        indexes=_canvas_target_model_requirement.indexes,
+    )
+}
+CANVAS_RESULT_TARGET_INDEX_REQUIREMENTS = {
+    "generation_result_receipts": (
+        IndexRequirement(
+            ("owner_id", "result_ref"),
+            name="ix_generation_result_receipts_owner_result_ref",
+        ),
+    )
 }
 MIGRATION_HISTORY_REQUIREMENT = TableRequirement(
     {
@@ -972,6 +1109,36 @@ def _check_requirements(
                 for item in candidates
             ):
                 issues.append(SchemaIssue("unique_not_effective_validated_and_global", table_name, expected.name or str(expected.columns)))
+        for expected in requirement.indexes:
+            candidates = [
+                item
+                for item in actual.indexes
+                if item.columns == expected.columns
+                and item.unique is expected.unique
+                and (expected.name is None or item.name == expected.name)
+            ]
+            if not candidates:
+                issues.append(
+                    SchemaIssue(
+                        "missing_or_incompatible_index",
+                        table_name,
+                        expected.name or str(expected.columns),
+                    )
+                )
+            elif not any(
+                item.effective is True
+                and item.ready is True
+                and item.live is True
+                and item.predicate is None
+                for item in candidates
+            ):
+                issues.append(
+                    SchemaIssue(
+                        "index_not_effective_ready_live_and_global",
+                        table_name,
+                        expected.name or str(expected.columns),
+                    )
+                )
         string_columns = frozenset(
             name
             for name, column in requirement.columns.items()
@@ -1018,6 +1185,66 @@ def check_generation_record_schema(catalog: CatalogReader) -> SchemaCheck:
     )
 
 
+def _check_index_requirements(
+    catalog: CatalogReader,
+    table_name: str,
+    requirements: Sequence[IndexRequirement],
+) -> tuple[SchemaIssue, ...]:
+    if table_name not in catalog.table_names():
+        return (SchemaIssue("missing_table", table_name, "required index table is absent"),)
+    actual_indexes = catalog.table(table_name).indexes
+    issues: list[SchemaIssue] = []
+    for expected in requirements:
+        candidates = [
+            item
+            for item in actual_indexes
+            if item.columns == expected.columns
+            and item.unique is expected.unique
+            and (expected.name is None or item.name == expected.name)
+        ]
+        if not candidates:
+            issues.append(
+                SchemaIssue(
+                    "missing_or_incompatible_index",
+                    table_name,
+                    expected.name or str(expected.columns),
+                )
+            )
+        elif not any(
+            item.effective is True
+            and item.ready is True
+            and item.live is True
+            and item.predicate is None
+            for item in candidates
+        ):
+            issues.append(
+                SchemaIssue(
+                    "index_not_effective_ready_live_and_global",
+                    table_name,
+                    expected.name or str(expected.columns),
+                )
+            )
+    return tuple(issues)
+
+
+def check_canvas_result_target_schema(catalog: CatalogReader) -> SchemaCheck:
+    """Require the projection table and both live, full indexes for v2."""
+
+    table_check = _check_requirements(
+        catalog,
+        CANVAS_RESULT_TARGET_REQUIREMENTS,
+        (CANVAS_RESULT_TARGETS_TABLE_NAME,),
+        reject_extra_columns=True,
+    )
+    index_issues = tuple(
+        issue
+        for table_name, requirements in CANVAS_RESULT_TARGET_INDEX_REQUIREMENTS.items()
+        for issue in _check_index_requirements(catalog, table_name, requirements)
+    )
+    issues = (*table_check.issues, *index_issues)
+    return SchemaCheck(not issues, tuple(issues))
+
+
 def check_migration_history_schema(catalog: CatalogReader) -> SchemaCheck:
     """Require the migration history key, typed columns, and nullability."""
 
@@ -1040,8 +1267,27 @@ def check_generation_version_set(
     unsupported = sorted(set(versions) - set(GENERATION_SUPPORTED_VERSIONS))
     if unsupported:
         issues.append(SchemaIssue("unsupported_generation_version", GENERATION_MIGRATION_HISTORY_TABLE, ", ".join(unsupported)))
-    if require_current and GENERATION_SCHEMA_VERSION not in versions:
-        issues.append(SchemaIssue("generation_migration_not_applied", GENERATION_MIGRATION_HISTORY_TABLE, GENERATION_SCHEMA_VERSION))
+    known = set(versions) & set(GENERATION_SUPPORTED_VERSIONS)
+    ordered = tuple(
+        version for version in GENERATION_SUPPORTED_VERSIONS if version in known
+    )
+    expected_prefix = GENERATION_SUPPORTED_VERSIONS[: len(ordered)]
+    if ordered != expected_prefix:
+        issues.append(
+            SchemaIssue(
+                "generation_migration_history_gap",
+                GENERATION_MIGRATION_HISTORY_TABLE,
+                ", ".join(ordered),
+            )
+        )
+    if require_current and ordered != GENERATION_SUPPORTED_VERSIONS:
+        issues.append(
+            SchemaIssue(
+                "generation_migration_not_applied",
+                GENERATION_MIGRATION_HISTORY_TABLE,
+                GENERATION_CURRENT_SCHEMA_VERSION,
+            )
+        )
     return SchemaCheck(not issues, tuple(issues))
 
 
@@ -1051,10 +1297,16 @@ def sqlalchemy_catalog(connection: Connection) -> SQLAlchemyCatalog:
 
 __all__ = (
     "FoundationBase",
+    "GenerationAuxiliaryBase",
     "GENERATION_SCHEMA_VERSION",
     "GENERATION_SCHEMA_CHECKSUM",
+    "CANVAS_RESULT_TARGETS_SCHEMA_VERSION",
+    "CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM",
+    "GENERATION_CURRENT_SCHEMA_VERSION",
+    "GENERATION_CURRENT_SCHEMA_CHECKSUM",
     "GENERATION_MIGRATION_HISTORY_TABLE",
     "GENERATION_SUPPORTED_VERSIONS",
+    "CANVAS_RESULT_TARGETS_TABLE_NAME",
     "UserRow",
     "AITaskRow",
     "TaskQuoteRow",
@@ -1067,6 +1319,7 @@ __all__ = (
     "CreditLogRow",
     "UnitFeeDecisionRow",
     "GenerationResultReceiptRow",
+    "GenerationResultTargetRow",
     "ApplicationRecordRow",
     "ExecutionAttemptGroupRow",
     "LocalContinuationWorkRow",
@@ -1078,12 +1331,16 @@ __all__ = (
     "GENERATION_RECORD_TABLE_NAMES",
     "GENERATION_RECORD_TABLES",
     "GENERATION_RECORD_REQUIREMENTS",
+    "CANVAS_RESULT_TARGET_REQUIREMENTS",
+    "CANVAS_RESULT_TARGET_INDEX_REQUIREMENTS",
     "FOUNDATION_REQUIREMENTS",
     "MIGRATION_HISTORY_REQUIREMENT",
     "CatalogColumn",
     "CatalogForeignKey",
     "CatalogUnique",
     "CatalogCheck",
+    "IndexRequirement",
+    "CatalogIndex",
     "CatalogTable",
     "CatalogReader",
     "SchemaIssue",
@@ -1091,6 +1348,7 @@ __all__ = (
     "SQLAlchemyCatalog",
     "check_foundation_schema",
     "check_generation_record_schema",
+    "check_canvas_result_target_schema",
     "check_migration_history_schema",
     "check_generation_version_set",
     "sqlalchemy_catalog",

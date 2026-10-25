@@ -173,6 +173,9 @@ from .task_observation.authentication import (
 )
 from .task_observation.cancellation import SqlTaskCancellationWriter
 from .task_observation.canvas_result_http import build_canvas_result_http_router
+from .task_observation.canvas_result_discovery_http import (
+    build_canvas_result_discovery_http_router,
+)
 from .task_observation.frame_review_cancellation import (
     build_frame_review_cancellation_facade,
 )
@@ -872,6 +875,12 @@ def create_app(
     )
     app.include_router(
         build_canvas_result_http_router(
+            session_factory=effective_session_factory,
+            resolve_account_actor=account_actor_resolver,
+        )
+    )
+    app.include_router(
+        build_canvas_result_discovery_http_router(
             session_factory=effective_session_factory,
             resolve_account_actor=account_actor_resolver,
         )

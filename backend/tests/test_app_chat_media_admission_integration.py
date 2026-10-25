@@ -48,6 +48,7 @@ from haoai_backend.generation_core.base_schema import (
 from haoai_backend.generation_core.schema import (
     ApplicationRecordRow,
     GenerationResultReceiptRow,
+    GenerationResultTargetRow,
 )
 from haoai_backend.generation_contracts.records import GenerationResultReceipt
 from haoai_backend.generation_contracts.types import (
@@ -71,6 +72,9 @@ from haoai_backend.task_observation import (
     GenerationResultApplicationFacade,
     application_key_for,
     target_scope_for_snapshot,
+)
+from haoai_backend.task_observation.canvas_result_discovery import (
+    backfill_canvas_result_targets,
 )
 from haoai_backend.task_observation.canvas_result_http import (
     build_canvas_result_http_router,
@@ -651,8 +655,243 @@ def test_real_http_reads_canvas_application_history_after_source_edit(
         assert worker_outcome != "pending"
         assert worker_outcome != "ownership_lost"
         assert worker_outcome.result_ref
-        assert len(provider_calls) == 1
-        assert len(stored_media) == 1
+
+        second_binding = _joint_build_binding(
+            authentication,
+            system.capabilities,
+            _JointIdFactory("canvas-lookup-second-server"),
+            operation=AdmissionOperation.IMAGE_SINGLE.value,
+        )
+        second_admission_caller = _joint_caller(system.engine)
+        try:
+            second_staged = _joint_prepare_and_stage(
+                second_binding,
+                second_admission_caller,
+                operation=AdmissionOperation.IMAGE_SINGLE.value,
+                raw_key="canvas-result-lookup-real-chain-second",
+                request=dict(generation_request),
+            )
+            assert isinstance(second_staged, AdmissionStaged)
+            second_task_id = second_staged.ordered_tasks[0].task_id
+            second_target = captured_payloads[-1].items[0].snapshot.target_snapshot
+            assert second_target == target
+            second_admission_caller.commit()
+        finally:
+            second_admission_caller.close()
+
+        second_worker_outcome = runtime.run_claimed_once("image-single")
+        assert second_worker_outcome is not None
+        assert second_worker_outcome != "pending"
+        assert second_worker_outcome != "ownership_lost"
+        assert second_worker_outcome.result_ref
+        assert second_worker_outcome.result_ref != worker_outcome.result_ref
+        assert len(provider_calls) == 2
+        assert len(stored_media) == 2
+
+        discovery_path = (
+            "/api/chapters/joint-chapter-1/canvas-owned-results"
+            "?target_kind=frame_preview&identity_mode=strict-no-id-v1"
+            f"&frame_index={target.compat_frame_index}"
+            f"&expected_chapter_digest={target.full_chapter_digest}&limit=1"
+        )
+
+        # A changed chapter invalidates the original no-ID identity even when
+        # the frame at the old index still has the same content.
+        changed_sibling_frames = json.loads(raw_chapter)
+        changed_sibling_frames[0]["text"] = "无关分镜已编辑"
+        with system.engine.begin() as connection:
+            connection.execute(
+                update(catalog_chapters)
+                .where(catalog_chapters.c.id == "joint-chapter-1")
+                .values(
+                    content=json.dumps(
+                        changed_sibling_frames,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            )
+        before_stale_discovery = _canvas_lookup_write_state(system.engine)
+        stale_discovery_response = _get(system, discovery_path)
+        assert stale_discovery_response.status_code == 200, stale_discovery_response.text
+        _assert_last_lookup_session_is_read_only(system)
+        stale_discovery_page = stale_discovery_response.json()
+        assert len(stale_discovery_page["items"]) == 1
+        assert stale_discovery_page["items"][0]["eligibility"] == "stale"
+        assert stale_discovery_page["items"][0]["application"] is None
+        assert stale_discovery_page["next_cursor"]
+        stale_next_page = _get(
+            system,
+            f"{discovery_path}&cursor={stale_discovery_page['next_cursor']}",
+        )
+        assert stale_next_page.status_code == 200, stale_next_page.text
+        assert len(stale_next_page.json()["items"]) == 1
+        assert stale_next_page.json()["items"][0]["eligibility"] == "stale"
+        assert stale_next_page.json()["items"][0]["application"] is None
+        assert stale_next_page.json()["next_cursor"] is None
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_stale_discovery
+        with system.engine.begin() as connection:
+            connection.execute(
+                update(catalog_chapters)
+                .where(catalog_chapters.c.id == "joint-chapter-1")
+                .values(content=raw_chapter)
+            )
+
+        before_discovery = _canvas_lookup_write_state(system.engine)
+        discovery_response = _get(system, discovery_path)
+        assert discovery_response.status_code == 200, discovery_response.text
+        _assert_last_lookup_session_is_read_only(system)
+        discovery_payload = discovery_response.json()
+        assert set(discovery_payload) == {
+            "chapter_id",
+            "target",
+            "items",
+            "next_cursor",
+        }
+        assert discovery_payload["chapter_id"] == "joint-chapter-1"
+        assert discovery_payload["target"] == {
+            "kind": "frame_preview",
+            "chapter_id": "joint-chapter-1",
+            "identity_mode": "strict-no-id-v1",
+            "frame_index": target.compat_frame_index,
+            "expected_chapter_digest": target.full_chapter_digest,
+        }
+        assert discovery_payload["next_cursor"]
+        assert len(discovery_payload["items"]) == 1
+        discovery_item = discovery_payload["items"][0]
+        assert set(discovery_item) == {
+            "task_id",
+            "result_ref",
+            "operation",
+            "completed_at",
+            "expected_target",
+            "application_key",
+            "eligibility",
+            "application",
+        }
+        assert discovery_item["task_id"] in {task_id, second_task_id}
+        assert discovery_item["result_ref"] in {
+            worker_outcome.result_ref,
+            second_worker_outcome.result_ref,
+        }
+        assert discovery_item["operation"] == "image.single"
+        assert discovery_item["eligibility"] == "ready"
+        assert isinstance(discovery_item["expected_target"], dict)
+        assert set(discovery_item["expected_target"]) == {
+            "kind",
+            "chapter_id",
+            "series_id",
+            "stable_storyboard_asset_id",
+            "asset_type",
+            "asset_id",
+            "compat_frame_index",
+            "expected_text_digest",
+            "media_identity",
+            "content_digest",
+            "notes_revision",
+            "full_frame_digest",
+            "full_chapter_digest",
+            "expected_asset_image_url",
+            "same_series_target_digest",
+        }
+        assert discovery_item["expected_target"]["asset_id"] is None
+        assert discovery_item["expected_target"]["full_chapter_digest"] == (
+            target.full_chapter_digest
+        )
+        assert len(discovery_item["application_key"]) == 64
+        assert all(
+            character in "0123456789abcdef"
+            for character in discovery_item["application_key"]
+        )
+        assert discovery_item["application"] is None
+        assert datetime.fromisoformat(discovery_item["completed_at"]).utcoffset() is not None
+        discovery_next_page_response = _get(
+            system,
+            f"{discovery_path}&cursor={discovery_payload['next_cursor']}",
+        )
+        assert discovery_next_page_response.status_code == 200, discovery_next_page_response.text
+        _assert_last_lookup_session_is_read_only(system)
+        discovery_next_page = discovery_next_page_response.json()
+        assert discovery_next_page["next_cursor"] is None
+        assert len(discovery_next_page["items"]) == 1
+        other_discovery_item = discovery_next_page["items"][0]
+        assert other_discovery_item["eligibility"] == "ready"
+        assert other_discovery_item["application"] is None
+        assert other_discovery_item["result_ref"] != discovery_item["result_ref"]
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_discovery
+
+        missing_projection_ref = other_discovery_item["result_ref"]
+        with Session(system.engine, expire_on_commit=False) as projection_removal:
+            missing_projection = projection_removal.get(
+                GenerationResultTargetRow,
+                missing_projection_ref,
+            )
+            assert missing_projection is not None
+            projection_removal.delete(missing_projection)
+            projection_removal.commit()
+
+        before_missing_projection_lookup = _canvas_lookup_write_state(system.engine)
+        missing_projection_page = _get(system, discovery_path)
+        assert missing_projection_page.status_code == 200, missing_projection_page.text
+        missing_projection_payload = missing_projection_page.json()
+        assert len(missing_projection_payload["items"]) == 1
+        assert missing_projection_payload["items"][0]["result_ref"] == (
+            discovery_item["result_ref"]
+        )
+        assert missing_projection_payload["next_cursor"] is None
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_missing_projection_lookup
+
+        backfill_session = Session(system.engine, expire_on_commit=False)
+        try:
+            backfill_report = backfill_canvas_result_targets(
+                backfill_session,
+                TrustedActor(_G2_JOINT_ACTOR_ID),
+                limit=50,
+            )
+            assert backfill_report.scanned == 2
+            assert backfill_report.projected == 1
+            assert backfill_report.already_present == 1
+            assert backfill_report.unready == 0
+            assert backfill_report.conflict == 0
+            assert backfill_report.ignored_noncanvas == 0
+            assert backfill_report.next_cursor is None
+            assert not backfill_report.has_more
+            assert any(
+                isinstance(row, GenerationResultTargetRow)
+                and row.result_ref == missing_projection_ref
+                for row in backfill_session.new
+            )
+            assert _canvas_lookup_write_state(system.engine)[2] == 1
+            backfill_session.commit()
+        finally:
+            backfill_session.close()
+        assert _canvas_lookup_write_state(system.engine)[2] == 2
+
+        with Session(system.engine, expire_on_commit=False) as repeated_backfill:
+            repeat_report = backfill_canvas_result_targets(
+                repeated_backfill,
+                TrustedActor(_G2_JOINT_ACTOR_ID),
+                limit=50,
+            )
+            assert repeat_report.projected == 0
+            assert repeat_report.already_present == 2
+            assert repeat_report.next_cursor is None
+            assert not repeated_backfill.new
+
+        worker_by_result_ref = {
+            worker_outcome.result_ref: (worker_outcome, task_id, target),
+            second_worker_outcome.result_ref: (
+                second_worker_outcome,
+                second_task_id,
+                second_target,
+            ),
+        }
+        worker_outcome, task_id, target = worker_by_result_ref[
+            discovery_item["result_ref"]
+        ]
 
         lookup_path = (
             "/api/chapters/joint-chapter-1/canvas-owned-results/"
@@ -725,6 +964,28 @@ def test_real_http_reads_canvas_application_history_after_source_edit(
         assert native_committed_at.tzinfo is not None
         _assert_last_lookup_session_is_read_only(system)
         assert _canvas_lookup_write_state(system.engine) == before_native_lookup
+
+        before_applied_discovery = _canvas_lookup_write_state(system.engine)
+        applied_discovery_response = _get(system, discovery_path)
+        assert applied_discovery_response.status_code == 200, applied_discovery_response.text
+        _assert_last_lookup_session_is_read_only(system)
+        applied_discovery_item = applied_discovery_response.json()["items"][0]
+        assert applied_discovery_item["eligibility"] == "already_applied"
+        assert applied_discovery_item["application"] == native_applied_payload["application"]
+        assert applied_discovery_item["expected_target"] == discovery_item["expected_target"]
+        assert applied_discovery_response.json()["next_cursor"]
+        applied_discovery_next_page = _get(
+            system,
+            f"{discovery_path}&cursor={applied_discovery_response.json()['next_cursor']}",
+        )
+        assert applied_discovery_next_page.status_code == 200, applied_discovery_next_page.text
+        _assert_last_lookup_session_is_read_only(system)
+        stale_unapplied_item = applied_discovery_next_page.json()["items"][0]
+        assert stale_unapplied_item["eligibility"] == "stale"
+        assert stale_unapplied_item["application"] is None
+        assert applied_discovery_next_page.json()["next_cursor"] is None
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_applied_discovery
 
         # Seed the stored target snapshots into the prior nullable-key shape.
         # The execution step stores payload bindings, not a target snapshot.
@@ -815,7 +1076,27 @@ def test_real_http_reads_canvas_application_history_after_source_edit(
         history = _get(system, lookup_path)
         assert history.status_code == 200, history.text
         assert history.json() == applied_payload
+        before_discovery_history = _canvas_lookup_write_state(system.engine)
+        discovery_history = _get(system, discovery_path)
+        assert discovery_history.status_code == 200, discovery_history.text
         _assert_last_lookup_session_is_read_only(system)
+        discovery_history_payload = discovery_history.json()
+        assert discovery_history_payload["items"][0]["eligibility"] == "already_applied"
+        assert discovery_history_payload["items"][0]["application"] == (
+            native_applied_payload["application"]
+        )
+        assert discovery_history_payload["next_cursor"]
+        discovery_history_next_page = _get(
+            system,
+            f"{discovery_path}&cursor={discovery_history_payload['next_cursor']}",
+        )
+        assert discovery_history_next_page.status_code == 200, discovery_history_next_page.text
+        _assert_last_lookup_session_is_read_only(system)
+        assert discovery_history_next_page.json()["items"][0]["eligibility"] == "stale"
+        assert discovery_history_next_page.json()["items"][0]["application"] is None
+        assert discovery_history_next_page.json()["next_cursor"] is None
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_discovery_history
         assert _canvas_lookup_write_state(system.engine) == before_history_lookup
 
         missing_reference_path = (
@@ -943,14 +1224,21 @@ def test_real_http_reads_canvas_application_history_after_source_edit(
                 .where(catalog_series.c.id == "joint-series-1")
                 .values(user_id=other_owner_id)
             )
+        before_denied_discovery = _canvas_lookup_write_state(system.engine)
+        denied_discovery = _get(system, discovery_path)
+        assert denied_discovery.status_code == 403, denied_discovery.text
+        assert denied_discovery.json() == {"detail": "无权访问该剧集"}
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_denied_discovery
+
         before_denied_lookup = _canvas_lookup_write_state(system.engine)
         denied = _get(system, lookup_path)
         assert denied.status_code == 403, denied.text
         assert denied.json() == {"detail": "无权访问该剧集"}
         _assert_last_lookup_session_is_read_only(system)
         assert _canvas_lookup_write_state(system.engine) == before_denied_lookup
-        assert len(provider_calls) == 1
-        assert len(stored_media) == 1
+        assert len(provider_calls) == 2
+        assert len(stored_media) == 2
     finally:
         system.engine.dispose()
 
@@ -966,7 +1254,7 @@ def _target_snapshot_mapping(value: object) -> dict[str, object]:
     raise AssertionError("fixture snapshot must contain a canonical target_snapshot")
 
 
-def _canvas_lookup_write_state(engine: Engine) -> tuple[int, int, int, int]:
+def _canvas_lookup_write_state(engine: Engine) -> tuple[int, int, int, int, int]:
     with engine.connect() as connection:
         return (
             connection.execute(
@@ -974,6 +1262,9 @@ def _canvas_lookup_write_state(engine: Engine) -> tuple[int, int, int, int]:
             ).scalar_one(),
             connection.execute(
                 select(func.count()).select_from(ApplicationRecordRow.__table__)
+            ).scalar_one(),
+            connection.execute(
+                select(func.count()).select_from(GenerationResultTargetRow.__table__)
             ).scalar_one(),
             connection.execute(
                 select(func.count()).select_from(CreditLogRow.__table__)

@@ -15,6 +15,14 @@
         "policy_stop_events",
         "local_continuation_work"
       ]
+    },
+    {
+      "version": "0002_canvas_result_targets",
+      "file": "0002_canvas_result_targets.sql",
+      "sha256": "1d9482fc951fc4e13d9c0c3fe5c74fb3e605045a0427306d25906872cfda1f67",
+      "tables": [
+        "generation_result_targets"
+      ]
     }
   ]
 }

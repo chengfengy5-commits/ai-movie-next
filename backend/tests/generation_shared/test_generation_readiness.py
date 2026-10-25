@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -10,8 +11,12 @@ from sqlalchemy.orm import Session
 from haoai_backend.generation_contracts.ports import GenerationRuntimeConfig
 from haoai_backend.generation_core.base_schema import FOUNDATION_TABLES, UserRow
 from haoai_backend.generation_core.schema import (
+    CANVAS_RESULT_TARGETS_TABLE_NAME,
+    CatalogIndex,
     GENERATION_MIGRATION_HISTORY_TABLE,
     FoundationBase,
+    check_canvas_result_target_schema,
+    sqlalchemy_catalog,
 )
 from haoai_backend.generation_runtime.readiness import check_generation_readiness
 from haoai_backend.generation_runtime.runtime import build_runtime
@@ -85,6 +90,89 @@ def test_readiness_rejects_applied_checksum_with_same_name_incomplete_table() ->
         readiness = check_generation_readiness(session)
     assert readiness.status == "not_ready"
     assert any(issue.code == "missing_column" for issue in readiness.issues)
+    engine.dispose()
+
+
+def test_readiness_requires_the_complete_canvas_target_page_index() -> None:
+    engine = _engine_with_generation_schema()
+    with engine.begin() as connection:
+        connection.exec_driver_sql("DROP INDEX ix_generation_result_targets_page")
+
+    with Session(engine) as session:
+        readiness = check_generation_readiness(session)
+
+    assert readiness.status == "not_ready"
+    assert any(
+        issue.code == "missing_or_incompatible_index"
+        and issue.detail
+        == f"{CANVAS_RESULT_TARGETS_TABLE_NAME}: ix_generation_result_targets_page"
+        for issue in readiness.issues
+    )
+    engine.dispose()
+
+
+class _CatalogWithCanvasIndexOverride:
+    def __init__(self, source, indexes: tuple[CatalogIndex, ...]) -> None:
+        self._source = source
+        self._indexes = indexes
+
+    def table_names(self) -> set[str]:
+        return self._source.table_names()
+
+    def table(self, name: str):
+        table = self._source.table(name)
+        if name != CANVAS_RESULT_TARGETS_TABLE_NAME:
+            return table
+        return replace(table, indexes=self._indexes)
+
+
+@pytest.mark.parametrize(
+    ("defect", "expected_code"),
+    (
+        ("wrong_columns", "missing_or_incompatible_index"),
+        ("partial_columns", "missing_or_incompatible_index"),
+        ("invalid_catalog_state", "index_not_effective_ready_live_and_global"),
+    ),
+)
+def test_canvas_v2_readiness_rejects_bad_indexes_from_fake_catalog(
+    defect: str,
+    expected_code: str,
+) -> None:
+    engine = _engine_with_generation_schema()
+    with engine.connect() as connection:
+        source = sqlalchemy_catalog(connection)
+        table = source.table(CANVAS_RESULT_TARGETS_TABLE_NAME)
+        page_index = next(
+            index
+            for index in table.indexes
+            if index.name == "ix_generation_result_targets_page"
+        )
+        if defect == "wrong_columns":
+            replacement = replace(
+                page_index,
+                columns=("owner_id", "chapter_id", "target_identity"),
+            )
+        elif defect == "partial_columns":
+            replacement = replace(page_index, columns=page_index.columns[:-1])
+        else:
+            replacement = replace(page_index, effective=False)
+        indexes = tuple(
+            index
+            for index in table.indexes
+            if index.name != "ix_generation_result_targets_page"
+        ) + (replacement,)
+
+        check = check_canvas_result_target_schema(
+            _CatalogWithCanvasIndexOverride(source, indexes)
+        )
+
+    assert not check.ready
+    assert any(
+        issue.code == expected_code
+        and issue.table == CANVAS_RESULT_TARGETS_TABLE_NAME
+        and issue.detail == "ix_generation_result_targets_page"
+        for issue in check.issues
+    )
     engine.dispose()
 
 

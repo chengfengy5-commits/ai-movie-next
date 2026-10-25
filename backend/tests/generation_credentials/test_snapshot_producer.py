@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import importlib.util
 import json
+import sys
 import uuid
 import weakref
 from contextlib import contextmanager
@@ -13,7 +15,7 @@ from types import MappingProxyType, SimpleNamespace
 from typing import Iterator
 
 import pytest
-from sqlalchemy import Column, DateTime, String, Table, create_engine, event, func, insert, select, update
+from sqlalchemy import create_engine, event, func, insert, select, update
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, registry as orm_registry, sessionmaker
 
@@ -42,12 +44,13 @@ from haoai_backend.generation_contracts.types import (
     GenerationActor,
     TargetSnapshot,
 )
-from haoai_backend.generation_core.base_schema import AITaskRow, Base, BillingUnitRow, TaskSubmissionRow
-from haoai_backend.generation_core.schema import (
-    GENERATION_MIGRATION_HISTORY_TABLE,
-    GENERATION_SCHEMA_CHECKSUM,
-    GENERATION_SCHEMA_VERSION,
+from haoai_backend.generation_core.base_schema import (
+    FOUNDATION_TABLES,
+    AITaskRow,
+    BillingUnitRow,
+    TaskSubmissionRow,
 )
+from haoai_backend.generation_core.schema import FoundationBase
 from haoai_backend.generation_credentials.application import (
     CredentialRegistry,
     RegistryCapabilities,
@@ -113,13 +116,18 @@ MODEL_ID = "model-1"
 PRINCIPAL_ID = "30000000-0000-4000-8000-000000000001"
 PROVIDER_SECRET = "fixture-provider-secret"
 
-generation_schema_migrations = Table(
-    GENERATION_MIGRATION_HISTORY_TABLE,
-    Base.metadata,
-    Column("version", String(64), primary_key=True, nullable=False),
-    Column("checksum", String(64), nullable=False),
-    Column("applied_at", DateTime(timezone=False), nullable=False),
+GENERATION_MIGRATION_DIRECTORY = Path(__file__).resolve().parents[2] / "migrations"
+_GENERATION_MIGRATION_RUNNER_SPEC = importlib.util.spec_from_file_location(
+    "_haoai_snapshot_producer_generation_migration_runner",
+    GENERATION_MIGRATION_DIRECTORY / "run_generation_migrations.py",
 )
+assert _GENERATION_MIGRATION_RUNNER_SPEC is not None
+assert _GENERATION_MIGRATION_RUNNER_SPEC.loader is not None
+_GENERATION_MIGRATION_RUNNER = importlib.util.module_from_spec(
+    _GENERATION_MIGRATION_RUNNER_SPEC
+)
+sys.modules[_GENERATION_MIGRATION_RUNNER_SPEC.name] = _GENERATION_MIGRATION_RUNNER
+_GENERATION_MIGRATION_RUNNER_SPEC.loader.exec_module(_GENERATION_MIGRATION_RUNNER)
 
 
 class _AuthenticationService:
@@ -640,16 +648,15 @@ def _sqlite_schema(engine: Engine) -> None:
     authentication_metadata.create_all(engine)
     series_access_metadata.create_all(engine)
     catalog_metadata.create_all(engine)
-    Base.metadata.create_all(engine)
+    FoundationBase.metadata.create_all(engine, tables=list(FOUNDATION_TABLES))
     credential_metadata.create_all(engine)
+    migration_result = _GENERATION_MIGRATION_RUNNER.apply_generation_migrations(
+        engine,
+        GENERATION_MIGRATION_DIRECTORY,
+    )
+    if migration_result.status != "applied":
+        raise AssertionError(f"snapshot fixture migration did not apply: {migration_result}")
     with engine.begin() as connection:
-        connection.execute(
-            generation_schema_migrations.insert().values(
-                version=GENERATION_SCHEMA_VERSION,
-                checksum=GENERATION_SCHEMA_CHECKSUM,
-                applied_at=FIXTURE_NOW.replace(tzinfo=None),
-            )
-        )
         for trigger_name, table_name in SQLITE_GUARD_TABLES.items():
             action = "DELETE" if trigger_name.endswith("_delete") else "UPDATE"
             connection.exec_driver_sql(

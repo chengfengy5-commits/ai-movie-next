@@ -2,9 +2,6 @@
 
 from __future__ import annotations
 
-import json
-import math
-import unicodedata
 from collections.abc import Callable
 from datetime import datetime, timezone
 
@@ -12,6 +9,11 @@ from sqlalchemy import select
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
+from haoai_backend.generation_contracts.canvas_targets import (
+    CanvasTargetParseError,
+    is_valid_canvas_identifier,
+    target_snapshot_from_request_data,
+)
 from haoai_backend.generation_contracts.types import GenerationActor, TargetSnapshot
 from haoai_backend.generation_core.base_schema import AITaskRow
 from haoai_backend.series_access.application import require_series_access
@@ -40,59 +42,8 @@ from .generation import (
 
 SessionFactory = Callable[[], Session]
 
-_TARGET_FIELDS = frozenset(
-    {
-        "kind",
-        "chapter_id",
-        "series_id",
-        "stable_storyboard_asset_id",
-        "asset_type",
-        "asset_id",
-        "compat_frame_index",
-        "expected_text_digest",
-        "media_identity",
-        "content_digest",
-        "notes_revision",
-        "full_frame_digest",
-        "full_chapter_digest",
-        "expected_asset_image_url",
-        "same_series_target_digest",
-    }
-)
-_REQUIRED_TARGET_FIELDS = frozenset({"kind", "chapter_id", "series_id"})
-_ID_FIELDS = frozenset(
-    {"chapter_id", "series_id", "stable_storyboard_asset_id", "asset_id"}
-)
-_DIGEST_FIELDS = frozenset(
-    {
-        "expected_text_digest",
-        "content_digest",
-        "full_frame_digest",
-        "full_chapter_digest",
-        "same_series_target_digest",
-    }
-)
-_STRING_FIELDS = frozenset(
-    {
-        "kind",
-        "chapter_id",
-        "series_id",
-        "stable_storyboard_asset_id",
-        "asset_type",
-        "asset_id",
-        "expected_text_digest",
-        "media_identity",
-        "content_digest",
-        "full_frame_digest",
-        "full_chapter_digest",
-        "expected_asset_image_url",
-        "same_series_target_digest",
-    }
-)
-_INTEGER_FIELDS = frozenset({"compat_frame_index", "notes_revision"})
 _CANVAS_OPERATIONS = frozenset({"image.single", "image.batch"})
 _CANVAS_TARGET_KINDS = frozenset({"canvas_frame_preview", "canvas_asset_image"})
-_ASSET_TYPES = frozenset({"character", "scene", "prop"})
 _HEX = frozenset("0123456789abcdef")
 
 
@@ -258,123 +209,17 @@ def _lookup_in_session(
 
 
 def _target_snapshot_from_request_data(request_data: object) -> TargetSnapshot:
-    if not isinstance(request_data, str):
-        raise TaskObservationConflict("画布生成结果缺少原始目标快照")
     try:
-        decoded = json.loads(
-            request_data,
-            object_pairs_hook=_unique_object_pairs,
-            parse_constant=_reject_non_json_number,
-        )
-    except (TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise TaskObservationConflict("画布生成结果的原始目标快照无效") from exc
-    if type(decoded) is not dict or not _contains_only_finite_numbers(decoded):
-        raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-    raw_target = decoded.get("target_snapshot")
-    if (
-        type(raw_target) is not dict
-        or not _REQUIRED_TARGET_FIELDS.issubset(raw_target)
-        or not frozenset(raw_target).issubset(_TARGET_FIELDS)
-    ):
-        raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-    target_values = {field: raw_target.get(field) for field in _TARGET_FIELDS}
-
-    for field in _STRING_FIELDS:
-        value = target_values[field]
-        if value is not None and not isinstance(value, str):
-            raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-        if isinstance(value, str) and _has_control_characters(value):
-            raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-    for field in _ID_FIELDS:
-        value = target_values[field]
-        if value is not None and not is_valid_canvas_identifier(value):
-            raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-    for field in _DIGEST_FIELDS:
-        value = target_values[field]
-        if value is not None and not _is_sha256(value):
-            raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-    for field in _INTEGER_FIELDS:
-        value = target_values[field]
-        if value is not None and type(value) is not int:
-            raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-
-    target = TargetSnapshot(**target_values)
-    if (
-        target.kind not in _CANVAS_TARGET_KINDS
-        or not is_valid_canvas_identifier(target.chapter_id)
-        or not is_valid_canvas_identifier(target.series_id)
-        or target.compat_frame_index is not None and target.compat_frame_index < 0
-        or target.notes_revision is not None and target.notes_revision < 0
-    ):
-        raise TaskObservationConflict("画布生成结果的原始目标快照无效")
-
-    if target.kind == "canvas_frame_preview":
-        if (
-            target.asset_type not in {None, "storyboard"}
-            or not _is_sha256(target.full_frame_digest)
-            or (
-                target.stable_storyboard_asset_id is None
-                and not _is_sha256(target.full_chapter_digest)
-            )
-            or (
-                target.same_series_target_digest is not None
-                and not _is_sha256(target.same_series_target_digest)
-            )
-        ):
-            raise TaskObservationConflict("画布分镜快照无效")
-        if target.stable_storyboard_asset_id is None:
-            if (
-                target.asset_type is not None
-                or target.asset_id is not None
-                or type(target.compat_frame_index) is not int
-            ):
-                raise TaskObservationConflict("画布分镜身份快照无效")
-    else:
-        if (
-            target.asset_type not in _ASSET_TYPES
-            or not is_valid_canvas_identifier(target.asset_id)
-            or target.stable_storyboard_asset_id is not None
-            or target.compat_frame_index is not None
-            or not _is_sha256(target.same_series_target_digest)
-        ):
-            raise TaskObservationConflict("画布素材快照无效")
-    return target
-
-
-def _unique_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise ValueError("duplicate JSON object key")
-        result[key] = value
-    return result
-
-
-def _reject_non_json_number(value: str) -> None:
-    raise ValueError(f"non-JSON numeric constant: {value}")
-
-
-def is_valid_canvas_identifier(value: object) -> bool:
-    if (
-        not isinstance(value, str)
-        or not value
-        or value != value.strip()
-        or len(value) > 36
-        or value in {".", ".."}
-        or "/" in value
-        or "\\" in value
-        or _has_control_characters(value)
-    ):
-        return False
-    try:
-        value.encode("utf-8")
-    except UnicodeEncodeError:
-        return False
-    return True
-
-
-def _has_control_characters(value: str) -> bool:
-    return any(unicodedata.category(character) == "Cc" for character in value)
+        return target_snapshot_from_request_data(request_data)
+    except CanvasTargetParseError as exc:
+        details = {
+            "missing": "画布生成结果缺少原始目标快照",
+            "invalid": "画布生成结果的原始目标快照无效",
+            "frame": "画布分镜快照无效",
+            "frame_identity": "画布分镜身份快照无效",
+            "asset": "画布素材快照无效",
+        }
+        raise TaskObservationConflict(details.get(exc.code, details["invalid"])) from exc
 
 
 def _is_sha256(value: object) -> bool:
@@ -383,16 +228,6 @@ def _is_sha256(value: object) -> bool:
         and len(value) == 64
         and all(character in _HEX for character in value)
     )
-
-
-def _contains_only_finite_numbers(value: object) -> bool:
-    if isinstance(value, float):
-        return math.isfinite(value)
-    if isinstance(value, dict):
-        return all(_contains_only_finite_numbers(item) for item in value.values())
-    if isinstance(value, list):
-        return all(_contains_only_finite_numbers(item) for item in value)
-    return True
 
 
 __all__ = ("is_valid_canvas_identifier", "lookup_canvas_result_application")
