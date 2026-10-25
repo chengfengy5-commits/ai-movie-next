@@ -17,6 +17,8 @@ import { createCanvasGenerationApplicationsHttpPort } from "./canvasGenerationAp
 import type { CanvasGenerationApplicationsPort } from "./canvasGenerationApplications";
 import { createCanvasImageGenerationHttpPort } from "./canvasImageGenerationHttp";
 import type { CanvasImageGenerationPort } from "./canvasImageGeneration";
+import { createCanvasOwnedImageHttpPort } from "./canvasOwnedImageHttp";
+import type { CanvasOwnedImagePort } from "./canvasOwnedImage";
 import {
   parseAccountActionReceipt,
   parseEmailCodeReceipt,
@@ -227,6 +229,7 @@ export interface WorkspaceServices {
   readonly canvasOwnedResults?: CanvasOwnedResultsPort;
   readonly canvasGenerationApplications?: CanvasGenerationApplicationsPort;
   readonly canvasImageGeneration?: CanvasImageGenerationPort;
+  readonly canvasOwnedImage?: CanvasOwnedImagePort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
@@ -2948,6 +2951,11 @@ export function createApiServices(
       storage,
       fetcher,
       timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    canvasOwnedImage: createCanvasOwnedImageHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     teamManagement: createTeamManagementHttpPort(apiBaseUrl, {
