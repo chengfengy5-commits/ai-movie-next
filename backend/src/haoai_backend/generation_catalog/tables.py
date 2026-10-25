@@ -27,8 +27,16 @@ characters = Table(
     Column("id", String(36), primary_key=True),
     Column("series_id", String(36), nullable=False),
     Column("name", String(255), nullable=False),
+    Column("aliases", Text, nullable=True),
+    Column("canonical_key", String(255), nullable=True),
+    Column("gender", String(20), nullable=True),
+    Column("age", String(100), nullable=True),
+    Column("role", String(50), nullable=True),
+    Column("appearance", Text, nullable=True),
     Column("description", Text, nullable=True),
     Column("image_url", String(500), nullable=True),
+    Column("audio_url", String(500), nullable=True),
+    Column("voice_ref", Text, nullable=True),
     Column("updated_at", DateTime, nullable=False),
 )
 
@@ -40,6 +48,8 @@ scenes = Table(
     Column("title", String(255), nullable=False),
     Column("description", Text, nullable=True),
     Column("image_url", String(500), nullable=True),
+    Column("aliases", Text, nullable=True),
+    Column("canonical_key", String(255), nullable=True),
     Column("updated_at", DateTime, nullable=False),
 )
 
@@ -51,6 +61,8 @@ props = Table(
     Column("name", String(255), nullable=False),
     Column("description", Text, nullable=True),
     Column("image_url", String(500), nullable=True),
+    Column("aliases", Text, nullable=True),
+    Column("canonical_key", String(255), nullable=True),
     Column("updated_at", DateTime, nullable=False),
 )
 

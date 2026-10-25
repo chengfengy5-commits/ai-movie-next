@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-import hashlib
-import json
 from datetime import datetime
 from typing import Mapping
 
 from sqlalchemy import and_, select, update
 from sqlalchemy.orm import Session
 
+from haoai_backend.generation_contracts.canvas_asset_targets import (
+    CANVAS_ASSET_TARGET_FIELDS,
+    canvas_asset_target_digest,
+)
 from haoai_backend.generation_contracts.records import GenerationResultReceipt
 from haoai_backend.generation_contracts.types import ApplicationOutcome, CanvasApplyAuthority, TargetSnapshot
 from haoai_backend.series_access.application import require_series_access
@@ -26,21 +28,12 @@ from haoai_backend.task_observation import (
 
 from .tables import ASSET_TABLES
 
-_ASSET_DIGEST_FIELDS = {
-    "character": ("id", "series_id", "name", "aliases", "canonical_key", "gender", "age", "role", "appearance", "description", "image_url", "audio_url", "voice_ref"),
-    "scene": ("id", "series_id", "title", "description", "image_url", "aliases", "canonical_key"),
-    "prop": ("id", "series_id", "name", "description", "image_url", "aliases", "canonical_key"),
-}
+_ASSET_DIGEST_FIELDS = CANVAS_ASSET_TARGET_FIELDS
 
 
 def digest_asset_target(asset_type: str, row: Mapping[str, object]) -> str:
     """Digest the complete mutable target projection used by canvas CAS."""
-    fields = _ASSET_DIGEST_FIELDS.get(asset_type)
-    if fields is None:
-        raise ValueError("only character, scene, and prop images are canvas asset targets")
-    value = {name: row.get(name) for name in fields}
-    encoded = json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return canvas_asset_target_digest(asset_type, row)
 
 
 def stage_asset_image(

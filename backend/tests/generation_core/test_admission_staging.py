@@ -31,6 +31,7 @@ from haoai_backend.authentication.configuration import AuthenticationRuntime
 from haoai_backend.authentication.persistence import SqlAlchemyAuthenticationUnitOfWork
 from haoai_backend.authentication.tables import metadata as authentication_metadata
 from haoai_backend.authentication.tables import user_credits, users
+from haoai_backend.asset_data.generation import digest_asset_target
 from haoai_backend.chat_data.tables import chapters, chat_messages, metadata as chat_metadata
 from haoai_backend.generation_catalog.admission import AdmissionPolicy
 from haoai_backend.generation_catalog.admission_types import (
@@ -48,6 +49,9 @@ from haoai_backend.generation_catalog.domain import (
     ServerQuote,
 )
 from haoai_backend.generation_contracts.errors import GenerationError
+from haoai_backend.generation_contracts.canvas_asset_targets import (
+    CANVAS_ASSET_TARGET_FIELDS,
+)
 from haoai_backend.generation_contracts.types import (
     AdmissionFingerprint,
     EndpointPolicy,
@@ -1663,6 +1667,10 @@ def _assert_joint_graph_and_fees(
         )
         assert "ordered_manifest_digest" not in request_data
         if staged.operation == AdmissionOperation.IMAGE_BATCH.value:
+            target_facts = staged.producer_staged_result.preparation.items[index].target
+            target_snapshot = payload_item.snapshot.target_snapshot
+            assert target_snapshot.kind == "asset_message"
+            assert target_snapshot.same_series_target_digest == target_facts.asset_digest
             assert request_data["chapter_id"] == "joint-chapter-1"
             assert request_data["asset_id"] == (
                 "joint-character-1" if index == 0 else "joint-scene-1"
@@ -1782,9 +1790,11 @@ def test_real_public_entry_stages_actual_producer_g1_graph_and_fees(
         environment.engine.dispose()
 
 
+@pytest.mark.parametrize("asset_type", ("character", "scene", "prop"))
 def test_real_canvas_asset_safe_projection_preserves_existing_image_url(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    asset_type: str,
 ) -> None:
     environment = _joint_environment(
         tmp_path,
@@ -1792,11 +1802,48 @@ def test_real_canvas_asset_safe_projection_preserves_existing_image_url(
         operation=AdmissionOperation.IMAGE_SINGLE.value,
     )
     old_image_url = "https://assets.example.test/previous-image.png"
+    asset_ids = {
+        "character": "joint-character-1",
+        "scene": "joint-scene-1",
+        "prop": "joint-prop-1",
+    }
+    asset_id = asset_ids[asset_type]
+    non_null_fields = {
+        "character": {
+            "aliases": "[\"hero\"]",
+            "canonical_key": "hero",
+            "gender": "female",
+            "age": "30",
+            "role": "protagonist",
+            "appearance": "blue coat",
+            "audio_url": "https://assets.example.test/voice.mp3",
+            "voice_ref": "voice-hero",
+        },
+        "scene": {
+            "aliases": "[\"night-room\"]",
+            "canonical_key": "night-room",
+        },
+        "prop": {
+            "aliases": "[\"key\"]",
+            "canonical_key": "silver-key",
+        },
+    }[asset_type]
     with environment.engine.begin() as connection:
+        if asset_type == "prop":
+            connection.execute(
+                insert(ASSET_TABLES[asset_type]).values(
+                    id=asset_id,
+                    series_id="joint-series-1",
+                    name="Joint Prop",
+                    description="Fixture prop description",
+                    image_url=None,
+                    updated_at=_G2_JOINT_NOW.replace(tzinfo=None),
+                )
+            )
         connection.execute(
-            update(ASSET_TABLES["character"])
-            .where(ASSET_TABLES["character"].c.id == "joint-character-1")
-            .values(image_url=old_image_url)
+            update(ASSET_TABLES[asset_type])
+            .where(ASSET_TABLES[asset_type].c.id == asset_id)
+            .values(image_url=old_image_url, **non_null_fields)
         )
 
     caller = _joint_caller(environment.engine)
@@ -1828,8 +1875,8 @@ def test_real_canvas_asset_safe_projection_preserves_existing_image_url(
         "destination": {
             "kind": "asset_image",
             "chapter_id": "joint-chapter-1",
-            "asset_type": "character",
-            "asset_id": "joint-character-1",
+            "asset_type": asset_type,
+            "asset_id": asset_id,
         },
     }
 
@@ -1838,7 +1885,7 @@ def test_real_canvas_asset_safe_projection_preserves_existing_image_url(
             environment.binding,
             caller,
             operation=AdmissionOperation.IMAGE_SINGLE.value,
-            raw_key="joint-canvas-asset-old-image-url",
+            raw_key=f"joint-canvas-asset-{asset_type}-old-image-url",
             request=request,
         )
 
@@ -1849,6 +1896,22 @@ def test_real_canvas_asset_safe_projection_preserves_existing_image_url(
         producer_target = captured_payloads[0].items[0].snapshot.target_snapshot
         assert producer_target.kind == "canvas_asset_image"
         assert producer_target.expected_asset_image_url == old_image_url
+        assert producer_target.asset_type == asset_type
+        assert producer_target.asset_id == asset_id
+        full_target_row = caller.execute(
+            select(ASSET_TABLES[asset_type]).where(
+                ASSET_TABLES[asset_type].c.id == asset_id,
+                ASSET_TABLES[asset_type].c.series_id == "joint-series-1",
+            )
+        ).mappings().one()
+        assert all(
+            full_target_row.get(field) is not None
+            for field in CANVAS_ASSET_TARGET_FIELDS[asset_type]
+        )
+        assert producer_target.same_series_target_digest == digest_asset_target(
+            asset_type,
+            full_target_row,
+        )
 
         task_id = staged.ordered_tasks[0].task_id
         request_data = json.loads(

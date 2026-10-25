@@ -11,6 +11,10 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.orm import Session
 
 from haoai_backend.asset_data import digest_asset_target
+from haoai_backend.generation_contracts.canvas_asset_targets import (
+    CANVAS_ASSET_TARGET_FIELDS,
+    canvas_asset_target_digest,
+)
 from haoai_backend.chat_data import apply_web_text
 from haoai_backend.generation_contracts.errors import GenerationError
 from haoai_backend.generation_contracts.types import (
@@ -54,6 +58,8 @@ from haoai_backend.series_data.tables import (
     chapters,
     characters,
     chat_messages,
+    props,
+    scenes,
     storyboard_assets,
 )
 from haoai_backend.shared.identity import TrustedActor
@@ -477,27 +483,52 @@ def test_stable_storyboard_id_allows_unrelated_chapter_change_without_rewriting_
     seeded.engine.dispose()
 
 
-def _seed_completed_asset_application(seeded, now: datetime) -> tuple[CanvasApplyAuthority, GenerationApplicationCommand, str]:
+def _seed_completed_asset_application(
+    seeded,
+    now: datetime,
+    *,
+    asset_type: str = "character",
+) -> tuple[CanvasApplyAuthority, GenerationApplicationCommand, str]:
     actor = GenerationActor(seeded.owner_id, TrustedActor(seeded.owner_id))
     naive_now = now.replace(tzinfo=None)
     asset_id = str(uuid4())
+    asset_tables = {"character": characters, "scene": scenes, "prop": props}
+    target_rows = {
+        "character": {
+            "name": "hero",
+            "aliases": "[\"勇者\"]",
+            "canonical_key": "hero",
+            "gender": "female",
+            "age": "30",
+            "role": "protagonist",
+            "appearance": "blue coat",
+            "description": "original description",
+            "image_url": None,
+            "audio_url": "https://assets.example.test/voice.mp3",
+            "voice_ref": "voice-hero",
+        },
+        "scene": {
+            "title": "night-room",
+            "description": "original scene",
+            "image_url": None,
+            "aliases": "[\"night-room\"]",
+            "canonical_key": "night-room",
+        },
+        "prop": {
+            "name": "silver-key",
+            "description": "original prop",
+            "image_url": None,
+            "aliases": "[\"key\"]",
+            "canonical_key": "silver-key",
+        },
+    }
     row = {
         "id": asset_id,
         "series_id": seeded.series_id,
-        "name": "hero",
-        "aliases": None,
-        "canonical_key": None,
-        "gender": None,
-        "age": None,
-        "role": None,
-        "appearance": None,
-        "description": "original description",
-        "image_url": None,
-        "audio_url": None,
-        "voice_ref": None,
+        **target_rows[asset_type],
     }
     seeded.session.execute(
-        characters.insert().values(
+        asset_tables[asset_type].insert().values(
             **row,
             created_at=naive_now,
             updated_at=naive_now,
@@ -506,10 +537,10 @@ def _seed_completed_asset_application(seeded, now: datetime) -> tuple[CanvasAppl
     target = TargetSnapshot(
         kind="canvas_asset_image",
         series_id=seeded.series_id,
-        asset_type="character",
+        asset_type=asset_type,
         asset_id=asset_id,
-        expected_asset_image_url=None,
-        same_series_target_digest=digest_asset_target("character", row),
+        expected_asset_image_url=row["image_url"],
+        same_series_target_digest=digest_asset_target(asset_type, row),
     )
     payload = {"target_snapshot": asdict(target)}
     task = seeded.session.get(AITaskRow, seeded.task_id)
@@ -545,6 +576,104 @@ def _seed_completed_asset_application(seeded, now: datetime) -> tuple[CanvasAppl
         ),
     )
     return authority, command, asset_id
+
+
+def test_canvas_asset_target_digest_preserves_the_full_p5_projection_bytes() -> None:
+    row = {
+        "id": "character-1",
+        "series_id": "series-1",
+        "name": "hero",
+        "aliases": "[\"勇者\"]",
+        "canonical_key": "hero",
+        "gender": "female",
+        "age": "30",
+        "role": "protagonist",
+        "appearance": "blue coat",
+        "description": "original description",
+        "image_url": None,
+        "audio_url": "https://assets.example.test/voice.mp3",
+        "voice_ref": "voice-1",
+    }
+    expected_fields = {
+        "character": (
+            "id", "series_id", "name", "aliases", "canonical_key", "gender",
+            "age", "role", "appearance", "description", "image_url", "audio_url",
+            "voice_ref",
+        ),
+        "scene": (
+            "id", "series_id", "title", "description", "image_url", "aliases",
+            "canonical_key",
+        ),
+        "prop": (
+            "id", "series_id", "name", "description", "image_url", "aliases",
+            "canonical_key",
+        ),
+    }
+
+    assert dict(CANVAS_ASSET_TARGET_FIELDS) == expected_fields
+    assert canvas_asset_target_digest("character", row) == (
+        "c87e61097b8804d8c4e09b985b99f49e755c9b038a4e77f0880fb3bcf27906ec"
+    )
+    assert digest_asset_target("character", row) == canvas_asset_target_digest(
+        "character",
+        row,
+    )
+
+
+@pytest.mark.parametrize(
+    ("asset_type", "changed_field"),
+    (
+        ("character", "appearance"),
+        ("scene", "aliases"),
+        ("prop", "canonical_key"),
+    ),
+)
+def test_canvas_asset_apply_rejects_changed_full_target_fields(
+    tmp_path: Path,
+    asset_type: str,
+    changed_field: str,
+) -> None:
+    seeded = _seed_frame_result(tmp_path)
+    authority, command, asset_id = _seed_completed_asset_application(
+        seeded,
+        datetime.now(timezone.utc),
+        asset_type=asset_type,
+    )
+    asset_tables = {"character": characters, "scene": scenes, "prop": props}
+    table = asset_tables[asset_type]
+    seeded.session.commit()
+
+    with Session(seeded.engine) as editor:
+        editor.execute(
+            update(table)
+            .where(table.c.id == asset_id)
+            .values(**{changed_field: "edited after admission"})
+        )
+        editor.commit()
+
+    outcome = GenerationResultApplicationFacade(seeded.session).apply_canvas_media(
+        seeded.session,
+        authority,
+        command,
+    )
+
+    assert outcome.kind == "stale"
+    seeded.session.rollback()
+    with Session(seeded.engine) as observer:
+        asset_row = observer.execute(
+            select(table.c[changed_field], table.c.image_url).where(
+                table.c.id == asset_id
+            )
+        ).mappings().one()
+        assert asset_row[changed_field] == "edited after admission"
+        assert asset_row["image_url"] is None
+        assert observer.execute(
+            select(ApplicationRecordRow.application_ref).where(
+                ApplicationRecordRow.result_ref == seeded.result_ref
+            )
+        ).all() == []
+    seeded.session.close()
+    seeded.engine.dispose()
 
 
 def test_canvas_asset_apply_is_same_transaction_and_exact_replay_ignores_old_digest(tmp_path: Path) -> None:

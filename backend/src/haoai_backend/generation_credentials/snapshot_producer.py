@@ -56,6 +56,9 @@ from haoai_backend.generation_catalog.tables import (
     system_models,
     system_prompts,
 )
+from haoai_backend.generation_contracts.canvas_asset_targets import (
+    canvas_asset_target_digest,
+)
 from haoai_backend.generation_contracts.types import (
     EndpointPolicy as SnapshotEndpointPolicy,
     FrozenExecutionSnapshot,
@@ -794,6 +797,17 @@ class MediaSnapshotProducer:
         }.get(kind)
         if target_kind is None:
             raise _UnsafeSnapshot(409, "target_kind_unsupported")
+        target_digest = target_facts.asset_digest
+        if target_kind == "canvas_asset_image":
+            if asset_values is None:
+                raise _UnsafeSnapshot(409, "locked_asset_missing")
+            try:
+                target_digest = canvas_asset_target_digest(
+                    target_facts.asset_type or "",
+                    asset_values,
+                )
+            except (TypeError, ValueError):
+                raise _UnsafeSnapshot(409, "locked_asset_invalid") from None
         stable_storyboard_id = (
             target_facts.asset_id
             if kind in {"frame_message", "canvas_frame_preview"}
@@ -867,7 +881,7 @@ class MediaSnapshotProducer:
                 if asset_values is not None and asset_values.get("image_url") is not None
                 else None
             ),
-            same_series_target_digest=target_facts.asset_digest,
+            same_series_target_digest=target_digest,
         )
         protected = {
             "kind": kind,
