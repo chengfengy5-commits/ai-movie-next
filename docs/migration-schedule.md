@@ -54,13 +54,17 @@ Root614 在独立冻结副本上运行 45 个相关后端测试文件，408 项�
 
 ## 最新进展（2026-10-25）
 
-最近功能交付基线为 main@`3314b19a64fb28ebf15f0a9e2077aa90b109ddca`。Root678/679完成两个真实 Workspace 导出入口的源码复核及12个前端测试文件、325项冻结验证，TypeScript检查和Vite生产构建通过；Root680已将该批中文提交推送至main@`a00c6e07021c17949e938e1d4f367c476b9b231e`。U08.3为C/C、V=P、A=U：证据覆盖受控fetch/jsdom/fakeFS，不证明真实浏览器、磁盘落地或E2E。对应收据为 `haoai-next-root-media-export-ui-gate-679.json` 和 `haoai-next-root-media-export-ui-publish-680.json`。
+最近功能交付基线为 main@`d6ccfdacc684fc6ff45df776448e78ba97a47e08`。Root678/679完成两个真实 Workspace 导出入口的源码复核及12个前端测试文件、325项冻结验证，TypeScript检查和Vite生产构建通过；Root680已将该批中文提交推送至main@`a00c6e07021c17949e938e1d4f367c476b9b231e`。U08.3为C/C、V=P、A=U：证据覆盖受控fetch/jsdom/fakeFS，不证明真实浏览器、磁盘落地或E2E。对应收据为 `haoai-next-root-media-export-ui-gate-679.json` 和 `haoai-next-root-media-export-ui-publish-680.json`。
 
-Root685复核了Canvas稳定来源目标快照、旧asset image投影和普通 `frame_message` 兼容；Root689的7个后端测试文件、173项冻结验证通过，并由Root690中文提交推送至main@`5371fde958ef6f8e137537a64b20f00630a4747f`。这只证明对应后端源码与冻结测试范围；CAV03/04消费者、no-ID、owned结果发现/应用HTTP及浏览器接受仍待。对应收据为 `haoai-next-root-canvas-target-snapshot-gate-689.json` 和 `haoai-next-root-canvas-target-snapshot-publish-690.json`。
+Root685复核了Canvas稳定来源目标快照、旧asset image投影和普通 `frame_message` 兼容；Root689的7个后端测试文件、173项冻结验证通过，并由Root690中文提交推送至main@`5371fde958ef6f8e137537a64b20f00630a4747f`。该批时点仅证明对应后端源码与冻结测试范围；CAV03/04消费者、no-ID、owned结果发现/应用HTTP及浏览器接受仍待。对应收据为 `haoai-next-root-canvas-target-snapshot-gate-689.json` 和 `haoai-next-root-canvas-target-snapshot-publish-690.json`。
 
-Root686复核了旧index布局显示与经真实前后命令及receipt证明的插帧连续性，包括重复媒体槽、无媒体章节、手工边及未知字段保留；Root687-02的12个前端文件388项、TypeScript检查和Vite生产构建通过，Root688已将修复推送至当前main@`3314b19a64fb28ebf15f0a9e2077aa90b109ddca`。首次Root687冻结的387项通过、1项失败仍按原日志保留；失败是旧布局显示行为改变后遗留的断言，不是首次全绿。修正该断言后才由独立的687-02冻结通过。对应收据为 `haoai-next-root-canvas-legacy-layout-gate-687.json`、`haoai-next-root-canvas-legacy-layout-gate-687-02.json` 和 `haoai-next-root-canvas-legacy-layout-publish-688.json`。
+Root686复核了旧index布局显示与经真实前后命令及receipt证明的插帧连续性，包括重复媒体槽、无媒体章节、手工边及未知字段保留；Root687-02的12个前端文件388项、TypeScript检查和Vite生产构建通过，Root688已将修复推送至当时main@`3314b19a64fb28ebf15f0a9e2077aa90b109ddca`。首次Root687冻结的387项通过、1项失败仍按原日志保留；失败是旧布局显示行为改变后遗留的断言，不是首次全绿。修正该断言后才由独立的687-02冻结通过。对应收据为 `haoai-next-root-canvas-legacy-layout-gate-687.json`、`haoai-next-root-canvas-legacy-layout-gate-687-02.json` 和 `haoai-next-root-canvas-legacy-layout-publish-688.json`。
 
-U07.1、U07.2、U07.3、U07.4仍均未整行关闭；U07.2保持P/P、U07.4保持P/M。CAV03/04/no-ID与owned发现/应用HTTP、真实PostgreSQL、浏览器/E2E及外部服务验证仍待。U08.4的成片产品范围待明确；A01–A39完整矩阵接受数仍为0，A39仍为 `OFFLINE_PENDING`，51项验证/接受义务保持不变。当前计数为19/17/51；本次状态更新不推算整体完成度或新增整体ETA。
+Root698完整复核并修正严格no-ID越界准入测试夹具，覆盖准入→producer→worker→owned receipt→P5 writer路径及对应身份、准入锁定事实与原始内容CAS边界；Root699冻结13个后端测试文件、277项通过。Root700已将该批中文提交推送至main@`0a978b12b6f9c136c0119d3575c0f325b29744f5`，功能提交为 `71bc646ab583deed22836431e4ff6cba47f36873`。这只覆盖合成SQLite与受控 provider/storage stub，不证明真实浏览器/E2E、生产PostgreSQL、真实provider/storage或部署；CAV03 owned-result发现/HTTP应用及团队锁边界、CAV04生成UI消费者仍待。对应收据为 `haoai-next-root-canvas-strict-noid-gate-699.json` 和 `haoai-next-root-canvas-strict-noid-publish-700.json`。
+
+Root702复核了角色素材卡片音频维护：使用现有API上传、试听、明确保存音频URL和音色描述，支持null移除字段；没有新增TTS或voice库。Root703的219项前端测试通过后，TypeScript检查因3处新测试错误失败，原收据保留；修正后Root703-02冻结10个文件219项通过，TypeScript和Vite生产构建通过。Root704已将该批中文提交推送至main@`d6ccfdacc684fc6ff45df776448e78ba97a47e08`，功能提交为 `d4c2f0ec2b1ec753cbad1b5592cd942bedb1dbdf`。受控HTTP/jsdom不证明浏览器解码或可听播放；`reference_audios`、provider codecs、完整音频链和真实浏览器验收仍待。对应收据为 `haoai-next-root-character-audio-gate-703.json`、`haoai-next-root-character-audio-gate-703-02.json` 和 `haoai-next-root-character-audio-publish-704.json`。
+
+U07.1、U07.2、U07.3、U07.4仍均未整行关闭；U07.2保持P/P、U07.4保持P/M。no-ID生产路径已交付；CAV03 owned-result发现/HTTP应用及团队锁边界、CAV04生成UI消费者仍待，真实PostgreSQL、浏览器/E2E及外部服务验证也未完成。U05.5仍P/P；角色素材音频维护是局部交付，视频、OSS重试、生成历史、其他媒体引用及真实存储验证仍待。U06.6更新为P/P、V=P、A=U，但不代表新增TTS/voice库或完整旧音频工作流已迁完。U08.4的成片产品范围待明确；A01–A39完整矩阵接受数仍为0，A39仍为 `OFFLINE_PENDING`，51项验证/接受义务保持不变。当前计数仍为19/17/51，按原 `remaining_actions` 口径统计；非C单元格数不等于动作数，也不据此推算整体完成度或新增整体ETA。
 
 ## 十二类工作流与 51 项交付
 
@@ -106,7 +110,7 @@ U07.1、U07.2、U07.3、U07.4仍均未整行关闭；U07.2保持P/P、U07.4保�
 | U05.2 | 孤立项、重复项、忽略/取消忽略和合并 | C | C | V=P / A=U；素材维护 UI/API 已随十路径整合至 main@43b10ec；owned HTTP 五类维护路由×角色/场景/道具三类与 SQLite 检查通过，GUI 为部分通过 | 集中补齐 fault/unknown、独立 merge POST 计数与无自动重试、403/scope 切换、完整焦点路径及权限/媒体/认可保全；用户当前只暂缓 E2E，必要开发与单元/类型/源码检查继续，最终验收待补。 |
 | U05.3 | 融合素材查看/编辑/删除与生成 | P | M | V=P / A=U；准入/claim/应用和 ports 已有，create_app 默认 runtime/storage 为 None | 接入现有 runtime/storage 并做 owned 本地验证，再建 UI、任务回读和失败状态；真实 provider 另行验收。 |
 | U05.4 | 跨章节素材替换 | C | C | V=P / A=U；素材卡片、逐章影响预览与选择、再次读取核对/明确确认、串行单次 POST、独立 GET 核对、逐章 ACK/unknown/未发送状态及显式只读恢复已接入；5 个受影响前端测试文件 134 项、TSC 和生产构建通过 | 补 HTTP、GUI 与 E2E 验收，并继续核对权限、媒体与认可保全；用户当前暂缓 E2E。 |
-| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | P | V=P / A=U；d26910f 存储源码基线已在 main。图片侧已将 image-only 三类素材卡片入口接入 main，完成 fresh 目录 GET→multipart 上传→确认前 GET→仅 image_url PUT→独立 GET；含原 run/token 与迟到 401 防护、unknown/ACK、关窗历史与旧资格失效、受保护 proxy/Blob 预览回收、焦点及 StrictMode 恢复。560-03 复核关闭 AIMG560-01～09；前端四文件 89 项通过、TSC与Root561生产构建通过。后端非 core host/CLI 已接显式 R2 配置→原 adapter→同一 create_app，鉴权/业务共用 Session factory；raw create_app 默认 `storage=None` 不变，缺配置时存储能力不可用。Root577 定向后端 155 项通过，registry 250 方法/36 参数 exact，multipart 0.0.32 隔离 overlay；不代表全栈或真实 R2/PG/HTTP/浏览器验收。 | 完成音视频、OSS 重试、生成历史及其他媒体引用链；补真实 R2 配置下的存储验收和浏览器验收。 |
+| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | P | V=P / A=U；d26910f 存储源码基线已在 main。图片侧已将 image-only 三类素材卡片入口接入 main，完成 fresh 目录 GET→multipart 上传→确认前 GET→仅 image_url PUT→独立 GET；含原 run/token 与迟到 401 防护、unknown/ACK、关窗历史与旧资格失效、受保护 proxy/Blob 预览回收、焦点及 StrictMode 恢复。560-03 复核关闭 AIMG560-01～09；前端四文件 89 项通过、TSC与Root561生产构建通过。后端非 core host/CLI 已接显式 R2 配置→原 adapter→同一 create_app，鉴权/业务共用 Session factory；raw create_app 默认 `storage=None` 不变，缺配置时存储能力不可用。Root577 定向后端 155 项通过，registry 250 方法/36 参数 exact，multipart 0.0.32 隔离 overlay；角色素材卡片音频上传/试听/明确保存音频URL与音色描述、null移除字段已接现有API，Root702复核，Root703-02冻结10个文件219项及TSC/生产构建通过。此音频链不证明浏览器解码、完整音视频流程或真实R2/PG/HTTP验收；视频、OSS重试、生成历史、其他媒体引用链仍待。 | 完成音视频、OSS 重试、生成历史及其他媒体引用链；补真实 R2 配置下的存储验收和浏览器验收。 |
 
 ### U06 AI 助手、生成、提取、Worker 与恢复
 
@@ -117,7 +121,7 @@ U07.1、U07.2、U07.3、U07.4仍均未整行关闭；U07.2保持P/P、U07.4保�
 | U06.3 | 图片单张/批量与视频单条生成入口 | P | P | V=P / A=U；媒体准入、graph、计费及 image-single 无参考图同步执行已有 scoped PG/result 证据 | 完成批图、单视频、参考图/异步和其余 provider family consumer；接 React 状态和原 key 恢复；保留 A01–A12/A21–A29/A31–A38 原矩阵。 |
 | U06.4 | 提取角色/场景/道具及单镜/全镜生成 | P | P | V=P / A=U；六个提取/判断路由与React确认/逐镜保存已接入；642为三类保存增加章节内容/剧集来源、阶段权限重查及SQL CAS；Root643完整复核及修复重审通过，Root644-03按项目默认配置前端309项、类型与构建通过，精确同源后端185项与实际保存/CAS证据保留 | 继续补图片/单镜/全镜生成、跨章节清理并发及完整接受；分阶段提交不等于整请求原子性，21/18/51与整行状态保持不变。 |
 | U06.5 | Worker 可靠性、金融、结果应用、取消和重启恢复 | P | P | V=P / A=U；image.single、frame.review 各有局部实现；frame.optimize 原 intent 到期控制与提交边界修复已通过 Root630 独立176项后端定向测试，并由 Root631 中文提交推送至 main；完整金融/恢复接受仍待 | image.single 的有界PG证据见E179/E181/E185，frame.review 另有e094/PG392范围证据；保留各自层级。继续完整Group/event N6、失败/到期金融闭环、PG竞争和进程crash恢复、其它family、React控制、六项附加义务和完整A01–A39接受。 |
-| U06.6 | 音频相关原工作流 | U | M | V=U / A=U；旧入口有 uploadAudio、参考音频；本轮未完整审查旧音频界面，未见独立 TTS POST 证据 | 对照固定旧音频/音色行为，区分上传/参考音频和 TTS；保留原迁移范围，不凭名称新造协议或删目标。 |
+| U06.6 | 音频相关原工作流 | P | P | V=P / A=U；角色素材真实卡片音频维护已接现有API：上传、试听、明确保存音频URL和音色描述，并以null移除字段；Root702复核，Root703-02冻结10个文件219项、TSC和Vite生产构建通过。Root703首次219项测试通过后，TSC因3处新测试错误失败，留档后修正并通过703-02复验。此处仅覆盖角色素材音频维护，没有新增TTS或voice库；`reference_audios`、provider codecs、完整音频链和真实浏览器解码/可听验收仍待 | 对照并完成 `reference_audios`、provider codecs与完整音频链；补真实浏览器解码/可听验收，区分角色素材维护和TTS，不扩写为新增voice库。 |
 
 ### U07 多节点创作画布和结果回填
 
@@ -126,7 +130,7 @@ U07.1、U07.2、U07.3、U07.4仍均未整行关闭；U07.2保持P/P、U07.4保�
 | U07.1 | 图结构、缩放平移、节点/边选择和布局 | P | P | V=P / A=U；章节图、布局、缩放平移及节点/边选择已接入，完整旧行为对照和浏览器矩阵仍待 | 补齐旧图编辑行为与真实章节/素材图、多用户、键盘和窄屏浏览器验收。 |
 | U07.2 | 节点编辑、手动连线、卡片/便签和撤销重做 | P | P | V=P / A=U；本地便签、卡片、手动关系和 50 步 undo 已接入；CAV02 来源后端已实现 GET/POST、8类命令、事务/CAS与受控创建撤销，Root659完整复核/修复复核及Root660冻结27文件223项通过。665已发布真实Workspace来源消费者，677已发布新增素材与媒体绑定修复；Root676冻结11文件367项及TSC/生产构建通过。688已发布旧index布局/手工边显示兼容和经证明的插帧连续性（含重复媒体槽与无媒体章节）；Root686复核、Root687-02冻结12个前端文件388项及TSC/生产构建通过。首次687的387项通过、1项旧断言失败保留为历史。CAV03/04和整行验收仍待 | 完成选中状态、未知字段、会话/锁边界、CAV03/04及整行验收；补齐真实浏览器接受。 |
 | U07.3 | 画布文档/视口保存、版本冲突和失败恢复 | P | P | V=P / A=U；opt-in guarded-v1 SQL id/version CAS、2 秒防抖和配对 receipt 已接入；unknown/conflict 会停止自动保存。legacy blind-writer convergence、PostgreSQL 及完整浏览器接受仍待 | 补 legacy writer 收敛、PG 并发与完整浏览器失败恢复矩阵；维持未知写入停止自动重放。 |
-| U07.4 | 画布触发生成及 owned 结果应用 | P | M | V=P / A=U；authority/result reader 与 writer 已有；Root685复核稳定来源目标快照、旧asset image投影和普通 `frame_message` 兼容，Root689冻结7个后端文件173项通过，Root690已发布至main@`5371fde958ef6f8e137537a64b20f00630a4747f`。这不代表CAV03 owned-result或CAV04生成消费者已接入；no-ID与owned结果发现/应用HTTP仍待 | 接入并验 owner、完成任务、当前权限、稳定目标/CAS 和重复应用不增 revision；补齐no-ID及owned发现/应用HTTP验证。 |
+| U07.4 | 画布触发生成及 owned 结果应用 | P | M | V=P / A=U；authority/result reader 与 writer 已有。Root698复核并由Root699/700发布严格no-ID准入→producer→worker→owned receipt→P5 writer路径；该项no-ID生产缺口已关闭，不代表U07.4整行关闭。CAV03 owned-result发现/HTTP应用及团队锁边界、CAV04生成UI消费者仍未接入 | 接入CAV03发现/HTTP应用及团队锁边界、CAV04生成UI；验证owner、完成任务、当前权限、稳定目标/CAS和重复应用不增revision。 |
 
 ### U08 连续预览、粗剪、媒体导出与实际输出
 
