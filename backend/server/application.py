@@ -13,6 +13,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from haoai_backend.authentication import AuthenticationRuntime
+from haoai_backend.media_storage.owned_media_runtime import OwnedMediaRuntime
 from haoai_backend.media_storage.r2_sdk_factory import Boto3S3ClientFactory
 from haoai_backend.media_storage.transfer_types import SecretValue
 from haoai_backend.media_uploads import MediaUploadApplication
@@ -65,26 +66,47 @@ class _SecretHandle:
 
 
 class _OwnedResources:
-    def __init__(self, engine: Engine, storage: R2MediaUploadStorage | None) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        storage: R2MediaUploadStorage | None,
+        media_runtime: OwnedMediaRuntime | None = None,
+    ) -> None:
         self._engine = engine
         self._storage = storage
+        self._media_runtime = media_runtime
         self._lock = threading.Lock()
         self._storage_cleanup_complete = storage is None
+        self._media_runtime_cleanup_complete = media_runtime is None
         self._engine_disposed = False
 
     def close(self) -> None:
         with self._lock:
-            if self._storage_cleanup_complete and self._engine_disposed:
+            if (
+                self._media_runtime_cleanup_complete
+                and self._storage_cleanup_complete
+                and self._engine_disposed
+            ):
                 return
 
             failures = False
+            if (
+                not self._media_runtime_cleanup_complete
+                and self._media_runtime is not None
+            ):
+                try:
+                    self._media_runtime.close()
+                    self._media_runtime_cleanup_complete = True
+                except BaseException:
+                    failures = True
+
             if not self._storage_cleanup_complete and self._storage is not None:
                 try:
                     outcomes = self._storage.retry_pending_cleanup()
                     self._storage_cleanup_complete = all(
                         outcome is True for outcome in outcomes
                     )
-                    failures = not self._storage_cleanup_complete
+                    failures = failures or not self._storage_cleanup_complete
                 except BaseException:
                     failures = True
 
@@ -128,6 +150,7 @@ def create_server_host(
         )
         storyboard_asset_generation_runtime = OpenAICompatibleStoryboardAssetRuntime()
         storage: R2MediaUploadStorage | None = None
+        upload_factory: Boto3S3ClientFactory | None = None
         storage_probe = None
         media_application: MediaUploadApplication
 
@@ -179,7 +202,25 @@ def create_server_host(
                 client_factory=head_bucket_factory,
             )
 
-        resources = _OwnedResources(engine, storage)
+        image_generation_configuration = None
+        if configuration.image_single_enabled:
+            from .image_generation import build_image_generation_host_configuration
+
+            image_generation_configuration = build_image_generation_host_configuration(
+                configuration,
+                session_factory=session_factory,
+                s3_client_factory=upload_factory,
+            )
+
+        resources = _OwnedResources(
+            engine,
+            storage,
+            (
+                image_generation_configuration.media_runtime
+                if image_generation_configuration is not None
+                else None
+            ),
+        )
         from haoai_backend.app import create_app
 
         app = create_app(
@@ -202,12 +243,25 @@ def create_server_host(
             media_upload_application=media_application,
             frame_optimize_worker_configuration=frame_optimize_configuration,
             storyboard_asset_generation_runtime=storyboard_asset_generation_runtime,
+            chat_media_admission_configuration=(
+                image_generation_configuration.admission_configuration
+                if image_generation_configuration is not None
+                else None
+            ),
+            generation_worker_configuration=(
+                image_generation_configuration.generation_worker_configuration
+                if image_generation_configuration is not None
+                else None
+            ),
         )
         app.state.server_session_factory = session_factory
         app.state.server_resources = resources
         app.state.server_engine = engine
         app.state.server_frame_optimize_worker_configuration = (
             frame_optimize_configuration
+        )
+        app.state.server_image_generation_configuration = (
+            image_generation_configuration
         )
         _compose_host_lifespan(app, resources)
         return ServerHost(

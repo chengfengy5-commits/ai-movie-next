@@ -177,6 +177,8 @@ def _build_system(
     *,
     operation_category: str = "image",
     with_configuration: bool = True,
+    enabled_operations: frozenset[str] | None = None,
+    image_references_enabled: bool | None = None,
     lose_first_business_commit_ack: bool = False,
     business_close_gate: BusinessCloseGate | None = None,
 ) -> _System:
@@ -281,6 +283,16 @@ def _build_system(
                 reference_policy="chat-media-fixture-reference-v1",
             ),
         )
+        requested_configuration = {
+            name: value
+            for name, value in (
+                ("enabled_operations", enabled_operations),
+                ("image_references_enabled", image_references_enabled),
+            )
+            if value is not None
+        }
+        if requested_configuration:
+            configuration = replace(configuration, **requested_configuration)
     app = create_app(
         session_factory=business_factory,
         authentication_runtime=runtime,
@@ -1751,6 +1763,93 @@ def test_authenticated_default_without_admission_configuration_fails_closed(
         with system.engine.connect() as connection:
             assert connection.execute(select(AITaskRow.__table__)).all() == []
             assert connection.execute(select(CreditLogRow.__table__)).all() == []
+    finally:
+        system.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("path", "operation", "category"),
+    (
+        ("/api/chat/video", "video.single", "video"),
+        ("/api/chat/batch-generate-images", "image.batch", "image"),
+    ),
+)
+def test_real_http_rejects_disabled_media_operations_before_staging_or_charging(
+    tmp_path: Path,
+    path: str,
+    operation: str,
+    category: str,
+) -> None:
+    system = _build_system(
+        tmp_path,
+        operation_category=category,
+        enabled_operations=frozenset({"image.single"}),
+    )
+    try:
+        before = _canvas_lookup_write_state(system.engine)
+        response = _post(system, path, body=_body(operation))
+
+        assert system.business_sessions == [], response.text
+        assert response.status_code == 503, response.text
+        assert response.json() == {"detail": "该媒体生成操作尚未启用"}
+        assert len(system.auth_sessions) == 1
+        assert system.auth_sessions[0].info.get("observed_closed") is True
+        assert _canvas_lookup_write_state(system.engine) == before
+    finally:
+        system.engine.dispose()
+
+
+@pytest.mark.parametrize("reference_field", ("reference_image", "reference_images"))
+def test_real_http_rejects_unconsumed_image_references_before_staging_or_charging(
+    tmp_path: Path,
+    reference_field: str,
+) -> None:
+    system = _build_system(
+        tmp_path,
+        image_references_enabled=False,
+    )
+    body = _body("image.single")
+    if reference_field == "reference_image":
+        body[reference_field] = "https://references.example.test/reference.png"
+        body.pop("reference_images", None)
+    else:
+        body.pop("reference_image", None)
+        body[reference_field] = ["https://references.example.test/reference.png"]
+    try:
+        before = _canvas_lookup_write_state(system.engine)
+        response = _post(system, "/api/chat/image", body=body)
+
+        assert response.status_code == 422, response.text
+        assert response.json() == {"detail": "当前图片生成暂不支持参考图"}
+        assert len(system.auth_sessions) == 1
+        assert system.auth_sessions[0].info.get("observed_closed") is True
+        assert system.business_sessions == []
+        assert _canvas_lookup_write_state(system.engine) == before
+    finally:
+        system.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    "reference_fields",
+    ({}, {"reference_image": ""}, {"reference_images": []}),
+)
+def test_real_http_allows_image_single_without_references_when_references_are_disabled(
+    tmp_path: Path,
+    reference_fields: dict[str, object],
+) -> None:
+    system = _build_system(
+        tmp_path,
+        image_references_enabled=False,
+    )
+    body = _body("image.single")
+    body.pop("reference_image", None)
+    body.update(reference_fields)
+    try:
+        response = _post(system, "/api/chat/image", body=body)
+
+        assert response.status_code == 200, response.text
+        assert response.json()["operation"] == "image.single"
+        assert response.json()["billing_status"] == "charged"
     finally:
         system.engine.dispose()
 

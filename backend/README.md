@@ -139,6 +139,10 @@ backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分
 
 只有同时提供 `OBJECT_STORAGE_ENDPOINT_URL`、`OBJECT_STORAGE_ACCESS_KEY_ID`、`OBJECT_STORAGE_SECRET_ACCESS_KEY`、`OBJECT_STORAGE_BUCKET`、`OBJECT_STORAGE_PUBLIC_BASE_URL` 和已存在且可写的 `TRANSFER_TMP_DIR`，才会装配现有 R2 上传 adapter。`ALLOW_R2_DEV=true` 仅允许非生产环境显式使用 `r2.dev`。读取变量本身不会连接数据库或 R2；运行健康探测仅在 `/ready` 请求时执行。该入口不表示真实 R2、PostgreSQL、部署或浏览器验收已经完成。
 
+`image.single` host 仍默认关闭。显式设置 `IMAGE_SINGLE_ENABLED=true` 时，必须同时提供绝对路径 `IMAGE_SINGLE_CREDENTIALS_FILE` 和完整 R2 配置；关闭时不会读取该文件或构造单图媒体 runtime。启用后只装配单图准入与 worker，video 和 batch 路由在认证后返回 503，不打开业务 Session 或创建/扣费。该 host 暂不接收 `reference_image`/`reference_images`；带参考图的单图请求在准入前返回 422，空参考图请求可继续现有准入流程。
+
+单图 provider 使用原有 OpenAI image adapter 和已登记 Root 凭据；输出媒体写入采用 `business_type=generation` 的现有 R2 key 规则。owned media runtime 懒启动，沿用媒体传输的 200 MiB 上限、600 秒超时和双共享槽；双共享槽不是用户任务并发限额。用户并发策略仍沿用当前 `AdmissionPolicy(max_concurrent_tasks=0)`，正数限制因任务类型并发绑定未完成而保持 fail-closed。应用关闭时先停止 worker，再清理媒体 runtime 和 R2 上传资源，最后释放 Engine。
+
 ```sh
 PYTHONPATH=backend/src python3.12 -m backend.server
 ```

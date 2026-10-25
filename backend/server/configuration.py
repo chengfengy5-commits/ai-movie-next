@@ -33,6 +33,32 @@ class ServerConfiguration:
     frame_optimize_enabled: bool = False
     frame_optimize_credentials_file: Path | None = field(default=None, repr=False)
     frame_optimize_max_user_concurrency: int = 1
+    image_single_enabled: bool = False
+    image_single_credentials_file: Path | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        if type(self.image_single_enabled) is not bool:
+            raise ServerConfigurationError("IMAGE_SINGLE_ENABLED must be explicit")
+        if self.image_single_credentials_file is not None and (
+            not isinstance(self.image_single_credentials_file, Path)
+            or not self.image_single_credentials_file.is_absolute()
+        ):
+            raise ServerConfigurationError(
+                "IMAGE_SINGLE_CREDENTIALS_FILE must be an absolute path"
+            )
+        if self.image_single_enabled:
+            if self.image_single_credentials_file is None:
+                raise ServerConfigurationError(
+                    "IMAGE_SINGLE_CREDENTIALS_FILE is required when image.single is enabled"
+                )
+            if (
+                self.r2_configuration is None
+                or self.r2_access_key is None
+                or self.r2_secret_key is None
+            ):
+                raise ServerConfigurationError(
+                    "image.single requires complete object storage"
+                )
 
 
 _R2_KEYS = (
@@ -74,11 +100,28 @@ def load_server_configuration(
         raise ServerConfigurationError(
             "FRAME_OPTIMIZE_CREDENTIALS_FILE is required when frame.optimize is enabled"
         )
+    image_single_enabled = _boolean(
+        values,
+        "IMAGE_SINGLE_ENABLED",
+        default=False,
+    )
+    image_single_credentials_file = _optional_absolute_path(
+        values,
+        "IMAGE_SINGLE_CREDENTIALS_FILE",
+    )
+    if image_single_enabled and image_single_credentials_file is None:
+        raise ServerConfigurationError(
+            "IMAGE_SINGLE_CREDENTIALS_FILE is required when image.single is enabled"
+        )
 
     configured = tuple(key for key in _R2_KEYS if key in values)
     if not configured:
         if environment == "production":
             raise ServerConfigurationError("production object storage is required")
+        if image_single_enabled:
+            raise ServerConfigurationError(
+                "image.single requires complete object storage"
+            )
         if allow_r2_dev:
             raise ServerConfigurationError(
                 "ALLOW_R2_DEV requires complete object storage"
@@ -93,6 +136,8 @@ def load_server_configuration(
             frame_optimize_enabled=frame_optimize_enabled,
             frame_optimize_credentials_file=frame_optimize_credentials_file,
             frame_optimize_max_user_concurrency=frame_optimize_max_user_concurrency,
+            image_single_enabled=image_single_enabled,
+            image_single_credentials_file=image_single_credentials_file,
         )
 
     missing = tuple(
@@ -143,6 +188,8 @@ def load_server_configuration(
         frame_optimize_enabled=frame_optimize_enabled,
         frame_optimize_credentials_file=frame_optimize_credentials_file,
         frame_optimize_max_user_concurrency=frame_optimize_max_user_concurrency,
+        image_single_enabled=image_single_enabled,
+        image_single_credentials_file=image_single_credentials_file,
     )
 
 

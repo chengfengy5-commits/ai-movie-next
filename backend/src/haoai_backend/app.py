@@ -1250,6 +1250,16 @@ def create_app(
             authentication_service=authentication_service,
             session_factory=effective_session_factory,
             producer_binding=chat_media_producer_binding,
+            enabled_operations=(
+                chat_media_admission_configuration.enabled_operations
+                if chat_media_admission_configuration is not None
+                else None
+            ),
+            image_references_enabled=(
+                chat_media_admission_configuration.image_references_enabled
+                if chat_media_admission_configuration is not None
+                else True
+            ),
         )
     )
     chat_text_generation_router = build_chat_text_generation_router(
