@@ -10,9 +10,12 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from haoai_backend.generation_core.schema import (
+    CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM,
+    CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
     GENERATION_MIGRATION_HISTORY_TABLE,
     GENERATION_SCHEMA_CHECKSUM,
     GENERATION_SCHEMA_VERSION,
+    check_canvas_result_target_schema,
     check_foundation_schema,
     check_generation_record_schema,
     check_generation_version_set,
@@ -58,8 +61,9 @@ def check_generation_readiness(session: Session) -> GenerationReadiness:
                 return GenerationReadiness("not_ready", tuple(issues))
 
             records = check_generation_record_schema(catalog)
+            targets = check_canvas_result_target_schema(catalog)
             history = check_migration_history_schema(catalog)
-            issues.extend(_issues_from_checks(records, history))
+            issues.extend(_issues_from_checks(records, targets, history))
             if issues:
                 return GenerationReadiness("not_ready", tuple(issues))
 
@@ -80,6 +84,21 @@ def check_generation_readiness(session: Session) -> GenerationReadiness:
                     ReadinessIssue(
                         "generation_migration_checksum_mismatch",
                         GENERATION_SCHEMA_VERSION,
+                    )
+                )
+            target_rows = [
+                row
+                for row in rows
+                if str(row[0]) == CANVAS_RESULT_TARGETS_SCHEMA_VERSION
+            ]
+            if (
+                len(target_rows) != 1
+                or str(target_rows[0][1]) != CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM
+            ):
+                issues.append(
+                    ReadinessIssue(
+                        "generation_migration_checksum_mismatch",
+                        CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
                     )
                 )
     except SQLAlchemyError as error:

@@ -44,6 +44,7 @@ from .schema import (
     StreamFeeRecordRow,
     UnitFeeDecisionRow,
 )
+from .canvas_result_targets import prepare_canvas_result_target_projection
 
 
 GenerationRecord: TypeAlias = (
@@ -170,8 +171,24 @@ class GenerationRecordRepository:
         invalid = self._validate_bindings(record)
         if invalid is not None:
             return RecordWriteResult("invalid_binding", detail=invalid)
+        target_projection = None
+        if isinstance(record, GenerationResultReceipt):
+            prepared_projection = prepare_canvas_result_target_projection(
+                self._session,
+                record,
+            )
+            if prepared_projection.status == "invalid_binding":
+                return RecordWriteResult(
+                    "invalid_binding",
+                    detail=prepared_projection.detail,
+                )
+            if prepared_projection.status == "project":
+                target_projection = prepared_projection.row
         self._session.add(_row_from_record(record))
         self._session.flush()
+        if target_projection is not None:
+            self._session.add(target_projection)
+            self._session.flush()
         return RecordWriteResult("created", record)
 
     def reserve_poll(
