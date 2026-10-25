@@ -148,6 +148,8 @@ import { createAssetReplacementHttpPort } from "./assetReplacementHttp";
 import type { AssetReplacementPort } from "./assetReplacement";
 import { createAssetImageUploadHttpPort } from "./assetImageUploadHttp";
 import type { AssetImageUploadPort } from "./assetImageUpload";
+import { createCharacterAudioHttpPort } from "./characterAudioHttp";
+import type { CharacterAudioPort } from "./characterAudio";
 import {
   createStoryboardAssetGenerationHttpPort,
   STORYBOARD_ASSET_STREAM_TIMEOUT_MS,
@@ -209,6 +211,7 @@ export interface WorkspaceServices {
   readonly assetMaintenance?: AssetMaintenanceServicePort;
   readonly assetReplacement?: AssetReplacementPort;
   readonly assetImageUpload?: AssetImageUploadPort;
+  readonly characterAudio?: CharacterAudioPort;
   readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
   readonly canvasSource?: CanvasSourcePort;
@@ -2942,6 +2945,12 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     assetImageUpload: createAssetImageUploadHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    characterAudio: createCharacterAudioHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,

@@ -27,10 +27,18 @@ import {
   AssetImageUploadDialog,
   type AssetImageUploadAttempt,
 } from "./media/AssetImageUploadDialog";
+import {
+  CharacterAudioDialog,
+  type CharacterAudioAttempt,
+} from "./media/CharacterAudioDialog";
 import type {
   AssetImageDirectory,
   AssetImageUploadRun,
 } from "../../shared/api/assetImageUpload";
+import type {
+  CharacterAudioDirectory,
+  CharacterAudioRun,
+} from "../../shared/api/characterAudio";
 
 type AssetRecord = Character | Scene | Prop;
 
@@ -137,6 +145,18 @@ interface AssetImageUploadRequest {
   attempts: AssetImageUploadAttempt[];
   openEpoch: number;
   invalidateRun(): void;
+}
+
+interface CharacterAudioRequest {
+  id: number;
+  scope: LibraryScope;
+  category: "characters";
+  asset: Character;
+  directoryResult: ScopedAssetResult;
+  port: NonNullable<WorkspaceServices["characterAudio"]>;
+  run: CharacterAudioRun;
+  attempts: CharacterAudioAttempt[];
+  openEpoch: number;
 }
 
 const assetTypes: Array<{ id: AssetLibraryType; label: string }> = [
@@ -303,6 +323,8 @@ function AssetCard({
   replacementUnavailable,
   onUploadImage,
   imageUploadUnavailable,
+  onCharacterAudio,
+  characterAudioUnavailable,
   onEdit,
   onDelete,
   usageUnavailable,
@@ -321,6 +343,8 @@ function AssetCard({
   replacementUnavailable?: string | undefined;
   onUploadImage?: (() => void) | undefined;
   imageUploadUnavailable?: string | undefined;
+  onCharacterAudio?: (() => void) | undefined;
+  characterAudioUnavailable?: string | undefined;
   onEdit?: (() => void) | undefined;
   onDelete?: (() => void) | undefined;
   usageUnavailable: boolean;
@@ -398,6 +422,14 @@ function AssetCard({
           </button>
           {imageUploadUnavailable !== undefined && <small role="note">{imageUploadUnavailable}</small>}
         </div>
+        {character !== null && (
+          <div className="asset-card-character-audio-action">
+            <button className="secondary-button" disabled={onCharacterAudio === undefined} onClick={onCharacterAudio} type="button">
+              音频与音色
+            </button>
+            {characterAudioUnavailable !== undefined && <small role="note">{characterAudioUnavailable}</small>}
+          </div>
+        )}
         {(onEdit !== undefined || onDelete !== undefined) && (
           <div className="asset-card-management-actions" aria-label={name + "素材操作"}>
             {onEdit !== undefined && <button onClick={onEdit} type="button">编辑</button>}
@@ -473,6 +505,15 @@ export function AssetLibrary({
   const imageUploadRequestIdRef = useRef(0);
   const imageUploadAttemptIdRef = useRef(0);
   const [imageUploadIssue, setImageUploadIssue] = useState<string | null>(null);
+  const [characterAudioRequests, setCharacterAudioRequests] = useState<CharacterAudioRequest[]>([]);
+  const characterAudioRequestsRef = useRef(characterAudioRequests);
+  characterAudioRequestsRef.current = characterAudioRequests;
+  const [activeCharacterAudioId, setActiveCharacterAudioId] = useState<number | null>(null);
+  const activeCharacterAudioIdRef = useRef(activeCharacterAudioId);
+  activeCharacterAudioIdRef.current = activeCharacterAudioId;
+  const characterAudioRequestIdRef = useRef(0);
+  const characterAudioAttemptIdRef = useRef(0);
+  const [characterAudioIssue, setCharacterAudioIssue] = useState<string | null>(null);
   const [pendingLocateAsset, setPendingLocateAsset] = useState<{
     assetId: string;
     scope: LibraryScope;
@@ -536,9 +577,45 @@ export function AssetLibrary({
     openEpochRef.current += 1;
   }
 
+  function invalidateActiveCharacterAudio(): void {
+    const activeId = activeCharacterAudioIdRef.current;
+    if (activeId === null) return;
+    const request = characterAudioRequestsRef.current.find((candidate) => candidate.id === activeId);
+    if (request !== undefined) {
+      const lastAttempt = request.attempts.at(-1);
+      if (lastAttempt?.state === "uploading" || lastAttempt?.state === "confirming"
+        || lastAttempt?.state === "saving" || lastAttempt?.state === "acknowledged") {
+        const state: CharacterAudioAttempt["state"] = lastAttempt.state === "uploading"
+          ? "upload-unknown"
+          : lastAttempt.state === "confirming"
+            ? "save-not-sent"
+            : lastAttempt.state === "saving" ? "save-unknown" : "acknowledged-read-failed";
+        const message = lastAttempt.state === "uploading"
+          ? "窗口关闭或角色目录变化时上传已发出；结果未知，不会自动重发。"
+          : lastAttempt.state === "confirming"
+            ? "窗口关闭或角色目录变化时仍在保存前只读核对；角色更新未发送。"
+            : lastAttempt.state === "saving"
+              ? "窗口关闭或角色目录变化时保存已发出；结果未知，不会自动重放。"
+              : "服务器已确认保存，但独立目录读取尚未完成；可重新打开后只读核对。";
+        const nextAttempts = request.attempts.map((attempt) => attempt.id === lastAttempt.id
+          ? { ...attempt, state, message }
+          : attempt);
+        const nextRequests = characterAudioRequestsRef.current.map((candidate) => candidate.id === request.id
+          ? { ...candidate, attempts: nextAttempts }
+          : candidate);
+        characterAudioRequestsRef.current = nextRequests;
+        setCharacterAudioRequests(nextRequests);
+      }
+    }
+    activeCharacterAudioIdRef.current = null;
+    setActiveCharacterAudioId(null);
+    openEpochRef.current += 1;
+  }
+
   const previousScope = libraryScopeRef.current;
   if (previousScope.userId !== userId || previousScope.services !== services || previousScope.seriesId !== series.id) {
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     libraryScopeRef.current = { userId, services, seriesId: series.id, generation: previousScope.generation + 1 };
     directoryRequestGenerationRef.current += 1;
     searchGenerationRef.current += 1;
@@ -579,6 +656,7 @@ export function AssetLibrary({
     observedNavigationEpochRef.current = null;
   } else if (observedNavigationEpochRef.current !== effectiveNavigationIntent.navigationEpoch) {
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     observedNavigationEpochRef.current = effectiveNavigationIntent.navigationEpoch;
     directoryRequestGenerationRef.current += 1;
     searchGenerationRef.current += 1;
@@ -794,6 +872,7 @@ export function AssetLibrary({
     }
     directoryRequestGenerationRef.current += 1;
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
     setManagementRequest(null);
@@ -884,6 +963,7 @@ export function AssetLibrary({
       return;
     }
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     invalidateUsage();
     const request: AssetManagementRequest = {
       id: ++managementRequestIdRef.current,
@@ -913,6 +993,7 @@ export function AssetLibrary({
       return;
     }
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     const request: AssetMaintenanceRequest = {
       id: ++maintenanceRequestIdRef.current,
       scope: libraryScope,
@@ -957,6 +1038,7 @@ export function AssetLibrary({
     }
 
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     invalidateUsage();
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
@@ -1030,6 +1112,44 @@ export function AssetLibrary({
       && hasUniqueUsageIdentity(resultRef.current.result.items, activeRequest.asset, series.id);
   }
 
+  function isCurrentCharacterAudioContext(requestId: number): boolean {
+    const request = characterAudioRequestsRef.current.find((candidate) => candidate.id === requestId);
+    const activeResult = resultRef.current;
+    return request !== undefined
+      && request.scope === libraryScopeRef.current
+      && request.scope.userId === userId
+      && request.scope.services === services
+      && request.scope.seriesId === series.id
+      && request.category === selectedTypeRef.current
+      && request.port === services.characterAudio
+      && series.can_enter !== false
+      && activeResult === request.directoryResult
+      && activeResult.result.status === "ready"
+      && activeResult.result.type === "characters"
+      && directoryRequestGenerationRef.current === request.directoryResult.requestGeneration
+      && hasUniqueUsageIdentity(activeResult.result.items, request.asset, series.id);
+  }
+
+  function isCurrentCharacterAudio(request: CharacterAudioRequest, requestEpoch: number): boolean {
+    const activeRequest = characterAudioRequestsRef.current.find((candidate) => candidate.id === request.id);
+    return activeRequest !== undefined
+      && activeRequest.openEpoch === requestEpoch
+      && activeCharacterAudioIdRef.current === request.id
+      && openEpochRef.current === requestEpoch
+      && activeRequest.scope === libraryScopeRef.current
+      && activeRequest.scope.userId === userId
+      && activeRequest.scope.services === services
+      && activeRequest.scope.seriesId === series.id
+      && activeRequest.category === selectedTypeRef.current
+      && activeRequest.port === services.characterAudio
+      && series.can_enter !== false
+      && resultRef.current === activeRequest.directoryResult
+      && resultRef.current.result.status === "ready"
+      && resultRef.current.result.type === "characters"
+      && directoryRequestGenerationRef.current === activeRequest.directoryResult.requestGeneration
+      && hasUniqueUsageIdentity(resultRef.current.result.items, activeRequest.asset, series.id);
+  }
+
   function openImageUpload(
     category: AssetLibraryType,
     item: AssetRecord,
@@ -1062,6 +1182,7 @@ export function AssetLibrary({
       && request.run.isCurrent());
     if (existing !== undefined) {
       invalidateActiveImageUpload();
+      invalidateActiveCharacterAudio();
       invalidateUsage();
       managementRequestRef.current = null;
       invalidatedManagementRequestRef.current = null;
@@ -1080,6 +1201,7 @@ export function AssetLibrary({
     }
 
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     invalidateUsage();
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
@@ -1130,6 +1252,97 @@ export function AssetLibrary({
     activeImageUploadIdRef.current = request.id;
     setActiveImageUploadId(request.id);
     setImageUploadIssue(null);
+  }
+
+  function openCharacterAudio(item: Character, directoryItems: Character[]): void {
+    const activeResult = resultRef.current;
+    const port = services.characterAudio;
+    if (
+      replacementRequestsRef.current.some((request) => request.writeInFlight)
+      || series.can_enter === false
+      || port === undefined
+      || selectedTypeRef.current !== "characters"
+      || activeResult === null
+      || activeResult.scope !== libraryScope
+      || activeResult.result.status !== "ready"
+      || activeResult.result.type !== "characters"
+      || libraryScopeRef.current !== libraryScope
+      || !hasValidCategoryName("characters", item)
+      || !hasUniqueUsageIdentity(directoryItems, item, series.id)
+    ) {
+      return;
+    }
+
+    const existing = characterAudioRequestsRef.current.find((request) => request.scope === libraryScope
+      && request.category === "characters"
+      && request.asset.id === item.id
+      && request.port === port
+      && request.directoryResult === activeResult
+      && request.run.isCurrent());
+    invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
+    invalidateUsage();
+    managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
+    setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
+    resetAssetSearch();
+
+    if (existing !== undefined) {
+      const openEpoch = ++openEpochRef.current;
+      const nextRequest = { ...existing, asset: item, directoryResult: activeResult, openEpoch };
+      const nextRequests = characterAudioRequestsRef.current.map((request) => request.id === existing.id
+        ? nextRequest
+        : request);
+      characterAudioRequestsRef.current = nextRequests;
+      setCharacterAudioRequests(nextRequests);
+      activeCharacterAudioIdRef.current = nextRequest.id;
+      setActiveCharacterAudioId(nextRequest.id);
+      setCharacterAudioIssue(null);
+      return;
+    }
+
+    const previous = characterAudioRequestsRef.current.filter((request) => request.scope === libraryScope
+      && request.category === "characters"
+      && request.asset.id === item.id
+      && request.port === port).at(-1);
+    const requestId = ++characterAudioRequestIdRef.current;
+    const requestEpoch = ++openEpochRef.current;
+    let request: CharacterAudioRequest;
+    try {
+      const run = port.beginRun({
+        actorId: userId,
+        seriesId: series.id,
+        characterId: item.id,
+        directoryEpoch: activeResult.requestGeneration,
+        portEpoch: requestId,
+        character: item,
+        isContextCurrent: () => isCurrentCharacterAudioContext(requestId),
+      });
+      request = {
+        id: requestId,
+        scope: libraryScope,
+        category: "characters",
+        asset: item,
+        directoryResult: activeResult,
+        port,
+        run,
+        attempts: previous?.attempts ?? [],
+        openEpoch: requestEpoch,
+      };
+    } catch (error) {
+      setCharacterAudioIssue(error instanceof Error ? error.message : "无法创建音频操作，请重新读取角色目录。");
+      return;
+    }
+    const nextRequests = [...characterAudioRequestsRef.current, request];
+    characterAudioRequestsRef.current = nextRequests;
+    setCharacterAudioRequests(nextRequests);
+    activeCharacterAudioIdRef.current = request.id;
+    setActiveCharacterAudioId(request.id);
+    setCharacterAudioIssue(null);
   }
 
   function setImageUploadAttempts(
@@ -1185,6 +1398,59 @@ export function AssetLibrary({
     invalidateActiveImageUpload();
   }
 
+  function setCharacterAudioAttempts(
+    request: CharacterAudioRequest,
+    requestEpoch: number,
+    attempts: CharacterAudioAttempt[],
+  ): void {
+    if (!isCurrentCharacterAudio(request, requestEpoch)) return;
+    const nextRequests = characterAudioRequestsRef.current.map((candidate) => candidate.id === request.id
+      ? { ...candidate, attempts }
+      : candidate);
+    characterAudioRequestsRef.current = nextRequests;
+    setCharacterAudioRequests(nextRequests);
+  }
+
+  function acceptCharacterAudioDirectory(
+    request: CharacterAudioRequest,
+    directory: CharacterAudioDirectory,
+    requestEpoch: number,
+  ): void {
+    if (!isCurrentCharacterAudio(request, requestEpoch) || directory.category !== "characters") return;
+    const ready: AssetReadyResult = { type: "characters", status: "ready", items: directory.items };
+    const requestGeneration = ++directoryRequestGenerationRef.current;
+    cache.current.set("characters", ready);
+    resetAssetSearch();
+    usageOwnerRef.current = null;
+    setUsageOwner(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
+    setNavigationFeedback(null);
+    const nextResult: ScopedAssetResult = {
+      scope: request.scope,
+      requestGeneration,
+      navigationEpoch: null,
+      result: ready,
+    };
+    const updatedCharacter = directory.items.find((item) => item.id === request.asset.id);
+    const nextRequests = characterAudioRequestsRef.current.map((candidate) => candidate.id === request.id
+      ? {
+        ...candidate,
+        asset: updatedCharacter ?? candidate.asset,
+        directoryResult: nextResult,
+      }
+      : candidate);
+    characterAudioRequestsRef.current = nextRequests;
+    setCharacterAudioRequests(nextRequests);
+    resultRef.current = nextResult;
+    setResult(nextResult);
+  }
+
+  function closeCharacterAudio(request: CharacterAudioRequest, requestEpoch: number): void {
+    if (!isCurrentCharacterAudio(request, requestEpoch)) return;
+    invalidateActiveCharacterAudio();
+  }
+
   function openReplacementRecord(request: AssetReplacementRequest): void {
     const current = replacementRequestsRef.current.find((candidate) => candidate.id === request.id);
     if (
@@ -1201,6 +1467,7 @@ export function AssetLibrary({
     }
 
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     invalidateUsage();
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
@@ -1447,6 +1714,7 @@ export function AssetLibrary({
 
   function reloadCurrentType(): number {
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     const nextReloadVersion = reloadVersionRef.current + 1;
     reloadVersionRef.current = nextReloadVersion;
     directoryRequestGenerationRef.current += 1;
@@ -1478,6 +1746,7 @@ export function AssetLibrary({
 
   function goBack() {
     invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
     abandonNavigationIntent();
     invalidateUsage();
     invalidatedManagementRequestRef.current = null;
@@ -1513,6 +1782,17 @@ export function AssetLibrary({
         : services.assetImageUpload === undefined
           ? services.mode === "demo" ? "演示模式暂未接入图片上传服务。" : "当前服务暂未接入图片上传接口。"
           : undefined;
+    const characterAudioUnavailable = category !== "characters"
+      ? undefined
+      : !identityIsUnique
+        ? "角色身份暂无法核对，不能维护角色音频。"
+        : series.can_enter === false
+          ? "当前账号不能进入此剧集，不能维护角色音频。"
+          : replacementRequestsRef.current.some((request) => request.writeInFlight)
+            ? "章节素材替换仍在进行，暂不能维护角色音频。"
+            : services.characterAudio === undefined
+              ? services.mode === "demo" ? "演示模式暂未接入角色音频服务。" : "当前服务暂未接入角色音频接口。"
+              : undefined;
     return (
       <AssetCard
         apiBaseUrl={services.apiBaseUrl}
@@ -1545,6 +1825,10 @@ export function AssetLibrary({
         replacementUnavailable={replacementUnavailable}
         onUploadImage={imageUploadUnavailable === undefined ? () => openImageUpload(category, item, items) : undefined}
         imageUploadUnavailable={imageUploadUnavailable}
+        onCharacterAudio={category === "characters" && characterAudioUnavailable === undefined
+          ? () => openCharacterAudio(item as Character, items as Character[])
+          : undefined}
+        characterAudioUnavailable={characterAudioUnavailable}
         onEdit={identityIsUnique ? () => openManagement("edit", category, item, items) : undefined}
         onDelete={identityIsUnique ? () => openManagement("delete", category, item, items) : undefined}
         usageUnavailable={!identityIsUnique}
@@ -1823,6 +2107,9 @@ export function AssetLibrary({
       {imageUploadIssue !== null && (
         <p className="asset-image-upload-issue" role="alert">{imageUploadIssue}</p>
       )}
+      {characterAudioIssue !== null && (
+        <p className="asset-image-upload-issue" role="alert">{characterAudioIssue}</p>
+      )}
 
       <div className="asset-library-toolbar">
         <div className="asset-type-tabs" role="group" aria-label="素材分类">
@@ -2043,6 +2330,27 @@ export function AssetLibrary({
           onDirectoryUpdated={(directory) => acceptImageUploadDirectory(request, directory, request.openEpoch)}
           onUnauthorized={() => {
             if (isCurrentImageUpload(request, request.openEpoch)) unauthorizedHandlerRef.current();
+          }}
+          run={request.run}
+          runId={request.id}
+          seriesName={series.name}
+        />
+      ))}
+      {characterAudioRequests.filter((request) => request.id === activeCharacterAudioId
+        && request.scope === libraryScope
+        && request.category === "characters"
+        && request.port === services.characterAudio).map((request) => (
+        <CharacterAudioDialog
+          allocateAttemptId={() => ++characterAudioAttemptIdRef.current}
+          attempts={request.attempts}
+          character={request.asset}
+          isCurrent={() => isCurrentCharacterAudio(request, request.openEpoch)}
+          key={request.id}
+          onAttemptsChange={(attempts) => setCharacterAudioAttempts(request, request.openEpoch, attempts)}
+          onClose={() => closeCharacterAudio(request, request.openEpoch)}
+          onDirectoryUpdated={(directory) => acceptCharacterAudioDirectory(request, directory, request.openEpoch)}
+          onUnauthorized={() => {
+            if (isCurrentCharacterAudio(request, request.openEpoch)) unauthorizedHandlerRef.current();
           }}
           run={request.run}
           runId={request.id}
