@@ -52,6 +52,7 @@ import {
   type PersonalRoughCutFrameTarget,
   type PersonalRoughCutReadIdentity,
 } from "./PersonalRoughCutPanel";
+import { MediaExportDialog } from "./media-export/MediaExportDialog";
 import {
   findChapterFramePosition,
   findUniqueChapterStoryboardAsset,
@@ -151,6 +152,16 @@ interface ChapterOrderEditorContext {
   scope: ChapterBrowserScope;
   snapshot: Chapter[];
   requestGeneration: number;
+}
+
+interface MediaExportDialogOwner {
+  readonly scope: ChapterBrowserScope;
+  readonly sessionGeneration: number;
+  readonly chapter: Chapter;
+  readonly requestGeneration: number;
+  readonly sourceMode: "chapter" | "rough-cut";
+  readonly roughCutSnapshot: PersonalRoughCutSnapshot | null;
+  isSourceCurrent(): boolean;
 }
 
 type ChapterEditLockIdentity = { acquiredAt: string; userId: string } | null;
@@ -838,6 +849,9 @@ export function ChapterBrowser({
   const [personalNoteFrameFeedback, setPersonalNoteFrameFeedback] = useState<PersonalNoteFrameNavigationFeedback | null>(null);
   const [frameAssetReferenceOwner, setFrameAssetReferenceOwner] = useState<FrameAssetReferenceOwner | null>(null);
   const [personalRoughCutContext, setPersonalRoughCutContext] = useState<PersonalRoughCutContext | null>(null);
+  const [mediaExportOwner, setMediaExportOwner] = useState<MediaExportDialogOwner | null>(null);
+  const mediaExportOwnerRef = useRef<MediaExportDialogOwner | null>(mediaExportOwner);
+  mediaExportOwnerRef.current = mediaExportOwner;
   const [roughCutFrameFeedback, setRoughCutFrameFeedback] = useState<RoughCutFrameNavigationFeedback | null>(null);
   const roughCutContextRef = useRef<PersonalRoughCutContext | null>(personalRoughCutContext);
   roughCutContextRef.current = personalRoughCutContext;
@@ -926,6 +940,8 @@ export function ChapterBrowser({
     setPersonalNoteFrameFeedback(null);
     setFrameAssetReferenceOwner(null);
     setPersonalRoughCutContext(null);
+    mediaExportOwnerRef.current = null;
+    setMediaExportOwner(null);
     setRoughCutFrameFeedback(null);
   }
   chapterDirectoryRef.current = {
@@ -1192,6 +1208,13 @@ export function ChapterBrowser({
   }
   const frameAssetReferencesOpen = frameAssetReferenceOwner !== null
     && frameAssetReferenceScopeMatches;
+
+  useEffect(() => {
+    const owner = mediaExportOwnerRef.current;
+    if (owner !== null && !isMediaExportOwnerCurrent(owner)) {
+      closeMediaExport(owner);
+    }
+  }, [chapters, personalRoughCutOpen, selectedChapter, selectedChapterId, series.id, services, sessionGeneration, userId]);
 
   useEffect(() => {
     if (selectedChapter === null) {
@@ -1876,6 +1899,7 @@ export function ChapterBrowser({
     setPendingFrameNavigation(null);
     setFrameNavigationFeedback(null);
     assetRequestGeneration.current += 1;
+    closeMediaExport();
     closePersonalNotes();
     closeFrameAssetReferences();
     closePersonalRoughCut();
@@ -1893,6 +1917,71 @@ export function ChapterBrowser({
     setRoughCutFrameFeedback((current) => (
       expectedOwner === undefined || current?.owner === expectedOwner ? null : current
     ));
+  }
+
+  function isMediaExportChapterCurrent(owner: MediaExportDialogOwner): boolean {
+    const directory = chapterDirectoryRef.current;
+    return sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+      && owner.sessionGeneration === sessionGenerationRef.current
+      && owner.requestGeneration === chapterRequestGeneration.current
+      && owner.requestGeneration === directory.requestGeneration
+      && sameChapterBrowserScope(directory.scope, owner.scope)
+      && selectedChapterIdRef.current === owner.chapter.id
+      && directory.chapters?.some((chapter) => chapter === owner.chapter) === true;
+  }
+
+  function isMediaExportOwnerCurrent(owner: MediaExportDialogOwner): boolean {
+    return mediaExportOwnerRef.current === owner
+      && isMediaExportChapterCurrent(owner)
+      && owner.isSourceCurrent();
+  }
+
+  function closeMediaExport(expectedOwner?: MediaExportDialogOwner): void {
+    const owner = mediaExportOwnerRef.current;
+    if (owner === null || (expectedOwner !== undefined && expectedOwner !== owner)) {
+      return;
+    }
+    mediaExportOwnerRef.current = null;
+    setMediaExportOwner(null);
+  }
+
+  function openChapterMediaExport(): void {
+    if (selectedChapter === null || services.createMediaExportSession === undefined) {
+      return;
+    }
+    let owner: MediaExportDialogOwner;
+    owner = {
+      scope: currentScope,
+      sessionGeneration: sessionGenerationRef.current,
+      chapter: selectedChapter,
+      requestGeneration: chapterRequestGeneration.current,
+      sourceMode: "chapter",
+      roughCutSnapshot: null,
+      isSourceCurrent: () => isMediaExportChapterCurrent(owner),
+    };
+    mediaExportOwnerRef.current = owner;
+    setMediaExportOwner(owner);
+  }
+
+  function openSavedRoughCutMediaExport(
+    snapshot: PersonalRoughCutSnapshot,
+    isProjectionCurrent: () => boolean,
+  ): void {
+    if (selectedChapter === null || services.createMediaExportSession === undefined) {
+      return;
+    }
+    let owner: MediaExportDialogOwner;
+    owner = {
+      scope: currentScope,
+      sessionGeneration: sessionGenerationRef.current,
+      chapter: selectedChapter,
+      requestGeneration: chapterRequestGeneration.current,
+      sourceMode: "rough-cut",
+      roughCutSnapshot: snapshot,
+      isSourceCurrent: () => isMediaExportChapterCurrent(owner) && isProjectionCurrent(),
+    };
+    mediaExportOwnerRef.current = owner;
+    setMediaExportOwner(owner);
   }
 
   function openFrameAssetReferences(frame: StoryboardFrame, position: number) {
@@ -1978,6 +2067,7 @@ export function ChapterBrowser({
     pendingFrameNavigationRef.current = null;
     setPendingFrameNavigation(null);
     setFrameNavigationFeedback(null);
+    closeMediaExport();
     closePersonalNotes();
     closeFrameAssetReferences();
     closePersonalRoughCut();
@@ -4498,6 +4588,14 @@ export function ChapterBrowser({
                 </div>
                 <div className="selected-chapter-actions">
                   <span className="readonly-pill">{canEditStoryboard ? "可编辑分镜文字" : "只读"}</span>
+                  {services.createMediaExportSession !== undefined && (
+                    <button
+                      className="text-button chapter-media-export-open-button"
+                      disabled={chapterManagementBlocked || chapterManagement !== null || chaptersLoading}
+                      onClick={openChapterMediaExport}
+                      type="button"
+                    >导出本章视频</button>
+                  )}
                   {canEditStoryboard && (
                     <button
                       className="text-button storyboard-asset-extraction-open-button"
@@ -4647,6 +4745,9 @@ export function ChapterBrowser({
                   onClose={() => closePersonalRoughCut(personalRoughCutContext)}
                   onFrameNavigationInvalidated={onRoughCutFrameNavigationInvalidated}
                   onLocateFrame={onLocateRoughCutFrame}
+                  {...(services.createMediaExportSession === undefined
+                    ? {}
+                    : { onExportSavedSnapshot: openSavedRoughCutMediaExport })}
                   onUnauthorized={onUnauthorized}
                   seriesId={personalRoughCutContext.seriesId}
                   services={personalRoughCutContext.services}
@@ -4929,6 +5030,23 @@ export function ChapterBrowser({
           )}
         </div>
       </div>
+      {mediaExportOwner !== null && isMediaExportOwnerCurrent(mediaExportOwner) && (
+        <MediaExportDialog
+          key={`${mediaExportOwner.scope.userId}:${mediaExportOwner.scope.seriesId}:${mediaExportOwner.chapter.id}:${mediaExportOwner.requestGeneration}:${mediaExportOwner.sourceMode}`}
+          chapter={mediaExportOwner.chapter}
+          isSourceCurrent={() => isMediaExportOwnerCurrent(mediaExportOwner)}
+          onClose={() => closeMediaExport(mediaExportOwner)}
+          onUnauthorized={() => {
+            if (isMediaExportOwnerCurrent(mediaExportOwner)) {
+              unauthorizedHandlerRef.current();
+            }
+          }}
+          roughCutSnapshot={mediaExportOwner.roughCutSnapshot}
+          seriesName={series.name}
+          sourceMode={mediaExportOwner.sourceMode}
+          sourceRevision={mediaExportOwner.chapter.updated_at}
+        />
+      )}
       {chapterOrderEditor !== null && sameChapterBrowserScope(chapterOrderEditor.scope, currentScope) && (
         <ChapterOrderDialog
           key={`${chapterOrderEditor.scope.userId}:${chapterOrderEditor.scope.seriesId}:${chapterOrderEditor.requestGeneration}`}

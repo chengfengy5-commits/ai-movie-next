@@ -31,6 +31,7 @@ export interface DirectoryHandleLike {
 export interface CreateDirectoryMediaExportSinkOptions {
   readonly runId: string;
   readonly pickDirectory: () => Promise<DirectoryHandleLike>;
+  readonly context?: MediaExportSinkSaveContext;
 }
 
 function isNotFound(error: unknown): boolean {
@@ -67,10 +68,25 @@ function requireSaveContextCurrent(
   }
 }
 
+function requireDirectoryPreparationCurrent(context: MediaExportSinkSaveContext | undefined): void {
+  if (!isSaveContextCurrent(context)) {
+    throw new MediaExportSinkError("failed", "directory", "当前页面身份已变化，已停止准备目标目录。");
+  }
+}
+
+function directoryCreationOutcomeUnknown(): MediaExportSinkError {
+  return new MediaExportSinkError(
+    "unknown",
+    "directory",
+    "页面身份变化时已发出导出目录创建请求；目录结果无法确认，本次导出已停止。",
+  );
+}
+
 /** Call from a user gesture after directory permission has been requested. */
 export async function createDirectoryMediaExportSink(
   options: CreateDirectoryMediaExportSinkOptions,
 ): Promise<MediaExportSink> {
+  requireDirectoryPreparationCurrent(options.context);
   let parent: DirectoryHandleLike;
   try {
     parent = await options.pickDirectory();
@@ -83,25 +99,41 @@ export async function createDirectoryMediaExportSink(
         : "无法取得目标目录权限。",
     );
   }
+  requireDirectoryPreparationCurrent(options.context);
 
   const runDirectoryName = safeRunDirectoryName(options.runId);
   try {
+    requireDirectoryPreparationCurrent(options.context);
+    let existing: DirectoryHandleLike | null = null;
     try {
-      await parent.getDirectoryHandle(runDirectoryName);
+      existing = await parent.getDirectoryHandle(runDirectoryName);
+    } catch (error) {
+      requireDirectoryPreparationCurrent(options.context);
+      if (!isNotFound(error)) {
+        throw new MediaExportSinkError("failed", "directory", "无法检查本次导出目录状态。");
+      }
+    }
+    requireDirectoryPreparationCurrent(options.context);
+    if (existing !== null) {
       throw new MediaExportSinkError(
         "failed",
         "conflict",
         "本次导出目录已存在；为避免覆盖，请新建一次导出运行。",
       );
-    } catch (error) {
-      if (error instanceof MediaExportSinkError) {
-        throw error;
-      }
-      if (!isNotFound(error)) {
-        throw error;
-      }
     }
-    const runDirectory = await parent.getDirectoryHandle(runDirectoryName, { create: true });
+    requireDirectoryPreparationCurrent(options.context);
+    let runDirectory: DirectoryHandleLike;
+    try {
+      runDirectory = await parent.getDirectoryHandle(runDirectoryName, { create: true });
+    } catch (error) {
+      if (!isSaveContextCurrent(options.context)) {
+        throw directoryCreationOutcomeUnknown();
+      }
+      throw error;
+    }
+    if (!isSaveContextCurrent(options.context)) {
+      throw directoryCreationOutcomeUnknown();
+    }
     return {
       async save(
         item: MediaExportQueueItem,

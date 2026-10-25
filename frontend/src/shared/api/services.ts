@@ -97,6 +97,7 @@ import {
   type PersonalRoughCutUpdate,
 } from "./personalRoughCut";
 import { readRoughCutMedia as readRoughCutMediaBlob } from "./roughCutMedia";
+import { captureMediaExportSession, type MediaExportSessionTransport } from "./mediaExportSession";
 import { inspectRoughCutSource } from "../../features/chapters/personal-production/roughCutEdit";
 import { demoTaskRecords, getDemoMyTaskPage } from "../../features/tasks/demoTasks";
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
@@ -211,6 +212,7 @@ export interface WorkspaceServices {
   readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
   readonly canvasSource?: CanvasSourcePort;
+  createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
@@ -2898,6 +2900,15 @@ export function createApiServices(
   return {
     mode: "api",
     apiBaseUrl,
+    createMediaExportSession(isCurrent) {
+      const token = requireApiToken(storage);
+      return captureMediaExportSession({
+        apiBaseUrl,
+        token,
+        fetcher,
+        isCurrent: () => storage.getItem(API_TOKEN_KEY) === token && isCurrent(),
+      });
+    },
     canvasData: createCanvasDataHttpPort(apiBaseUrl, { storage, fetcher }),
     canvasSource: createCanvasSourceHttpPort(apiBaseUrl, { storage, fetcher, timeoutMs }),
     teamManagement: createTeamManagementHttpPort(apiBaseUrl, {

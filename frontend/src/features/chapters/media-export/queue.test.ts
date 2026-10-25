@@ -2,6 +2,7 @@
 import { describe, expect, it, vi } from "vitest";
 import type { Chapter, StoryboardFrame } from "../../../shared/api/contracts";
 import type { PersonalRoughCutSnapshot } from "../../../shared/api/personalRoughCut";
+import { captureMediaExportSession } from "../../../shared/api/mediaExportSession";
 import {
   buildChapterMediaExportQueue,
   buildSavedRoughCutMediaExportQueue,
@@ -10,6 +11,17 @@ import {
 } from "./queue";
 import { MediaExportSinkError } from "../../../shared/api/mediaExport";
 import type { MediaExportQueue, MediaExportQueueItem } from "../../../shared/api/mediaExport";
+
+const apiBaseUrl = "http://127.0.0.1:4175/api";
+
+function createTransport(fetcher: typeof fetch, isCurrent: () => boolean = () => true) {
+  return captureMediaExportSession({
+    apiBaseUrl,
+    token: "signing-token",
+    fetcher,
+    isCurrent,
+  });
+}
 
 function chapter(content: StoryboardFrame[]): Chapter {
   return {
@@ -104,6 +116,24 @@ describe("media export queue projection", () => {
     })).toThrow();
   });
 
+  it("keeps excluded and pending rough-cut rows from consuming exported filenames", () => {
+    const snapshot = roughCut([
+      { asset_id: "excluded", frame_index: 0, text: "未纳入项", preview_url: "https://cdn.example.invalid/excluded.mp4", missing_reason: null, included: false, pending: false },
+      { asset_id: "ready", frame_index: 0, text: "纳入项", preview_url: "https://cdn.example.invalid/ready.mp4", missing_reason: null, included: true, pending: false },
+    ]);
+
+    const queue = buildSavedRoughCutMediaExportQueue({
+      runId: "run-filename",
+      chapter: chapter([]),
+      seriesName: "剧集",
+      snapshot,
+    });
+
+    expect(queue.items[0]?.eligibility).toBe("excluded");
+    expect(queue.items[1]?.eligibility).toBe("ready");
+    expect(queue.items[1]?.filename).toBe("粗剪001_分镜001_雨夜_章节_剧集.mp4");
+  });
+
   it("keeps same-URL queue items as separate ordered downloads with distinct names", async () => {
     const items = [readyItem(0, "https://cdn.example.invalid/shared.mp4"), readyItem(1, "https://cdn.example.invalid/shared.mp4")];
     const queue = {
@@ -129,11 +159,8 @@ describe("media export queue projection", () => {
     const saved: string[] = [];
 
     const run = startMediaExport(queue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher,
+      transport: createTransport(fetcher),
       sink: { async save(item) { saved.push(item.filename ?? ""); return { kind: "saved" }; } },
-      isCurrent: () => true,
     });
     const result = await run.done;
 
@@ -167,11 +194,8 @@ describe("media export queue projection", () => {
     });
 
     const result = await startMediaExport(queue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher,
+      transport: createTransport(fetcher),
       sink: { save },
-      isCurrent: () => true,
     }).done;
 
     expect(result.items[0]?.state).toBe("unknown");
@@ -220,16 +244,13 @@ describe("media export queue projection", () => {
     });
     const savedNames: string[] = [];
     const options = {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher,
+      transport: createTransport(fetcher),
       sink: {
         async save(item: MediaExportQueueItem) {
           savedNames.push(item.filename);
           return { kind: "saved" as const };
         },
       },
-      isCurrent: () => true,
     };
 
     const directRestart = await startMediaExport(previous, options).done;
@@ -241,7 +262,7 @@ describe("media export queue projection", () => {
     expect(fetcher).not.toHaveBeenCalled();
     const staleRestart = await startMediaExport(previous, {
       ...options,
-      isCurrent: () => false,
+      transport: createTransport(fetcher, () => false),
     }).done;
     expect(staleRestart.items.map((item) => item.state)).toEqual([
       "saved", "download-started", "failed", "unknown", "stopped",
@@ -305,16 +326,13 @@ describe("media export queue projection", () => {
     });
     let attemptedFilename = "";
     const result = await startMediaExport(queue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher,
+      transport: createTransport(fetcher),
       sink: {
         async save(item) {
           attemptedFilename = item.filename;
           throw new MediaExportSinkError("unknown", "close", "close failed");
         },
       },
-      isCurrent: () => true,
     }).done;
 
     expect(attemptedFilename).toMatch(/\.webm$/u);
@@ -340,11 +358,8 @@ describe("media export queue projection", () => {
     const unauthorized = vi.fn();
     const resolver401 = vi.fn<typeof fetch>(async () => new Response("unauthorized", { status: 401 }));
     const resolverResult = await startMediaExport(authQueue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher: resolver401,
+      transport: createTransport(resolver401),
       sink: { async save() { return { kind: "saved" as const }; } },
-      isCurrent: () => true,
       onUnauthorized: unauthorized,
     }).done;
     expect(unauthorized).toHaveBeenCalledOnce();
@@ -364,11 +379,8 @@ describe("media export queue projection", () => {
       return response;
     });
     const protectedResult = await startMediaExport(protectedQueue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher: protectedFetcher,
+      transport: createTransport(protectedFetcher),
       sink: { async save() { return { kind: "saved" as const }; } },
-      isCurrent: () => true,
       onUnauthorized: protectedUnauthorized,
     }).done;
     expect(protectedUnauthorized).toHaveBeenCalledOnce();
@@ -398,11 +410,8 @@ describe("media export queue projection", () => {
       return response;
     });
     const providerResult = await startMediaExport(providerQueue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher: providerFetcher,
+      transport: createTransport(providerFetcher),
       sink: { async save() { return { kind: "saved" as const }; } },
-      isCurrent: () => true,
       onUnauthorized: providerUnauthorized,
     }).done;
     expect(providerUnauthorized).not.toHaveBeenCalled();
@@ -422,11 +431,8 @@ describe("media export queue projection", () => {
       });
     });
     const staleRun = startMediaExport(protectedQueue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher: staleFetcher,
+      transport: createTransport(staleFetcher, () => current),
       sink: { async save() { return { kind: "saved" as const }; } },
-      isCurrent: () => current,
       onUnauthorized: staleUnauthorized,
       onItem: staleOnItem,
     });
@@ -467,11 +473,8 @@ describe("media export queue projection", () => {
     });
     const saved: string[] = [];
     const run = startMediaExport(queue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher,
+      transport: createTransport(fetcher),
       sink: { async save(item) { saved.push(item.filename ?? ""); return { kind: "saved" }; } },
-      isCurrent: () => true,
     });
     await vi.waitFor(() => expect(fetcher).toHaveBeenCalledTimes(2));
     run.stopAfterCurrent();
@@ -510,11 +513,8 @@ describe("media export queue projection", () => {
     }));
     const onItem = vi.fn();
     const run = startMediaExport(queue, {
-      apiBaseUrl: "http://127.0.0.1:4175/api",
-      token: "signing-token",
-      fetcher,
+      transport: createTransport(fetcher, () => current),
       sink: { save },
-      isCurrent: () => current,
       onItem,
     });
     await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());

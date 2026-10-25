@@ -173,6 +173,80 @@ describe("media export sinks", () => {
     expect(file.createWritable).not.toHaveBeenCalled();
   });
 
+  it("does not create a run directory when its existence probe resolves after scope cancellation", async () => {
+    const probe = deferred<DirectoryHandleLike>();
+    const runDirectory: DirectoryHandleLike = {
+      async getDirectoryHandle() {
+        throw new DOMException("missing", "NotFoundError");
+      },
+      async getFileHandle() {
+        throw new DOMException("missing", "NotFoundError");
+      },
+    };
+    const parent: DirectoryHandleLike = {
+      getDirectoryHandle: vi.fn((_name: string, options?: { create?: boolean }) => (
+        options?.create === true ? Promise.resolve(runDirectory) : probe.promise
+      )),
+      async getFileHandle() {
+        throw new DOMException("missing", "NotFoundError");
+      },
+    };
+    const controller = new AbortController();
+    let current = true;
+    const preparing = createDirectoryMediaExportSink({
+      runId: "run-stale-probe",
+      pickDirectory: async () => parent,
+      context: { signal: controller.signal, isCurrent: () => current },
+    });
+    await vi.waitFor(() => expect(parent.getDirectoryHandle).toHaveBeenCalledOnce());
+
+    current = false;
+    controller.abort();
+    probe.reject(new DOMException("missing", "NotFoundError"));
+
+    await expect(preparing).rejects.toMatchObject({ kind: "failed", stage: "directory" });
+    expect(parent.getDirectoryHandle).toHaveBeenCalledOnce();
+    expect(parent.getDirectoryHandle).not.toHaveBeenCalledWith("media-export-run-stale-probe", { create: true });
+  });
+
+  it("reports an unknown directory result if scope changes after create is dispatched", async () => {
+    const creation = deferred<DirectoryHandleLike>();
+    const runDirectory: DirectoryHandleLike = {
+      async getDirectoryHandle() {
+        throw new DOMException("missing", "NotFoundError");
+      },
+      async getFileHandle() {
+        throw new DOMException("missing", "NotFoundError");
+      },
+    };
+    const parent: DirectoryHandleLike = {
+      getDirectoryHandle: vi.fn((_name: string, options?: { create?: boolean }) => (
+        options?.create === true
+          ? creation.promise
+          : Promise.reject(new DOMException("missing", "NotFoundError"))
+      )),
+      async getFileHandle() {
+        throw new DOMException("missing", "NotFoundError");
+      },
+    };
+    const controller = new AbortController();
+    let current = true;
+    const preparing = createDirectoryMediaExportSink({
+      runId: "run-late-create",
+      pickDirectory: async () => parent,
+      context: { signal: controller.signal, isCurrent: () => current },
+    });
+    await vi.waitFor(() => expect(parent.getDirectoryHandle).toHaveBeenCalledTimes(2));
+
+    current = false;
+    controller.abort();
+    creation.resolve(runDirectory);
+
+    await expect(preparing).rejects.toMatchObject({ kind: "unknown", stage: "directory" });
+    expect(parent.getDirectoryHandle).toHaveBeenCalledTimes(2);
+    expect(parent.getDirectoryHandle).toHaveBeenCalledWith("media-export-run-late-create", { create: true });
+  });
+
   it("aborts a late writer before its first write when createWritable resolves after scope change", async () => {
     const writableHandle = deferred<{
       write(data: Blob): Promise<void>;
