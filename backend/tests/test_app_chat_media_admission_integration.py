@@ -5,16 +5,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Callable
 
 import httpx
 import pytest
-from sqlalchemy import insert, select, update
+from fastapi import FastAPI
+from sqlalchemy import func, insert, select, update
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from haoai_backend.app import create_app
@@ -24,28 +28,81 @@ from haoai_backend.authentication.tokens import JoseTokenCodec
 from haoai_backend.chat_data.tables import chat_messages
 from haoai_backend.chat_media_admission import ChatMediaAdmissionConfiguration
 from haoai_backend.generation_catalog.admission import AdmissionPolicy
+from haoai_backend.generation_catalog.admission_types import AdmissionOperation
 from haoai_backend.generation_catalog.domain import ModelSource
 from haoai_backend.generation_catalog.tables import chapters as catalog_chapters
+from haoai_backend.generation_catalog.tables import series as catalog_series
 from haoai_backend.generation_catalog.tables import system_models
 from haoai_backend.generation_core.admission_receipts import (
     AdmissionCommitUnknown,
     AdmissionConfirmed,
+    AdmissionStaged,
 )
 from haoai_backend.generation_core.base_schema import (
     AITaskRow,
     BillingUnitRow,
     CreditLogRow,
+    ExternalSubmissionRow,
     UserCreditRow,
 )
+from haoai_backend.generation_core.schema import (
+    ApplicationRecordRow,
+    GenerationResultReceiptRow,
+)
+from haoai_backend.generation_contracts.records import GenerationResultReceipt
+from haoai_backend.generation_contracts.types import (
+    CanvasApplyAuthority,
+    GenerationActor,
+    GenerationApplicationCommand,
+    StoredMedia,
+)
 from haoai_backend.generation_credentials import snapshot_producer
+from haoai_backend.generation_runtime.assembly import (
+    GenerationWorkerConfiguration,
+    build_generation_worker_runtime,
+)
+from haoai_backend.personal_production.notes.tables import (
+    metadata as notes_metadata,
+    personal_production_notes,
+    storyboard_media_states,
+)
+from haoai_backend.shared.identity import TrustedActor
+from haoai_backend.task_observation import (
+    GenerationResultApplicationFacade,
+    application_key_for,
+    target_scope_for_snapshot,
+)
+from haoai_backend.task_observation.canvas_result_http import (
+    build_canvas_result_http_router,
+)
 from generation_core.test_admission_staging import (
     _G2_JOINT_ACTOR_ID,
     _G2_JOINT_MODEL_ID,
     _G2_JOINT_NOW,
     _JointIdFactory,
+    _joint_authentication_service,
+    _joint_build_binding,
+    _joint_caller,
     _joint_database,
+    _joint_prepare_and_stage,
     _joint_registered_capabilities,
+    _joint_request,
 )
+import generation_core.test_admission_staging as admission_staging_module
+
+_TEST_DIRECTORIES = (
+    Path(__file__).resolve().parent / "generation_core",
+    Path(__file__).resolve().parent / "generation_execution",
+)
+_ADDED_TEST_PATHS = [
+    str(directory) for directory in _TEST_DIRECTORIES if str(directory) not in sys.path
+]
+sys.path[:0] = _ADDED_TEST_PATHS
+try:
+    from test_image_single_worker import _provider_body, _runtime_configuration
+finally:
+    for _path in _ADDED_TEST_PATHS:
+        sys.path.remove(_path)
 
 SECRET = "chat-media-admission-integration-synthetic-secret"
 JTI = "chat-media-admission-integration-session"
@@ -59,7 +116,20 @@ class _ObservedSession(Session):
         self.info["events"].append(
             (f"execute:{self.info['kind']}", threading.get_ident())
         )
+        statement = args[0] if args else None
+        if getattr(statement, "is_dml", False):
+            self.info["dml_execute_calls"] = int(
+                self.info.get("dml_execute_calls", 0)
+            ) + 1
         return super().execute(*args, **kwargs)
+
+    def flush(self, objects: Any = None) -> None:
+        self.info["flush_calls"] = int(self.info.get("flush_calls", 0)) + 1
+        super().flush(objects)
+
+    def rollback(self) -> None:
+        self.info["rollback_calls"] = int(self.info.get("rollback_calls", 0)) + 1
+        super().rollback()
 
     def close(self) -> None:
         if not self.info.get("observed_closed"):
@@ -91,6 +161,7 @@ class _ObservedSession(Session):
 class _System:
     engine: Engine
     app: Any
+    capabilities: Any
     events: list[tuple[str, int]]
     auth_sessions: list[_ObservedSession]
     business_sessions: list[_ObservedSession]
@@ -234,6 +305,7 @@ def _build_system(
     return _System(
         engine=engine,
         app=app,
+        capabilities=capabilities,
         events=events,
         auth_sessions=auth_sessions,
         business_sessions=business_sessions,
@@ -266,6 +338,25 @@ def _post(
                 headers["Content-Type"] = "application/json"
                 return await client.post(path, headers=headers, content=raw)
             return await client.post(path, headers=headers, json=body)
+
+    return asyncio.run(send())
+
+
+def _get(
+    system: _System,
+    path: str,
+    *,
+    token: str | None = None,
+) -> httpx.Response:
+    async def send() -> httpx.Response:
+        headers = {
+            "Authorization": f"Bearer {token or system.token_for()}",
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=system.app, raise_app_exceptions=False),
+            base_url=BASE_URL,
+        ) as client:
+            return await client.get(path, headers=headers)
 
     return asyncio.run(send())
 
@@ -319,6 +410,585 @@ def _body(operation: str) -> dict[str, object]:
             "client_api_key": "ignored by legacy batch DTO",
         }
     raise AssertionError(operation)
+
+
+def test_real_http_registers_canvas_owned_result_application_lookup(
+    tmp_path: Path,
+) -> None:
+    system = _build_system(tmp_path)
+    try:
+        response = _get(
+            system,
+            "/api/chapters/joint-chapter-1/canvas-owned-results/missing-result/application"
+            "?task_id=missing-task",
+        )
+
+        assert response.status_code == 404, response.text
+        assert response.json() == {"detail": "画布生成结果不存在或无权访问"}
+    finally:
+        system.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("query", "expected_status", "expected_detail", "business_sessions"),
+    (
+        (None, 422, "查询参数必须且只能包含 task_id", 0),
+        ("task_id=valid&extra=1", 422, "查询参数必须且只能包含 task_id", 0),
+        ("task_id=first&task_id=second", 422, "查询参数必须且只能包含 task_id", 0),
+        ("task_id=", 422, "画布结果标识必须为 1 到 36 个有效字符", 0),
+        ("task_id=%20task", 422, "画布结果标识必须为 1 到 36 个有效字符", 0),
+        ("task_id=.", 422, "画布结果标识必须为 1 到 36 个有效字符", 0),
+        ("task_id=..", 422, "画布结果标识必须为 1 到 36 个有效字符", 0),
+        ("task_id=a%2Fb", 422, "画布结果标识必须为 1 到 36 个有效字符", 0),
+        ("task_id=a%5Cb", 422, "画布结果标识必须为 1 到 36 个有效字符", 0),
+        ("task_id=%01", 422, "画布结果标识必须为 1 到 36 个有效字符", 0),
+        (
+            "task_id=1234567890123456789012345678901234567",
+            422,
+            "画布结果标识必须为 1 到 36 个有效字符",
+            0,
+        ),
+        ("task_id=task%2Bref", 404, "画布生成结果不存在或无权访问", 1),
+    ),
+)
+def test_real_http_validates_canvas_lookup_query_after_authentication(
+    tmp_path: Path,
+    query: str | None,
+    expected_status: int,
+    expected_detail: str,
+    business_sessions: int,
+) -> None:
+    system = _build_system(tmp_path)
+    path = "/api/chapters/joint-chapter-1/canvas-owned-results/missing-result/application"
+    if query is not None:
+        path = f"{path}?{query}"
+    try:
+        response = _get(system, path)
+
+        assert response.status_code == expected_status, response.text
+        assert response.json() == {"detail": expected_detail}
+        assert len(system.auth_sessions) == 1
+        assert system.auth_sessions[0].info.get("observed_closed") is True
+        assert len(system.business_sessions) == business_sessions
+        if business_sessions:
+            _assert_last_lookup_session_is_read_only(system)
+    finally:
+        system.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("session_factory_kind", "expected_detail"),
+    (
+        ("missing", "画布结果查询服务尚未接线"),
+        ("unavailable", "数据库暂时不可用"),
+    ),
+)
+def test_canvas_lookup_reports_unwired_or_unavailable_database_after_auth(
+    session_factory_kind: str,
+    expected_detail: str,
+) -> None:
+    actor_resolutions: list[bool] = []
+
+    def resolve_actor(_request):
+        actor_resolutions.append(True)
+        return TrustedActor("canvas-lookup-actor")
+
+    if session_factory_kind == "missing":
+        session_factory = None
+    else:
+        def session_factory():
+            raise SQLAlchemyError("synthetic database unavailable")
+
+    app = FastAPI()
+    app.include_router(
+        build_canvas_result_http_router(
+            session_factory=session_factory,
+            resolve_account_actor=resolve_actor,
+        )
+    )
+
+    async def send() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url=BASE_URL,
+        ) as client:
+            return await client.get(
+                "/api/chapters/joint-chapter-1/canvas-owned-results/"
+                "missing-result/application?task_id=missing-task"
+            )
+
+    response = asyncio.run(send())
+    assert response.status_code == 503, response.text
+    assert response.json() == {"detail": expected_detail}
+    assert actor_resolutions == [True]
+
+
+@pytest.mark.parametrize("enrich_optional_snapshot", (False, True))
+def test_real_http_reads_canvas_application_history_after_source_edit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enrich_optional_snapshot: bool,
+) -> None:
+    """Exercise admission, producer, worker, P5, and the create_app lookup route."""
+
+    monkeypatch.setattr(admission_staging_module, "_G2_JOINT_PROVIDER", "openai")
+    system = _build_system(tmp_path)
+    raw_chapter = json.dumps(
+        _NO_ID_CANVAS_FRAMES,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    try:
+        with system.engine.begin() as connection:
+            connection.exec_driver_sql(
+                "ALTER TABLE storyboard_assets ADD COLUMN created_at DATETIME"
+            )
+            connection.execute(
+                update(catalog_chapters)
+                .where(catalog_chapters.c.id == "joint-chapter-1")
+                .values(content=raw_chapter)
+            )
+        notes_metadata.create_all(
+            system.engine,
+            tables=[storyboard_media_states, personal_production_notes],
+        )
+
+        authentication, _authentication_sessions = _joint_authentication_service(
+            system.engine
+        )
+        binding = _joint_build_binding(
+            authentication,
+            system.capabilities,
+            _JointIdFactory("canvas-lookup-server"),
+            operation=AdmissionOperation.IMAGE_SINGLE.value,
+        )
+        captured_payloads = []
+        optional_text_digest = _canonical_json_digest(_NO_ID_CANVAS_FRAMES[1]["text"])
+        original_read_target = snapshot_producer.MediaSnapshotProducer._read_target
+        original_prepare_and_stage = (
+            snapshot_producer.MediaSnapshotProducer.prepare_and_stage
+        )
+
+        def enrich_canonical_target(producer, session, facts):
+            full_target = original_read_target(producer, session, facts)
+            return replace(
+                full_target,
+                snapshot=replace(
+                    full_target.snapshot,
+                    expected_text_digest=optional_text_digest,
+                ),
+            )
+
+        def capture_producer_payloads(producer, caller, **kwargs):
+            result = original_prepare_and_stage(producer, caller, **kwargs)
+            if isinstance(result, snapshot_producer.SnapshotPayloadsStaged):
+                captured_payloads.append(result)
+            return result
+
+        if enrich_optional_snapshot:
+            monkeypatch.setattr(
+                snapshot_producer.MediaSnapshotProducer,
+                "_read_target",
+                enrich_canonical_target,
+            )
+        monkeypatch.setattr(
+            snapshot_producer.MediaSnapshotProducer,
+            "prepare_and_stage",
+            capture_producer_payloads,
+        )
+
+        generation_request = _joint_request(AdmissionOperation.IMAGE_SINGLE.value)
+        generation_request["reference_images"] = []
+        generation_request["target"] = {
+            "kind": "canvas_apply",
+            "destination": {
+                "kind": "frame_preview",
+                "chapter_id": "joint-chapter-1",
+                "identity_mode": "strict-no-id-v1",
+                "frame_index": 1,
+                "expected_chapter_digest": _canonical_json_digest(
+                    _NO_ID_CANVAS_FRAMES
+                ),
+            },
+        }
+        admission_caller = _joint_caller(system.engine)
+        try:
+            staged = _joint_prepare_and_stage(
+                binding,
+                admission_caller,
+                operation=AdmissionOperation.IMAGE_SINGLE.value,
+                raw_key="canvas-result-lookup-real-chain",
+                request=generation_request,
+            )
+            assert isinstance(staged, AdmissionStaged)
+            assert len(captured_payloads) == 1
+            task_id = staged.ordered_tasks[0].task_id
+            target = captured_payloads[0].items[0].snapshot.target_snapshot
+            assert target.kind == "canvas_frame_preview"
+            if enrich_optional_snapshot:
+                assert target.expected_text_digest == optional_text_digest
+            else:
+                assert target.expected_text_digest is None
+            admission_caller.commit()
+        finally:
+            admission_caller.close()
+
+        worker_environment = SimpleNamespace(
+            engine=system.engine,
+            capabilities=system.capabilities,
+        )
+        stored_media: list[StoredMedia] = []
+        runtime_config, provider_calls = _runtime_configuration(
+            worker_environment,
+            _provider_body(),
+            stored_media,
+        )
+        runtime = build_generation_worker_runtime(
+            GenerationWorkerConfiguration(runtime_config, system.capabilities)
+        )
+        worker_outcome = runtime.run_claimed_once("image-single")
+        assert worker_outcome is not None
+        assert worker_outcome != "pending"
+        assert worker_outcome != "ownership_lost"
+        assert worker_outcome.result_ref
+        assert len(provider_calls) == 1
+        assert len(stored_media) == 1
+
+        lookup_path = (
+            "/api/chapters/joint-chapter-1/canvas-owned-results/"
+            f"{worker_outcome.result_ref}/application?task_id={task_id}"
+        )
+        before_lookup = _canvas_lookup_write_state(system.engine)
+        not_applied = _get(system, lookup_path)
+        assert not_applied.status_code == 200, not_applied.text
+        assert not_applied.json() == {
+            "task_id": task_id,
+            "result_ref": worker_outcome.result_ref,
+            "status": "not_applied",
+            "application": None,
+        }
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_lookup
+
+        actor = GenerationActor(
+            _G2_JOINT_ACTOR_ID,
+            TrustedActor(_G2_JOINT_ACTOR_ID),
+        )
+        apply_session = Session(system.engine, expire_on_commit=False)
+        try:
+            facade = GenerationResultApplicationFacade(apply_session)
+            receipt = facade.load_owned_completed_result(
+                apply_session,
+                actor,
+                task_id,
+                worker_outcome.result_ref,
+            )
+            assert isinstance(receipt, GenerationResultReceipt)
+            scope = target_scope_for_snapshot(target)
+            authority = CanvasApplyAuthority(
+                actor=actor,
+                task_id=task_id,
+                result_ref=receipt.result_ref,
+                operation=receipt.operation,
+                target=target,
+                result_digest=receipt.content_digest,
+            )
+            command = GenerationApplicationCommand(
+                task_id=task_id,
+                result_ref=receipt.result_ref,
+                expected_target=target,
+                application_key=application_key_for(receipt.result_ref, scope),
+            )
+            applied = facade.apply_canvas_media(apply_session, authority, command)
+            assert applied.kind == "applied"
+            assert applied.application_ref
+            apply_session.commit()
+        finally:
+            apply_session.close()
+
+        before_native_lookup = _canvas_lookup_write_state(system.engine)
+        native_applied_response = _get(system, lookup_path)
+        assert native_applied_response.status_code == 200, native_applied_response.text
+        native_applied_payload = native_applied_response.json()
+        assert native_applied_payload["task_id"] == task_id
+        assert native_applied_payload["result_ref"] == worker_outcome.result_ref
+        assert native_applied_payload["status"] == "applied"
+        assert native_applied_payload["application"]["application_ref"] == (
+            applied.application_ref
+        )
+        assert native_applied_payload["application"]["target_revision"] == (
+            applied.target_revision
+        )
+        native_committed_at = datetime.fromisoformat(
+            native_applied_payload["application"]["committed_at"]
+        )
+        assert native_committed_at.tzinfo is not None
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_native_lookup
+
+        # Seed the stored target snapshots into the prior nullable-key shape.
+        # The execution step stores payload bindings, not a target snapshot.
+        with Session(system.engine, expire_on_commit=False) as legacy_snapshot_fixture:
+            task = legacy_snapshot_fixture.get(AITaskRow, task_id)
+            receipt_row = legacy_snapshot_fixture.get(
+                GenerationResultReceiptRow,
+                worker_outcome.result_ref,
+            )
+            assert task is not None and task.request_data is not None
+            legacy_request_data = task.request_data
+            assert receipt_row is not None
+            task_snapshot_root = json.loads(task.request_data)
+            task_target = _target_snapshot_mapping(task_snapshot_root)
+            assert task_target["expected_asset_image_url"] is None
+            del task_target["expected_asset_image_url"]
+            task.request_data = json.dumps(
+                task_snapshot_root,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            )
+
+            submission = legacy_snapshot_fixture.get(
+                ExternalSubmissionRow,
+                receipt_row.submission_id,
+            )
+            assert submission is not None and isinstance(submission.request_snapshot, dict)
+            submission_snapshot = json.loads(json.dumps(submission.request_snapshot))
+            submission_target = _target_snapshot_mapping(submission_snapshot)
+            assert submission_target["expected_asset_image_url"] is None
+            del submission_target["expected_asset_image_url"]
+            submission.request_snapshot = submission_snapshot
+            legacy_snapshot_fixture.commit()
+
+        before_applied_lookup = _canvas_lookup_write_state(system.engine)
+        applied_response = _get(system, lookup_path)
+        assert applied_response.status_code == 200, applied_response.text
+        applied_payload = applied_response.json()
+        assert set(applied_payload) == {
+            "task_id",
+            "result_ref",
+            "status",
+            "application",
+        }
+        assert applied_payload["task_id"] == task_id
+        assert applied_payload["result_ref"] == worker_outcome.result_ref
+        assert applied_payload["status"] == "applied"
+        assert isinstance(applied_payload["application"], dict)
+        application_payload = applied_payload["application"]
+        assert set(application_payload) == {
+            "application_ref",
+            "target_revision",
+            "committed_at",
+        }
+        assert application_payload["application_ref"] == applied.application_ref
+        assert application_payload["target_revision"] == applied.target_revision
+        committed_at = datetime.fromisoformat(
+            application_payload["committed_at"]
+        )
+        assert committed_at.tzinfo is not None
+        assert len(application_payload["application_ref"]) <= 36
+        assert len(application_payload["target_revision"]) == 64
+        assert all(
+            character in "0123456789abcdef"
+            for character in application_payload["target_revision"]
+        )
+        assert applied_payload == native_applied_payload
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_applied_lookup
+
+        manually_edited_frames = json.loads(raw_chapter)
+        manually_edited_frames[1]["text"] = "应用后的人工编辑"
+        with system.engine.begin() as connection:
+            connection.execute(
+                update(catalog_chapters)
+                .where(catalog_chapters.c.id == "joint-chapter-1")
+                .values(
+                    content=json.dumps(
+                        manually_edited_frames,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    )
+                )
+            )
+        before_history_lookup = _canvas_lookup_write_state(system.engine)
+        history = _get(system, lookup_path)
+        assert history.status_code == 200, history.text
+        assert history.json() == applied_payload
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_history_lookup
+
+        missing_reference_path = (
+            "/api/chapters/joint-chapter-1/canvas-owned-results/other-result/application"
+            f"?task_id={task_id}"
+        )
+        missing_task_path = (
+            "/api/chapters/joint-chapter-1/canvas-owned-results/"
+            f"{worker_outcome.result_ref}/application?task_id=other-task"
+        )
+        wrong_chapter_path = (
+            "/api/chapters/joint-chapter-2/canvas-owned-results/"
+            f"{worker_outcome.result_ref}/application?task_id={task_id}"
+        )
+        other_owner_id = "canvas-lookup-other-owner"
+        other_owner_task_id = "canvas-lookup-other-task"
+        with system.engine.begin() as connection:
+            connection.execute(
+                insert(users).values(
+                    id=other_owner_id,
+                    username="canvas-lookup-other-owner",
+                    email="canvas-lookup-other-owner@example.test",
+                    hashed_password="fixture-only-hash",
+                    is_superuser=False,
+                    membership_type="premium",
+                    membership_expires_at=None,
+                    created_at=_G2_JOINT_NOW.replace(tzinfo=None),
+                )
+            )
+            connection.execute(
+                insert(AITaskRow.__table__).values(
+                    id=other_owner_task_id,
+                    user_id=other_owner_id,
+                    type="image-single",
+                    status="completed",
+                    message_id="canvas-lookup-other-message",
+                    credit_cost=3,
+                    billing_status="charged",
+                    created_at=_G2_JOINT_NOW.replace(tzinfo=None),
+                    updated_at=_G2_JOINT_NOW.replace(tzinfo=None),
+                )
+            )
+        other_owner_path = (
+            "/api/chapters/joint-chapter-1/canvas-owned-results/"
+            f"{worker_outcome.result_ref}/application?task_id={other_owner_task_id}"
+        )
+        for private_path in (
+            missing_reference_path,
+            missing_task_path,
+            wrong_chapter_path,
+            other_owner_path,
+        ):
+            before_private_lookup = _canvas_lookup_write_state(system.engine)
+            private_response = _get(system, private_path)
+            assert private_response.status_code == 404, private_response.text
+            assert private_response.json() == {
+                "detail": "画布生成结果不存在或无权访问"
+            }
+            _assert_last_lookup_session_is_read_only(system)
+            assert _canvas_lookup_write_state(system.engine) == before_private_lookup
+
+        duplicate_payload = json.loads(legacy_request_data)
+        duplicate_target = _target_snapshot_mapping(duplicate_payload)
+        duplicate_value = json.dumps(
+            duplicate_target,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        duplicate_request_data = (
+            f'{{"target_snapshot":{duplicate_value},'
+            f'"target_snapshot":{duplicate_value}}}'
+        )
+        unknown_payload = json.loads(legacy_request_data)
+        _target_snapshot_mapping(unknown_payload)["unexpected"] = "rejected"
+        invalid_request_data_values = (
+            "{",
+            "{}",
+            '{"noise":NaN}',
+            '{"noise":1e999}',
+            duplicate_request_data,
+            json.dumps(unknown_payload, ensure_ascii=False, separators=(",", ":")),
+        )
+        for invalid_request_data in invalid_request_data_values:
+            with Session(system.engine, expire_on_commit=False) as snapshot_fixture:
+                task = snapshot_fixture.get(AITaskRow, task_id)
+                assert task is not None
+                task.request_data = invalid_request_data
+                snapshot_fixture.commit()
+            before_invalid_snapshot_lookup = _canvas_lookup_write_state(system.engine)
+            invalid_snapshot_response = _get(system, lookup_path)
+            assert invalid_snapshot_response.status_code == 409
+            assert invalid_snapshot_response.json() == {
+                "detail": "画布生成结果的原始目标快照无效"
+            }
+            _assert_last_lookup_session_is_read_only(system)
+            assert _canvas_lookup_write_state(system.engine) == before_invalid_snapshot_lookup
+        with Session(system.engine, expire_on_commit=False) as snapshot_fixture:
+            task = snapshot_fixture.get(AITaskRow, task_id)
+            assert task is not None
+            task.request_data = legacy_request_data
+            snapshot_fixture.commit()
+
+        with Session(system.engine, expire_on_commit=False) as proof_fixture:
+            application_row = proof_fixture.execute(
+                select(ApplicationRecordRow).where(
+                    ApplicationRecordRow.application_ref == applied.application_ref
+                )
+            ).scalar_one()
+            application_row.after_target_digest = "F" * 64
+            proof_fixture.commit()
+        before_invalid_proof_lookup = _canvas_lookup_write_state(system.engine)
+        invalid_proof_response = _get(system, lookup_path)
+        assert invalid_proof_response.status_code == 409
+        assert invalid_proof_response.json() == {
+            "detail": "画布生成结果的应用证明无效"
+        }
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_invalid_proof_lookup
+
+        with system.engine.begin() as connection:
+            connection.execute(
+                update(catalog_series)
+                .where(catalog_series.c.id == "joint-series-1")
+                .values(user_id=other_owner_id)
+            )
+        before_denied_lookup = _canvas_lookup_write_state(system.engine)
+        denied = _get(system, lookup_path)
+        assert denied.status_code == 403, denied.text
+        assert denied.json() == {"detail": "无权访问该剧集"}
+        _assert_last_lookup_session_is_read_only(system)
+        assert _canvas_lookup_write_state(system.engine) == before_denied_lookup
+        assert len(provider_calls) == 1
+        assert len(stored_media) == 1
+    finally:
+        system.engine.dispose()
+
+
+def _target_snapshot_mapping(value: object) -> dict[str, object]:
+    if type(value) is dict:
+        target = value.get("target_snapshot")
+        if type(target) is dict:
+            return target
+        nested = value.get("snapshot")
+        if type(nested) is dict and type(nested.get("target_snapshot")) is dict:
+            return nested["target_snapshot"]
+    raise AssertionError("fixture snapshot must contain a canonical target_snapshot")
+
+
+def _canvas_lookup_write_state(engine: Engine) -> tuple[int, int, int, int]:
+    with engine.connect() as connection:
+        return (
+            connection.execute(
+                select(func.count()).select_from(AITaskRow.__table__)
+            ).scalar_one(),
+            connection.execute(
+                select(func.count()).select_from(ApplicationRecordRow.__table__)
+            ).scalar_one(),
+            connection.execute(
+                select(func.count()).select_from(CreditLogRow.__table__)
+            ).scalar_one(),
+            connection.execute(select(UserCreditRow.__table__.c.credits)).scalar_one(),
+        )
+
+
+def _assert_last_lookup_session_is_read_only(system: _System) -> None:
+    session = system.business_sessions[-1]
+    assert session.info.get("dml_execute_calls", 0) == 0
+    assert session.info.get("flush_calls", 0) == 0
+    assert session.info.get("commit_calls", 0) == 0
+    assert session.info.get("rollback_calls", 0) == 1
+    assert session.info.get("close_count") == 1
 
 
 @pytest.mark.parametrize(

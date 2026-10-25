@@ -172,6 +172,7 @@ from .task_observation.authentication import (
     resolve_active_actor as resolve_task_active_actor,
 )
 from .task_observation.cancellation import SqlTaskCancellationWriter
+from .task_observation.canvas_result_http import build_canvas_result_http_router
 from .task_observation.frame_review_cancellation import (
     build_frame_review_cancellation_facade,
 )
@@ -867,6 +868,12 @@ def create_app(
             cancellation_writer=task_cancellation_writer,
             frame_review_cancellation=frame_review_cancellation,
             frame_optimize_cancellation=frame_optimize_cancellation,
+        )
+    )
+    app.include_router(
+        build_canvas_result_http_router(
+            session_factory=effective_session_factory,
+            resolve_account_actor=account_actor_resolver,
         )
     )
 
