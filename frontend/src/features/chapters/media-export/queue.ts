@@ -8,12 +8,8 @@ import {
   type MediaExportQueueItem,
   type MediaExportSink,
 } from "../../../shared/api/mediaExport";
-import {
-  classifyMediaExportUrl,
-  MediaExportReaderError,
-  readMediaExportSource,
-  resolveMediaExportDownloadLinks,
-} from "../../../shared/api/mediaExportReader";
+import { MediaExportReaderError } from "../../../shared/api/mediaExportReader";
+import type { MediaExportSessionTransport } from "../../../shared/api/mediaExportSession";
 
 const FILE_EXTENSION = /\.(mp4|webm|mov|avi|mkv|m4v|ogv)$/iu;
 
@@ -33,12 +29,9 @@ export interface BuildSavedRoughCutMediaExportQueueInput extends QueueBaseInput 
 }
 
 export interface StartMediaExportOptions {
-  readonly apiBaseUrl: string;
-  readonly token: string;
-  readonly fetcher: typeof fetch;
+  readonly transport: MediaExportSessionTransport;
   readonly sink: MediaExportSink;
   readonly signal?: AbortSignal;
-  readonly isCurrent: () => boolean;
   readonly onItem?: (item: MediaExportQueueItem) => void;
   readonly onUnauthorized?: (error: MediaExportReaderError) => void;
 }
@@ -239,12 +232,13 @@ export function buildSavedRoughCutMediaExportQueue(
       eligibility = "ready";
     }
     const filenameOrder = eligibility === "ready" ? ++exportOrdinal : exportOrdinal + 1;
-    const filename = uniqueFilename(
+    const projectedFilename =
       "粗剪" + String(filenameOrder).padStart(3, "0")
         + "_分镜" + String(validFrameIndex ? frame.frame_index + 1 : index + 1).padStart(3, "0")
-        + "_" + safeChapter + "_" + safeSeries + "." + videoExtension(sourceUrl),
-      usedFilenames,
-    );
+        + "_" + safeChapter + "_" + safeSeries + "." + videoExtension(sourceUrl);
+    const filename = eligibility === "ready"
+      ? uniqueFilename(projectedFilename, usedFilenames)
+      : projectedFilename;
     return itemBase(
       input,
       "rough-cut",
@@ -378,7 +372,7 @@ export function startMediaExport(
     }
     const updated = cloneItem(current, state, message, filename ?? current.filename, failedAt);
     results[index] = updated;
-    if (options.isCurrent()) {
+    if (options.transport.isCurrent()) {
       options.onItem?.(updated);
     }
   };
@@ -387,7 +381,7 @@ export function startMediaExport(
     if (
       unauthorizedReported
       || controller.signal.aborted
-      || !options.isCurrent()
+      || !options.transport.isCurrent()
       || !(error instanceof MediaExportReaderError)
       || error.kind !== "http"
       || error.status !== 401
@@ -411,7 +405,7 @@ export function startMediaExport(
 
   const done = (async (): Promise<MediaExportQueue> => {
     try {
-      if (!options.isCurrent() || controller.signal.aborted) {
+      if (!options.transport.isCurrent() || controller.signal.aborted) {
         markQueuedReady("stopped", "当前页面身份已变化，未启动导出。");
         return { ...queue, items: results };
       }
@@ -425,7 +419,7 @@ export function startMediaExport(
           return [];
         }
         try {
-          const route = classifyMediaExportUrl(item.sourceUrl, options.apiBaseUrl);
+          const route = options.transport.classifyUrl(item.sourceUrl);
           safeCandidateIndexes.push(index);
           return [{ url: route.url, filename: item.filename }];
         } catch {
@@ -436,7 +430,7 @@ export function startMediaExport(
       for (const index of safeCandidateIndexes) {
         emit(index, "resolving");
       }
-      if (controller.signal.aborted || !options.isCurrent()) {
+      if (controller.signal.aborted || !options.transport.isCurrent()) {
         controller.abort();
         for (const index of safeCandidateIndexes) {
           emit(index, "stopped", "当前页面身份已变化，未启动下载地址解析。");
@@ -445,25 +439,18 @@ export function startMediaExport(
       }
       let resolutions;
       try {
-        resolutions = await resolveMediaExportDownloadLinks({
-          items: candidates,
-          apiBaseUrl: options.apiBaseUrl,
-          token: options.token,
-          fetcher: options.fetcher,
-          signal: controller.signal,
-          isCurrent: options.isCurrent,
-        });
+        resolutions = await options.transport.resolveDownloadLinks(candidates, controller.signal);
       } catch (error) {
         const unauthorized = reportCurrentUnauthorized(error);
         for (const index of safeCandidateIndexes) {
           emit(
             index,
-            unauthorized || (!controller.signal.aborted && options.isCurrent()) ? "failed" : "stopped",
-            unauthorized || (!controller.signal.aborted && options.isCurrent())
+            unauthorized || (!controller.signal.aborted && options.transport.isCurrent()) ? "failed" : "stopped",
+            unauthorized || (!controller.signal.aborted && options.transport.isCurrent())
               ? failureMessage(error)
               : "用户已停止或当前页面已离开。",
             undefined,
-            unauthorized || (!controller.signal.aborted && options.isCurrent())
+            unauthorized || (!controller.signal.aborted && options.transport.isCurrent())
               ? failureStage(error, "resolve")
               : undefined,
           );
@@ -497,29 +484,22 @@ export function startMediaExport(
           }
           break;
         }
-        if (controller.signal.aborted || !options.isCurrent()) {
+        if (controller.signal.aborted || !options.transport.isCurrent()) {
           emit(index, "stopped", "当前页面身份已变化，未写入此文件。");
           controller.abort();
           continue;
         }
         currentIndex = index;
         emit(index, "reading");
-        if (controller.signal.aborted || !options.isCurrent()) {
+        if (controller.signal.aborted || !options.transport.isCurrent()) {
           emit(index, "stopped", "当前页面身份已变化，未读取此文件。");
           controller.abort();
           continue;
         }
         let currentStage: "read" | "write" = "read";
         try {
-          const mediaRoute = classifyMediaExportUrl(resolved.url, options.apiBaseUrl);
-          const media = await readMediaExportSource({
-            mediaUrl: mediaRoute.url,
-            apiBaseUrl: options.apiBaseUrl,
-            token: options.token,
-            fetcher: options.fetcher,
-            signal: controller.signal,
-          });
-          if (controller.signal.aborted || !options.isCurrent()) {
+          const media = await options.transport.readMedia(resolved.url, controller.signal);
+          if (controller.signal.aborted || !options.transport.isCurrent()) {
             emit(index, "stopped", "当前页面身份已变化，未写入此文件。");
             controller.abort();
             continue;
@@ -530,7 +510,7 @@ export function startMediaExport(
           );
           emit(index, "writing", null, finalFilename);
           currentStage = "write";
-          if (controller.signal.aborted || !options.isCurrent()) {
+          if (controller.signal.aborted || !options.transport.isCurrent()) {
             emit(index, "stopped", "当前页面身份已变化，未写入此文件。", finalFilename);
             controller.abort();
             continue;
@@ -538,7 +518,7 @@ export function startMediaExport(
           const result = await options.sink.save(
             { ...results[index]!, filename: finalFilename },
             media,
-            { signal: controller.signal, isCurrent: options.isCurrent },
+            { signal: controller.signal, isCurrent: options.transport.isCurrent },
           );
           emit(index, result.kind === "saved" ? "saved" : "download-started", null, finalFilename);
         } catch (error) {
@@ -546,7 +526,7 @@ export function startMediaExport(
           const failureAt = failureStage(error, currentStage);
           const state = error instanceof MediaExportSinkError && error.kind === "unknown"
             ? "unknown"
-            : controller.signal.aborted || !options.isCurrent()
+            : controller.signal.aborted || !options.transport.isCurrent()
               ? "stopped"
               : "failed";
           emit(
@@ -556,7 +536,7 @@ export function startMediaExport(
             undefined,
             state === "failed" || state === "unknown" ? failureAt : undefined,
           );
-          if (unauthorized || controller.signal.aborted || !options.isCurrent()) {
+          if (unauthorized || controller.signal.aborted || !options.transport.isCurrent()) {
             controller.abort();
           }
         }

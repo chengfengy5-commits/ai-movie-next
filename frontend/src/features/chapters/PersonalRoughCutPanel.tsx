@@ -43,6 +43,7 @@ interface PersonalRoughCutPanelProps {
   userId: string;
   onClose(): void;
   onUnauthorized(): void;
+  onExportSavedSnapshot?(snapshot: PersonalRoughCutSnapshot, isCurrent: () => boolean): void;
   assets?: StoryboardAsset[] | null;
   assetSnapshotToken?: object | null;
   assetRequestGeneration?: number;
@@ -181,6 +182,7 @@ export function PersonalRoughCutPanel({
   userId,
   onClose,
   onUnauthorized,
+  onExportSavedSnapshot,
   assets = null,
   assetSnapshotToken = null,
   assetRequestGeneration = 0,
@@ -549,6 +551,49 @@ export function PersonalRoughCutPanel({
     });
   }
 
+  function exportSavedSnapshot(): void {
+    if (
+      snapshot === null
+      || !snapshot.saved
+      || readState.status !== "ready"
+      || !hasCurrentCanonicalRead
+      || roughCutEditor.editing
+      || roughCutEditor.isSaving
+      || roughCutEditor.isLocked
+      || onExportSavedSnapshot === undefined
+    ) {
+      return;
+    }
+    const expectedSnapshot = snapshot;
+    const expectedGeneration = readState.requestGeneration;
+    const expectedPortIdentity = readState.portIdentity;
+    const expectedDirectoryIdentity = readState.directoryIdentity;
+    const expectedEditorGeneration = roughCutEditor.editorGeneration;
+    const expectedDraftGeneration = roughCutEditor.draftGeneration;
+    const isCurrent = (): boolean => (
+      !closedRef.current
+      && !scopeInvalidatedRef.current
+      && sameScope(boundScope, currentScope.current)
+      && requestGeneration.current === expectedGeneration
+      && readStateRef.current.status === "ready"
+      && readStateRef.current.snapshot === expectedSnapshot
+      && readStateRef.current.requestGeneration === expectedGeneration
+      && readStateRef.current.portIdentity === expectedPortIdentity
+      && readStateRef.current.directoryIdentity === expectedDirectoryIdentity
+      && currentPortIdentityRef.current === expectedPortIdentity
+      && currentDirectoryIdentityRef.current === expectedDirectoryIdentity
+      && roughCutEditor.isCurrentNavigationRead(expectedGeneration)
+      && roughCutEditor.isCurrentPanelAction(
+        expectedGeneration,
+        expectedEditorGeneration,
+        expectedDraftGeneration,
+      )
+    );
+    if (isCurrent()) {
+      onExportSavedSnapshot(expectedSnapshot, isCurrent);
+    }
+  }
+
   function roughCutTarget(
     currentSnapshot: PersonalRoughCutSnapshot,
     row: PersonalRoughCutFrame,
@@ -632,6 +677,17 @@ export function PersonalRoughCutPanel({
           <p>正文与视频引用来自读取时的章节；纳入状态不代表可播放、可导出或已认可。</p>
         </div>
         <div className="personal-rough-cut-actions">
+          {onExportSavedSnapshot !== undefined && (
+            <button
+              className="secondary-button"
+              disabled={!hasCurrentCanonicalRead || snapshot?.saved !== true || roughCutEditor.editing
+                || roughCutEditor.isSaving || roughCutEditor.isLocked}
+              onClick={exportSavedSnapshot}
+              type="button"
+            >
+              导出已保存粗剪
+            </button>
+          )}
           {boundScope.services.savePersonalRoughCut !== undefined && (
             <button
               className="secondary-button"

@@ -1,0 +1,263 @@
+.media-export-backdrop {
+  position: fixed;
+  z-index: 120;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: rgba(25, 39, 42, 0.48);
+}
+
+.media-export-dialog {
+  display: grid;
+  gap: 16px;
+  width: min(760px, 100%);
+  max-height: min(88vh, 920px);
+  overflow: auto;
+  padding: 22px;
+  border: 1px solid #e0e9e6;
+  border-radius: 14px;
+  color: #314247;
+  background: #fff;
+  box-shadow: 0 24px 70px rgba(22, 42, 44, 0.2);
+}
+
+.media-export-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.media-export-header h2,
+.media-export-header p,
+.media-export-header .media-export-eyebrow {
+  margin: 0;
+}
+
+.media-export-header h2 {
+  margin: 4px 0;
+  color: #263b3d;
+  font-size: 20px;
+}
+
+.media-export-header > div > p:last-child {
+  color: #738582;
+  font-size: 12px;
+}
+
+.media-export-eyebrow {
+  color: #438070;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.media-export-close {
+  width: 34px;
+  height: 34px;
+  border: 1px solid #e1e9e6;
+  border-radius: 8px;
+  color: #546a68;
+  background: #fff;
+  font-size: 21px;
+  cursor: pointer;
+}
+
+.media-export-source-choice {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 18px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #e3ece8;
+  border-radius: 9px;
+}
+
+.media-export-source-choice > strong {
+  color: #516a65;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.media-export-confirmation,
+.media-export-item-select,
+.media-export-retry-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: #405557;
+  font-size: 12px;
+}
+
+.media-export-source-choice p {
+  flex-basis: 100%;
+  margin: 0;
+  color: #738582;
+  font-size: 12px;
+}
+
+.media-export-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+
+.media-export-summary span,
+.media-export-status {
+  padding: 4px 8px;
+  border-radius: 999px;
+  color: #526966;
+  background: #f2f7f5;
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.media-export-items {
+  display: grid;
+  gap: 7px;
+  max-height: 300px;
+  overflow: auto;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.media-export-item {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 52px;
+  padding: 8px 10px;
+  border: 1px solid #e5edea;
+  border-radius: 8px;
+}
+
+.media-export-item-main {
+  display: grid;
+  min-width: 0;
+  gap: 3px;
+}
+
+.media-export-item-main strong,
+.media-export-item-main span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.media-export-item-main strong {
+  color: #35494b;
+  font-size: 12px;
+}
+
+.media-export-item-main span {
+  color: #7a8b88;
+  font-size: 11px;
+}
+
+.media-export-status-missing,
+.media-export-status-duplicate,
+.media-export-status-pending,
+.media-export-status-invalid,
+.media-export-status-failed,
+.media-export-status-unknown {
+  color: #8a5939;
+  background: #fbf4ed;
+}
+
+.media-export-status-saved {
+  color: #2f6a54;
+  background: #edf7f1;
+}
+
+.media-export-confirmation-title,
+.media-export-error,
+.media-export-notice,
+.media-export-run-controls p {
+  margin: 0;
+  color: #536b66;
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+.media-export-error {
+  color: #9a483e;
+}
+
+.media-export-notice {
+  color: #788681;
+}
+
+.media-export-actions,
+.media-export-run-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 9px;
+}
+
+.media-export-run-controls {
+  justify-content: space-between;
+}
+
+.media-export-dialog .secondary-button {
+  min-height: 40px;
+  padding: 0 14px;
+  border: 1px solid #dce8e3;
+  color: #426c62;
+  background: #fff;
+  cursor: pointer;
+}
+
+.media-export-dialog button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+
+.media-export-retry {
+  display: grid;
+  gap: 9px;
+  padding-top: 12px;
+  border-top: 1px solid #e7efec;
+}
+
+.media-export-retry h3,
+.media-export-retry p {
+  margin: 0;
+}
+
+.media-export-retry h3 {
+  font-size: 13px;
+}
+
+.media-export-retry p {
+  color: #738582;
+  font-size: 11px;
+}
+
+.media-export-retry-item span {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .media-export-backdrop {
+    padding: 8px;
+  }
+
+  .media-export-dialog {
+    max-height: 94vh;
+    padding: 15px;
+  }
+
+  .media-export-item {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .media-export-item > .media-export-status {
+    grid-column: 2;
+    justify-self: start;
+  }
+}
