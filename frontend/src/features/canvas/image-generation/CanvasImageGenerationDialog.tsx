@@ -27,7 +27,9 @@ export interface CanvasImageGenerationIntentView {
   readonly prompt: string;
   readonly size: string | null;
   readonly targetLabel: string;
+  readonly ordinal: number;
   readonly state: "unknown" | "not-found";
+  readonly batch: CanvasImageGenerationBatchView;
 }
 
 export interface CanvasImageGenerationReceiptView {
@@ -40,11 +42,27 @@ export interface CanvasImageGenerationReceiptView {
   readonly targetLabel: string;
 }
 
+export interface CanvasImageGenerationBatchReceiptView extends CanvasImageGenerationReceiptView {
+  readonly ordinal: number;
+  readonly idempotencyKey: string;
+}
+
+export interface CanvasImageGenerationBatchView {
+  readonly requestedCount: number;
+  readonly acceptedReceipts: readonly CanvasImageGenerationBatchReceiptView[];
+  readonly notSentCount: number;
+  readonly activeOrdinal: number | null;
+  readonly stoppedOrdinal: number | null;
+  readonly outcome: "submitting" | "unknown" | "stopped" | "complete";
+}
+
 export interface CanvasImageGenerationDialogProps {
   readonly mode: "form" | "intent" | "receipt";
   readonly targetLabel: string;
   readonly models: readonly CanvasImageGenerationModelOption[];
   readonly selectedModelId: string;
+  readonly selectedCount: number;
+  readonly countSelectionInvalid: boolean;
   readonly selectedSize: string;
   readonly sizeSelectionInvalid: boolean;
   readonly promptTemplates: readonly CanvasImageGenerationPromptTemplateOption[];
@@ -63,8 +81,10 @@ export interface CanvasImageGenerationDialogProps {
   readonly lockPending: boolean;
   readonly pendingIntent: CanvasImageGenerationIntentView | null;
   readonly receipt: CanvasImageGenerationReceiptView | null;
+  readonly batch: CanvasImageGenerationBatchView | null;
   onClose(): void;
   onSelectModel(modelId: string): void;
+  onSelectCount(count: string): void;
   onSelectSize(size: string): void;
   onSelectPromptTemplate(promptTemplateId: string): void;
   onChangePrompt(prompt: string): void;
@@ -127,11 +147,42 @@ function receiptDetails(view: CanvasImageGenerationReceiptView) {
   );
 }
 
+function batchProgress(batch: CanvasImageGenerationBatchView) {
+  return (
+    <div className="canvas-image-generation-batch" aria-label="本轮图片任务进度" role="status">
+      <p>本轮请求 {batch.requestedCount} 张；已受理 {batch.acceptedReceipts.length} 张；未发送 {batch.notSentCount} 张。</p>
+      {batch.activeOrdinal !== null && (
+        <p>正在处理第 {batch.activeOrdinal} 张单图任务。</p>
+      )}
+      {batch.outcome === "unknown" && batch.stoppedOrdinal !== null && (
+        <p>本轮停在第 {batch.stoppedOrdinal} 张，结果待确认；其后的请求未发送。</p>
+      )}
+      {batch.outcome === "stopped" && batch.stoppedOrdinal !== null && (
+        <p>本轮停在第 {batch.stoppedOrdinal} 张；其后的请求未发送。</p>
+      )}
+      {batch.acceptedReceipts.length > 0 && (
+        <ol aria-label="本轮已受理图片任务">
+          {batch.acceptedReceipts.map((item) => (
+            <li key={item.idempotencyKey}>
+              <p>第 {item.ordinal} 张 · 请求编号：{item.idempotencyKey}</p>
+              <p>任务编号：{item.receipt.taskId} · 状态：{taskStatus(item.receipt.status)}</p>
+              <p>服务器报价：{item.receipt.quotedAmount} · 计费状态：{billingStatus(item.receipt.billingStatus)}</p>
+              {receiptDetails(item)}
+            </li>
+          ))}
+        </ol>
+      )}
+    </div>
+  );
+}
+
 export function CanvasImageGenerationDialog({
   mode,
   targetLabel,
   models,
   selectedModelId,
+  selectedCount,
+  countSelectionInvalid,
   selectedSize,
   sizeSelectionInvalid,
   promptTemplates,
@@ -150,8 +201,10 @@ export function CanvasImageGenerationDialog({
   lockPending,
   pendingIntent,
   receipt,
+  batch,
   onClose,
   onSelectModel,
+  onSelectCount,
   onSelectSize,
   onSelectPromptTemplate,
   onChangePrompt,
@@ -164,6 +217,7 @@ export function CanvasImageGenerationDialog({
   const focus = useSeriesDialogFocus({ active: true, canDismiss: true, onDismiss: onClose });
   const selectedModel = models.find((model) => model.id === selectedModelId);
   const sizeConfigurationInvalid = selectedModel !== undefined && selectedModel.sizeConfigurationError !== null;
+  const countSelectionBlocked = countSelectionInvalid || ![1, 2, 3, 4].includes(selectedCount);
   const sizeSelectionBlocked = selectedModel !== undefined && selectedModel.sizeOptions.length > 0
     && (sizeSelectionInvalid || !selectedModel.sizeOptions.includes(selectedSize));
   const title = mode === "form" ? "生成图片"
@@ -183,7 +237,7 @@ export function CanvasImageGenerationDialog({
           <div>
             <p className="eyebrow">{targetLabel}</p>
             <h2 id="canvas-image-generation-title">{title}</h2>
-            <p>提交后会创建单张图片任务。任务回执不会自动应用到画布。</p>
+            <p>按数量创建独立的单张图片任务。每张分别提交；任务回执不会自动应用到画布。</p>
           </div>
           <button
             aria-label="关闭生成图片"
@@ -207,6 +261,23 @@ export function CanvasImageGenerationDialog({
                 {models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
               </select>
             </label>
+            <label>
+              生成数量
+              <select
+                aria-label="生成数量"
+                disabled={busy}
+                onChange={(event) => onSelectCount(event.currentTarget.value)}
+                value={String(selectedCount)}
+              >
+                {countSelectionBlocked && (
+                  <option disabled value={String(selectedCount)}>请选择1至4张</option>
+                )}
+                {[1, 2, 3, 4].map((count) => <option key={count} value={count}>{count} 张</option>)}
+              </select>
+            </label>
+            {countSelectionBlocked && (
+              <p className="canvas-image-generation-error" role="alert">请选择1至4张，未发送图片任务。</p>
+            )}
             {selectedModel !== undefined && selectedModel.sizeConfigurationError !== null && (
               <p className="canvas-image-generation-error" role="alert">{selectedModel.sizeConfigurationError}</p>
             )}
@@ -284,10 +355,12 @@ export function CanvasImageGenerationDialog({
             )}
             {error !== null && <p className="canvas-image-generation-error" role="alert">{error}</p>}
             {message !== null && <p className="canvas-image-generation-message" role="status">{message}</p>}
+            {batch !== null && batchProgress(batch)}
             <footer className="canvas-image-generation-footer">
               <button disabled={busy || modelsLoading || models.length === 0 || selectedModelId === ""
+                || countSelectionBlocked
                 || sizeConfigurationInvalid || sizeSelectionBlocked} type="submit">
-                {busy ? "正在提交…" : "提交单张图片任务"}
+                {busy ? "正在提交…" : selectedCount === 1 ? "提交单张图片任务" : `提交${selectedCount}张图片任务`}
               </button>
               <button disabled={busy} onClick={onClose} type="button">取消</button>
             </footer>
@@ -303,11 +376,13 @@ export function CanvasImageGenerationDialog({
             </p>
             {error !== null && <p>{error}</p>}
             {message !== null && <p>{message}</p>}
+            {batch !== null && batchProgress(batch)}
             <details className="canvas-image-generation-details">
               <summary>查看原提交详情</summary>
               <p>目标：{targetIdentity(pendingIntent.destination)}</p>
               <p>模型：{pendingIntent.modelName}</p>
               <p>图片尺寸：{pendingIntent.size ?? "模型默认"}</p>
+              <p>当前请求：第 {pendingIntent.ordinal} 张 / 共 {pendingIntent.batch.requestedCount} 张</p>
               <p>提示词：{pendingIntent.prompt}</p>
               <p>模型编号：{pendingIntent.modelId}</p>
               <p>请求编号：{pendingIntent.idempotencyKey}</p>
@@ -333,18 +408,25 @@ export function CanvasImageGenerationDialog({
           </div>
         )}
 
-        {mode === "receipt" && receipt !== null && (
+        {mode === "receipt" && batch !== null && (
           <div className="canvas-image-generation-receipt" role="status">
-            <p>{receiptOutcome(receipt.receipt)}</p>
-            <p>任务状态：{taskStatus(receipt.receipt.status)}</p>
-            <p>图片尺寸：{receipt.size ?? "模型默认"}</p>
-            <p>服务器报价：{receipt.receipt.quotedAmount}</p>
-            <p>计费状态：{billingStatus(receipt.receipt.billingStatus)}</p>
-            {receiptDetails(receipt)}
+            {receipt !== null && <p>{receiptOutcome(receipt.receipt)}</p>}
+            {batch.requestedCount > 1 && receipt !== null && (
+              <p>图片尺寸：{receipt.size ?? "模型默认"}</p>
+            )}
+            {batch.requestedCount === 1 && receipt !== null && (
+              <>
+                <p>任务状态：{taskStatus(receipt.receipt.status)}</p>
+                <p>图片尺寸：{receipt.size ?? "模型默认"}</p>
+                <p>服务器报价：{receipt.receipt.quotedAmount}</p>
+                <p>计费状态：{billingStatus(receipt.receipt.billingStatus)}</p>
+              </>
+            )}
+            {batchProgress(batch)}
             {message !== null && <p>{message}</p>}
             {error !== null && <p className="canvas-image-generation-error" role="alert">{error}</p>}
             <footer className="canvas-image-generation-footer">
-              <button onClick={onStartNew} type="button">生成另一张图片</button>
+              <button onClick={onStartNew} type="button">开始新一轮图片任务（默认1张）</button>
               <button onClick={onClose} type="button">关闭</button>
             </footer>
           </div>
