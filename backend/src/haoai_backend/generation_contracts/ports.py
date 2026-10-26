@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager, AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Literal, Protocol, TypeAlias
@@ -501,6 +501,18 @@ class GenerationMediaStore(Protocol):
     ) -> PreparedReference: ...
 
 
+class WorkerCapacityLease(Protocol):
+    """A capacity permit whose release is safe to call from runtime cleanup."""
+
+    def release(self) -> bool: ...
+
+
+class WorkerExecutionCapacity(Protocol):
+    """A nonblocking process-local gate checked before generation claims."""
+
+    def try_acquire(self) -> WorkerCapacityLease | None: ...
+
+
 @dataclass(frozen=True, slots=True)
 class GenerationRuntimeConfig:
     """Explicit lazy dependency bundle; construction opens no resources."""
@@ -529,6 +541,11 @@ class GenerationRuntimeConfig:
     timeout_settings: RuntimeTimeoutSettings = RuntimeTimeoutSettings()
     concurrency_settings: RuntimeConcurrencySettings = RuntimeConcurrencySettings()
     shutdown_timeout_seconds: float = 10.0
+    worker_capacity: WorkerExecutionCapacity | None = field(
+        default=None,
+        repr=False,
+        compare=False,
+    )
 
 
 class GenerationResultApplicationPort(Protocol):

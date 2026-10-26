@@ -136,6 +136,26 @@ class _ConfiguredRuntime:
             return "pending"
         if not self._run_recovery(factory):
             return "pending"
+        capacity = self._config.worker_capacity
+        lease = None
+        if capacity is not None:
+            try:
+                lease = capacity.try_acquire()
+            except Exception:
+                return "pending"
+            if lease is None:
+                return "pending"
+        try:
+            return self._run_claimed_with_capacity(task_type, factory)
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def _run_claimed_with_capacity(
+        self,
+        task_type: str,
+        factory: RegisteredExecutorFactory,
+    ) -> WorkerExecutionOutcome:
         instance = self._worker_instance()
         if instance is None:
             return "pending"

@@ -32,7 +32,7 @@ def main(
     runner: Callable[..., Any] | None = None,
 ) -> None:
     configuration = load_server_configuration(environ)
-    host = create_server_host(configuration)
+    host = create_server_host(configuration, worker_environment=environ)
     app_error: BaseException | None = None
     try:
         run = runner if runner is not None else _load_uvicorn_runner()

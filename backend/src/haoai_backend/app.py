@@ -128,6 +128,10 @@ from .generation_runtime.frame_optimize_assembly import (
     build_frame_optimize_worker_runtime,
 )
 from .generation_runtime.worker_service import GenerationWorkerService
+from .generation_runtime.worker_capacity import (
+    WorkerCapacityBootstrap,
+    WorkerExecutionCapacity,
+)
 from .provider_status import ProviderStatusRuntime
 from .runtime_status.authentication import create_account_only_current_user_resolver
 from .runtime_status.configuration import RuntimeStatusConfiguration
@@ -272,6 +276,7 @@ def create_app(
     generation_worker_configuration: GenerationWorkerConfiguration | None = None,
     frame_review_worker_configuration: FrameReviewWorkerConfiguration | None = None,
     frame_optimize_worker_configuration: FrameOptimizeWorkerConfiguration | None = None,
+    worker_capacity_bootstrap: WorkerCapacityBootstrap | None = None,
 ) -> FastAPI:
     """Compose routes; explicitly configured generation workers start in lifespan."""
     if authentication_runtime is not None:
@@ -356,19 +361,55 @@ def create_app(
         raise ValueError(
             "frame.optimize dependencies must share the app authentication Session factory"
         )
+    worker_capacity_needed = bool(
+        generation_worker_configuration is not None
+        or frame_review_worker_configuration is not None
+        or (
+            frame_optimize_worker_configuration is not None
+            and frame_optimize_worker_configuration.enabled
+            and frame_optimize_session_bound
+        )
+    )
+    worker_capacity = (
+        WorkerExecutionCapacity() if worker_capacity_needed else None
+    )
+
+    def add_worker_capacity(configuration):
+        if configuration is None or worker_capacity is None:
+            return configuration
+        return replace(
+            configuration,
+            runtime=replace(
+                configuration.runtime,
+                worker_capacity=worker_capacity,
+            ),
+        )
+
+    effective_generation_worker_configuration = add_worker_capacity(
+        generation_worker_configuration
+    )
+    effective_frame_review_worker_configuration = add_worker_capacity(
+        frame_review_worker_configuration
+    )
+    effective_frame_optimize_worker_configuration = (
+        add_worker_capacity(frame_optimize_worker_configuration)
+        if frame_optimize_worker_configuration is not None
+        and frame_optimize_worker_configuration.enabled
+        else frame_optimize_worker_configuration
+    )
     generation_worker_runtime = (
-        build_generation_worker_runtime(generation_worker_configuration)
-        if generation_worker_configuration is not None
+        build_generation_worker_runtime(effective_generation_worker_configuration)
+        if effective_generation_worker_configuration is not None
         else None
     )
     frame_review_worker_runtime = (
-        build_frame_review_worker_runtime(frame_review_worker_configuration)
-        if frame_review_worker_configuration is not None
+        build_frame_review_worker_runtime(effective_frame_review_worker_configuration)
+        if effective_frame_review_worker_configuration is not None
         else None
     )
     frame_optimize_worker_runtime = (
-        build_frame_optimize_worker_runtime(frame_optimize_worker_configuration)
-        if frame_optimize_worker_configuration is not None
+        build_frame_optimize_worker_runtime(effective_frame_optimize_worker_configuration)
+        if effective_frame_optimize_worker_configuration is not None
         and frame_optimize_session_bound
         else None
     )
@@ -379,6 +420,9 @@ def create_app(
         frame_review_service: GenerationWorkerService | None = None
         frame_optimize_service: GenerationWorkerService | None = None
         try:
+            if worker_capacity is not None:
+                bootstrap = worker_capacity_bootstrap or WorkerCapacityBootstrap()
+                worker_capacity.configure(await bootstrap.resolve())
             if (
                 generation_worker_runtime is not None
                 and generation_worker_configuration is not None
@@ -424,6 +468,8 @@ def create_app(
                 frame_optimize_service.start()
             yield
         finally:
+            if worker_capacity is not None:
+                worker_capacity.close_claims()
             if frame_optimize_service is not None:
                 receipt = await run_in_threadpool(
                     frame_optimize_service.shutdown,
@@ -458,6 +504,7 @@ def create_app(
     app.state.frame_review_worker_service = None
     app.state.frame_optimize_worker_runtime = frame_optimize_worker_runtime
     app.state.frame_optimize_worker_service = None
+    app.state.worker_execution_capacity = worker_capacity
     authentication_uow_factory: AuthenticationUnitOfWorkFactory | None = None
     if authentication_runtime is not None and callable(authentication_runtime.session_factory):
         def make_authentication_uow():

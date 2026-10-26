@@ -1004,8 +1004,8 @@ def test_cli_passes_the_composed_app_and_closes_after_runner_failure(
     created: list[Any] = []
     original_create_host = server_cli.create_server_host
 
-    def observe_create_host(configuration: Any) -> Any:
-        host = original_create_host(configuration)
+    def observe_create_host(configuration: Any, **kwargs: Any) -> Any:
+        host = original_create_host(configuration, **kwargs)
         created.append(host)
         return host
 
@@ -1041,8 +1041,8 @@ def test_cli_closes_host_if_uvicorn_is_missing(
     original_pools: list[Any] = []
     original_create_host = server_cli.create_server_host
 
-    def observe_create_host(configuration: Any) -> Any:
-        host = original_create_host(configuration)
+    def observe_create_host(configuration: Any, **kwargs: Any) -> Any:
+        host = original_create_host(configuration, **kwargs)
         created.append(host)
         original_pools.append(host.app.state.server_engine.pool)
         return host
@@ -1307,10 +1307,11 @@ def test_cli_surfaces_lifespan_cleanup_failure_swallowed_by_uvicorn(
     sdk_session, sdk_config, sdk_state = _sdk_factories(close_failures=50)
     original_create_host = server_cli.create_server_host
 
-    def create_host_with_pending_cleanup(configuration: Any) -> Any:
+    def create_host_with_pending_cleanup(configuration: Any, **kwargs: Any) -> Any:
         host = original_create_host(
             configuration,
             sdk_factories=(sdk_session, sdk_config),
+            **kwargs,
         )
         token = _seed_authenticated_user(host.app.state.server_engine)
         response = _request_upload(host.app, token)
