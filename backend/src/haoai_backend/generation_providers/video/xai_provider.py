@@ -424,9 +424,9 @@ class XaiVideoProvider:
         snapshot: FrozenExecutionSnapshot, key: str, default: object
     ) -> object:
         configured = snapshot.model_params.get(key)
-        if not isinstance(configured, Mapping):
-            return default
-        return configured.get("default", default)
+        if isinstance(configured, Mapping):
+            return configured.get("default", default)
+        return default if configured is None else configured
 
     def _request_content(
         self,
