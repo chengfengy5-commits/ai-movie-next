@@ -8,8 +8,8 @@
 
 本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；会员、系统配置、后台和早期全量检查等历史收据仍按各自源码时点解释。功能整合基线为 `e094224e7751ba92c25d22fe17d51e89bb15a264`；Root收据395确认该批整合后 main 与 AI 分支远端均精确指向该提交。e094整合团队管理13个方法、团队剧集协作7个方法及 frame.review 后端链。Root406确认V02移动topbar CSS与清单回写已推送至 main@`2d3ed579e739a2027db05b7681e3796142a2b0da`。其后 main 已整合 reporting 源码、hidden CSS 与 frame.review AI 分镜复核；Root469 收据所记录的 main@`d11dc51e31df3bc8ab3c5f1f3066c854bb56a6e4`及功能分支 tip `f249fd15fdd64782c1eb17d374abe94bd308c738`仍按各自历史时点解释。Root518 确认素材整理十路径已从功能分支 tip `cea87f69c02005ba806289279cc8882c666e852e` 普通合并并推送至 main@`43b10ec9b8c254bc14bc0a036869a115d5757683`。在该历史记录时点，U05.4 的开发与接线为 C/C，V=P、A=U；受影响前端测试、TSC与生产构建已通过，HTTP、GUI与E2E验收仍待补。下文较早的分支未合入状态均保留为当时记录；最新记录区分新增源码、分层验证与尚未完成范围。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
 
-Root849时点记录的已发布功能基线为 main@`69c715105ea0f7e8337b446d3844f53f4a9a041b`；Root849已将feature `89e077c3a0c27f24d2811da5669caa6fed530541` 发布至main并确认fresh remote精确一致。feature工作树干净，main已跟踪文件与暂存区干净，8个受保护未跟踪文件保留。上一发布基线为Root851的canvas legacy revision修复：feature `dea08354eed0cd962da860791d1fbd910af015ef`、main `fd4d72854ba4c10d9b41a7a9ae4d6797c685fcaa`。此前Root839发布的后台worker执行容量消费者feature为`270994d95e7b00fe1b675640407fa53d0464281d`、main为`184376c80086954c82ef5f7b612fc67fadfb4cf5`；更早基线仍按各自收据对应的历史状态解释。以下当前计数及范围按最新基线校准，不改写此前各收据对应的历史状态。
-最新整合基线由 Root859 确认为 main@`59ff56eba55e9131f20667a35b44e3c83b84e6e6`，fresh remote 精确一致；其中包含 Root859 发布的 C856 feature `2674441d419a9810e30e2a2423718fe063b75b47`，以及 Root873 发布的 F870 feature `660e173fcb2416560ef8d61cae2e43898805158d`（当时 main@`661ea2ddc1a55e57aef03d5baf1a469a95cdaa7b`）。以下计数和范围按该整合基线校准，历史收据仍按各自源码快照解释。
+Root849时点记录的已发布功能基线为 main@`69c715105ea0f7e8337b446d3844f53f4a9a041b`；Root849已将feature `89e077c3a0c27f24d2811da5669caa6fed530541` 发布至main并确认fresh remote精确一致。feature工作树干净，main已跟踪文件与暂存区干净，8个受保护未跟踪文件保留。上一发布基线为Root851的canvas legacy revision修复：feature `dea08354eed0cd962da860791d1fbd910af015ef`、main `fd4d72854ba4c10d9b41a7a9ae4d6797c685fcaa`。此前Root839发布的后台worker执行容量消费者feature为`270994d95e7b00fe1b675640407fa53d0464281d`、main为`184376c80086954c82ef5f7b612fc67fadfb4cf5`；更早基线仍按各自收据对应的历史状态解释。该段计数及范围按对应历史时点校准，不改写此前各收据对应的历史状态。
+Root859时点的整合基线为 main@`59ff56eba55e9131f20667a35b44e3c83b84e6e6`，fresh remote 精确一致；其中包含 Root859 发布的 C856 feature `2674441d419a9810e30e2a2423718fe063b75b47`，以及 Root873 发布的 F870 feature `660e173fcb2416560ef8d61cae2e43898805158d`（当时 main@`661ea2ddc1a55e57aef03d5baf1a469a95cdaa7b`）。该段为对应发布时点记录；后续发布和当前进度见文末2026-10-26记录，历史收据仍按各自源码快照解释。
 
 固定旧源共有 248 个显式 method/path 声明；backend385 收据中的 create_app registry 为 250 个方法、36 个参数项，旧声明已登记差集为0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
 
@@ -534,3 +534,16 @@ Root878 的最终相关集合为19个模块、309项通过；Root872 是 F870 �
 失败与修复记录继续分别保留，不跨快照拼成一次通过：Root858 首轮记录845项与79个 subtests 后因收集路径出错；858-02只核对原 artifact/source、未重跑。Root860、860-02、860-03 的扫描验收识别了非 UTC PostgreSQL 下 naive 参数被按服务器本地时区解释的根因。874 首轮 runner 在 intent/claim 行为已通过后，因查询不存在的 `result_evidence.task_id` 未完成接受；860-04 的首项 PG case 通过，第二项则因同一次运行已追加 `.cases.jsonl` 被 fixture freshness guard 误拒。874-02 和860-05仅修正 E-only runner 的列名与同进程 freshness 检查；Root860-05 的两项 PG 场景通过。上述工具/fixture失败均未放宽金融条件或修改产品源码。
 
 本次不改变整行与总体义务状态：12类工作流、51个有序 UI 交付行及19/17/51重叠动作计数保持；U12.6等行的既有状态不变，A01–A39完整矩阵接受数仍为0，A39仍为`OFFLINE_PENDING`。frame.review/frame.optimize完整 PostgreSQL 矩阵、其他 `system_configs` 消费者、真实 Provider/R2、生产迁移及历史回填、真实浏览器、用户暂缓的 E2E 与部署接受仍待。
+
+## 批量图片与普通视频执行组件发布记录（2026-10-26）
+
+最新发布基线为 main@`48f3d9a9118acf5f6e6203b475a5832886bda8e9`。以下组件尚未接入公共 worker host；局部验证不关闭 `image.batch` 或 `video.single` 整行。
+
+| 批次 | feature → main | 已有复核与验证证据 |
+| --- | --- | --- |
+| H881 `image.batch` 逐项领取与租约隔离 | `3bf7c3167ec72a487d4a1c53acb6e085fe17cc08` → `64d1add4a88931462e0f08dc46e298acdaab853b` | Root885-02复核；Root886-03确认原12模块160项通过（未重跑）；Root888两项临时PG场景通过 |
+| C880 `image.batch` 冻结执行输入读取 | `14cc638d3160cbcd6cba894d9b29cec3aeeb7d9f` → `33bfa028b5eef8f6b9b244734a15c3cd46b165eb` | Root882-02复核；Root883为2模块72项PASS |
+| H900 `video.single` 领取与租约管理 | `1798f6637e782383c8a43efcf3ca78ffdaf47c66` → `00ff198ca2cafad85ebd31274299afba59b72321` | Root901-01复核；Root902为2模块56项PASS；Root904未运行PG |
+| F890 `video.single` 冻结执行输入读取 | `e29d31ce9f6b27510088f26d18cbb4e181544b4d` → `48f3d9a9118acf5f6e6203b475a5832886bda8e9` | Root891-01完整复核；Root892为2模块34项PASS |
+
+这些切片不调整12类工作流、51个有序UI交付ID及19/17/51重叠计数；U12.6等行状态保持，A01–A39整项接受数仍为0、A39仍为`OFFLINE_PENDING`。用户最新要求优先功能翻版和接线，测试仅覆盖本次改动及直接相关范围，不扩展矩阵；端到端继续暂缓。批量结果持久化接线留待后续批次。
