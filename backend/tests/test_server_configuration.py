@@ -59,6 +59,8 @@ def test_nonproduction_without_storage_is_explicit_and_repr_is_redacted(
     assert configuration.frame_optimize_credentials_file is None
     assert configuration.image_single_enabled is False
     assert configuration.image_single_credentials_file is None
+    assert configuration.image_batch_enabled is False
+    assert configuration.image_batch_credentials_file is None
 
 
 def test_frame_optimize_is_opt_in_and_requires_an_absolute_bundle_path(
@@ -150,6 +152,47 @@ def test_image_single_is_opt_in_and_requires_credentials_and_complete_storage(
     configuration = load_server_configuration(environment)
     assert configuration.image_single_enabled is True
     assert configuration.image_single_credentials_file == tmp_path / "missing-bundle.json"
+
+
+def test_image_batch_is_opt_in_and_requires_one_shared_credential_bundle(
+    tmp_path: Path,
+) -> None:
+    environment = _base_environment(tmp_path)
+    assert load_server_configuration(environment).image_batch_enabled is False
+
+    environment["IMAGE_BATCH_ENABLED"] = "true"
+    with pytest.raises(ServerConfigurationError, match="IMAGE_BATCH_CREDENTIALS_FILE"):
+        load_server_configuration(environment)
+
+    bundle_path = tmp_path / "batch-bundle.json"
+    environment["IMAGE_BATCH_CREDENTIALS_FILE"] = str(bundle_path)
+    with pytest.raises(ServerConfigurationError, match="complete object storage"):
+        load_server_configuration(environment)
+
+    environment = _r2_environment(tmp_path)
+    environment.update(
+        {
+            "IMAGE_BATCH_ENABLED": "true",
+            "IMAGE_BATCH_CREDENTIALS_FILE": str(bundle_path),
+        }
+    )
+    configuration = load_server_configuration(environment)
+    assert configuration.image_batch_enabled is True
+    assert configuration.image_batch_credentials_file == bundle_path
+
+    environment.update(
+        {
+            "IMAGE_SINGLE_ENABLED": "true",
+            "IMAGE_SINGLE_CREDENTIALS_FILE": str(tmp_path / "single-bundle.json"),
+        }
+    )
+    with pytest.raises(ServerConfigurationError, match="same credentials file"):
+        load_server_configuration(environment)
+
+    environment["IMAGE_SINGLE_CREDENTIALS_FILE"] = str(bundle_path)
+    combined = load_server_configuration(environment)
+    assert combined.image_single_enabled is True
+    assert combined.image_batch_enabled is True
 
 
 def test_disabled_image_single_does_not_open_configured_credentials_file(

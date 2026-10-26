@@ -35,12 +35,16 @@ class ServerConfiguration:
     user_task_max_concurrency: int = 0
     image_single_enabled: bool = False
     image_single_credentials_file: Path | None = field(default=None, repr=False)
+    image_batch_enabled: bool = False
+    image_batch_credentials_file: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.user_task_max_concurrency) is not int:
             raise ServerConfigurationError("AI_USER_MAX_CONCURRENT must be an integer")
         if type(self.image_single_enabled) is not bool:
             raise ServerConfigurationError("IMAGE_SINGLE_ENABLED must be explicit")
+        if type(self.image_batch_enabled) is not bool:
+            raise ServerConfigurationError("IMAGE_BATCH_ENABLED must be explicit")
         if self.image_single_credentials_file is not None and (
             not isinstance(self.image_single_credentials_file, Path)
             or not self.image_single_credentials_file.is_absolute()
@@ -61,6 +65,35 @@ class ServerConfiguration:
                 raise ServerConfigurationError(
                     "image.single requires complete object storage"
                 )
+        if self.image_batch_credentials_file is not None and (
+            not isinstance(self.image_batch_credentials_file, Path)
+            or not self.image_batch_credentials_file.is_absolute()
+        ):
+            raise ServerConfigurationError(
+                "IMAGE_BATCH_CREDENTIALS_FILE must be an absolute path"
+            )
+        if self.image_batch_enabled:
+            if self.image_batch_credentials_file is None:
+                raise ServerConfigurationError(
+                    "IMAGE_BATCH_CREDENTIALS_FILE is required when image.batch is enabled"
+                )
+            if (
+                self.r2_configuration is None
+                or self.r2_access_key is None
+                or self.r2_secret_key is None
+            ):
+                raise ServerConfigurationError(
+                    "image.batch requires complete object storage"
+                )
+        if (
+            self.image_single_enabled
+            and self.image_batch_enabled
+            and self.image_single_credentials_file
+            != self.image_batch_credentials_file
+        ):
+            raise ServerConfigurationError(
+                "image.single and image.batch must use the same credentials file"
+            )
 
     @property
     def frame_optimize_max_user_concurrency(self) -> int:
@@ -117,6 +150,27 @@ def load_server_configuration(
         raise ServerConfigurationError(
             "IMAGE_SINGLE_CREDENTIALS_FILE is required when image.single is enabled"
         )
+    image_batch_enabled = _boolean(
+        values,
+        "IMAGE_BATCH_ENABLED",
+        default=False,
+    )
+    image_batch_credentials_file = _optional_absolute_path(
+        values,
+        "IMAGE_BATCH_CREDENTIALS_FILE",
+    )
+    if image_batch_enabled and image_batch_credentials_file is None:
+        raise ServerConfigurationError(
+            "IMAGE_BATCH_CREDENTIALS_FILE is required when image.batch is enabled"
+        )
+    if (
+        image_single_enabled
+        and image_batch_enabled
+        and image_single_credentials_file != image_batch_credentials_file
+    ):
+        raise ServerConfigurationError(
+            "image.single and image.batch must use the same credentials file"
+        )
 
     configured = tuple(key for key in _R2_KEYS if key in values)
     if not configured:
@@ -125,6 +179,10 @@ def load_server_configuration(
         if image_single_enabled:
             raise ServerConfigurationError(
                 "image.single requires complete object storage"
+            )
+        if image_batch_enabled:
+            raise ServerConfigurationError(
+                "image.batch requires complete object storage"
             )
         if allow_r2_dev:
             raise ServerConfigurationError(
@@ -142,6 +200,8 @@ def load_server_configuration(
             user_task_max_concurrency=user_task_max_concurrency,
             image_single_enabled=image_single_enabled,
             image_single_credentials_file=image_single_credentials_file,
+            image_batch_enabled=image_batch_enabled,
+            image_batch_credentials_file=image_batch_credentials_file,
         )
 
     missing = tuple(
@@ -194,6 +254,8 @@ def load_server_configuration(
         user_task_max_concurrency=user_task_max_concurrency,
         image_single_enabled=image_single_enabled,
         image_single_credentials_file=image_single_credentials_file,
+        image_batch_enabled=image_batch_enabled,
+        image_batch_credentials_file=image_batch_credentials_file,
     )
 
 

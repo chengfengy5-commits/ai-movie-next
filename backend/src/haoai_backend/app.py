@@ -119,6 +119,10 @@ from .generation_runtime.assembly import (
     GenerationWorkerConfiguration,
     build_generation_worker_runtime,
 )
+from .generation_runtime.image_batch_assembly import (
+    ImageBatchWorkerConfiguration,
+    build_image_batch_worker_runtime,
+)
 from .generation_runtime.frame_review_assembly import (
     FrameReviewWorkerConfiguration,
     build_frame_review_worker_runtime,
@@ -274,6 +278,7 @@ def create_app(
     chat_media_admission_configuration: ChatMediaAdmissionConfiguration | None = None,
     chat_text_generation_configuration: ChatTextGenerationConfiguration | None = None,
     generation_worker_configuration: GenerationWorkerConfiguration | None = None,
+    image_batch_worker_configuration: ImageBatchWorkerConfiguration | None = None,
     frame_review_worker_configuration: FrameReviewWorkerConfiguration | None = None,
     frame_optimize_worker_configuration: FrameOptimizeWorkerConfiguration | None = None,
     worker_capacity_bootstrap: WorkerCapacityBootstrap | None = None,
@@ -361,8 +366,18 @@ def create_app(
         raise ValueError(
             "frame.optimize dependencies must share the app authentication Session factory"
         )
+    image_batch_session_bound = _image_batch_session_bound(
+        image_batch_worker_configuration,
+        effective_session_factory,
+        authentication_runtime,
+    )
+    if image_batch_worker_configuration is not None and not image_batch_session_bound:
+        raise ValueError(
+            "image.batch dependencies must share the app authentication Session factory"
+        )
     worker_capacity_needed = bool(
         generation_worker_configuration is not None
+        or image_batch_worker_configuration is not None
         or frame_review_worker_configuration is not None
         or (
             frame_optimize_worker_configuration is not None
@@ -388,6 +403,9 @@ def create_app(
     effective_generation_worker_configuration = add_worker_capacity(
         generation_worker_configuration
     )
+    effective_image_batch_worker_configuration = add_worker_capacity(
+        image_batch_worker_configuration
+    )
     effective_frame_review_worker_configuration = add_worker_capacity(
         frame_review_worker_configuration
     )
@@ -400,6 +418,11 @@ def create_app(
     generation_worker_runtime = (
         build_generation_worker_runtime(effective_generation_worker_configuration)
         if effective_generation_worker_configuration is not None
+        else None
+    )
+    image_batch_worker_runtime = (
+        build_image_batch_worker_runtime(effective_image_batch_worker_configuration)
+        if effective_image_batch_worker_configuration is not None
         else None
     )
     frame_review_worker_runtime = (
@@ -417,6 +440,7 @@ def create_app(
     @asynccontextmanager
     async def lifespan(application: FastAPI):
         worker_service: GenerationWorkerService | None = None
+        image_batch_service: GenerationWorkerService | None = None
         frame_review_service: GenerationWorkerService | None = None
         frame_optimize_service: GenerationWorkerService | None = None
         try:
@@ -437,6 +461,20 @@ def create_app(
                 )
                 application.state.generation_worker_service = worker_service
                 worker_service.start()
+            if (
+                image_batch_worker_runtime is not None
+                and effective_image_batch_worker_configuration is not None
+            ):
+                image_batch_service = GenerationWorkerService(
+                    image_batch_worker_runtime,
+                    task_type="batch-image",
+                    poll_interval_seconds=_GENERATION_WORKER_POLL_INTERVAL_SECONDS,
+                    shutdown_timeout_seconds=(
+                        effective_image_batch_worker_configuration.runtime.shutdown_timeout_seconds
+                    ),
+                )
+                application.state.image_batch_worker_service = image_batch_service
+                image_batch_service.start()
             if (
                 frame_review_worker_runtime is not None
                 and frame_review_worker_configuration is not None
@@ -477,6 +515,13 @@ def create_app(
                 )
                 application.state.frame_optimize_worker_shutdown = receipt
                 application.state.frame_optimize_worker_service = None
+            if image_batch_service is not None:
+                receipt = await run_in_threadpool(
+                    image_batch_service.shutdown,
+                    "application lifespan shutdown",
+                )
+                application.state.image_batch_worker_shutdown = receipt
+                application.state.image_batch_worker_service = None
             if frame_review_service is not None:
                 receipt = await run_in_threadpool(
                     frame_review_service.shutdown,
@@ -500,6 +545,9 @@ def create_app(
     )
     app.state.generation_worker_runtime = generation_worker_runtime
     app.state.generation_worker_service = None
+    app.state.image_batch_worker_runtime = image_batch_worker_runtime
+    app.state.image_batch_worker_service = None
+    app.state.image_batch_worker_shutdown = None
     app.state.frame_review_worker_runtime = frame_review_worker_runtime
     app.state.frame_review_worker_service = None
     app.state.frame_optimize_worker_runtime = frame_optimize_worker_runtime
@@ -1348,6 +1396,24 @@ def create_app(
 
 def _frame_optimize_session_bound(
     configuration: FrameOptimizeWorkerConfiguration | None,
+    session_factory: SessionFactory | None,
+    authentication_runtime: AuthenticationRuntime | None,
+) -> bool:
+    if configuration is None:
+        return True
+    return bool(
+        session_factory is not None
+        and configuration.runtime.session_factory is session_factory
+        and configuration.registry_capabilities.read_session_factory is session_factory
+        and (
+            authentication_runtime is None
+            or authentication_runtime.session_factory is session_factory
+        )
+    )
+
+
+def _image_batch_session_bound(
+    configuration: ImageBatchWorkerConfiguration | None,
     session_factory: SessionFactory | None,
     authentication_runtime: AuthenticationRuntime | None,
 ) -> bool:

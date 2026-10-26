@@ -217,7 +217,7 @@ def create_server_host(
             )
 
         image_generation_configuration = None
-        if configuration.image_single_enabled:
+        if configuration.image_single_enabled or configuration.image_batch_enabled:
             from .image_generation import build_image_generation_host_configuration
 
             image_generation_configuration = build_image_generation_host_configuration(
@@ -230,8 +230,12 @@ def create_server_host(
         worker_capacity_enabled = bool(
             (
                 image_generation_configuration is not None
-                and image_generation_configuration.generation_worker_configuration
-                is not None
+                and (
+                    image_generation_configuration.generation_worker_configuration
+                    is not None
+                    or image_generation_configuration.image_batch_worker_configuration
+                    is not None
+                )
             )
             or (
                 frame_optimize_configuration is not None
@@ -288,6 +292,11 @@ def create_server_host(
                 if image_generation_configuration is not None
                 else None
             ),
+            image_batch_worker_configuration=(
+                image_generation_configuration.image_batch_worker_configuration
+                if image_generation_configuration is not None
+                else None
+            ),
             worker_capacity_bootstrap=worker_capacity_bootstrap,
         )
         app.state.server_session_factory = session_factory
@@ -298,6 +307,11 @@ def create_server_host(
         )
         app.state.server_image_generation_configuration = (
             image_generation_configuration
+        )
+        app.state.server_image_batch_worker_configuration = (
+            image_generation_configuration.image_batch_worker_configuration
+            if image_generation_configuration is not None
+            else None
         )
         _compose_host_lifespan(app, resources)
         return ServerHost(

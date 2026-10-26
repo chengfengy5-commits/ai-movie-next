@@ -537,7 +537,7 @@ Root878 的最终相关集合为19个模块、309项通过；Root872 是 F870 �
 
 ## 批量图片与普通视频执行组件发布记录（2026-10-26）
 
-最新发布基线为 main@`48f3d9a9118acf5f6e6203b475a5832886bda8e9`。以下组件尚未接入公共 worker host；局部验证不关闭 `image.batch` 或 `video.single` 整行。
+本段整合起点为 main@`9df2e3f699dc513b86989d27c6144bf777921243`；本次校订时的发布基线为 main@`166821f32a2cdc282ba849195b4d40f6106d36d6`。此前下表记录的 C880/H881/H900/F890 仍按各自历史源码和验证时点解释。
 
 | 批次 | feature → main | 已有复核与验证证据 |
 | --- | --- | --- |
@@ -545,5 +545,14 @@ Root878 的最终相关集合为19个模块、309项通过；Root872 是 F870 �
 | C880 `image.batch` 冻结执行输入读取 | `14cc638d3160cbcd6cba894d9b29cec3aeeb7d9f` → `33bfa028b5eef8f6b9b244734a15c3cd46b165eb` | Root882-02复核；Root883为2模块72项PASS |
 | H900 `video.single` 领取与租约管理 | `1798f6637e782383c8a43efcf3ca78ffdaf47c66` → `00ff198ca2cafad85ebd31274299afba59b72321` | Root901-01复核；Root902为2模块56项PASS；Root904未运行PG |
 | F890 `video.single` 冻结执行输入读取 | `e29d31ce9f6b27510088f26d18cbb4e181544b4d` → `48f3d9a9118acf5f6e6203b475a5832886bda8e9` | Root891-01完整复核；Root892为2模块34项PASS |
+| C927 `image.batch` 原幂等键回执查询 | `b44af3219ab02925748afa2d0c60d3fc045bf711` → `a0d88adb95a99a1b6a85a0c445a218ce528574a4` | Root932发布 |
+| F926 批量图片与普通视频入口 | `4d7266dc1d3a67d813a8975d84cee50cb7f95636` → `855341e8aad4884c097601fc041f919187762ec0` | Root935发布 |
+| H929 `video.single` 执行与到期恢复 | `f6e1b62b9157265dd43bff09e51c5a7a8f57f5b2` → `e61b8d5890f07b0c8f42800168fcca55eaaeabb7` | Root939发布 |
+| C928 `image.batch` 空素材回填与本地应用恢复 | `438c0701af15804be915e663a677ebd57c8536fc` → `8bac54699d6dd339295c6977adbf9eab47169cd1` | Root940全范围复核、Root941复用5项作者focused验证；Root942发布 |
+| F936 普通单图生成入口 | `dcaa9600271f99ecb0cfbf4f62381c8950806bd8` → `9df2e3f699dc513b86989d27c6144bf777921243` | Root945发布 |
+| F948 媒体参考素材上传与表单保全 | `6d34eb47f006f2539d799c38f38585c011fae938` → `6dd7f5f45361f50ba2bc4a085a07d712e3030590` | Root951发布 |
+| H946 `video.single` 已知ID原任务恢复 | `49d3a1ebe8baf6effc6a7e02c2e55c90a8e97da7` → `166821f32a2cdc282ba849195b4d40f6106d36d6` | Root958发布；source及5个controlled cases覆盖优雅runtime重建后的原任务查询；真实crash与PG接受仍待 |
 
-这些切片不调整12类工作流、51个有序UI交付ID及19/17/51重叠计数；U12.6等行状态保持，A01–A39整项接受数仍为0、A39仍为`OFFLINE_PENDING`。用户最新要求优先功能翻版和接线，测试仅覆盖本次改动及直接相关范围，不扩展矩阵；端到端继续暂缓。批量结果持久化接线留待后续批次。
+C947本段记录 `codex/image-batch-host-947` 的实现与作者验证范围：`IMAGE_BATCH_ENABLED` 默认关闭；单图与批量共用同一凭据文件、RegistryCapabilities、OwnedMediaRuntime 和进程内 worker capacity；batch-only 也能构造，并在 app lifespan 启停 `batch-image` worker。作者5项 focused 用例通过，覆盖合成SQLite、fake HTTP/S3、batch POST→worker→原回执和任务查询、空素材回填、同 key 重放及账务不变；不代表真实服务、Provider、R2或部署验收。最终合入与验证状态以Git及Root953/954/955收据为准。本地验证不关闭 `image.batch` 或 `video.single` 整行；视频 worker host、known-ID946的真实crash/PG接受、真实配置服务和浏览器/E2E仍待。
+
+这些切片不调整12类工作流、51个有序UI交付ID及19/17/51重叠计数；U06.3、U06.5及U12.6等行状态不整体关闭，A01–A39整项接受数仍为0、A39仍为`OFFLINE_PENDING`。用户最新要求优先功能翻版和接线，测试仅覆盖本次改动及直接相关范围，不扩展矩阵；端到端继续暂缓。
