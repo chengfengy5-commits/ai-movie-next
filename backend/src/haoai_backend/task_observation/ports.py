@@ -8,7 +8,11 @@ from typing import Any, Literal, Protocol, TypeAlias
 
 from haoai_backend.generation_contracts.ports import CallerTransaction
 from haoai_backend.generation_contracts.records import ApplicationRecord, GenerationResultReceipt
-from haoai_backend.generation_contracts.types import GenerationActor, OwnerTaskScope
+from haoai_backend.generation_contracts.types import (
+    BatchImageReceipt,
+    GenerationActor,
+    OwnerTaskScope,
+)
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import BillingUnitRecord, TaskRecord, TaskSubmissionRecord, TeamMembershipRecord
@@ -63,6 +67,10 @@ class TaskReceiptReader(Protocol):
     ) -> TaskSubmissionRecord | TaskRow | None: ...
 
     def unique_billing_unit(self, task_id: str) -> BillingUnitRecord | TaskRow | None: ...
+
+    def load_original_batch_receipt(
+        self, actor_id: str, raw_key: str
+    ) -> BatchImageReceipt | None: ...
 
 
 class TaskRequestAccessReader(Protocol):
