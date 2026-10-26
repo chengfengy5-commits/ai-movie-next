@@ -6,11 +6,13 @@
 
 ## 当前基线与计数口径
 
-本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；会员、系统配置、后台和早期全量检查等历史收据仍按各自源码时点解释。功能整合基线为 `e094224e7751ba92c25d22fe17d51e89bb15a264`；Root收据395确认该批整合后 main 与 AI 分支远端均精确指向该提交。e094整合团队管理13个方法、团队剧集协作7个方法及 frame.review 后端链。Root406确认V02移动topbar CSS与清单回写已推送至 main@`2d3ed579e739a2027db05b7681e3796142a2b0da`。其后 main 已整合 reporting 源码、hidden CSS 与 frame.review AI 分镜复核；Root469 收据所记录的 main@`d11dc51e31df3bc8ab3c5f1f3066c854bb56a6e4`及功能分支 tip `f249fd15fdd64782c1eb17d374abe94bd308c738`仍按各自历史时点解释。Root518 确认素材整理十路径已从功能分支 tip `cea87f69c02005ba806289279cc8882c666e852e` 普通合并并推送至 main@`43b10ec9b8c254bc14bc0a036869a115d5757683`。截至本条最新记录，U05.4 的开发与接线为 C/C，V=P、A=U；受影响前端测试、TSC与生产构建已通过，HTTP、GUI与E2E验收仍待补。下文较早的分支未合入状态均保留为当时记录；最新记录区分新增源码、分层验证与尚未完成范围。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
+本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；会员、系统配置、后台和早期全量检查等历史收据仍按各自源码时点解释。功能整合基线为 `e094224e7751ba92c25d22fe17d51e89bb15a264`；Root收据395确认该批整合后 main 与 AI 分支远端均精确指向该提交。e094整合团队管理13个方法、团队剧集协作7个方法及 frame.review 后端链。Root406确认V02移动topbar CSS与清单回写已推送至 main@`2d3ed579e739a2027db05b7681e3796142a2b0da`。其后 main 已整合 reporting 源码、hidden CSS 与 frame.review AI 分镜复核；Root469 收据所记录的 main@`d11dc51e31df3bc8ab3c5f1f3066c854bb56a6e4`及功能分支 tip `f249fd15fdd64782c1eb17d374abe94bd308c738`仍按各自历史时点解释。Root518 确认素材整理十路径已从功能分支 tip `cea87f69c02005ba806289279cc8882c666e852e` 普通合并并推送至 main@`43b10ec9b8c254bc14bc0a036869a115d5757683`。在该历史记录时点，U05.4 的开发与接线为 C/C，V=P、A=U；受影响前端测试、TSC与生产构建已通过，HTTP、GUI与E2E验收仍待补。下文较早的分支未合入状态均保留为当时记录；最新记录区分新增源码、分层验证与尚未完成范围。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
+
+最新功能基线为 main@`184376c80086954c82ef5f7b612fc67fadfb4cf5`；Root839已将后台worker执行容量消费者（833）发布至main，feature为`270994d95e7b00fe1b675640407fa53d0464281d`，fresh remote核对精确一致。以下当前状态以该基线和Root838冻结证据为准；不改写此前各收据对应的历史状态。
 
 固定旧源共有 248 个显式 method/path 声明；backend385 收据中的 create_app registry 为 250 个方法、36 个参数项，旧声明已登记差集为0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
 
-清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。U12.5 与 U12.7 又各完成一行开发和接线后为27、24、51。e094将 U03.1、U03.2、U03.3 各一行的开发与接线义务并入主线，计数为24、21、51；U03.4 闭合一行开发和接线后为23、20、51；U05.2闭合一行开发和接线后，计数为22、19、51；随后 U05.4 再闭合一行开发和接线义务，该时点为21、18、51；U01.3 闭合开发后，该时点为20、18、51；U08.3 两个导出入口的开发和接线义务完成后，当前计数为19、17、51，验证/接受仍为51。U12.6 的运行时消费者接线仍待完成。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
+清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。U12.5 与 U12.7 又各完成一行开发和接线后为27、24、51。e094将 U03.1、U03.2、U03.3 各一行的开发与接线义务并入主线，计数为24、21、51；U03.4 闭合一行开发和接线后为23、20、51；U05.2闭合一行开发和接线后，计数为22、19、51；随后 U05.4 再闭合一行开发和接线义务，该时点为21、18、51；U01.3 闭合开发后，该时点为20、18、51；U08.3 两个导出入口的开发和接线义务完成后，当前计数为19、17、51，验证/接受仍为51。U12.6 的worker容量消费者已接入；其它配置消费者仍待逐项落实。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
 
 ## 历史画布来源后端交付（2026-10-24）
 
@@ -120,9 +122,19 @@ U07.1–U07.3未整行关闭；U07.4仍为P/P、V=P、A=U。当前React生成表
 
 ### 统一用户任务并发准入（821，Root825发布）
 
-正数 `AI_USER_MAX_CONCURRENT` 现在由共享A2准入策略对五类 `AITask` 和四种在途状态统一计数；只排除精确 `billing_status=refunded` 的任务行，不从Unit、Work或submission推断占用。`image.batch`按实际任务数N计算，`frame.optimize`按一个任务计算；统一配置默认值为0，零/负数继续关闭此准入限制。旧 `FRAME_OPTIMIZE_MAX_USER_CONCURRENCY` 环境变量保留为兼容别名；与新变量同时设置且值冲突时启动拒绝。PostgreSQL正数计数要求READ COMMITTED新语句可见性；注入的非兼容隔离级别会在原key replay之后明确拒绝为503，既有replay与非正数路径不受影响。后台worker容量消费者仍待实现，不能用worker并发配置替代用户任务上限。
+正数 `AI_USER_MAX_CONCURRENT` 现在由共享A2准入策略对五类 `AITask` 和四种在途状态统一计数；只排除精确 `billing_status=refunded` 的任务行，不从Unit、Work或submission推断占用。`image.batch`按实际任务数N计算，`frame.optimize`按一个任务计算；统一配置默认值为0，零/负数继续关闭此准入限制。旧 `FRAME_OPTIMIZE_MAX_USER_CONCURRENCY` 环境变量保留为兼容别名；与新变量同时设置且值冲突时启动拒绝。PostgreSQL正数计数要求READ COMMITTED新语句可见性；注入的非兼容隔离级别会在原key replay之后明确拒绝为503，既有replay与非正数路径不受影响。后台worker容量消费者现已接入，细节见下节；它不替代用户任务准入限制，也不代表其它系统配置消费者已接入。
 
 Root824在39个受影响后端模块上通过661项与79个subtests，0项跳过。作者先前12模块189项通过，新增batch原子拒绝/两任务stage用例后的 `test_admission_staging.py` 25项通过，均按各自源码时点单独记录，不相加。Root823首次只遇到PG fixture地址CIDR解析导致的6项setup ERROR；修正后Root823-02以临时owned PostgreSQL真实事务通过6项竞争/隔离案例，覆盖提交后429、回滚后准入、同key零新增、不同用户不互阻、跨family共享容量及REPEATABLE READ拒绝（同时验证零限制/replay路径）。这些使用合成账户/钱包与独立临时数据库，不调用Provider；只证明用户任务准入PG竞争，不覆盖Canvas目标锁/CAS竞争或其他family完整PG矩阵，也不代表生产数据库迁移或部署验收。首次setup错误及修复后的记录均保留。其余真实Provider/R2、浏览器/E2E、生产DB migration/backfill和部署验收仍待。
+
+## 后台worker执行容量消费者（833，Root839发布）
+
+Root839已发布feature `270994d95e7b00fe1b675640407fa53d0464281d` 至main@`184376c80086954c82ef5f7b612fc67fadfb4cf5`，fresh remote精确一致。worker启用时，app lifespan启动服务前只读一次`system_configs.worker_max_concurrency`单字段，并建立同一app进程内共享容量gate；默认worker关闭时不读取该配置。正常读取按DB正数→`WORKER_CONCURRENCY`正数→100选择；reader异常时走正常环境fallback。读取超时沿用旧外层fallback，环境值0/负数取1、非法值取100。所选容量在本次进程运行期间固定，不热更新。
+
+每个已启用family仍使用原来的单worker循环。每轮先做该family recovery，再尝试共享容量gate，取得槽位后才调用claim或continuation claim；容量满时保持pending且不claim。容量票据只在实际claim执行路径退出后归还；共同shutdown先关闭共享claim入口，再依次停止各runtime。即使有界shutdown已返回，只要executor仍活着，它仍占有容量槽，直到自然unwind。单个app内image.single、frame.review和frame.optimize共享进程级对象；不构成跨进程或任意多个app的全局配额。
+
+Root837源码复核通过；Root838冻结47个受影响模块738项通过、79个subtests通过、0项跳过。最终14模块212项通过按当时完整回归记录；后续超时bridge精度用例5项通过，shutdown期间活executor继续持槽用例1项通过，各自按源码时点记录，不相加。首轮14模块201项通过、11项失败仍保留；C833-HOST-OFF-01修复默认关闭配置返回None时的host空值判断，修后定向23项及最终14模块通过。验证仅覆盖源码、受控线程和合成SQLite；本批没有真实PostgreSQL、Provider、R2、浏览器/E2E或部署验收。
+
+family仍各自串行轮询，缺少dispatcher，因此容量高于已启用family数时不会恢复单family内部并行吞吐；recovery仍在每family串行循环内，长执行会延迟该family扫描；独立到期扫描调度仍待。真实多进程PostgreSQL claim矩阵和其它系统配置消费者仍待验证/接线，不闭合U12.6、U07.4或19/17/51的整体义务。
 
 ## 十二类工作流与 51 项交付
 
@@ -232,7 +244,7 @@ Root824在39个受影响后端模块上通过661项与79个subtests，0项跳过
 | U12.3 | 系统提示词 list/create/edit/delete | C | C | V=P / A=U；旧 3 个视图及删除均已接入源码 | 验分类、原文保全、系统权限和真实 API 浏览器行为。 |
 | U12.4 | 用户管理、积分/流水及关联记录 | C | C | V=P / A=U；旧用户 3 视图已接入源码；积分/流水/关联记录是额外扩展读取 | 验管理员自删、外键、未知写入与用户隔离；关联记录只读不等于旧全局剧集/任务资源。 |
 | U12.5 | 后台剧集 3 视图和全局任务 1 视图 | C | C | V=P / A=U；剧集功能与只读 TaskList 已接入。232/233 为剧集局部 HTTP/GUI 证据，233 不是全量浏览器验收；移动 CSS 在 c8f 修复后仍待 GUI 复验。全局任务列表真实 HTTP/浏览器验收仍待。 | 补 TaskList 的真实 HTTP/owned SQL 与浏览器验收，覆盖筛选、服务端分页/排序、当前 query 全量 CSV、身份隔离和迟到导出；剧集补移动视觉复验与剩余全流程/权限验收。 |
-| U12.6 | 系统配置 list/edit | C | P | V=P / A=P；32b3 已提交页面、19 字段、真实 API 与 host 接线；194 源码复核、196 前端门禁、201 真实 HTTP/owned SQL 通过，209 局部 GUI 及独立 SQL 已证 | 页面与 API 接线已完成；运行配置消费者桥接仍待，不能由保存 metadata 推断 CORS/frontend_url/worker 已生效。补脏离开取消保稿、in-flight/unknown/cross-session GUI；移动 CSS 已源码修复但尚待新 GUI 复验，其它消费者实际生效按原边界验。 |
+| U12.6 | 系统配置 list/edit | C | P | V=P / A=P；32b3 已提交页面、19 字段、真实 API 与 host 接线；194 源码复核、196 前端门禁、201 真实 HTTP/owned SQL 通过，209 局部 GUI 及独立 SQL 已证 | 页面与 API 接线已完成；worker_max_concurrency运行时消费者已接入：启用worker的lifespan中仅读取该字段一次，并在单个app进程内供已启用worker共享；worker关闭时不读，不热更新。其它配置消费者（如CORS/frontend_url）仍待逐项接线，不能由保存metadata推断其已生效。补脏离开取消保稿、in-flight/unknown/cross-session GUI；移动CSS已源码修复但尚待新GUI复验。 |
 | U12.7 | SMTP 账户 list/create/edit/delete、启停和计数 | C | C | V=P / A=U；SMTP 账户管理前端与 host 已接入并由 78a4d9f 推送；真实 HTTP/owned SQL、浏览器 CRUD 尚未验收，未证明真实 SMTP 发送 | 补列表和 CRUD 的真实 HTTP/owned SQL 及浏览器验收，覆盖密钥保留/替换与未知退出；发送行为仍归 U01.3，secret 不回显，真实邮件另需适用授权。 |
 | U12.8 | 兑换码列表/筛选/导出/批量创建/删除 | C | C | V=P / A=P；129-02/03 与 148 源码复核完成；137 owned HTTP/SQL 覆盖后台方法、鉴权及 used/expired/unused 删除，144 桌面浏览器已验列表/创建 | 补验筛选、导出和 GUI 删除；CSV 下载工具超时未证，移动端及 unknown/in-flight/cross-session 浏览器负例仍待；137 的 API 删除不等于 GUI 删除，生成至用户兑换/账本闭环另待。 |
 | U12.9 | 套餐 CRUD、启停、分类与排序 | C | C | V=P / A=P；129-02/03 与 148 源码复核完成；137 owned HTTP/SQL 覆盖管理 CRUD/公开读取，144 桌面浏览器已验列表、创建、编辑及 0/null/false 保存回读 | 继续补停用显示/排序及未知、在途、跨会话等浏览器负例；不虚构真实支付。 |
