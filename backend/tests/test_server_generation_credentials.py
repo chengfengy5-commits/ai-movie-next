@@ -419,7 +419,7 @@ def test_server_host_opt_in_wires_image_single_admission_and_worker(
             image_host.media_runtime,
         )
         assert legacy_positional_configuration.image_batch_worker_configuration is None
-        assert admission.image_references_enabled is False
+        assert admission.image_references_enabled is True
         assert worker.runtime.timeout_settings.public_media_fetch_seconds == 600
         assert worker.runtime.concurrency_settings.public_media_fetches == 2
     finally:

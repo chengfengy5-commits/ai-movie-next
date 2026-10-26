@@ -308,7 +308,7 @@ def build_image_generation_host_configuration(
                 )
                 if enabled
             ),
-            image_references_enabled=False,
+            image_references_enabled=True,
         )
     except BaseException:
         if media_runtime is not None:
@@ -328,6 +328,8 @@ def _image_media_policy(*, include_video: bool = False) -> SafeMediaPolicy:
     image_rules = (
         MediaTypeRule("image/png", ".png"),
         MediaTypeRule("image/jpeg", ".jpg"),
+        MediaTypeRule("image/gif", ".gif"),
+        MediaTypeRule("image/bmp", ".bmp"),
         MediaTypeRule("image/webp", ".webp"),
     )
     video_rules = (

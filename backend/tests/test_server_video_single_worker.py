@@ -453,7 +453,7 @@ def test_video_single_configuration_is_opt_in_and_builds_cold_host(
         admission = generation.admission_configuration
         assert admission is not None
         assert admission.enabled_operations == frozenset({"video.single"})
-        assert admission.image_references_enabled is False
+        assert admission.image_references_enabled is True
         assert loaded_paths == [provisioned_bundle]
         assert not credentials_file.exists()
         assert host.app.state.video_single_worker_runtime is not None
@@ -596,7 +596,7 @@ def test_server_lifespan_runs_video_single_through_shared_image_host(
         assert admission.enabled_operations == frozenset(
             {"image.single", "video.single"}
         )
-        assert admission.image_references_enabled is False
+        assert admission.image_references_enabled is True
         assert len(single_configurations) == len(video_configurations) == 1
         assert (
             single_configurations[0].runtime.worker_capacity
