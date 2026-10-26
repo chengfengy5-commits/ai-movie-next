@@ -2810,12 +2810,18 @@ export function CanvasWorkspace({
             mode={imageGeneration.state.mode}
             models={imageGeneration.state.models}
             modelsLoading={imageGeneration.state.modelsLoading}
+            promptTemplates={imageGeneration.state.promptTemplates}
+            promptTemplatesLoading={imageGeneration.state.promptTemplatesLoading}
+            promptTemplateError={imageGeneration.state.promptTemplateError}
+            promptTemplateSelectionInvalid={imageGeneration.state.promptTemplateSelectionInvalid}
+            selectedPromptTemplateId={imageGeneration.state.selectedPromptTemplateId}
             onAcquireLock={() => void imageGeneration.acquireLock()}
             onChangePrompt={imageGeneration.setPrompt}
             onClose={imageGeneration.close}
             onLookup={() => void imageGeneration.lookupPendingIntent()}
             onRetry={() => void imageGeneration.retryOriginalIntent()}
             onSelectModel={imageGeneration.setSelectedModelId}
+            onSelectPromptTemplate={imageGeneration.setSelectedPromptTemplateId}
             onStartNew={startAnotherImageGeneration}
             onSubmit={() => void imageGeneration.submitNew()}
             pendingIntent={imageGeneration.state.intent}

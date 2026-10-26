@@ -6,10 +6,11 @@ import {
   type CanvasImageGenerationSubmitInput,
 } from "../../../shared/api/canvasImageGeneration";
 import type { CanvasOwnedResultsTarget } from "../../../shared/api/canvasOwnedResults";
-import type { CreatorSettingsServicePort } from "../../../shared/api/creatorSettings";
+import type { CreatorPrompt, CreatorSettingsServicePort } from "../../../shared/api/creatorSettings";
 import type {
   CanvasImageGenerationIntentView,
   CanvasImageGenerationModelOption,
+  CanvasImageGenerationPromptTemplateOption,
   CanvasImageGenerationReceiptView,
 } from "./CanvasImageGenerationDialog";
 
@@ -50,8 +51,13 @@ export interface CanvasImageGenerationControllerState {
   readonly target: CanvasImageGenerationTarget | null;
   readonly models: readonly CanvasImageGenerationModelOption[];
   readonly selectedModelId: string;
+  readonly promptTemplates: readonly CanvasImageGenerationPromptTemplateOption[];
+  readonly selectedPromptTemplateId: string;
+  readonly promptTemplateSelectionInvalid: boolean;
   readonly prompt: string;
   readonly modelsLoading: boolean;
+  readonly promptTemplatesLoading: boolean;
+  readonly promptTemplateError: string | null;
   readonly busy: boolean;
   readonly error: string | null;
   readonly message: string | null;
@@ -86,8 +92,13 @@ const EMPTY_STATE: CanvasImageGenerationControllerState = {
   target: null,
   models: [],
   selectedModelId: "",
+  promptTemplates: [],
+  selectedPromptTemplateId: "",
+  promptTemplateSelectionInvalid: false,
   prompt: "",
   modelsLoading: false,
+  promptTemplatesLoading: false,
+  promptTemplateError: null,
   busy: false,
   error: null,
   message: null,
@@ -171,6 +182,74 @@ function errorKind(cause: unknown): CanvasImageGenerationError["kind"] | null {
   return cause instanceof CanvasImageGenerationError ? cause.kind : null;
 }
 
+const IMAGE_PROMPT_TEMPLATE_CATEGORIES = new Set([
+  "character-design",
+  "scene-design",
+  "prop-design",
+  "storyboard-design",
+  "image",
+  "style",
+  "fused",
+  "fuse",
+  "frame",
+]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPromptText(value: unknown): value is string | null | undefined {
+  return value === undefined || value === null || typeof value === "string";
+}
+
+function projectImagePromptTemplates(rows: readonly CreatorPrompt[]): readonly CanvasImageGenerationPromptTemplateOption[] {
+  const idCounts = new Map<string, number>();
+  for (const row of rows) {
+    if (isRecord(row) && typeof row.id === "string") {
+      idCounts.set(row.id, (idCounts.get(row.id) ?? 0) + 1);
+    }
+  }
+
+  const templates: CanvasImageGenerationPromptTemplateOption[] = [];
+  for (const row of rows) {
+    if (!isRecord(row)
+      || typeof row.id !== "string"
+      || row.id.trim() === ""
+      || idCounts.get(row.id) !== 1
+      || typeof row.name !== "string"
+      || row.name.trim() === ""
+      || typeof row.category !== "string"
+      || !IMAGE_PROMPT_TEMPLATE_CATEGORIES.has(row.category)
+      || !isPromptText(row.system_prompt)
+      || !isPromptText(row.user_prompt)) continue;
+
+    templates.push(Object.freeze({
+      id: row.id,
+      name: row.name,
+      category: row.category,
+      systemPrompt: row.system_prompt ?? null,
+      userPrompt: row.user_prompt ?? null,
+    }));
+  }
+  return Object.freeze(templates);
+}
+
+function composeImagePrompt(
+  userInput: string,
+  promptSeed: string,
+  template: CanvasImageGenerationPromptTemplateOption | null,
+): string {
+  const basePrompt = (userInput || promptSeed || "").trim();
+  if (template !== null) {
+    const composed = [template.systemPrompt, template.userPrompt, userInput]
+      .filter((part): part is string => typeof part === "string" && part !== "")
+      .join("\n")
+      .trim();
+    if (composed !== "") return composed;
+  }
+  return basePrompt || "生成一张高质量图片";
+}
+
 export function useCanvasImageGenerationController(options: CanvasImageGenerationControllerOptions) {
   const [state, setState] = useState(EMPTY_STATE);
   const stateRef = useRef(state);
@@ -182,9 +261,11 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
   const optionsRef = useRef(options);
   optionsRef.current = options;
   const modelControllerRef = useRef<AbortController | null>(null);
+  const promptTemplateControllerRef = useRef<AbortController | null>(null);
   const actionRef = useRef<ActionHandle | null>(null);
   const requestDispatchedRef = useRef(false);
   const modelRunIdRef = useRef(0);
+  const promptTemplateRunIdRef = useRef(0);
 
   const update = useCallback((change: (current: CanvasImageGenerationControllerState) => CanvasImageGenerationControllerState) => {
     const next = change(stateRef.current);
@@ -234,13 +315,21 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     modelRunIdRef.current += 1;
     modelControllerRef.current?.abort();
     modelControllerRef.current = null;
+    promptTemplateRunIdRef.current += 1;
+    promptTemplateControllerRef.current?.abort();
+    promptTemplateControllerRef.current = null;
 
     const action = actionRef.current;
     if (action !== null && (action.kind !== "submit" && action.kind !== "retry"
       || !requestDispatchedRef.current)) {
       action.controller.abort();
     }
-    update((current) => ({ ...current, mode: null, modelsLoading: false }));
+    update((current) => ({
+      ...current,
+      mode: null,
+      modelsLoading: false,
+      promptTemplatesLoading: false,
+    }));
     notifyGuard();
   }, [notifyGuard, update]);
 
@@ -318,6 +407,82 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     });
   }, [update]);
 
+  const loadPromptTemplates = useCallback((target: CanvasImageGenerationTarget) => {
+    promptTemplateRunIdRef.current += 1;
+    const runId = promptTemplateRunIdRef.current;
+    promptTemplateControllerRef.current?.abort();
+    const controller = new AbortController();
+    promptTemplateControllerRef.current = controller;
+    update((current) => ({
+      ...current,
+      promptTemplates: [],
+      selectedPromptTemplateId: "",
+      promptTemplateSelectionInvalid: false,
+      promptTemplatesLoading: true,
+      promptTemplateError: null,
+    }));
+
+    const settings = optionsRef.current.creatorSettings;
+    if (settings === undefined) {
+      update((current) => current.target?.targetKey !== target.targetKey || current.mode !== "form" ? current : {
+        ...current,
+        promptTemplatesLoading: false,
+        promptTemplateError: "提示词模板暂时无法读取；仍可填写描述生成。",
+      });
+      promptTemplateControllerRef.current = null;
+      return;
+    }
+
+    const serviceIdentity = optionsRef.current.serviceIdentity;
+    const isCurrent = () => {
+      try {
+        const current = stateRef.current;
+        return !controller.signal.aborted
+          && runId === promptTemplateRunIdRef.current
+          && target.context.isCurrent()
+          && optionsRef.current.serviceIdentity === serviceIdentity
+          && optionsRef.current.creatorSettings === settings
+          && optionsRef.current.selectedTargetKey === target.targetKey
+          && current.mode === "form"
+          && current.target?.targetKey === target.targetKey;
+      } catch {
+        return false;
+      }
+    };
+
+    void Promise.resolve().then(() => {
+      if (!isCurrent()) return null;
+      return settings.listPrompts(undefined, controller.signal);
+    }).then((rows) => {
+      if (rows === null || !isCurrent()) return;
+      const promptTemplates = projectImagePromptTemplates(rows);
+      update((current) => current.target?.targetKey !== target.targetKey || current.mode !== "form" ? current : {
+        ...current,
+        promptTemplates,
+        selectedPromptTemplateId: "",
+        promptTemplateSelectionInvalid: false,
+        promptTemplateError: null,
+      });
+    }).catch(() => {
+      if (!isCurrent()) return;
+      update((current) => current.target?.targetKey !== target.targetKey || current.mode !== "form" ? current : {
+        ...current,
+        promptTemplates: [],
+        selectedPromptTemplateId: "",
+        promptTemplateSelectionInvalid: false,
+        promptTemplateError: "提示词模板暂时无法读取；仍可填写描述生成。",
+      });
+    }).finally(() => {
+      if (promptTemplateControllerRef.current === controller) promptTemplateControllerRef.current = null;
+      if (isCurrent()) {
+        update((current) => current.target?.targetKey !== target.targetKey || current.mode !== "form" ? current : {
+          ...current,
+          promptTemplatesLoading: false,
+        });
+      }
+    });
+  }, [update]);
+
   const openNew = useCallback((target: CanvasImageGenerationTarget): boolean => {
     if (busyRef.current || intentRef.current !== null
       || target.targetKey !== optionsRef.current.selectedTargetKey
@@ -328,8 +493,13 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       target,
       models: [],
       selectedModelId: "",
+      promptTemplates: [],
+      selectedPromptTemplateId: "",
+      promptTemplateSelectionInvalid: false,
       prompt: target.promptSeed,
       modelsLoading: true,
+      promptTemplatesLoading: true,
+      promptTemplateError: null,
       error: null,
       message: null,
       lockMessage: null,
@@ -338,8 +508,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     }));
     notifyGuard();
     loadModels(target);
+    loadPromptTemplates(target);
     return true;
-  }, [loadModels, notifyGuard, update]);
+  }, [loadModels, loadPromptTemplates, notifyGuard, update]);
 
   const openPendingIntent = useCallback((): boolean => {
     const intent = intentRef.current;
@@ -369,6 +540,36 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const current = stateRef.current;
     if (current.busy || !current.models.some((model) => model.id === modelId)) return;
     update((latest) => ({ ...latest, selectedModelId: modelId, error: null }));
+  }, [update]);
+
+  const setSelectedPromptTemplateId = useCallback((promptTemplateId: string) => {
+    const current = stateRef.current;
+    if (current.mode !== "form" || current.busy) return;
+    if (promptTemplateId === "") {
+      update((latest) => ({
+        ...latest,
+        selectedPromptTemplateId: "",
+        promptTemplateSelectionInvalid: false,
+        promptTemplateError: null,
+      }));
+      return;
+    }
+    const matches = current.promptTemplates.filter((template) => template.id === promptTemplateId);
+    if (matches.length !== 1) {
+      update((latest) => ({
+        ...latest,
+        selectedPromptTemplateId: promptTemplateId,
+        promptTemplateSelectionInvalid: true,
+        promptTemplateError: "所选提示词模板无法唯一确认，请重新选择模板或选择“无（纯画面描述）”。",
+      }));
+      return;
+    }
+    update((latest) => ({
+      ...latest,
+      selectedPromptTemplateId: promptTemplateId,
+      promptTemplateSelectionInvalid: false,
+      promptTemplateError: null,
+    }));
   }, [update]);
 
   const setPrompt = useCallback((prompt: string) => {
@@ -403,13 +604,38 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const current = stateRef.current;
     const target = current.target;
     const model = current.models.find((option) => option.id === current.selectedModelId);
-    if (target === null || model === undefined || current.prompt.trim() === ""
+    if (current.mode !== "form" || target === null || model === undefined
       || current.modelsLoading || busyRef.current || intentRef.current !== null) return;
+    if (current.promptTemplateSelectionInvalid) {
+      update((latest) => ({
+        ...latest,
+        promptTemplateError: "请重新选择有效提示词模板或选择“无（纯画面描述）”，未发送图片任务。",
+      }));
+      return;
+    }
+
+    let selectedTemplate: CanvasImageGenerationPromptTemplateOption | null = null;
+    if (current.selectedPromptTemplateId !== "") {
+      const matches = current.promptTemplates.filter((template) => template.id === current.selectedPromptTemplateId);
+      if (matches.length !== 1) {
+        update((latest) => ({
+          ...latest,
+          selectedPromptTemplateId: current.selectedPromptTemplateId,
+          promptTemplateSelectionInvalid: true,
+          promptTemplateError: "所选提示词模板无法唯一确认，请重新选择模板或选择“无（纯画面描述）”，未发送图片任务。",
+        }));
+        return;
+      }
+      const match = matches[0];
+      if (match === undefined) return;
+      selectedTemplate = Object.freeze({ ...match });
+    }
+    const prompt = composeImagePrompt(current.prompt, target.promptSeed, selectedTemplate);
+    const modelId = model.id;
+    const modelName = model.name;
 
     const action = beginAction("submit");
     if (action === null) return;
-    const prompt = current.prompt;
-    const modelId = model.id;
     try {
       if (!target.context.isCurrent() || !await optionsRef.current.validateTarget(target, action.controller.signal, true)) {
         if (!action.controller.signal.aborted && target.context.isCurrent()) {
@@ -433,7 +659,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
         destination: target.destination,
         idempotencyKey,
       });
-      const intent = intentView(target, input, model.name, "unknown");
+      const intent = intentView(target, input, modelName, "unknown");
       updateIntent(intent);
       update((latest) => ({ ...latest, error: null, message: null, mode: "form" }));
       await finishSubmission(intent, action);
@@ -587,6 +813,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     modelRunIdRef.current += 1;
     modelControllerRef.current?.abort();
     modelControllerRef.current = null;
+    promptTemplateRunIdRef.current += 1;
+    promptTemplateControllerRef.current?.abort();
+    promptTemplateControllerRef.current = null;
     actionRef.current?.controller.abort();
     actionRef.current = null;
     requestDispatchedRef.current = false;
@@ -598,6 +827,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     return () => {
       modelRunIdRef.current += 1;
       modelControllerRef.current?.abort();
+      promptTemplateRunIdRef.current += 1;
+      promptTemplateControllerRef.current?.abort();
       actionRef.current?.controller.abort();
     };
   }, [options.contextKey, options.serviceIdentity]);
@@ -621,6 +852,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     openReceipt,
     close,
     setSelectedModelId,
+    setSelectedPromptTemplateId,
     setPrompt,
     submitNew,
     lookupPendingIntent,
