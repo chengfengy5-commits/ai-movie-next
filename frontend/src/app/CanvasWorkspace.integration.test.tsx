@@ -43,6 +43,11 @@ interface GenerationWorkspaceHarnessOptions {
   readonly deferredPromptList?: boolean;
   readonly deferredImageModels?: boolean;
   readonly frameText?: string;
+  readonly referenceFramePreview?: string | null;
+  readonly referenceStoryboardImageUrl?: string | null;
+  readonly referenceCharacterImageUrl?: string | null;
+  readonly referenceSceneImageUrl?: string | null;
+  readonly hiddenRelations?: readonly string[];
   readonly deferredImageSubmit?: boolean;
   readonly deferredImageSubmitOrdinal?: number;
   readonly ownedImageReplies?: readonly {
@@ -94,7 +99,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     scene: assetKind === "scene" ? [assetId] : [],
     prop: assetKind === "prop" ? [assetId] : [],
     storyboard: stable ? ["board-generation"] : [],
-    preview: null,
+    preview: options.referenceFramePreview ?? null,
     videos: [],
   };
   const currentChapter: Chapter = {
@@ -114,17 +119,19 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     frame_index: 0,
     name: "生成分镜",
     description: null,
-    image_url: null,
+    image_url: options.referenceStoryboardImageUrl ?? null,
     created_at: timestamp,
     updated_at: timestamp,
   } : null;
   const character: Character | null = includesCharacter ? {
-    id: characterId, series_id: currentSeries.id, name: "生成角色", description: null, image_url: null,
+    id: characterId, series_id: currentSeries.id, name: "生成角色", description: null,
+    image_url: options.referenceCharacterImageUrl ?? null,
     aliases: null, canonical_key: null, gender: null, age: null, role: null, appearance: null,
     audio_url: null, voice_ref: null, created_at: timestamp, updated_at: timestamp,
   } : null;
   const scene: Scene | null = assetKind === "scene" ? {
-    id: assetId, series_id: currentSeries.id, title: "生成场景", description: null, image_url: null,
+    id: assetId, series_id: currentSeries.id, title: "生成场景", description: null,
+    image_url: options.referenceSceneImageUrl ?? null,
     aliases: null, canonical_key: null, created_at: timestamp, updated_at: timestamp,
   } : null;
   const prop: Prop | null = assetKind === "prop" ? {
@@ -234,7 +241,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     notes: [{ id: "existing-note", text: "保留便签", x: 31, y: 42, width: 220, height: 120 }],
     cards: [{ id: "existing-card", text: "保留卡片", x: 53, y: 64, width: 260, height: 150 }],
     manualEdges: [{ id: "existing-edge", sourceRef: "frame:0", targetRef: "future-node", relation: "manual", extension: true }],
-    hiddenRelations: ["future:relation"],
+    hiddenRelations: [...(options.hiddenRelations ?? []), "future:relation"],
     viewport: { x: 0, y: 0, zoom: 1 },
     unknown: { preserve: true },
   };
@@ -396,6 +403,12 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       return Response.json({
         id: "generation-canvas", chapter_id: activeChapter.id, version: 1, document_json: documentJson,
         updated_by: "demo-user", updated_at: timestamp, save_capability: "guarded-v1",
+      });
+    }
+    if (method === "GET" && (url.pathname.startsWith("/uploads/") || url.pathname === "/api/chat/proxy-image")) {
+      return new Response(new Uint8Array([137, 80, 78, 71]), {
+        status: 200,
+        headers: { "Content-Type": "image/png" },
       });
     }
     if (method === "GET" && url.pathname === `/api/chapters/${activeChapter.id}/canvas-owned-results`) {
@@ -595,7 +608,6 @@ async function openGenerationResultsFor(nodeName = "分镜 1") {
 async function waitForImageModelOption(dialog: HTMLElement) {
   const queries = within(dialog);
   await queries.findByRole("option", { name: "画布单图模型" });
-  await waitFor(() => expect(queries.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled());
   return queries;
 }
 
@@ -620,6 +632,274 @@ describe("selected chapter to canvas integration", () => {
     expect(dialog.innerHTML).not.toContain("private-api-key-value");
     expect(within(dialog).queryByText("不可选的视频模型")).toBeNull();
     expect(harness.requests.filter((request) => request.method === "POST")).toHaveLength(0);
+  });
+
+  it("offers local reference-image selection in the real generation form", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const referenceInput = await within(dialog).findByLabelText("选择本地参考图片");
+
+    expect(referenceInput).toHaveAttribute("type", "file");
+    expect(referenceInput).toHaveAttribute("multiple");
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
+  it("freezes selected graph and local references into each single-image request", async () => {
+    const characterUrl = "https://images.example.test/character.png?revision=7";
+    const storyboardUrl = "https://images.example.test/storyboard.png";
+    const previewUrl = "https://images.example.test/preview.png";
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceFramePreview: previewUrl,
+      referenceStoryboardImageUrl: storyboardUrl,
+      referenceCharacterImageUrl: characterUrl,
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    await waitForImageModelOption(dialog);
+
+    const characterChoice = within(dialog).getByLabelText("生成角色") as HTMLInputElement;
+    const storyboardChoice = within(dialog).getByLabelText("生成分镜") as HTMLInputElement;
+    const previewChoice = within(dialog).getByLabelText("分镜预览") as HTMLInputElement;
+    expect(characterChoice.checked).toBe(true);
+    expect(storyboardChoice.checked).toBe(true);
+    expect(previewChoice.checked).toBe(true);
+    fireEvent.click(previewChoice);
+    expect(previewChoice.checked).toBe(false);
+
+    fireEvent.change(within(dialog).getByLabelText("生成数量"), { target: { value: "3" } });
+    const localFile = new File([new Uint8Array([1, 2, 3])], "local-reference.png", { type: "image/png" });
+    fireEvent.change(within(dialog).getByLabelText("选择本地参考图片"), { target: { files: [localFile] } });
+    expect(within(dialog).getByText("local-reference.png")).toBeTruthy();
+    fireEvent.click(within(dialog).getByRole("button", { name: "提交3张图片任务" }));
+
+    await waitFor(() => expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(3));
+    const submissions = harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    const expectedReferences = [characterUrl, storyboardUrl, "data:image/png;base64,AQID"];
+    expect(submissions.map((request) => (request.body as { reference_images: string[] }).reference_images))
+      .toEqual([expectedReferences, expectedReferences, expectedReferences]);
+    expect(new Set(submissions.map((request) => request.headers.get("Idempotency-Key"))).size).toBe(3);
+    const receiptDialog = await screen.findByRole("dialog", { name: "生成任务状态" });
+    expect(receiptDialog.innerHTML).not.toContain("data:image/png");
+    expect(receiptDialog.innerHTML).not.toContain(characterUrl);
+    expect(within(receiptDialog).getAllByText("参考图（3）：生成角色、生成分镜、local-reference.png")).toHaveLength(2);
+  });
+
+  it("defaults the selected graph image first, followed by connected image nodes", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceFramePreview: "https://images.example.test/selected-preview.png",
+      referenceCharacterImageUrl: "https://images.example.test/connected-character.png",
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜预览" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+
+    expect((dialog.getByLabelText("分镜预览") as HTMLInputElement).checked).toBe(true);
+    expect((dialog.getByLabelText("生成角色") as HTMLInputElement).checked).toBe(true);
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
+  it("keeps a connected image selectable when its edge relation is hidden on the canvas", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceCharacterImageUrl: "https://images.example.test/hidden-connected.png",
+      hiddenRelations: ["uses"],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    const reference = dialog.getByLabelText("生成角色") as HTMLInputElement;
+
+    expect(reference.checked).toBe(true);
+    fireEvent.click(reference);
+    expect(reference.checked).toBe(false);
+    fireEvent.click(reference);
+    expect(reference.checked).toBe(true);
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
+  it("prepares safe root-relative uploads through the canvas data port before submitting", async () => {
+    const uploadPath = "/uploads/reference-image.png";
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceCharacterImageUrl: uploadPath,
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    await waitFor(() => expect(harness.requests.some((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toBe(true));
+    const uploadReads = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === uploadPath);
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(uploadReads.length).toBeGreaterThanOrEqual(1);
+    expect(submission?.body).toMatchObject({ reference_images: ["data:image/png;base64,iVBORw=="] });
+  });
+
+  it("reports rejected local files without removing valid graph references", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceCharacterImageUrl: "https://images.example.test/kept-reference.png",
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    const valid = new File([new Uint8Array([1, 2, 3])], "kept-local.png", { type: "image/png" });
+    const invalid = new File(["not an image"], "rejected.txt", { type: "text/plain" });
+    fireEvent.change(dialog.getByLabelText("选择本地参考图片"), { target: { files: [invalid, valid] } });
+
+    expect((dialog.getByLabelText("生成角色") as HTMLInputElement).checked).toBe(true);
+    expect(dialog.getByText("kept-local.png")).toBeTruthy();
+    expect(dialog.getByText("有文件不是受支持的图片，或超过10 MiB；这些文件未加入参考图。")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
+  it("blocks an over-limit reference selection and never truncates it", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceFramePreview: "https://images.example.test/preview-limit.png",
+      referenceStoryboardImageUrl: "https://images.example.test/storyboard-limit.png",
+      referenceCharacterImageUrl: "https://images.example.test/character-limit.png",
+      imageModelParams: JSON.stringify({
+        max_reference_images: { enabled: true, options: [1, 2, 4], default: 2 },
+      }),
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+
+    expect(dialog.getByRole("alert").textContent).toBe("当前模型最多接受 2 张参考图，请减少选择；不会自动截断。");
+    expect(dialog.getByRole("button", { name: "提交单张图片任务" })).toBeDisabled();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+    fireEvent.click(dialog.getByLabelText("分镜预览"));
+    expect(dialog.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled();
+  });
+
+  it("clears references for a disabled model and omits them from an accepted text-only request", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceCharacterImageUrl: "https://images.example.test/disabled-reference.png",
+      imageModelParams: JSON.stringify({ max_reference_images: { enabled: false } }),
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+
+    expect(dialog.getByText("当前模型不接受参考图，所选参考图已清除。")).toBeTruthy();
+    expect((dialog.getByLabelText("生成角色") as HTMLInputElement).checked).toBe(false);
+    expect(dialog.getByLabelText("生成角色")).toBeDisabled();
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    await waitFor(() => expect(harness.requests.some((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toBe(true));
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).not.toHaveProperty("reference_images");
+  });
+
+  it("clears references when switching to a model that disables them", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      referenceCharacterImageUrl: "https://images.example.test/model-switch.png",
+      additionalImageModels: [{
+        id: "image-model-no-references",
+        category: "image",
+        name: "无参考图模型",
+        provider: "private-provider-value",
+        model: "private-model-value",
+        base_url: "https://private-model.example.invalid",
+        params: JSON.stringify({
+          image_size: { enabled: true, options: ["4:3", "16:9"], default: "16:9" },
+          max_reference_images: { enabled: false },
+        }),
+        api_key: "private-api-key-value",
+        sort_order: 1,
+        is_system: false,
+        user_id: "demo-user",
+      }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    expect((dialog.getByLabelText("生成角色") as HTMLInputElement).checked).toBe(true);
+    fireEvent.change(dialog.getByLabelText("图片模型"), { target: { value: "image-model-no-references" } });
+
+    expect((dialog.getByLabelText("图片尺寸") as HTMLSelectElement).value).toBe("16:9");
+    expect((dialog.getByLabelText("生成角色") as HTMLInputElement).checked).toBe(false);
+    expect(dialog.getByLabelText("生成角色")).toBeDisabled();
+    expect(dialog.getByText("当前图片模型不接受参考图，已清除本轮参考图选择。")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
+  it("blocks malformed reference configuration without sending a request", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageModelParams: JSON.stringify({ max_reference_images: { options: [1, 2], default: 3 } }),
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+
+    expect(dialog.getByText("该图片模型的参考图配置无效，无法安全提交。")).toBeTruthy();
+    expect(dialog.getByRole("button", { name: "提交单张图片任务" })).toBeDisabled();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
+  it.each([
+    ["extension metadata", { options: [1, 2], default: 2, provider_metadata: "ignored" }, true],
+    ["null default", { options: [1, 2], default: null }, false],
+  ] as const)("projects backend reference configuration with %s", async (_name, configuration, accepted) => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageModelParams: JSON.stringify({ max_reference_images: configuration }),
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+
+    if (accepted) {
+      expect(dialog.getByText("已选择 0 张；当前模型上限 2 张。")).toBeTruthy();
+      expect(dialog.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled();
+      fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+      expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+      expect(harness.requests.some((request) => request.method === "POST"
+        && request.url.pathname === "/api/chat/image")).toBe(true);
+      return;
+    }
+
+    expect(dialog.getByText("该图片模型的参考图配置无效，无法安全提交。")).toBeTruthy();
+    expect(dialog.getByRole("button", { name: "提交单张图片任务" })).toBeDisabled();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
+  it("cancels late local reference preparation without submitting or changing the session", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    const localFile = new File([new Uint8Array([1, 2, 3])], "cancelled-reference.png", { type: "image/png" });
+    fireEvent.change(dialog.getByLabelText("选择本地参考图片"), { target: { files: [localFile] } });
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+    fireEvent.click(dialog.getByRole("button", { name: "关闭生成图片" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "生成图片" })).toBeNull());
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+    expect(harness.token()).toBe("generation-fixture-token");
   });
 
   it("offers a one-to-four image request count in the real generation form", async () => {
@@ -1467,8 +1747,12 @@ describe("selected chapter to canvas integration", () => {
   });
 
   it("keeps the original composed body and key across unknown lookup and explicit retry", async () => {
+    const characterUrl = "https://images.example.test/character-frozen.png";
+    const storyboardUrl = "https://images.example.test/storyboard-frozen.png";
     const harness = mountGenerationWorkspace({
       targetKind: "stable-frame",
+      referenceCharacterImageUrl: characterUrl,
+      referenceStoryboardImageUrl: storyboardUrl,
       promptRows: [promptRow("original-template", "character-design", "原模板", "原系统段落", "原用户段落")],
       imageModelParams: JSON.stringify({
         image_size: { enabled: true, options: ["16:9", "quality:high"], default: "16:9" },
@@ -1487,6 +1771,8 @@ describe("selected chapter to canvas integration", () => {
       target: { value: "original-template" },
     });
     fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), { target: { value: "原补充描述" } });
+    const localFile = new File([new Uint8Array([4, 5, 6])], "unknown-reference.png", { type: "image/png" });
+    fireEvent.change(dialogQueries.getByLabelText("选择本地参考图片"), { target: { files: [localFile] } });
     fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
     dialog = await screen.findByRole("dialog", { name: "核对原生成任务" });
     dialogQueries = within(dialog);
@@ -1511,6 +1797,11 @@ describe("selected chapter to canvas integration", () => {
     expect(submissions).toHaveLength(2);
     expect(submissions[0]?.body).toEqual(submissions[1]?.body);
     expect(submissions[0]?.body).toMatchObject({ size: "quality:high" });
+    expect((submissions[0]?.body as { reference_images: string[] }).reference_images).toEqual([
+      characterUrl,
+      storyboardUrl,
+      "data:image/png;base64,BAUG",
+    ]);
     expect(submissions[0]?.headers.get("Idempotency-Key")).toBe(submissions[1]?.headers.get("Idempotency-Key"));
     expect(submissions[0]?.body).toMatchObject({ prompt: "原系统段落\n原用户段落\n原补充描述" });
     expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);

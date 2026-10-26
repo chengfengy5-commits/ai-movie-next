@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CanvasImageGenerationError,
+  isValidCanvasImageReference,
   isValidCanvasImageGenerationSize,
+  type CanvasImageGenerationSubmitInput,
   type CanvasImageGenerationPort,
   type CanvasImageGenerationReceipt,
-  type CanvasImageGenerationSubmitInput,
 } from "../../../shared/api/canvasImageGeneration";
 import type { CanvasOwnedResultsTarget } from "../../../shared/api/canvasOwnedResults";
 import type { CreatorPrompt, CreatorSettingsServicePort } from "../../../shared/api/creatorSettings";
@@ -15,6 +16,15 @@ import type {
   CanvasImageGenerationModelOption,
   CanvasImageGenerationPromptTemplateOption,
 } from "./CanvasImageGenerationDialog";
+import {
+  CanvasImageReferencePreparationError,
+  isSupportedCanvasImageFile,
+  isSafeCanvasUploadPath,
+  projectCanvasImageReferenceConfiguration,
+  readCanvasImageBlobAsDataUrl,
+  safeCanvasImageReferenceName,
+  type CanvasImageReferenceCandidate,
+} from "./canvasImageReferences";
 
 export interface CanvasImageGenerationWorkspaceContext {
   readonly actorId: string;
@@ -31,6 +41,7 @@ export interface CanvasImageGenerationTarget {
   readonly sourceVersion: string;
   readonly requiresLock: boolean;
   readonly promptSeed: string;
+  readonly referenceCandidates: readonly CanvasImageReferenceCandidate[];
   readonly context: CanvasImageGenerationWorkspaceContext;
 }
 
@@ -61,6 +72,8 @@ export interface CanvasImageGenerationControllerState {
   readonly selectedPromptTemplateId: string;
   readonly promptTemplateSelectionInvalid: boolean;
   readonly prompt: string;
+  readonly selectedReferenceIds: readonly string[];
+  readonly referenceFiles: readonly File[];
   readonly modelsLoading: boolean;
   readonly promptTemplatesLoading: boolean;
   readonly promptTemplateError: string | null;
@@ -81,6 +94,7 @@ export interface CanvasImageGenerationControllerOptions {
   readonly selectedTargetKey: string | null;
   readonly creatorSettings: CreatorSettingsServicePort | undefined;
   readonly port: CanvasImageGenerationPort | undefined;
+  readReferenceImage?(imageUrl: string, signal: AbortSignal): Promise<Blob>;
   validateTarget(target: CanvasImageGenerationTarget, signal: AbortSignal, requireSelection: boolean): Promise<boolean>;
   checkEditLock(target: CanvasImageGenerationTarget, signal: AbortSignal): Promise<CanvasImageGenerationLockResult>;
   acquireEditLock(target: CanvasImageGenerationTarget, signal: AbortSignal): Promise<CanvasImageGenerationLockResult>;
@@ -99,9 +113,14 @@ interface FrozenImageGenerationRequest {
   readonly input: CanvasImageGenerationSubmitInput;
 }
 
+type FrozenReferenceSource =
+  | { readonly kind: "url"; readonly name: string; readonly value: string }
+  | { readonly kind: "file"; readonly name: string; readonly file: File };
+
 interface FrozenImageGenerationBatch {
   readonly target: CanvasImageGenerationTarget;
   readonly modelName: string;
+  readonly referenceNames: readonly string[];
   readonly serviceIdentity: object;
   readonly port: CanvasImageGenerationPort;
   readonly requests: readonly FrozenImageGenerationRequest[];
@@ -125,6 +144,8 @@ const EMPTY_STATE: CanvasImageGenerationControllerState = {
   selectedPromptTemplateId: "",
   promptTemplateSelectionInvalid: false,
   prompt: "",
+  selectedReferenceIds: [],
+  referenceFiles: [],
   modelsLoading: false,
   promptTemplatesLoading: false,
   promptTemplateError: null,
@@ -160,6 +181,7 @@ function receiptView(
   target: CanvasImageGenerationTarget,
   input: CanvasImageGenerationSubmitInput,
   modelName: string,
+  referenceNames: readonly string[],
   receipt: CanvasImageGenerationReceipt,
   ordinal: number,
 ): CanvasImageGenerationWorkspaceReceipt {
@@ -170,6 +192,7 @@ function receiptView(
     modelName,
     prompt: input.prompt,
     size: input.size ?? null,
+    referenceNames,
     receipt,
     targetLabel: target.targetLabel,
     ordinal,
@@ -181,6 +204,7 @@ function intentView(
   target: CanvasImageGenerationTarget,
   input: CanvasImageGenerationSubmitInput,
   modelName: string,
+  referenceNames: readonly string[],
   state: CanvasImageGenerationWorkspaceIntent["state"],
   batch: CanvasImageGenerationBatchView,
   ordinal: number,
@@ -193,6 +217,7 @@ function intentView(
     modelName,
     prompt: input.prompt,
     size: input.size ?? null,
+    referenceNames,
     targetLabel: target.targetLabel,
     ordinal,
     batch,
@@ -204,6 +229,7 @@ function intentView(
 function batchView(batch: FrozenImageGenerationBatch): CanvasImageGenerationBatchView {
   return {
     requestedCount: batch.requests.length,
+    referenceNames: batch.referenceNames,
     acceptedReceipts: batch.acceptedReceipts,
     notSentCount: batch.notSentCount,
     activeOrdinal: batch.activeOrdinal,
@@ -256,6 +282,21 @@ interface ImageSizeConfiguration {
   readonly sizeOptions: readonly string[];
   readonly defaultSize: string | null;
   readonly sizeConfigurationError: string | null;
+}
+
+function imageModelOptions(params: string | null): ImageSizeConfiguration & {
+  readonly referenceImagesEnabled: boolean;
+  readonly maximumReferenceImages: number;
+  readonly referenceConfigurationError: string | null;
+} {
+  const size = imageSizeConfiguration(params);
+  const references = projectCanvasImageReferenceConfiguration(params);
+  return {
+    ...size,
+    referenceImagesEnabled: references.enabled,
+    maximumReferenceImages: references.maximum,
+    referenceConfigurationError: references.error,
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -522,7 +563,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
   ) => {
     if (!intent.target.context.isCurrent()
       || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
-    const confirmed = receiptView(intent.target, intent.input, intent.modelName, receipt, intent.ordinal);
+    const confirmed = receiptView(
+      intent.target, intent.input, intent.modelName, batch.referenceNames, receipt, intent.ordinal,
+    );
     const remainingCount = batch.requests.length - batch.acceptedReceipts.length - 1;
     const allComplete = complete && remainingCount === 0;
     const nextBatch: FrozenImageGenerationBatch = {
@@ -592,15 +635,27 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       }).map((model) => ({
         id: model.id,
         name: model.name,
-        ...imageSizeConfiguration(model.params),
+        ...imageModelOptions(model.params),
       }));
-      update((current) => current.target?.targetKey !== target.targetKey ? current : {
-        ...current,
-        models,
-        selectedModelId: models[0]?.id ?? "",
-        selectedSize: models[0]?.defaultSize ?? "",
-        sizeSelectionInvalid: false,
-        error: null,
+      update((current) => {
+        if (current.target?.targetKey !== target.targetKey) return current;
+        const firstModel = models[0];
+        const clearsReferences = firstModel !== undefined && !firstModel.referenceImagesEnabled;
+        return {
+          ...current,
+          models,
+          selectedModelId: firstModel?.id ?? "",
+          selectedSize: firstModel?.defaultSize ?? "",
+          sizeSelectionInvalid: false,
+          ...(clearsReferences ? {
+            selectedReferenceIds: Object.freeze([]),
+            referenceFiles: Object.freeze([]),
+            message: current.selectedReferenceIds.length + current.referenceFiles.length > 0
+              ? "当前图片模型不接受参考图，已清除本轮参考图选择。"
+              : null,
+          } : {}),
+          error: null,
+        };
       });
     }).catch(() => {
       if (controller.signal.aborted || runId !== modelRunIdRef.current || !target.context.isCurrent()) return;
@@ -714,6 +769,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       selectedPromptTemplateId: "",
       promptTemplateSelectionInvalid: false,
       prompt: target.promptSeed,
+      selectedReferenceIds: Object.freeze(target.referenceCandidates.map((candidate) => candidate.id)),
+      referenceFiles: Object.freeze([]),
       modelsLoading: true,
       promptTemplatesLoading: true,
       promptTemplateError: null,
@@ -769,6 +826,58 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       selectedModelId: modelId,
       selectedSize: model.defaultSize ?? "",
       sizeSelectionInvalid: false,
+      ...(model.referenceImagesEnabled ? {} : {
+        selectedReferenceIds: Object.freeze([]),
+        referenceFiles: Object.freeze([]),
+        message: "当前图片模型不接受参考图，已清除本轮参考图选择。",
+      }),
+      error: null,
+    }));
+  }, [update]);
+
+  const toggleReference = useCallback((id: string, selected: boolean) => {
+    const current = stateRef.current;
+    const model = current.models.find((option) => option.id === current.selectedModelId);
+    if (current.mode !== "form" || current.busy || model === undefined || !model.referenceImagesEnabled
+      || model.referenceConfigurationError !== null
+      || !current.target?.referenceCandidates.some((candidate) => candidate.id === id)) return;
+    const selectedIds = new Set(current.selectedReferenceIds);
+    if (selected) selectedIds.add(id);
+    else selectedIds.delete(id);
+    update((latest) => ({
+      ...latest,
+      selectedReferenceIds: Object.freeze([...selectedIds]),
+      message: null,
+      error: null,
+    }));
+  }, [update]);
+
+  const selectReferenceFiles = useCallback((files: FileList | null) => {
+    const current = stateRef.current;
+    const model = current.models.find((option) => option.id === current.selectedModelId);
+    if (current.mode !== "form" || current.busy || model === undefined || !model.referenceImagesEnabled
+      || model.referenceConfigurationError !== null || files === null || files.length === 0) return;
+    const valid: File[] = [];
+    const rejectedNames: string[] = [];
+    for (const file of Array.from(files)) {
+      if (isSupportedCanvasImageFile(file)) valid.push(file);
+      else rejectedNames.push(safeCanvasImageReferenceName(file.name, "所选文件"));
+    }
+    update((latest) => ({
+      ...latest,
+      referenceFiles: Object.freeze([...latest.referenceFiles, ...valid]),
+      error: rejectedNames.length === 0 ? null : "有文件不是受支持的图片，或超过10 MiB；这些文件未加入参考图。",
+      message: null,
+    }));
+  }, [update]);
+
+  const removeReferenceFile = useCallback((index: number) => {
+    const current = stateRef.current;
+    if (current.mode !== "form" || current.busy || !Number.isInteger(index)
+      || index < 0 || index >= current.referenceFiles.length) return;
+    update((latest) => ({
+      ...latest,
+      referenceFiles: Object.freeze(latest.referenceFiles.filter((_file, fileIndex) => fileIndex !== index)),
       error: null,
     }));
   }, [update]);
@@ -878,6 +987,10 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       return;
     }
     if (model.sizeConfigurationError !== null) return;
+    if (model.referenceConfigurationError !== null) {
+      update((latest) => ({ ...latest, error: model.referenceConfigurationError }));
+      return;
+    }
     const size = model.sizeOptions.length > 0 ? current.selectedSize : undefined;
     if (model.sizeOptions.length > 0
       && (current.sizeSelectionInvalid || !model.sizeOptions.includes(current.selectedSize)
@@ -912,6 +1025,41 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const prompt = composeImagePrompt(current.prompt, target.promptSeed, selectedTemplate);
     const modelId = model.id;
     const modelName = model.name;
+    const selectedCandidates = target.referenceCandidates.filter((candidate) => current.selectedReferenceIds.includes(candidate.id));
+    if (selectedCandidates.length !== current.selectedReferenceIds.length) {
+      update((latest) => ({ ...latest, error: "所选画布参考图已变化，请重新选择后提交。" }));
+      return;
+    }
+    if (!model.referenceImagesEnabled && (selectedCandidates.length > 0 || current.referenceFiles.length > 0)) {
+      update((latest) => ({ ...latest, error: "当前图片模型不接受参考图，请切换模型或清除参考图选择。" }));
+      return;
+    }
+    const referenceCount = selectedCandidates.length + current.referenceFiles.length;
+    if (referenceCount > model.maximumReferenceImages || referenceCount > 8) {
+      update((latest) => ({
+        ...latest,
+        error: `当前图片模型最多接受 ${model.maximumReferenceImages} 张参考图，请减少选择；不会自动截断。`,
+      }));
+      return;
+    }
+    const referenceSources: FrozenReferenceSource[] = [
+      ...selectedCandidates.map((candidate): FrozenReferenceSource => ({
+        kind: "url",
+        name: candidate.name,
+        value: candidate.value,
+      })),
+      ...current.referenceFiles.map((file, index): FrozenReferenceSource => ({
+        kind: "file",
+        name: safeCanvasImageReferenceName(file.name, `本地参考图 ${index + 1}`),
+        file,
+      })),
+    ];
+    if (referenceSources.some((source) => source.kind === "url"
+      && !(isSafeCanvasUploadPath(source.value) || isValidCanvasImageReference(source.value)))
+      || referenceSources.some((source) => source.kind === "file" && !isSupportedCanvasImageFile(source.file))) {
+      update((latest) => ({ ...latest, error: "有参考图来源无法安全确认，请重新选择图片后提交。" }));
+      return;
+    }
     const serviceIdentity = optionsRef.current.serviceIdentity;
     const port = optionsRef.current.port;
     if (port === undefined) {
@@ -920,7 +1068,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     }
     const destination = Object.freeze({ ...target.destination });
     const idempotencyKeys = new Set<string>();
-    const requests: FrozenImageGenerationRequest[] = [];
+    const idempotencyKeysByOrdinal: string[] = [];
     for (let ordinal = 1; ordinal <= current.selectedCount; ordinal += 1) {
       const idempotencyKey = globalThis.crypto?.randomUUID?.();
       if (idempotencyKey === undefined || idempotencyKeys.has(idempotencyKey)) {
@@ -928,34 +1076,71 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
         return;
       }
       idempotencyKeys.add(idempotencyKey);
-      const input: CanvasImageGenerationSubmitInput = Object.freeze({
-        modelId,
-        prompt,
-        destination,
-        ...(size === undefined ? {} : { size }),
-        idempotencyKey,
-      });
-      requests.push(Object.freeze({ ordinal, input }));
+      idempotencyKeysByOrdinal.push(idempotencyKey);
     }
 
     const action = beginAction("submit");
     if (action === null) return;
     stopBatchAfterCurrentRef.current = false;
-    let batch: FrozenImageGenerationBatch = {
-      target,
-      modelName,
-      serviceIdentity,
-      port,
-      requests: Object.freeze(requests),
-      acceptedReceipts: Object.freeze([]),
-      notSentCount: requests.length,
-      activeOrdinal: null,
-      stoppedOrdinal: null,
-      outcome: "submitting",
-    };
-    publishBatch(batch);
-    update((latest) => ({ ...latest, receipt: null, message: null, error: null }));
+    let batch: FrozenImageGenerationBatch | null = null;
+    update((latest) => ({ ...latest, message: referenceSources.length > 0 ? "正在准备参考图…" : null, error: null }));
     try {
+      const referenceImages = await Promise.all(referenceSources.map(async (source): Promise<string> => {
+        if (action.controller.signal.aborted) throw new CanvasImageReferencePreparationError("参考图读取已取消。");
+        if (source.kind === "file") return readCanvasImageBlobAsDataUrl(source.file, action.controller.signal);
+        if (!isSafeCanvasUploadPath(source.value)) return source.value;
+        const readImage = optionsRef.current.readReferenceImage;
+        if (readImage === undefined) {
+          throw new CanvasImageReferencePreparationError("当前画布服务无法安全读取本地参考图。");
+        }
+        const blob = await readImage(source.value, action.controller.signal);
+        if (action.controller.signal.aborted) throw new CanvasImageReferencePreparationError("参考图读取已取消。");
+        return readCanvasImageBlobAsDataUrl(blob, action.controller.signal);
+      }));
+      if (action.controller.signal.aborted || !target.context.isCurrent()) return;
+      const currentOptions = optionsRef.current;
+      const latestState = stateRef.current;
+      if (currentOptions.selectedTargetKey !== target.targetKey
+        || currentOptions.serviceIdentity !== serviceIdentity || currentOptions.port !== port
+        || latestState.target?.targetKey !== target.targetKey || latestState.selectedModelId !== modelId) {
+        update((latest) => latest.target?.targetKey !== target.targetKey || latest.mode !== "form" ? latest : {
+          ...latest,
+          error: "目标、会话或图片服务已变化，没有发送图片任务。",
+          message: null,
+        });
+        return;
+      }
+      if (referenceImages.length !== referenceSources.length
+        || referenceImages.some((reference) => !isValidCanvasImageReference(reference))) {
+        throw new CanvasImageReferencePreparationError("参考图读取结果无法安全确认，没有发送图片任务。");
+      }
+      const frozenReferences = Object.freeze([...referenceImages]);
+      const requests: FrozenImageGenerationRequest[] = idempotencyKeysByOrdinal.map((idempotencyKey, index) => {
+        const input: CanvasImageGenerationSubmitInput = Object.freeze({
+          modelId,
+          prompt,
+          destination,
+          ...(size === undefined ? {} : { size }),
+          ...(frozenReferences.length === 0 ? {} : { referenceImages: frozenReferences }),
+          idempotencyKey,
+        });
+        return Object.freeze({ ordinal: index + 1, input });
+      });
+      batch = {
+        target,
+        modelName,
+        referenceNames: Object.freeze(referenceSources.map((source) => source.name)),
+        serviceIdentity,
+        port,
+        requests: Object.freeze(requests),
+        acceptedReceipts: Object.freeze([]),
+        notSentCount: requests.length,
+        activeOrdinal: null,
+        stoppedOrdinal: null,
+        outcome: "submitting",
+      };
+      publishBatch(batch);
+      update((latest) => ({ ...latest, receipt: null, message: null, error: null }));
       for (const request of batch.requests) {
         if (stopBatchAfterCurrentRef.current) {
           stopBatch(batch, "stopped", request.ordinal, batch.requests.length - batch.acceptedReceipts.length,
@@ -1012,7 +1197,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
         };
         batch = activeBatch;
         publishBatch(batch);
-        const intent = intentView(target, request.input, modelName, "unknown", batchView(batch), request.ordinal);
+        const intent = intentView(
+          target, request.input, modelName, batch.referenceNames, "unknown", batchView(batch), request.ordinal,
+        );
         updateIntent(intent);
         const run = createRun(intent, batch);
         if (!isBatchContextCurrent(batch, action)) return;
@@ -1034,6 +1221,20 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
         }
       }
     } catch (cause) {
+      if (batch === null) {
+        const preparationWasCancelled = action.controller.signal.aborted;
+        if (!preparationWasCancelled) action.controller.abort();
+        if (!preparationWasCancelled && target.context.isCurrent()) {
+          update((latest) => ({
+            ...latest,
+            error: cause instanceof CanvasImageReferencePreparationError
+              ? cause.message
+              : "参考图准备失败，没有发送图片任务。请重新选择图片后重试。",
+            message: null,
+          }));
+        }
+        return;
+      }
       const activeBatch = batchRef.current;
       if (activeBatch === null || activeBatch.requests !== batch.requests || !isBatchSnapshotCurrent(activeBatch)) return;
       const kind = errorKind(cause);
@@ -1236,6 +1437,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     setSelectedSize,
     setSelectedPromptTemplateId,
     setPrompt,
+    toggleReference,
+    selectReferenceFiles,
+    removeReferenceFile,
     submitNew,
     lookupPendingIntent,
     retryOriginalIntent,

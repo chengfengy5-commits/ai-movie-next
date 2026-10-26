@@ -107,6 +107,45 @@
   font-weight: 400;
 }
 
+.canvas-image-generation-references {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 12px;
+  border: 1px solid #cbd5e1;
+  border-radius: 8px;
+}
+
+.canvas-image-generation-references legend {
+  padding: 0 4px;
+  color: #334155;
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.canvas-image-generation-reference-choice,
+.canvas-image-generation-file-choice,
+.canvas-image-generation-reference-file {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: #334155;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.canvas-image-generation-reference-choice input {
+  flex: 0 0 auto;
+}
+
+.canvas-image-generation-reference-file {
+  justify-content: space-between;
+}
+
+.canvas-image-generation-reference-file button {
+  flex: 0 0 auto;
+}
+
 .canvas-image-generation-form textarea {
   min-height: 130px;
   resize: vertical;

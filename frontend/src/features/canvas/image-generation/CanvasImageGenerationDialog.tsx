@@ -1,6 +1,8 @@
 import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
 import type { CanvasImageGenerationReceipt } from "../../../shared/api/canvasImageGeneration";
 import type { CanvasOwnedResultsTarget } from "../../../shared/api/canvasOwnedResults";
+import type { CanvasImageReferenceCandidate } from "./canvasImageReferences";
+import { safeCanvasImageReferenceName } from "./canvasImageReferences";
 import "./CanvasImageGenerationDialog.css";
 
 export interface CanvasImageGenerationModelOption {
@@ -9,6 +11,9 @@ export interface CanvasImageGenerationModelOption {
   readonly sizeOptions: readonly string[];
   readonly defaultSize: string | null;
   readonly sizeConfigurationError: string | null;
+  readonly referenceImagesEnabled: boolean;
+  readonly maximumReferenceImages: number;
+  readonly referenceConfigurationError: string | null;
 }
 
 export interface CanvasImageGenerationPromptTemplateOption {
@@ -26,6 +31,7 @@ export interface CanvasImageGenerationIntentView {
   readonly modelName: string;
   readonly prompt: string;
   readonly size: string | null;
+  readonly referenceNames: readonly string[];
   readonly targetLabel: string;
   readonly ordinal: number;
   readonly state: "unknown" | "not-found";
@@ -38,6 +44,7 @@ export interface CanvasImageGenerationReceiptView {
   readonly modelName: string;
   readonly prompt: string;
   readonly size: string | null;
+  readonly referenceNames: readonly string[];
   readonly receipt: CanvasImageGenerationReceipt;
   readonly targetLabel: string;
 }
@@ -49,6 +56,7 @@ export interface CanvasImageGenerationBatchReceiptView extends CanvasImageGenera
 
 export interface CanvasImageGenerationBatchView {
   readonly requestedCount: number;
+  readonly referenceNames: readonly string[];
   readonly acceptedReceipts: readonly CanvasImageGenerationBatchReceiptView[];
   readonly notSentCount: number;
   readonly activeOrdinal: number | null;
@@ -69,6 +77,9 @@ export interface CanvasImageGenerationDialogProps {
   readonly selectedPromptTemplateId: string;
   readonly promptTemplateSelectionInvalid: boolean;
   readonly prompt: string;
+  readonly referenceCandidates: readonly CanvasImageReferenceCandidate[];
+  readonly selectedReferenceIds: readonly string[];
+  readonly referenceFiles: readonly File[];
   readonly modelsLoading: boolean;
   readonly promptTemplatesLoading: boolean;
   readonly promptTemplateError: string | null;
@@ -88,6 +99,9 @@ export interface CanvasImageGenerationDialogProps {
   onSelectSize(size: string): void;
   onSelectPromptTemplate(promptTemplateId: string): void;
   onChangePrompt(prompt: string): void;
+  onToggleReference(id: string, selected: boolean): void;
+  onSelectReferenceFiles(files: FileList | null): void;
+  onRemoveReferenceFile(index: number): void;
   onSubmit(): void;
   onLookup(): void;
   onRetry(): void;
@@ -143,6 +157,7 @@ function receiptDetails(view: CanvasImageGenerationReceiptView) {
       <p>任务编号：{receipt.taskId}</p>
       <p>消息编号：{receipt.messageId ?? "无"}</p>
       <p>操作：{receipt.operation === "image.single" ? "单张图片" : receipt.operation}</p>
+      <p>参考图：{view.referenceNames.length === 0 ? "无" : view.referenceNames.join("、")}</p>
     </details>
   );
 }
@@ -151,6 +166,7 @@ function batchProgress(batch: CanvasImageGenerationBatchView) {
   return (
     <div className="canvas-image-generation-batch" aria-label="本轮图片任务进度" role="status">
       <p>本轮请求 {batch.requestedCount} 张；已受理 {batch.acceptedReceipts.length} 张；未发送 {batch.notSentCount} 张。</p>
+      <p>参考图（{batch.referenceNames.length}）：{batch.referenceNames.length === 0 ? "无" : batch.referenceNames.join("、")}</p>
       {batch.activeOrdinal !== null && (
         <p>正在处理第 {batch.activeOrdinal} 张单图任务。</p>
       )}
@@ -189,6 +205,9 @@ export function CanvasImageGenerationDialog({
   selectedPromptTemplateId,
   promptTemplateSelectionInvalid,
   prompt,
+  referenceCandidates,
+  selectedReferenceIds,
+  referenceFiles,
   modelsLoading,
   promptTemplatesLoading,
   promptTemplateError,
@@ -208,6 +227,9 @@ export function CanvasImageGenerationDialog({
   onSelectSize,
   onSelectPromptTemplate,
   onChangePrompt,
+  onToggleReference,
+  onSelectReferenceFiles,
+  onRemoveReferenceFile,
   onSubmit,
   onLookup,
   onRetry,
@@ -220,6 +242,11 @@ export function CanvasImageGenerationDialog({
   const countSelectionBlocked = countSelectionInvalid || ![1, 2, 3, 4].includes(selectedCount);
   const sizeSelectionBlocked = selectedModel !== undefined && selectedModel.sizeOptions.length > 0
     && (sizeSelectionInvalid || !selectedModel.sizeOptions.includes(selectedSize));
+  const referenceSelectionCount = selectedReferenceIds.length + referenceFiles.length;
+  const referenceConfigurationInvalid = selectedModel !== undefined
+    && selectedModel.referenceConfigurationError !== null;
+  const referenceSelectionBlocked = selectedModel !== undefined && selectedModel.referenceImagesEnabled
+    && referenceSelectionCount > selectedModel.maximumReferenceImages;
   const title = mode === "form" ? "生成图片"
     : mode === "intent" ? "核对原生成任务" : "生成任务状态";
 
@@ -302,6 +329,59 @@ export function CanvasImageGenerationDialog({
                 请选择当前模型提供的有效尺寸，未发送图片任务。
               </p>
             )}
+            <fieldset className="canvas-image-generation-references">
+              <legend>参考图</legend>
+              {selectedModel?.referenceConfigurationError !== null && selectedModel?.referenceConfigurationError !== undefined && (
+                <p className="canvas-image-generation-error" role="alert">{selectedModel.referenceConfigurationError}</p>
+              )}
+              {selectedModel !== undefined && !selectedModel.referenceImagesEnabled && (
+                <p className="canvas-image-generation-message" role="status">当前模型不接受参考图，所选参考图已清除。</p>
+              )}
+              {referenceCandidates.length === 0 && (
+                <p className="canvas-image-generation-message" role="status">当前目标及相邻连线没有可用图片。</p>
+              )}
+              {referenceCandidates.map((candidate) => (
+                <label className="canvas-image-generation-reference-choice" key={candidate.id}>
+                  <input
+                    checked={selectedReferenceIds.includes(candidate.id)}
+                    disabled={busy || selectedModel === undefined || selectedModel.referenceImagesEnabled === false || referenceConfigurationInvalid}
+                    onChange={(event) => onToggleReference(candidate.id, event.currentTarget.checked)}
+                    type="checkbox"
+                  />
+                  <span>{candidate.name}</span>
+                </label>
+              ))}
+              <label className="canvas-image-generation-file-choice">
+                添加本地参考图片（PNG、JPEG、WebP、GIF、BMP；每张不超过10 MiB）
+                <input
+                  aria-label="选择本地参考图片"
+                  accept="image/png,image/jpeg,image/webp,image/gif,image/bmp"
+                  disabled={busy || selectedModel === undefined || selectedModel.referenceImagesEnabled === false || referenceConfigurationInvalid}
+                  multiple
+                  onChange={(event) => {
+                    onSelectReferenceFiles(event.currentTarget.files);
+                    event.currentTarget.value = "";
+                  }}
+                  type="file"
+                />
+              </label>
+              {referenceFiles.map((file, index) => (
+                <div className="canvas-image-generation-reference-file" key={`${file.name}:${file.lastModified}:${index}`}>
+                  <span>{safeCanvasImageReferenceName(file.name, `本地参考图 ${index + 1}`)}</span>
+                  <button disabled={busy} onClick={() => onRemoveReferenceFile(index)} type="button">移除</button>
+                </div>
+              ))}
+              {referenceSelectionBlocked && (
+                <p className="canvas-image-generation-error" role="alert">
+                  当前模型最多接受 {selectedModel?.maximumReferenceImages ?? 0} 张参考图，请减少选择；不会自动截断。
+                </p>
+              )}
+              {selectedModel !== undefined && selectedModel.referenceImagesEnabled && (
+                <p className="canvas-image-generation-prompt-hint">
+                  已选择 {referenceSelectionCount} 张；当前模型上限 {selectedModel.maximumReferenceImages} 张。
+                </p>
+              )}
+            </fieldset>
             <label>
               提示词模板
               <select
@@ -359,7 +439,8 @@ export function CanvasImageGenerationDialog({
             <footer className="canvas-image-generation-footer">
               <button disabled={busy || modelsLoading || models.length === 0 || selectedModelId === ""
                 || countSelectionBlocked
-                || sizeConfigurationInvalid || sizeSelectionBlocked} type="submit">
+                || sizeConfigurationInvalid || sizeSelectionBlocked || referenceConfigurationInvalid
+                || referenceSelectionBlocked} type="submit">
                 {busy ? "正在提交…" : selectedCount === 1 ? "提交单张图片任务" : `提交${selectedCount}张图片任务`}
               </button>
               <button disabled={busy} onClick={onClose} type="button">取消</button>
@@ -382,6 +463,7 @@ export function CanvasImageGenerationDialog({
               <p>目标：{targetIdentity(pendingIntent.destination)}</p>
               <p>模型：{pendingIntent.modelName}</p>
               <p>图片尺寸：{pendingIntent.size ?? "模型默认"}</p>
+              <p>参考图（{pendingIntent.referenceNames.length}）：{pendingIntent.referenceNames.length === 0 ? "无" : pendingIntent.referenceNames.join("、")}</p>
               <p>当前请求：第 {pendingIntent.ordinal} 张 / 共 {pendingIntent.batch.requestedCount} 张</p>
               <p>提示词：{pendingIntent.prompt}</p>
               <p>模型编号：{pendingIntent.modelId}</p>
@@ -412,12 +494,16 @@ export function CanvasImageGenerationDialog({
           <div className="canvas-image-generation-receipt" role="status">
             {receipt !== null && <p>{receiptOutcome(receipt.receipt)}</p>}
             {batch.requestedCount > 1 && receipt !== null && (
-              <p>图片尺寸：{receipt.size ?? "模型默认"}</p>
+              <>
+                <p>图片尺寸：{receipt.size ?? "模型默认"}</p>
+                <p>参考图（{receipt.referenceNames.length}）：{receipt.referenceNames.length === 0 ? "无" : receipt.referenceNames.join("、")}</p>
+              </>
             )}
             {batch.requestedCount === 1 && receipt !== null && (
               <>
                 <p>任务状态：{taskStatus(receipt.receipt.status)}</p>
                 <p>图片尺寸：{receipt.size ?? "模型默认"}</p>
+                <p>参考图（{receipt.referenceNames.length}）：{receipt.referenceNames.length === 0 ? "无" : receipt.referenceNames.join("、")}</p>
                 <p>服务器报价：{receipt.receipt.quotedAmount}</p>
                 <p>计费状态：{billingStatus(receipt.receipt.billingStatus)}</p>
               </>
