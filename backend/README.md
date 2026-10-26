@@ -139,7 +139,9 @@ backend/src/haoai_backend/download_links 将两个既有下载链接方法拆分
 
 只有同时提供 `OBJECT_STORAGE_ENDPOINT_URL`、`OBJECT_STORAGE_ACCESS_KEY_ID`、`OBJECT_STORAGE_SECRET_ACCESS_KEY`、`OBJECT_STORAGE_BUCKET`、`OBJECT_STORAGE_PUBLIC_BASE_URL` 和已存在且可写的 `TRANSFER_TMP_DIR`，才会装配现有 R2 上传 adapter。`ALLOW_R2_DEV=true` 仅允许非生产环境显式使用 `r2.dev`。读取变量本身不会连接数据库或 R2；运行健康探测仅在 `/ready` 请求时执行。该入口不表示真实 R2、PostgreSQL、部署或浏览器验收已经完成。
 
-`image.single` host 仍默认关闭。显式设置 `IMAGE_SINGLE_ENABLED=true` 时，必须同时提供绝对路径 `IMAGE_SINGLE_CREDENTIALS_FILE` 和完整 R2 配置；关闭时不会读取该文件或构造单图媒体 runtime。启用后只装配单图准入与 worker，video 和 batch 路由在认证后返回 503，不打开业务 Session 或创建/扣费。该 host 暂不接收 `reference_image`/`reference_images`；带参考图的单图请求在准入前返回 422，空参考图请求可继续现有准入流程。
+`image.single` host 默认关闭。显式设置 `IMAGE_SINGLE_ENABLED=true` 时，必须同时提供绝对路径 `IMAGE_SINGLE_CREDENTIALS_FILE` 和完整 R2 配置；关闭时不会读取该文件或构造单图媒体 runtime。仅启用单图时，video 和 batch 路由在认证后返回 503，不打开业务 Session 或创建/扣费。该 host 暂不接收 `reference_image`/`reference_images`；带参考图的单图请求在准入前返回 422，空参考图请求可继续现有准入流程。
+
+普通 `video.single` host 也默认关闭。显式设置 `VIDEO_SINGLE_ENABLED=true` 时，必须提供绝对路径 `VIDEO_SINGLE_CREDENTIALS_FILE` 和完整 R2 配置；如果同时启用单图或批量图片，所有媒体 worker 必须共用同一凭据文件。视频复用单图/批量图片的 registry、owned media runtime、worker capacity 和 app lifespan，不另外创建 host 或媒体存储 facade。普通视频目前接入 xAI 和 Manxiaobai 的单任务流程，接受 `video/mp4`、`video/webm`、`video/quicktime`、`video/x-m4v`、`video/x-msvideo`、`video/x-matroska`，传输与存储上限仍为 50 MiB、超时仍为 600 秒。HaoAI 三步视频尝试组不会降级为普通单任务。关闭时不会读取视频凭据文件或构造视频 worker。
 
 聊天文本流默认关闭。显式设置 `TEXT_CHAT_ENABLED=true` 后，host 才会接通 `/api/chat/stream` 的 OpenAI 兼容文本 runtime；模型、provider、密钥和自定义 base URL 沿用数据库中的文本模型配置，不需要额外凭据文件。该开关不读取 `.env`，host 构造时不发起 provider 请求。
 

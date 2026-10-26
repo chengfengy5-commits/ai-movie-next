@@ -123,6 +123,10 @@ from .generation_runtime.image_batch_assembly import (
     ImageBatchWorkerConfiguration,
     build_image_batch_worker_runtime,
 )
+from .generation_runtime.video_single_assembly import (
+    VideoSingleWorkerConfiguration,
+    build_video_single_worker_runtime,
+)
 from .generation_runtime.frame_review_assembly import (
     FrameReviewWorkerConfiguration,
     build_frame_review_worker_runtime,
@@ -282,6 +286,7 @@ def create_app(
     frame_review_worker_configuration: FrameReviewWorkerConfiguration | None = None,
     frame_optimize_worker_configuration: FrameOptimizeWorkerConfiguration | None = None,
     worker_capacity_bootstrap: WorkerCapacityBootstrap | None = None,
+    video_single_worker_configuration: VideoSingleWorkerConfiguration | None = None,
 ) -> FastAPI:
     """Compose routes; explicitly configured generation workers start in lifespan."""
     if authentication_runtime is not None:
@@ -375,9 +380,22 @@ def create_app(
         raise ValueError(
             "image.batch dependencies must share the app authentication Session factory"
         )
+    video_single_session_bound = _video_single_session_bound(
+        video_single_worker_configuration,
+        effective_session_factory,
+        authentication_runtime,
+    )
+    if (
+        video_single_worker_configuration is not None
+        and not video_single_session_bound
+    ):
+        raise ValueError(
+            "video.single dependencies must share the app authentication Session factory"
+        )
     worker_capacity_needed = bool(
         generation_worker_configuration is not None
         or image_batch_worker_configuration is not None
+        or video_single_worker_configuration is not None
         or frame_review_worker_configuration is not None
         or (
             frame_optimize_worker_configuration is not None
@@ -406,6 +424,9 @@ def create_app(
     effective_image_batch_worker_configuration = add_worker_capacity(
         image_batch_worker_configuration
     )
+    effective_video_single_worker_configuration = add_worker_capacity(
+        video_single_worker_configuration
+    )
     effective_frame_review_worker_configuration = add_worker_capacity(
         frame_review_worker_configuration
     )
@@ -425,6 +446,12 @@ def create_app(
         if effective_image_batch_worker_configuration is not None
         else None
     )
+    video_single_worker_runtime = (
+        build_video_single_worker_runtime(effective_video_single_worker_configuration)
+        if effective_video_single_worker_configuration is not None
+        and video_single_session_bound
+        else None
+    )
     frame_review_worker_runtime = (
         build_frame_review_worker_runtime(effective_frame_review_worker_configuration)
         if effective_frame_review_worker_configuration is not None
@@ -441,6 +468,7 @@ def create_app(
     async def lifespan(application: FastAPI):
         worker_service: GenerationWorkerService | None = None
         image_batch_service: GenerationWorkerService | None = None
+        video_single_service: GenerationWorkerService | None = None
         frame_review_service: GenerationWorkerService | None = None
         frame_optimize_service: GenerationWorkerService | None = None
         try:
@@ -475,6 +503,20 @@ def create_app(
                 )
                 application.state.image_batch_worker_service = image_batch_service
                 image_batch_service.start()
+            if (
+                video_single_worker_runtime is not None
+                and effective_video_single_worker_configuration is not None
+            ):
+                video_single_service = GenerationWorkerService(
+                    video_single_worker_runtime,
+                    task_type="video-single",
+                    poll_interval_seconds=_GENERATION_WORKER_POLL_INTERVAL_SECONDS,
+                    shutdown_timeout_seconds=(
+                        effective_video_single_worker_configuration.runtime.shutdown_timeout_seconds
+                    ),
+                )
+                application.state.video_single_worker_service = video_single_service
+                video_single_service.start()
             if (
                 frame_review_worker_runtime is not None
                 and frame_review_worker_configuration is not None
@@ -522,6 +564,13 @@ def create_app(
                 )
                 application.state.image_batch_worker_shutdown = receipt
                 application.state.image_batch_worker_service = None
+            if video_single_service is not None:
+                receipt = await run_in_threadpool(
+                    video_single_service.shutdown,
+                    "application lifespan shutdown",
+                )
+                application.state.video_single_worker_shutdown = receipt
+                application.state.video_single_worker_service = None
             if frame_review_service is not None:
                 receipt = await run_in_threadpool(
                     frame_review_service.shutdown,
@@ -548,6 +597,9 @@ def create_app(
     app.state.image_batch_worker_runtime = image_batch_worker_runtime
     app.state.image_batch_worker_service = None
     app.state.image_batch_worker_shutdown = None
+    app.state.video_single_worker_runtime = video_single_worker_runtime
+    app.state.video_single_worker_service = None
+    app.state.video_single_worker_shutdown = None
     app.state.frame_review_worker_runtime = frame_review_worker_runtime
     app.state.frame_review_worker_service = None
     app.state.frame_optimize_worker_runtime = frame_optimize_worker_runtime
@@ -1414,6 +1466,24 @@ def _frame_optimize_session_bound(
 
 def _image_batch_session_bound(
     configuration: ImageBatchWorkerConfiguration | None,
+    session_factory: SessionFactory | None,
+    authentication_runtime: AuthenticationRuntime | None,
+) -> bool:
+    if configuration is None:
+        return True
+    return bool(
+        session_factory is not None
+        and configuration.runtime.session_factory is session_factory
+        and configuration.registry_capabilities.read_session_factory is session_factory
+        and (
+            authentication_runtime is None
+            or authentication_runtime.session_factory is session_factory
+        )
+    )
+
+
+def _video_single_session_bound(
+    configuration: VideoSingleWorkerConfiguration | None,
     session_factory: SessionFactory | None,
     authentication_runtime: AuthenticationRuntime | None,
 ) -> bool:

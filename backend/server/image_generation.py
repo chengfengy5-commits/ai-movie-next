@@ -41,6 +41,9 @@ from haoai_backend.generation_runtime.assembly import GenerationWorkerConfigurat
 from haoai_backend.generation_runtime.image_batch_assembly import (
     ImageBatchWorkerConfiguration,
 )
+from haoai_backend.generation_runtime.video_single_assembly import (
+    VideoSingleWorkerConfiguration,
+)
 from haoai_backend.media_storage.aiohttp_library import AiohttpMatureHttpLibrary
 from haoai_backend.media_storage.owned_media_runtime import (
     OwnedMediaDependencies,
@@ -76,12 +79,13 @@ class ImageGenerationHostConfigurationError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class ImageGenerationHostConfiguration:
-    """Shared admission and media dependencies for opt-in image workers."""
+    """Shared admission and media dependencies for opt-in generation workers."""
 
     admission_configuration: ChatMediaAdmissionConfiguration | None
     generation_worker_configuration: GenerationWorkerConfiguration | None
     media_runtime: OwnedMediaRuntime | None = field(default=None, repr=False)
     image_batch_worker_configuration: ImageBatchWorkerConfiguration | None = None
+    video_single_worker_configuration: VideoSingleWorkerConfiguration | None = None
 
     def __post_init__(self) -> None:
         if self.admission_configuration is None:
@@ -90,6 +94,7 @@ class ImageGenerationHostConfiguration:
                 for value in (
                     self.generation_worker_configuration,
                     self.image_batch_worker_configuration,
+                    self.video_single_worker_configuration,
                     self.media_runtime,
                 )
             ):
@@ -100,6 +105,7 @@ class ImageGenerationHostConfiguration:
             or (
                 self.generation_worker_configuration is None
                 and self.image_batch_worker_configuration is None
+                and self.video_single_worker_configuration is None
             )
         ):
             raise ValueError(
@@ -110,6 +116,7 @@ class ImageGenerationHostConfiguration:
             for worker in (
                 self.generation_worker_configuration,
                 self.image_batch_worker_configuration,
+                self.video_single_worker_configuration,
             )
             if worker is not None
         )
@@ -120,7 +127,7 @@ class ImageGenerationHostConfiguration:
             for worker in worker_configurations[1:]
         ):
             raise ValueError(
-                "image workers must share one runtime and credential registry"
+                "generation workers must share one runtime and credential registry"
             )
 
 
@@ -149,14 +156,20 @@ def build_image_generation_host_configuration(
         )
     image_single_enabled = configuration.image_single_enabled
     image_batch_enabled = configuration.image_batch_enabled
-    if not image_single_enabled and not image_batch_enabled:
+    video_single_enabled = configuration.video_single_enabled
+    if not image_single_enabled and not image_batch_enabled and not video_single_enabled:
         return ImageGenerationHostConfiguration(None, None, None)
 
-    credentials_path = (
-        configuration.image_batch_credentials_file
-        if image_batch_enabled and not image_single_enabled
-        else configuration.image_single_credentials_file
+    enabled_credentials = tuple(
+        path
+        for enabled, path in (
+            (image_single_enabled, configuration.image_single_credentials_file),
+            (image_batch_enabled, configuration.image_batch_credentials_file),
+            (video_single_enabled, configuration.video_single_credentials_file),
+        )
+        if enabled
     )
+    credentials_path = enabled_credentials[0] if enabled_credentials else None
     r2_configuration = configuration.r2_configuration
     if (
         credentials_path is None
@@ -169,16 +182,11 @@ def build_image_generation_host_configuration(
         or not callable(session_factory)
     ):
         raise ImageGenerationHostConfigurationError(
-            "enabled image workers require credentials and object storage"
+            "enabled media workers require credentials and object storage"
         )
-    if (
-        image_single_enabled
-        and image_batch_enabled
-        and configuration.image_single_credentials_file
-        != configuration.image_batch_credentials_file
-    ):
+    if any(path != credentials_path for path in enabled_credentials[1:]):
         raise ImageGenerationHostConfigurationError(
-            "image workers must use the same credentials file"
+            "enabled media workers must use the same credentials file"
         )
 
     db_clock = _database_clock(session_factory)
@@ -191,7 +199,7 @@ def build_image_generation_host_configuration(
         id_factory=id_factory,
     )
     registry = build_credential_registry(capabilities)
-    media_policy = _image_media_policy()
+    media_policy = _image_media_policy(include_video=video_single_enabled)
     http_library = _build_http_library()
     generation_r2 = replace(r2_configuration, business_type="generation")
     managed_origin_map = _managed_origin_map(r2_configuration)
@@ -268,6 +276,11 @@ def build_image_generation_host_configuration(
             if image_batch_enabled
             else None
         )
+        video_worker = (
+            VideoSingleWorkerConfiguration(runtime, capabilities)
+            if video_single_enabled
+            else None
+        )
         admission = ChatMediaAdmissionConfiguration(
             registry_capabilities=capabilities,
             server_id_factory=id_factory,
@@ -291,6 +304,7 @@ def build_image_generation_host_configuration(
                 for operation, enabled in (
                     ("image.single", image_single_enabled),
                     ("image.batch", image_batch_enabled),
+                    ("video.single", video_single_enabled),
                 )
                 if enabled
             ),
@@ -306,16 +320,25 @@ def build_image_generation_host_configuration(
         generation_worker_configuration=single_worker,
         media_runtime=media_runtime,
         image_batch_worker_configuration=batch_worker,
+        video_single_worker_configuration=video_worker,
     )
 
 
-def _image_media_policy() -> SafeMediaPolicy:
-    rules = (
+def _image_media_policy(*, include_video: bool = False) -> SafeMediaPolicy:
+    image_rules = (
         MediaTypeRule("image/png", ".png"),
         MediaTypeRule("image/jpeg", ".jpg"),
         MediaTypeRule("image/webp", ".webp"),
     )
-    return SafeMediaPolicy(rules)
+    video_rules = (
+        MediaTypeRule("video/mp4", ".mp4"),
+        MediaTypeRule("video/webm", ".webm"),
+        MediaTypeRule("video/quicktime", ".mov"),
+        MediaTypeRule("video/x-m4v", ".m4v"),
+        MediaTypeRule("video/x-msvideo", ".avi"),
+        MediaTypeRule("video/x-matroska", ".mkv"),
+    )
+    return SafeMediaPolicy(image_rules + (video_rules if include_video else ()))
 
 
 def _build_http_library() -> AiohttpMatureHttpLibrary:

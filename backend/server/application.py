@@ -222,7 +222,11 @@ def create_server_host(
             )
 
         image_generation_configuration = None
-        if configuration.image_single_enabled or configuration.image_batch_enabled:
+        if (
+            configuration.image_single_enabled
+            or configuration.image_batch_enabled
+            or configuration.video_single_enabled
+        ):
             from .image_generation import build_image_generation_host_configuration
 
             image_generation_configuration = build_image_generation_host_configuration(
@@ -252,6 +256,8 @@ def create_server_host(
                     image_generation_configuration.generation_worker_configuration
                     is not None
                     or image_generation_configuration.image_batch_worker_configuration
+                    is not None
+                    or image_generation_configuration.video_single_worker_configuration
                     is not None
                 )
             )
@@ -316,6 +322,11 @@ def create_server_host(
                 if image_generation_configuration is not None
                 else None
             ),
+            video_single_worker_configuration=(
+                image_generation_configuration.video_single_worker_configuration
+                if image_generation_configuration is not None
+                else None
+            ),
             worker_capacity_bootstrap=worker_capacity_bootstrap,
         )
         app.state.server_session_factory = session_factory
@@ -329,6 +340,11 @@ def create_server_host(
         )
         app.state.server_image_batch_worker_configuration = (
             image_generation_configuration.image_batch_worker_configuration
+            if image_generation_configuration is not None
+            else None
+        )
+        app.state.server_video_single_worker_configuration = (
+            image_generation_configuration.video_single_worker_configuration
             if image_generation_configuration is not None
             else None
         )
