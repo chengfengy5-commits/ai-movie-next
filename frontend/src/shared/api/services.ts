@@ -21,6 +21,8 @@ import { createMediaGenerationHttpPort } from "./mediaGenerationHttp";
 import type { MediaGenerationPort } from "./mediaGeneration";
 import { createMediaReferenceUploadHttpPort } from "./mediaReferenceUploadHttp";
 import type { MediaReferenceUploadPort } from "./mediaReferenceUpload";
+import { createChatAssistantHttpPort } from "./chatAssistantHttp";
+import type { ChatAssistantPort } from "./chatAssistant";
 import { createCanvasOwnedImageHttpPort } from "./canvasOwnedImageHttp";
 import type { CanvasOwnedImagePort } from "./canvasOwnedImage";
 import {
@@ -235,6 +237,7 @@ export interface WorkspaceServices {
   readonly canvasImageGeneration?: CanvasImageGenerationPort;
   readonly mediaGeneration?: MediaGenerationPort;
   readonly mediaReferenceUpload?: MediaReferenceUploadPort;
+  readonly chatAssistant?: ChatAssistantPort;
   readonly canvasOwnedImage?: CanvasOwnedImagePort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
@@ -2966,6 +2969,12 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     mediaReferenceUpload: createMediaReferenceUploadHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    chatAssistant: createChatAssistantHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,
