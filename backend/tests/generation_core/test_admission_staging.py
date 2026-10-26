@@ -37,6 +37,7 @@ from haoai_backend.generation_catalog.admission import AdmissionPolicy
 from haoai_backend.generation_catalog.admission_types import (
     AdmissionOperation,
     AdmissionPreparationFacts,
+    AdmissionRefusal,
     AdmissionReplay,
     CONTEXT_SCHEMA_VERSION,
     LockedTargetFacts,
@@ -1216,12 +1217,13 @@ def _joint_build_binding(
     server_ids: _JointIdFactory,
     *,
     operation: str,
+    max_concurrent_tasks: int = 0,
 ) -> MediaSnapshotProducerBinding:
     binding = build_media_snapshot_producer(
         authentication,
         capabilities,
         server_id_factory=server_ids,
-        policies={operation: AdmissionPolicy(max_concurrent_tasks=0)},
+        policies={operation: AdmissionPolicy(max_concurrent_tasks=max_concurrent_tasks)},
         versions=snapshot_producer.SnapshotVersions(
             projector="joint-fixture-projector-v1",
             reference_policy="joint-fixture-reference-policy-v1",
@@ -1786,6 +1788,193 @@ def test_real_public_entry_stages_actual_producer_g1_graph_and_fees(
         assert observed.verifier_sessions == [independent]
         assert tuple(environment.server_ids.values) == ids_after_staging
     finally:
+        caller.close()
+        environment.engine.dispose()
+
+
+def test_positive_user_task_limit_allows_authenticated_single_task_with_capacity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    operation = AdmissionOperation.IMAGE_SINGLE.value
+    environment = _joint_environment(
+        tmp_path,
+        model_source=ModelSource.SYSTEM,
+        operation=operation,
+    )
+    environment.binding = _joint_build_binding(
+        environment.authentication,
+        environment.capabilities,
+        environment.server_ids,
+        operation=operation,
+        max_concurrent_tasks=1,
+    )
+    caller = _joint_caller(environment.engine)
+    observed = _observe_joint_public_paths(
+        monkeypatch,
+        authentication_sessions=environment.authentication_sessions,
+    )
+    try:
+        staged = _joint_prepare_and_stage(
+            environment.binding,
+            caller,
+            operation=operation,
+            raw_key="joint-positive-user-limit-single",
+            request=_joint_request(operation),
+        )
+
+        assert isinstance(staged, AdmissionStaged), (
+            "a user with one available task slot should pass authenticated A2/G1 staging; "
+            f"got {staged!r}"
+        )
+        assert observed.producer_sessions == [caller]
+        assert len(observed.a2_calls) == 1
+        assert len(observed.graph_plans) == 1
+        assert len(observed.graph_plans[0].tasks) == 1
+        _assert_joint_graph_and_fees(
+            caller,
+            staged,
+            quotes=(3,),
+            starting_wallet=500,
+            expected_messages=0,
+        )
+        second = _joint_prepare_and_stage(
+            environment.binding,
+            caller,
+            operation=operation,
+            raw_key="joint-positive-user-limit-second-task",
+            request=_joint_request(operation),
+        )
+        assert isinstance(second, AdmissionRefusal)
+        assert (second.status_code, second.code) == (429, "concurrency_limit_reached")
+        assert _joint_count(caller, AITaskRow.__table__) == 1
+        caller.commit()
+        with Session(environment.engine) as reader:
+            assert reader.execute(
+                select(AITaskRow.__table__.c.id).where(
+                    AITaskRow.__table__.c.user_id == _G2_JOINT_ACTOR_ID,
+                    AITaskRow.__table__.c.type == "image-single",
+                )
+            ).scalars().all() == [staged.ordered_tasks[0].task_id]
+    finally:
+        if caller.in_transaction():
+            caller.rollback()
+        caller.close()
+        environment.engine.dispose()
+
+
+def test_authenticated_batch_limit_counts_all_items_before_staging_atomically(
+    tmp_path: Path,
+) -> None:
+    operation = AdmissionOperation.IMAGE_BATCH.value
+    environment = _joint_environment(
+        tmp_path,
+        model_source=ModelSource.SYSTEM,
+        operation=operation,
+    )
+    environment.binding = _joint_build_binding(
+        environment.authentication,
+        environment.capabilities,
+        environment.server_ids,
+        operation=operation,
+        max_concurrent_tasks=1,
+    )
+    caller = _joint_caller(environment.engine)
+    try:
+        result = _joint_prepare_and_stage(
+            environment.binding,
+            caller,
+            operation=operation,
+            raw_key="joint-positive-user-limit-batch-two-over-one",
+            request=_joint_request(operation),
+        )
+
+        assert isinstance(result, AdmissionRefusal)
+        assert (result.status_code, result.code) == (429, "concurrency_limit_reached")
+        for table in (
+            TaskSubmissionRow.__table__,
+            AITaskRow.__table__,
+            BillingUnitRow.__table__,
+            ExecutionStepRow.__table__,
+            prepared_payloads,
+            CreditLogRow.__table__,
+        ):
+            assert _joint_count(caller, table) == 0
+        caller.rollback()
+        with Session(environment.engine) as reader:
+            for table in (
+                TaskSubmissionRow.__table__,
+                AITaskRow.__table__,
+                BillingUnitRow.__table__,
+                ExecutionStepRow.__table__,
+                prepared_payloads,
+                CreditLogRow.__table__,
+            ):
+                assert _joint_count(reader, table) == 0
+            balance = reader.execute(
+                select(UserCreditRow.__table__.c.credits).where(
+                    UserCreditRow.__table__.c.user_id == _G2_JOINT_ACTOR_ID
+                )
+            ).scalar_one()
+            assert balance == 500
+    finally:
+        if caller.in_transaction():
+            caller.rollback()
+        caller.close()
+        environment.engine.dispose()
+
+
+def test_authenticated_batch_limit_two_stages_two_tasks_and_fees(
+    tmp_path: Path,
+) -> None:
+    operation = AdmissionOperation.IMAGE_BATCH.value
+    environment = _joint_environment(
+        tmp_path,
+        model_source=ModelSource.SYSTEM,
+        operation=operation,
+    )
+    environment.binding = _joint_build_binding(
+        environment.authentication,
+        environment.capabilities,
+        environment.server_ids,
+        operation=operation,
+        max_concurrent_tasks=2,
+    )
+    caller = _joint_caller(environment.engine)
+    try:
+        staged = _joint_prepare_and_stage(
+            environment.binding,
+            caller,
+            operation=operation,
+            raw_key="joint-positive-user-limit-batch-two-of-two",
+            request=_joint_request(operation),
+        )
+
+        assert isinstance(staged, AdmissionStaged), repr(staged)
+        assert len(staged.ordered_tasks) == 2
+        _assert_joint_graph_and_fees(
+            caller,
+            staged,
+            quotes=(3, 3),
+            starting_wallet=500,
+            expected_messages=4,
+        )
+        caller.commit()
+        with Session(environment.engine) as reader:
+            assert _joint_count(reader, TaskSubmissionRow.__table__) == 1
+            assert _joint_count(reader, AITaskRow.__table__) == 2
+            assert _joint_count(reader, BillingUnitRow.__table__) == 2
+            assert _joint_count(reader, ExecutionStepRow.__table__) == 2
+            assert _joint_count(reader, CreditLogRow.__table__) == 2
+            stored_task_ids = reader.execute(
+                select(TaskSubmissionRow.__table__.c.task_ids).where(
+                    TaskSubmissionRow.__table__.c.id == staged.submission_id
+                )
+            ).scalar_one()
+            assert stored_task_ids == [task.task_id for task in staged.ordered_tasks]
+    finally:
+        if caller.in_transaction():
+            caller.rollback()
         caller.close()
         environment.engine.dispose()
 

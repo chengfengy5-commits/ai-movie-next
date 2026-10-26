@@ -32,11 +32,13 @@ class ServerConfiguration:
     r2_secret_key: SecretValue | None
     frame_optimize_enabled: bool = False
     frame_optimize_credentials_file: Path | None = field(default=None, repr=False)
-    frame_optimize_max_user_concurrency: int = 1
+    user_task_max_concurrency: int = 0
     image_single_enabled: bool = False
     image_single_credentials_file: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
+        if type(self.user_task_max_concurrency) is not int:
+            raise ServerConfigurationError("AI_USER_MAX_CONCURRENT must be an integer")
         if type(self.image_single_enabled) is not bool:
             raise ServerConfigurationError("IMAGE_SINGLE_ENABLED must be explicit")
         if self.image_single_credentials_file is not None and (
@@ -59,6 +61,12 @@ class ServerConfiguration:
                 raise ServerConfigurationError(
                     "image.single requires complete object storage"
                 )
+
+    @property
+    def frame_optimize_max_user_concurrency(self) -> int:
+        """Deprecated read alias for the shared user task limit."""
+
+        return self.user_task_max_concurrency
 
 
 _R2_KEYS = (
@@ -91,11 +99,7 @@ def load_server_configuration(
     frame_optimize_credentials_file = _optional_absolute_path(
         values, "FRAME_OPTIMIZE_CREDENTIALS_FILE"
     )
-    frame_optimize_max_user_concurrency = _non_negative_integer(
-        values,
-        "FRAME_OPTIMIZE_MAX_USER_CONCURRENCY",
-        default=1,
-    )
+    user_task_max_concurrency = _user_task_concurrency_limit(values)
     if frame_optimize_enabled and frame_optimize_credentials_file is None:
         raise ServerConfigurationError(
             "FRAME_OPTIMIZE_CREDENTIALS_FILE is required when frame.optimize is enabled"
@@ -135,7 +139,7 @@ def load_server_configuration(
             r2_secret_key=None,
             frame_optimize_enabled=frame_optimize_enabled,
             frame_optimize_credentials_file=frame_optimize_credentials_file,
-            frame_optimize_max_user_concurrency=frame_optimize_max_user_concurrency,
+            user_task_max_concurrency=user_task_max_concurrency,
             image_single_enabled=image_single_enabled,
             image_single_credentials_file=image_single_credentials_file,
         )
@@ -187,7 +191,7 @@ def load_server_configuration(
         r2_secret_key=SecretValue(values["OBJECT_STORAGE_SECRET_ACCESS_KEY"]),
         frame_optimize_enabled=frame_optimize_enabled,
         frame_optimize_credentials_file=frame_optimize_credentials_file,
-        frame_optimize_max_user_concurrency=frame_optimize_max_user_concurrency,
+        user_task_max_concurrency=user_task_max_concurrency,
         image_single_enabled=image_single_enabled,
         image_single_credentials_file=image_single_credentials_file,
     )
@@ -223,18 +227,30 @@ def _optional_absolute_path(environ: Mapping[str, str], name: str) -> Path | Non
     return path
 
 
-def _non_negative_integer(
-    environ: Mapping[str, str], name: str, *, default: int
-) -> int:
+def _configured_integer(environ: Mapping[str, str], name: str) -> int | None:
     value = environ.get(name)
     if value is None:
-        return default
-    if not isinstance(value, str) or not value.isascii() or not value.isdecimal():
-        raise ServerConfigurationError(f"{name} must be a non-negative integer")
+        return None
+    if not isinstance(value, str):
+        raise ServerConfigurationError(f"{name} must be an integer")
     try:
         return int(value)
     except ValueError:
-        raise ServerConfigurationError(f"{name} must be a non-negative integer") from None
+        raise ServerConfigurationError(f"{name} must be an integer") from None
+
+
+def _user_task_concurrency_limit(environ: Mapping[str, str]) -> int:
+    configured = _configured_integer(environ, "AI_USER_MAX_CONCURRENT")
+    legacy = _configured_integer(environ, "FRAME_OPTIMIZE_MAX_USER_CONCURRENCY")
+    if configured is not None and legacy is not None and configured != legacy:
+        raise ServerConfigurationError(
+            "AI_USER_MAX_CONCURRENT conflicts with FRAME_OPTIMIZE_MAX_USER_CONCURRENCY"
+        )
+    if configured is not None:
+        return configured
+    if legacy is not None:
+        return legacy
+    return 0
 
 
 def _validate_database_url(value: str, environment: str) -> None:

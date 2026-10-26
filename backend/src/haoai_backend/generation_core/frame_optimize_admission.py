@@ -13,7 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from haoai_backend.chat_text_generation.errors import ChatTextGenerationError
-from haoai_backend.chat_text_generation.persistence import _begin_write, _check_concurrency, _now
+from haoai_backend.chat_text_generation.persistence import _begin_write, _now
 from haoai_backend.generation_catalog.admission import AdmissionPolicy, prepare_admission
 from haoai_backend.generation_catalog.admission_types import (
     AdmissionContext,
@@ -80,7 +80,7 @@ def admit_frame_optimize(
         raise ChatTextGenerationError(503, "聊天服务暂不可用")
     if not isinstance(registry_capabilities, RegistryCapabilities):
         raise ChatTextGenerationError(503, "分镜优化准入能力尚未配置")
-    if type(max_user_concurrency) is not int or max_user_concurrency < 0:
+    if type(max_user_concurrency) is not int:
         raise ChatTextGenerationError(503, "分镜优化并发策略无法确认")
     try:
         payload = _request_mapping(request)
@@ -102,15 +102,13 @@ def admit_frame_optimize(
             session,
             context,
             now=_aware_utc(now),
-            policy=AdmissionPolicy(max_concurrent_tasks=0),
+            policy=AdmissionPolicy(max_concurrent_tasks=max_user_concurrency),
         )
         if isinstance(preparation, AdmissionRefusal):
             raise ChatTextGenerationError(preparation.status_code, preparation.message)
         if not _valid_preparation(context, preparation):
             raise ChatTextGenerationError(503, "分镜优化准入事实无法安全确认")
 
-        # prepare_admission holds the account and chapter locks through this transaction.
-        _check_concurrency(session, user_id, max_user_concurrency, account_locked=True)
         staged = _stage_frame_optimize(
             session,
             user_id=user_id,

@@ -62,6 +62,7 @@ from haoai_backend.generation_core.unit_fees import (
 )
 from haoai_backend.generation_credentials.domain import PreparedPayloadStaged
 from haoai_backend.generation_runtime.registry import operation_policy
+from haoai_backend.generation_task_concurrency import graph_tasks_match_shape
 
 
 _PRODUCER_MODULE = "haoai_backend.generation_credentials.snapshot_producer"
@@ -646,6 +647,12 @@ def _build_graph_and_rows(
             graph_version=graph_version,
             items=graph_inputs,
         )
+        if not graph_tasks_match_shape(operation, len(preparation.items), graph.tasks):
+            return _stage_refusal(
+                "receipt_unverified",
+                "已准入任务数量与实际任务图不一致",
+                abort=True,
+            )
         fee_plan = build_fee_phase_plan(operation, graph=graph)
     except GenerationError as exc:
         return _stage_refusal(exc.code, exc.safe_detail, abort=True)

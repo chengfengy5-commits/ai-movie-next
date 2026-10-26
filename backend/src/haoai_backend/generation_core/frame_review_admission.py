@@ -15,7 +15,6 @@ from sqlalchemy.orm import Session
 from haoai_backend.chat_text_generation.errors import ChatTextGenerationError
 from haoai_backend.chat_text_generation.persistence import (
     _begin_write,
-    _check_concurrency,
     _now,
 )
 from haoai_backend.generation_catalog.admission import AdmissionPolicy, prepare_admission
@@ -100,7 +99,7 @@ def admit_frame_review(
             session,
             context,
             now=_aware_utc(now),
-            policy=AdmissionPolicy(max_concurrent_tasks=0),
+            policy=AdmissionPolicy(max_concurrent_tasks=max_user_concurrency),
         )
         if isinstance(result, AdmissionRefusal):
             raise ChatTextGenerationError(result.status_code, result.message)
@@ -114,8 +113,6 @@ def admit_frame_review(
         ):
             raise ChatTextGenerationError(503, "AI 复核准入事实无法安全确认")
 
-        # prepare_admission already holds the account lock in this transaction.
-        _check_concurrency(session, user_id, max_user_concurrency, account_locked=True)
         staged = _stage_review(
             session,
             user_id=user_id,

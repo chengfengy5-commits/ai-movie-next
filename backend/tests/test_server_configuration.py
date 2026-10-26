@@ -75,11 +75,58 @@ def test_frame_optimize_is_opt_in_and_requires_an_absolute_bundle_path(
         load_server_configuration(environment)
 
     environment["FRAME_OPTIMIZE_CREDENTIALS_FILE"] = str(tmp_path / "bundle.json")
-    environment["FRAME_OPTIMIZE_MAX_USER_CONCURRENCY"] = "0"
+    environment["AI_USER_MAX_CONCURRENT"] = "0"
     configuration = load_server_configuration(environment)
     assert configuration.frame_optimize_enabled is False
     assert configuration.frame_optimize_credentials_file == tmp_path / "bundle.json"
-    assert configuration.frame_optimize_max_user_concurrency == 0
+    assert configuration.user_task_max_concurrency == 0
+
+
+def test_user_task_limit_uses_legacy_integer_parsing_and_defaults_to_disabled(
+    tmp_path: Path,
+) -> None:
+    environment = _base_environment(tmp_path)
+    assert load_server_configuration(environment).user_task_max_concurrency == 0
+
+    environment["AI_USER_MAX_CONCURRENT"] = "  +3 "
+    assert load_server_configuration(environment).user_task_max_concurrency == 3
+    environment["AI_USER_MAX_CONCURRENT"] = "-2"
+    assert load_server_configuration(environment).user_task_max_concurrency == -2
+    environment["AI_USER_MAX_CONCURRENT"] = "invalid"
+    with pytest.raises(ServerConfigurationError, match="AI_USER_MAX_CONCURRENT"):
+        load_server_configuration(environment)
+
+    environment.pop("AI_USER_MAX_CONCURRENT")
+    environment["FRAME_OPTIMIZE_MAX_USER_CONCURRENCY"] = "4"
+    configuration = load_server_configuration(environment)
+    assert configuration.user_task_max_concurrency == 4
+    assert configuration.frame_optimize_max_user_concurrency == 4
+
+    environment["AI_USER_MAX_CONCURRENT"] = "4"
+    assert load_server_configuration(environment).user_task_max_concurrency == 4
+    environment["AI_USER_MAX_CONCURRENT"] = "3"
+    with pytest.raises(ServerConfigurationError, match="conflicts"):
+        load_server_configuration(environment)
+
+
+def test_server_engine_explicitly_uses_read_committed_for_postgres(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[str, dict[str, object]]] = []
+
+    def capture_engine(database_url: str, **options: object) -> object:
+        calls.append((database_url, dict(options)))
+        return object()
+
+    monkeypatch.setattr(host_module, "create_engine", capture_engine)
+
+    host_module._create_engine(
+        "postgresql+psycopg2://synthetic:synthetic@127.0.0.1:5432/unused"
+    )
+    host_module._create_engine("sqlite:////tmp/unused.sqlite")
+
+    assert calls[0][1]["isolation_level"] == "READ COMMITTED"
+    assert "isolation_level" not in calls[1][1]
 
 
 def test_image_single_is_opt_in_and_requires_credentials_and_complete_storage(

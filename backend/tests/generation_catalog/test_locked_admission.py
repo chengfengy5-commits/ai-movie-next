@@ -765,8 +765,9 @@ def test_positive_policy_replays_existing_ordered_batch_before_new_state(engine:
     _assert_read_only(executed)
 
 
-def test_positive_policy_refuses_only_after_account_and_absent_receipt_checks(engine: Engine) -> None:
+def test_positive_policy_checks_capacity_before_catalog(engine: Engine) -> None:
     _add_account(engine)
+    _add_model(engine, "image-model", "image")
     context = _context("image.single", image_single(), raw_key="new-request-key")
 
     with Session(engine) as session, _capture_sql(engine) as (_, executed):
@@ -777,12 +778,65 @@ def test_positive_policy_refuses_only_after_account_and_absent_receipt_checks(en
             policy=AdmissionPolicy(max_concurrent_tasks=1),
         )
 
-    assert isinstance(result, AdmissionRefusal)
-    assert (result.status_code, result.code) == (503, "concurrency_policy_not_bound")
+    assert isinstance(result, AdmissionPreparationFacts)
+    assert result.operation == "image.single"
     sql = "\n".join(executed).lower()
     assert "users" in sql and "task_submissions" in sql
+    assert "ai_tasks" in sql
+    assert "system_models" in sql and "user_credits" in sql
+    _assert_read_only(executed)
+
+
+def test_positive_policy_rejects_capacity_using_cross_family_in_flight_rows(
+    engine: Engine,
+) -> None:
+    _add_account(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(AITaskRow.__table__).values(
+                id="existing-video-task",
+                user_id="actor",
+                type="video-single",
+                status="reconciling",
+                billing_status="legacy_unreconciled",
+                message_id="existing-message",
+            )
+        )
+    context = _context("image.single", image_single(), raw_key="over-capacity-key")
+
+    with Session(engine) as session, _capture_sql(engine) as (_, executed):
+        result = prepare_admission(
+            session,
+            context,
+            now=NOW,
+            policy=AdmissionPolicy(max_concurrent_tasks=1),
+        )
+
+    assert isinstance(result, AdmissionRefusal)
+    assert (result.status_code, result.code) == (429, "concurrency_limit_reached")
+    sql = "\n".join(executed).lower()
+    assert "ai_tasks" in sql
     assert not any(name in sql for name in ("system_models", "model_configs", "user_credits"))
     _assert_read_only(executed)
+
+
+def test_positive_policy_keeps_taskless_operation_unbound(engine: Engine) -> None:
+    _add_account(engine)
+    context = _context(
+        "text.stream",
+        {"model_id": "text-model", "messages": [{"role": "user", "content": "hello"}]},
+    )
+
+    with Session(engine) as session:
+        result = prepare_admission(
+            session,
+            context,
+            now=NOW,
+            policy=AdmissionPolicy(max_concurrent_tasks=1),
+        )
+
+    assert isinstance(result, AdmissionRefusal)
+    assert (result.status_code, result.code) == (503, "concurrency_policy_not_bound")
 
 
 @pytest.mark.parametrize("limit", [-1, 0])
