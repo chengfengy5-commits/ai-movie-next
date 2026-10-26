@@ -278,6 +278,13 @@ export interface WorkspaceServices {
   listScenes(seriesId: string, signal: AbortSignal): Promise<Scene[]>;
   listProps(seriesId: string, signal: AbortSignal): Promise<Prop[]>;
   listFusedAssets?(seriesId: string, signal: AbortSignal): Promise<FusedAsset[]>;
+  updateFusedAsset?(
+    seriesId: string,
+    assetId: string,
+    update: Readonly<{ name: string }>,
+    signal: AbortSignal,
+  ): Promise<FusedAsset>;
+  deleteFusedAsset?(assetId: string, signal: AbortSignal): Promise<void>;
   createCharacter?(seriesId: string, input: CharacterCreateInput, signal: AbortSignal): Promise<Character>;
   updateCharacter?(seriesId: string, assetId: string, update: CharacterUpdateInput, signal: AbortSignal): Promise<Character>;
   deleteCharacter?(assetId: string, signal: AbortSignal): Promise<void>;
@@ -2085,6 +2092,8 @@ type ApiEndpoint =
   | "scenes"
   | "props"
   | "fusedAssets"
+  | "updateFusedAsset"
+  | "deleteFusedAsset"
   | "createCharacter"
   | "updateCharacter"
   | "deleteCharacter"
@@ -2376,6 +2385,14 @@ function apiRequestDefinition(
     }
     const query = new URLSearchParams({ page: String(page), page_size: String(MY_TASK_PAGE_SIZE) });
     return { path: "/chat/tasks/list?" + query.toString(), method: "GET" };
+  }
+  if (endpoint === "updateFusedAsset" || endpoint === "deleteFusedAsset") {
+    const assetId = encodeApiPathId(identifiers?.assetId, "融合素材");
+    return {
+      path: "/fused-assets/" + assetId,
+      method: endpoint === "updateFusedAsset" ? "PUT" : "DELETE",
+      expectedStatus: endpoint === "updateFusedAsset" ? 200 : 204,
+    };
   }
 
   const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
@@ -3331,6 +3348,35 @@ export function createApiServices(
         await requestForCurrentApiSession("fusedAssets", token, signal, undefined, { seriesId }),
         seriesId,
       );
+    },
+    async updateFusedAsset(seriesId, assetId, update, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession(
+        "updateFusedAsset",
+        token,
+        signal,
+        { name: update.name },
+        { assetId },
+      );
+      const asset = parseFusedAssetList([value], seriesId)[0];
+      if (asset === undefined || asset.id !== assetId) {
+        throw new InvalidResponseError("服务器返回的融合素材与本次修改不匹配。");
+      }
+      ensureCurrentApiSession(storage, token, signal);
+      return asset;
+    },
+    async deleteFusedAsset(assetId, signal) {
+      const token = requireApiToken(storage);
+      const value = await requestForCurrentApiSession(
+        "deleteFusedAsset",
+        token,
+        signal,
+        undefined,
+        { assetId },
+      );
+      if (value !== undefined) {
+        throw new InvalidResponseError("服务器删除融合素材时返回了非预期内容。");
+      }
     },
     async createCharacter(seriesId, input, signal) {
       const token = requireApiToken(storage);

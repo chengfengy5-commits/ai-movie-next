@@ -5,6 +5,7 @@ import { useAuth } from "../features/auth/AuthProvider";
 import { LoginPage } from "../features/auth/LoginPage";
 import { ChapterBrowser, type ChapterNavigationIntent } from "../features/chapters/ChapterBrowser";
 import { AssetLibrary, type AssetNavigationIntent } from "../features/assets/AssetLibrary";
+import { FusedAssetsPage } from "../features/fused-assets/FusedAssetsPage";
 import type {
   AssetFrameUsageChapterTarget,
   AssetFrameUsageFrameTarget,
@@ -37,7 +38,7 @@ function restoreErrorMessage(error: ApiError): string {
   return error.detail ?? "暂时无法验证当前登录状态。";
 }
 
-type WorkspaceView = "series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings"
+type WorkspaceView = "series" | "chapters" | "assets" | "fused-assets" | "tasks" | "teams" | "creator-settings"
   | "media-generation" | "chat-assistant" | "account";
 
 function Dashboard() {
@@ -82,6 +83,7 @@ function Dashboard() {
   const dashboardMounted = useRef(false);
   const creatorSettingsDirtyRef = useRef(false);
   const accountDirtyRef = useRef(false);
+  const fusedAssetWriteInFlightRef = useRef(false);
   const teamGuardRef = useRef({ scopeKey: "", dirty: false, inFlight: false });
   const seriesShareGuardRef = useRef({ scopeKey: "", dirty: false, inFlight: false });
   const currentNavigationContext = useRef<{
@@ -157,6 +159,7 @@ function Dashboard() {
     setMediaGenerationVisited(false);
     setChatAssistantVisited(false);
     setChatAssistantSeries(null);
+    fusedAssetWriteInFlightRef.current = false;
   }
 
   const renderNavigationContext = {
@@ -206,10 +209,17 @@ function Dashboard() {
     setSelectedSeries(null);
     setSelectedView("series");
     setMediaGenerationVisited(false);
+    fusedAssetWriteInFlightRef.current = false;
     logout();
   }
 
   function confirmLeaveCurrentView(): boolean {
+    if (selectedView === "fused-assets" && fusedAssetWriteInFlightRef.current) {
+      if (!window.confirm("融合素材写入或目录核对仍在进行。离开会停止本地跟踪；服务器操作仍可能完成，这不代表已取消。仍要离开吗？")) {
+        return false;
+      }
+      fusedAssetWriteInFlightRef.current = false;
+    }
     if (selectedView === "series"
       && seriesShareGuardRef.current.scopeKey === seriesShareGuardScopeKey
       && seriesShareGuardRef.current.dirty) {
@@ -297,6 +307,14 @@ function Dashboard() {
     setChatAssistantSeries(selectedSeries);
     setChatAssistantVisited(true);
     setSelectedView("chat-assistant");
+  }
+
+  function navigateToFusedAssets() {
+    if (selectedView === "fused-assets" || selectedSeries === null || selectedSeries.can_enter !== true
+      || !confirmLeaveCurrentView()) return;
+    clearChapterNavigationIntent();
+    clearAssetNavigationIntent();
+    setSelectedView("fused-assets");
   }
 
   function navigateToAccount() {
@@ -559,6 +577,18 @@ function Dashboard() {
               <span>AI 助手</span>
             </button>
           )}
+          {selectedSeries !== null && (
+            <button
+              aria-current={selectedView === "fused-assets" ? "page" : undefined}
+              className={selectedView === "fused-assets" ? "nav-item active" : "nav-item"}
+              disabled={selectedSeries.can_enter !== true}
+              onClick={navigateToFusedAssets}
+              type="button"
+            >
+              <span className="nav-icon" aria-hidden="true">✧</span>
+              <span>融合素材</span>
+            </button>
+          )}
           <button
             aria-current={selectedView === "creator-settings" ? "page" : undefined}
             className={selectedView === "creator-settings" ? "nav-item active" : "nav-item"}
@@ -620,6 +650,8 @@ function Dashboard() {
                 ? "AI 生成"
               : selectedView === "chat-assistant"
                 ? "AI 助手"
+              : selectedView === "fused-assets"
+                ? "融合素材"
               : selectedView === "account"
                 ? "我的账户"
                 : selectedView === "tasks"
@@ -654,6 +686,11 @@ function Dashboard() {
             {selectedSeries !== null && selectedView !== "chat-assistant" && (
               <button className="mobile-task-entry" disabled={selectedSeries.can_enter !== true}
                 onClick={navigateToChatAssistant} type="button">AI 助手</button>
+            )}
+            {selectedSeries !== null && selectedSeries.can_enter === true && selectedView !== "fused-assets" && (
+              <button className="mobile-task-entry" onClick={navigateToFusedAssets} type="button">
+                融合素材
+              </button>
             )}
             {selectedView !== "teams" && (
               <button className="mobile-task-entry teams-mobile-entry" onClick={navigateToTeams} type="button">
@@ -760,6 +797,18 @@ function Dashboard() {
               series={selectedSeries}
               services={services}
               userId={state.user.id}
+            />
+          )}
+          {selectedSeries !== null && selectedView === "fused-assets" && selectedSeries.can_enter === true && (
+            <FusedAssetsPage
+              key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}:${selectedSeries.id}`}
+              services={services}
+              series={selectedSeries}
+              userId={state.user.id}
+              sessionGeneration={sessionGeneration}
+              onBack={navigateToSeries}
+              onUnauthorized={logoutFromWorkspace}
+              onActivityChange={(active) => { fusedAssetWriteInFlightRef.current = active; }}
             />
           )}
           {selectedView === "tasks" && (
@@ -870,6 +919,8 @@ function Dashboard() {
                 ? "视频与批量图片任务"
               : selectedView === "chat-assistant"
                 ? "剧集文字会话"
+              : selectedView === "fused-assets"
+                ? "融合素材管理"
               : selectedView === "account"
                 ? "本人资料、登录设备与密码"
               : selectedView === "tasks"

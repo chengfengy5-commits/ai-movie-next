@@ -1295,6 +1295,29 @@ describe("read-only workspace", () => {
     expect(fetch).not.toHaveBeenCalled();
   });
 
+  it("offers fused asset management in the mobile task entries for an enterable selected series", async () => {
+    const user = userEvent.setup();
+    const services = createDemoServices(window.localStorage);
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const { container } = renderWorkspace(services);
+
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    await within(seriesRegion).findAllByRole("article");
+    const seriesCard = within(seriesRegion).getAllByRole("article")[0]!;
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看素材库/ }));
+    await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+
+    const topbarActions = container.querySelector(".topbar-actions");
+    expect(topbarActions).not.toBeNull();
+    const mobileEntry = within(topbarActions as HTMLElement).getByRole("button", { name: "融合素材" });
+    expect(mobileEntry).toHaveClass("mobile-task-entry");
+    expect(mobileEntry).toBeEnabled();
+    await user.click(mobileEntry);
+
+    expect(await screen.findByRole("region", { name: "雾港来信 · 融合素材" })).toBeInTheDocument();
+    expect(screen.getByRole("heading", { name: "雾港来信 · 融合素材" })).toBeInTheDocument();
+  });
+
 
   it.each([
     {
