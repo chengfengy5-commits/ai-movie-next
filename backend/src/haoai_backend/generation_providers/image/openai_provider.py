@@ -25,6 +25,9 @@ from haoai_backend.generation_contracts import (
 
 from .openai_codec import (
     OpenAIImageCodecError,
+    OpenAIImageEditReference,
+    OpenAIImageEditRequest,
+    build_openai_image_edit_request,
     build_openai_text_to_image_request,
     parse_openai_image_response,
 )
@@ -33,6 +36,12 @@ from .openai_codec import (
 _OPENAI_TIMEOUT_SECONDS = 1800.0
 _RESPONSE_CHUNK_BYTES = 64 * 1024
 _MAX_REQUEST_BODY_BYTES = 1024 * 1024
+_MAX_REFERENCE_IMAGES = 8
+_MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_REFERENCE_TOTAL_BYTES = _MAX_REFERENCE_IMAGES * _MAX_REFERENCE_IMAGE_BYTES
+_REFERENCE_MEDIA_TYPES = frozenset(
+    {"image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp"}
+)
 _MAX_RESPONSE_BODY_BYTES = 64 * 1024 * 1024
 _SUPPORTED_PROVIDERS = frozenset({"openai", "haoai"})
 _CREDENTIAL_UNAVAILABLE: Literal["unavailable"] = "unavailable"
@@ -87,11 +96,10 @@ class _OriginalImageExecutionBinding:
 
 
 class OpenAIImageProvider:
-    """Implements only the JSON text-to-image create method.
+    """Implements the original JSON generation and multipart edit methods.
 
     Dependencies are injected and remain unopened until a supported request is
-    explicitly invoked. Reference editing and unrelated provider methods are
-    intentionally unsupported in this batch.
+    explicitly invoked. Unrelated provider methods remain unsupported.
     """
 
     def __init__(
@@ -137,23 +145,25 @@ class OpenAIImageProvider:
         refs: Sequence[ReferenceInput],
         intent: CommittedIntent,
     ) -> MediaResult | UnknownCreate | Failure:
-        """Submit one JSON text-to-image request with no retry or fallback."""
+        """Submit exactly one frozen create request, without retry or fallback."""
 
         if _running_loop_exists():
             return Failure(
                 "wrong_execution_context",
                 "同步图片生成不能在运行中的事件循环内执行",
             )
-        if refs:
-            return Failure(
-                "unsupported_reference_images",
-                "当前图片适配器仅支持 JSON 文生图",
-            )
         invalid = self._validate_frozen_inputs(snapshot, intent)
         if invalid is not None:
             return invalid
+        edit_references: tuple[OpenAIImageEditReference, ...] | None = None
+        if refs:
+            edit_references, invalid = _prepare_edit_references(refs)
+            if invalid is not None:
+                return invalid
         try:
-            return asyncio.run(self._generate(self._execution))
+            return asyncio.run(
+                self._generate(self._execution, edit_references=edit_references)
+            )
         except asyncio.CancelledError:
             return UnknownCreate(reason="图片生成请求已取消，结果未知")
         except Exception:
@@ -188,9 +198,29 @@ class OpenAIImageProvider:
     async def _generate(
         self,
         execution: _OriginalImageExecutionBinding,
+        *,
+        edit_references: tuple[OpenAIImageEditReference, ...] | None = None,
     ) -> MediaResult | UnknownCreate | Failure:
         snapshot = execution.snapshot
         binding = execution.credential_binding
+        params = _thaw_json(snapshot.model_params)
+        size = params.get("size") if isinstance(params, Mapping) else None
+        request: OpenAIImageEditRequest | None = None
+        if edit_references is not None:
+            try:
+                request = build_openai_image_edit_request(
+                    base_url=binding.endpoint_origin,
+                    model=execution.wire_model,
+                    prompt=snapshot.effective_prompt,
+                    size=size if isinstance(size, str) else None,
+                    references=edit_references,
+                )
+            except ValueError:
+                return Failure(
+                    "request_body_too_large",
+                    "图片编辑请求超过本地传输上限",
+                )
+
         credential = self.resolve_original_credential(binding, "create")
         if credential == _CREDENTIAL_UNAVAILABLE:
             return Failure(
@@ -198,21 +228,27 @@ class OpenAIImageProvider:
                 "原图片 provider 凭证不可用",
             )
 
-        params = _thaw_json(snapshot.model_params)
-        size = params.get("size") if isinstance(params, Mapping) else None
-        try:
-            request = build_openai_text_to_image_request(
-                base_url=binding.endpoint_origin,
-                model=execution.wire_model,
-                prompt=snapshot.effective_prompt,
-                size=size if isinstance(size, str) else None,
-                provider=snapshot.model_ref.provider,
-                params=params,
-            )
-        except Exception:
-            return Failure("invalid_frozen_snapshot", "图片冻结参数无法编码")
-        if len(request.body_json) > _MAX_REQUEST_BODY_BYTES:
-            return Failure("request_body_too_large", "图片请求超过本地传输上限")
+        if request is None:
+            try:
+                text_request = build_openai_text_to_image_request(
+                    base_url=binding.endpoint_origin,
+                    model=execution.wire_model,
+                    prompt=snapshot.effective_prompt,
+                    size=size if isinstance(size, str) else None,
+                    provider=snapshot.model_ref.provider,
+                    params=params,
+                )
+            except Exception:
+                return Failure("invalid_frozen_snapshot", "图片冻结参数无法编码")
+            if len(text_request.body_json) > _MAX_REQUEST_BODY_BYTES:
+                return Failure("request_body_too_large", "图片请求超过本地传输上限")
+            request_url = text_request.url
+            request_content_type = text_request.content_type
+            request_body = text_request.body_json
+        else:
+            request_url = request.url
+            request_content_type = request.content_type
+            request_body = request.body
 
         request_started = False
         try:
@@ -220,12 +256,12 @@ class OpenAIImageProvider:
                 request_started = True
                 response = await client.request(
                     "POST",
-                    request.url,
+                    request_url,
                     headers={
                         "Authorization": f"Bearer {credential.secret}",
-                        "Content-Type": request.content_type,
+                        "Content-Type": request_content_type,
                     },
-                    content=request.body_json,
+                    content=request_body,
                     timeout_seconds=_OPENAI_TIMEOUT_SECONDS,
                     follow_redirects=False,
                 )
@@ -263,6 +299,50 @@ class OpenAIImageProvider:
                 "provider_transport_unavailable",
                 "图片 provider 传输不可用",
             )
+
+
+def _prepare_edit_references(
+    references: Sequence[ReferenceInput],
+) -> tuple[tuple[OpenAIImageEditReference, ...] | None, Failure | None]:
+    if (
+        not isinstance(references, Sequence)
+        or isinstance(references, (str, bytes))
+        or len(references) > _MAX_REFERENCE_IMAGES
+    ):
+        return None, Failure(
+            "request_body_too_large",
+            "参考图数量超过图片编辑请求上限",
+        )
+    prepared: list[OpenAIImageEditReference] = []
+    total_bytes = 0
+    for reference in references:
+        if (
+            type(reference) is not ReferenceInput
+            or reference.kind != "bytes"
+            or reference.locator is not None
+            or type(reference.content) is not bytes
+            or not 1 <= len(reference.content) <= _MAX_REFERENCE_IMAGE_BYTES
+            or not isinstance(reference.media_type, str)
+            or reference.media_type not in _REFERENCE_MEDIA_TYPES
+            or reference.provider_operation_ref is not None
+        ):
+            return None, Failure(
+                "invalid_frozen_snapshot",
+                "图片参考图未经过安全准备",
+            )
+        total_bytes += len(reference.content)
+        if total_bytes > _MAX_REFERENCE_TOTAL_BYTES:
+            return None, Failure(
+                "request_body_too_large",
+                "参考图数据超过图片编辑请求上限",
+            )
+        prepared.append(
+            OpenAIImageEditReference(
+                content=reference.content,
+                media_type=reference.media_type,
+            )
+        )
+    return tuple(prepared), None
 
 
 def build_original_openai_image_provider(

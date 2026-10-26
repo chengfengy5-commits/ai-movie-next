@@ -338,20 +338,139 @@ class OpenAIImageProviderTests(unittest.TestCase):
             "quality": "high",
         })
 
-    def test_unsupported_reference_returns_before_resolution_or_post(self) -> None:
+    def test_unprepared_reference_returns_before_resolution_or_post(self) -> None:
         provider, client, context, resolver_calls = self.make_provider()
 
-        result = provider.generate_sync_image(
-            self.snapshot,
-            (ReferenceInput(kind="public_http", locator="https://ref.example/a.png"),),
-            self.intent,
-        )
-
-        self.assertIsInstance(result, Failure)
-        self.assertEqual(result.code, "unsupported_reference_images")
+        for reference in (
+            ReferenceInput(
+                kind="public_http", locator="https://ref.example/a.png"
+            ),
+            ReferenceInput(
+                kind="bytes",
+                content=b"not validated",
+                media_type="image/svg+xml",
+            ),
+        ):
+            with self.subTest(reference=reference.kind):
+                result = provider.generate_sync_image(
+                    self.snapshot,
+                    (reference,),
+                    self.intent,
+                )
+                self.assertIsInstance(result, Failure)
+                self.assertEqual(result.code, "invalid_frozen_snapshot")
         self.assertEqual(client.calls, [])
         self.assertFalse(context.entered)
         self.assertEqual(resolver_calls, [])
+
+    def test_prepared_references_use_one_ordered_multipart_edit_post(self) -> None:
+        first = b"\x89PNG\r\n\x1a\nfirst-reference"
+        second = b"\xff\xd8\xffsecond-reference"
+        provider, client, _, resolver_calls = self.make_provider()
+
+        result = provider.generate_sync_image(
+            self.snapshot,
+            (
+                ReferenceInput(kind="bytes", content=first, media_type="image/png"),
+                ReferenceInput(kind="bytes", content=second, media_type="image/jpeg"),
+            ),
+            self.intent,
+        )
+
+        self.assertIsInstance(result, MediaResult)
+        self.assertEqual(len(client.calls), 1)
+        call = client.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertEqual(
+            call["url"], "https://images.example/v1/images/edits"
+        )
+        self.assertEqual(call["headers"]["Authorization"], "Bearer test-secret")
+        content_type = call["headers"]["Content-Type"]
+        self.assertTrue(content_type.startswith("multipart/form-data; boundary="))
+        boundary = content_type.split("boundary=", 1)[1]
+        body = call["content"]
+        self.assertIsInstance(body, bytes)
+        self.assertTrue(body.startswith(f"--{boundary}\r\n".encode("ascii")))
+        self.assertEqual(body.count(b'name="image"; filename="ref_0.png"'), 1)
+        self.assertEqual(body.count(b'name="image"; filename="ref_1.png"'), 1)
+        self.assertEqual(body.count(b"Content-Type: image/png"), 1)
+        self.assertEqual(body.count(b"Content-Type: image/jpeg"), 1)
+        self.assertLess(body.index(first), body.index(second))
+        self.assertIn(b'name="model"', body)
+        self.assertIn(b"gpt-image-1", body)
+        self.assertIn(b'name="prompt"', body)
+        self.assertIn(b"draw a red kite", body)
+        self.assertIn(b'name="size"', body)
+        self.assertIn(b"1024x1024", body)
+        self.assertEqual(len(resolver_calls), 1)
+        self.assertFalse(call["follow_redirects"])
+
+    def test_haoai_multipart_edit_omits_quality(self) -> None:
+        self.binding = CredentialBinding(
+            source="model_config", row_id="r", owner_or_system="owner-9",
+            provider="haoai", original_principal_id="p",
+            endpoint_origin="https://haoai.example/v1",
+            allowed_content_paths=(), binding_version="1",
+        )
+        self.snapshot = self.make_snapshot(
+            provider="haoai",
+            params={"size": "16:9", "quality": {"default": "high"}},
+            origin="https://haoai.example/v1",
+        )
+        self.intent = self.make_intent(self.snapshot)
+        provider, client, _, _ = self.make_provider()
+        reference = ReferenceInput(
+            kind="bytes",
+            content=b"\x89PNG\r\n\x1a\nref",
+            media_type="image/png",
+        )
+
+        result = provider.generate_sync_image(
+            self.snapshot,
+            (reference,),
+            self.intent,
+        )
+
+        self.assertIsInstance(result, MediaResult)
+        self.assertEqual(len(client.calls), 1)
+        call = client.calls[0]
+        self.assertEqual(call["url"], "https://haoai.example/v1/images/edits")
+        self.assertNotIn(b'name="quality"', call["content"])
+        self.assertIn(b'name="size"', call["content"])
+        self.assertIn(b"1792x1024", call["content"])
+
+    def test_large_prepared_edit_body_does_not_use_json_limit(self) -> None:
+        content = b"\x89PNG\r\n\x1a\n" + b"x" * (_MAX_REQUEST_BODY_BYTES + 1)
+        provider, client, _, _ = self.make_provider()
+
+        result = provider.generate_sync_image(
+            self.snapshot,
+            (ReferenceInput(kind="bytes", content=content, media_type="image/png"),),
+            self.intent,
+        )
+
+        self.assertIsInstance(result, MediaResult)
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(client.calls[0]["url"].endswith("/images/edits"))
+        self.assertGreater(len(client.calls[0]["content"]), _MAX_REQUEST_BODY_BYTES)
+
+    def test_reference_transport_failure_is_unknown_and_never_retried(self) -> None:
+        provider, client, _, _ = self.make_provider(
+            request_error=RuntimeError("fixture timeout after request entry")
+        )
+        references = (
+            ReferenceInput(
+                kind="bytes",
+                content=b"\x89PNG\r\n\x1a\nprepared-image",
+                media_type="image/png",
+            ),
+        )
+
+        result = provider.generate_sync_image(self.snapshot, references, self.intent)
+
+        self.assertIsInstance(result, UnknownCreate)
+        self.assertEqual(len(client.calls), 1)
+        self.assertTrue(client.calls[0]["url"].endswith("/images/edits"))
 
     def test_original_execution_pair_mismatches_fail_before_resolution(self) -> None:
         provider, client, context, resolver_calls = self.make_provider()

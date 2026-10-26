@@ -180,6 +180,7 @@ def _admitted_image_task(
     *,
     model_source=None,
     wallet_credits: int | None = 20,
+    reference_images: tuple[str, ...] = (),
 ):
     monkeypatch.setattr(admission_staging_module, "_G2_JOINT_PROVIDER", "openai")
     if model_source is None:
@@ -207,7 +208,7 @@ def _admitted_image_task(
             "prompt": "Worker integration test",
             "target": {"kind": "standalone"},
             "size": None,
-            "reference_images": [],
+            "reference_images": list(reference_images),
         },
     )
     assert isinstance(staged, AdmissionStaged)
@@ -676,6 +677,364 @@ def test_registered_worker_runs_one_provider_post_and_commits_original_result(
         assert evidence.result_location == stores[0].locator
         assert reader.execute(select(func.count()).select_from(CreditLogRow)).scalar_one() >= 1
         assert reader.execute(select(func.count()).select_from(UserCreditRow)).scalar_one() == 1
+    environment.engine.dispose()
+
+
+def test_registered_worker_edits_from_authenticated_ordered_references(
+    tmp_path: Path, monkeypatch
+) -> None:
+    first_content = _PNG + b"first-reference"
+    remote_content = _PNG + b"remote-reference"
+    first_data_uri = "data:image/png;base64," + base64.b64encode(
+        first_content
+    ).decode("ascii")
+    reference_url = "https://ref.example.test/reference.png?signature=fixture"
+    references = (first_data_uri, reference_url, first_data_uri)
+    environment, task_id = _admitted_image_task(
+        tmp_path,
+        monkeypatch,
+        "image-worker-reference-edit",
+        reference_images=references,
+    )
+    stores: list[StoredMedia] = []
+    fetched_references: list[object] = []
+
+    class Fetcher:
+        async def fetch_public(self, reference, *, max_bytes, timeout_seconds):
+            fetched_references.append((reference, max_bytes, timeout_seconds))
+            return PreparedReference(
+                kind="bytes",
+                locator=None,
+                content=remote_content,
+                media_type="image/png",
+            )
+
+    runtime_config, provider_calls = _runtime_configuration(
+        environment,
+        _provider_body(),
+        stores,
+        public_media_fetcher_factory=Fetcher,
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+
+    outcome = runtime.run_claimed_once("image-single")
+
+    assert outcome is not None and outcome != "pending" and outcome != "ownership_lost"
+    assert len(fetched_references) == 1
+    assert fetched_references[0][0].locator == references[1]
+    assert fetched_references[0][1] == 10 * 1024 * 1024
+    assert len(provider_calls) == 1
+    request = provider_calls[0]
+    assert request["method"] == "POST"
+    assert request["url"].endswith("/images/edits")
+    assert request["follow_redirects"] is False
+    assert request["headers"]["Authorization"].startswith("Bearer ")
+    assert request["headers"]["Content-Type"].startswith("multipart/form-data; boundary=")
+    body = request["content"]
+    assert isinstance(body, bytes)
+    assert body.count(b'name="image"; filename="ref_0.png"') == 1
+    assert body.count(b'name="image"; filename="ref_1.png"') == 1
+    assert body.count(b'name="image"; filename="ref_2.png"') == 1
+    assert body.count(b"Content-Type: image/png") == 3
+    assert body.count(first_content) == 2
+    assert body.count(remote_content) == 1
+    first_position = body.index(first_content)
+    remote_position = body.index(remote_content)
+    repeated_position = body.rindex(first_content)
+    assert first_position < remote_position < repeated_position
+    assert b'name="prompt"' in body and b"Worker integration test" in body
+    assert b'name="model"' in body and b"wire-joint-fixture-model" in body
+    assert b'name="n"' in body and b"1" in body
+    assert len(stores) == 1
+
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow).where(AITaskRow.id == task_id)
+        ).scalar_one()
+        unit = reader.execute(
+            select(BillingUnitRow).where(BillingUnitRow.task_id == task_id)
+        ).scalar_one()
+        receipt = reader.execute(
+            select(GenerationResultReceiptRow.__table__).where(
+                GenerationResultReceiptRow.__table__.c.task_id == task_id
+            )
+        ).mappings().one()
+        evidence = reader.execute(
+            select(ResultEvidenceRow.__table__).where(
+                ResultEvidenceRow.__table__.c.id == receipt["evidence_id"]
+            )
+        ).mappings().one()
+        result = json.loads(task.result)
+        assert task.status == "completed"
+        assert unit.result_status == "succeeded"
+        assert unit.refunded_amount == 0
+        assert receipt["owner_id"] == task.user_id
+        assert receipt["unit_id"] == unit.id
+        assert receipt["operation"] == "image.single"
+        assert receipt["result_ref"] == outcome.result_ref == result["result_ref"]
+        assert receipt["recoverable_locator"] == stores[0].locator == result["url"]
+        assert receipt["content_digest"] == stores[0].content_digest
+        assert receipt["automatic_application_allowed"] is True
+        assert evidence["validity"] == "valid"
+        assert evidence["result_location"] == receipt["recoverable_locator"]
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.type == "refund"
+            )
+        ).scalar_one() == 0
+    environment.engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("failure_point", "expected_code"),
+    (
+        ("data_uri", "invalid_frozen_snapshot"),
+        ("remote_after_data_uri", "invalid_frozen_snapshot"),
+        ("reference_count", "request_body_too_large"),
+    ),
+)
+def test_bad_reference_stops_before_provider_post_or_storage(
+    tmp_path: Path,
+    monkeypatch,
+    failure_point: str,
+    expected_code: str,
+) -> None:
+    valid_data_uri = _PNG_DATA_URI
+    if failure_point == "data_uri":
+        reference_images = ("data:image/png;base64,ZmFrZQ==",)
+    elif failure_point == "remote_after_data_uri":
+        reference_images = (valid_data_uri, "https://ref.example.test/bad-signature.png")
+    else:
+        reference_images = (valid_data_uri,) * 9
+    environment, task_id = _admitted_image_task(
+        tmp_path,
+        monkeypatch,
+        f"image-worker-invalid-reference-{failure_point}",
+        reference_images=reference_images,
+    )
+    stores: list[StoredMedia] = []
+    fetch_calls: list[object] = []
+
+    class Fetcher:
+        async def fetch_public(self, reference, *, max_bytes, timeout_seconds):
+            fetch_calls.append(reference)
+            return PreparedReference(
+                kind="bytes",
+                locator=None,
+                content=b"not-a-png-signature",
+                media_type="image/png",
+            )
+
+    runtime_config, provider_calls = _runtime_configuration(
+        environment,
+        _provider_body(),
+        stores,
+        public_media_fetcher_factory=Fetcher,
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+
+    outcome = runtime.run_claimed_once("image-single")
+
+    assert outcome is None
+    assert len(fetch_calls) == int(failure_point == "remote_after_data_uri")
+    assert provider_calls == []
+    assert stores == []
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow).where(AITaskRow.id == task_id)
+        ).scalar_one()
+        unit = reader.execute(
+            select(BillingUnitRow).where(BillingUnitRow.task_id == task_id)
+        ).scalar_one()
+        assert task.status == "failed"
+        assert json.loads(task.result)["code"] == expected_code
+        assert unit.result_status == "failed"
+        assert unit.refunded_amount == 3
+        assert reader.execute(
+            select(func.count()).select_from(GenerationResultReceiptRow)
+        ).scalar_one() == 0
+    environment.engine.dispose()
+
+
+def test_lost_claim_during_reference_fetch_never_posts_to_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    reference_url = "https://ref.example.test/reference.png"
+    environment, task_id = _admitted_image_task(
+        tmp_path,
+        monkeypatch,
+        "image-worker-lost-during-reference-fetch",
+        reference_images=(reference_url,),
+    )
+    stores: list[StoredMedia] = []
+    fetch_entered = Event()
+    proceed = Event()
+    fetch_calls: list[object] = []
+
+    class Fetcher:
+        async def fetch_public(self, reference, *, max_bytes, timeout_seconds):
+            fetch_calls.append(reference)
+            fetch_entered.set()
+            assert proceed.wait(5)
+            return PreparedReference(
+                kind="bytes",
+                locator=None,
+                content=_PNG,
+                media_type="image/png",
+            )
+
+    runtime_config, provider_calls = _runtime_configuration(
+        environment,
+        _provider_body(),
+        stores,
+        public_media_fetcher_factory=Fetcher,
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+    outcomes: list[object] = []
+    thread = _run_in_thread(runtime, outcomes)
+    try:
+        assert fetch_entered.wait(5)
+        _cancel_task(environment, task_id)
+    finally:
+        proceed.set()
+        thread.join(timeout=5)
+
+    assert not thread.is_alive()
+    assert outcomes == ["ownership_lost"]
+    assert len(fetch_calls) == 1
+    assert provider_calls == []
+    assert stores == []
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow).where(AITaskRow.id == task_id)
+        ).scalar_one()
+        assert task.status == "cancelling"
+        assert reader.execute(
+            select(func.count()).select_from(GenerationResultReceiptRow)
+        ).scalar_one() == 0
+    environment.engine.dispose()
+
+
+def test_lost_claim_during_reference_fetcher_factory_never_fetches_or_posts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    reference_url = "https://ref.example.test/reference.png"
+    environment, task_id = _admitted_image_task(
+        tmp_path,
+        monkeypatch,
+        "image-worker-lost-during-reference-fetcher-factory",
+        reference_images=(reference_url,),
+    )
+    stores: list[StoredMedia] = []
+    factory_calls: list[bool] = []
+    fetch_calls: list[object] = []
+
+    class Fetcher:
+        async def fetch_public(self, reference, *, max_bytes, timeout_seconds):
+            fetch_calls.append(reference)
+            return PreparedReference(
+                kind="bytes",
+                locator=None,
+                content=_PNG,
+                media_type="image/png",
+            )
+
+    def fetcher_factory():
+        factory_calls.append(True)
+        _cancel_task(environment, task_id)
+        return Fetcher()
+
+    runtime_config, provider_calls = _runtime_configuration(
+        environment,
+        _provider_body(),
+        stores,
+        public_media_fetcher_factory=fetcher_factory,
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+
+    outcome = runtime.run_claimed_once("image-single")
+
+    assert outcome == "ownership_lost"
+    assert factory_calls == [True]
+    assert fetch_calls == []
+    assert provider_calls == []
+    assert stores == []
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow).where(AITaskRow.id == task_id)
+        ).scalar_one()
+        assert task.status == "cancelling"
+        assert reader.execute(
+            select(func.count()).select_from(GenerationResultReceiptRow)
+        ).scalar_one() == 0
+    environment.engine.dispose()
+
+
+def test_reference_intent_reentry_never_refetches_or_reposts(
+    tmp_path: Path, monkeypatch
+) -> None:
+    reference_url = "https://ref.example.test/reference.png"
+    environment, task_id = _admitted_image_task(
+        tmp_path,
+        monkeypatch,
+        "image-worker-reference-intent-reentry",
+        reference_images=(reference_url,),
+    )
+    stores: list[StoredMedia] = []
+    fetch_calls: list[object] = []
+
+    class Fetcher:
+        async def fetch_public(self, reference, *, max_bytes, timeout_seconds):
+            fetch_calls.append(reference)
+            return PreparedReference(
+                kind="bytes",
+                locator=None,
+                content=_PNG,
+                media_type="image/png",
+            )
+
+    runtime_config, provider_calls = _runtime_configuration(
+        environment,
+        _provider_body(status=500),
+        stores,
+        response_status=500,
+        public_media_fetcher_factory=Fetcher,
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+
+    first = runtime.run_claimed_once("image-single")
+    second = runtime.run_claimed_once("image-single")
+
+    assert first == "pending"
+    assert second == "pending"
+    assert len(fetch_calls) == 1
+    assert len(provider_calls) == 1
+    assert stores == []
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow).where(AITaskRow.id == task_id)
+        ).scalar_one()
+        unit = reader.execute(
+            select(BillingUnitRow).where(BillingUnitRow.task_id == task_id)
+        ).scalar_one()
+        assert task.status == "reconciling"
+        assert unit.result_status == "unknown"
+        assert unit.refunded_amount == 0
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.type == "refund"
+            )
+        ).scalar_one() == 0
     environment.engine.dispose()
 
 
@@ -2231,6 +2590,72 @@ def test_lost_after_public_fetch_return_never_starts_media_storage(
         assert evidence.result_location is None
         assert reader.execute(
             select(func.count()).select_from(GenerationResultReceiptRow)
+        ).scalar_one() == 0
+    environment.engine.dispose()
+
+
+def test_lost_after_http_response_keeps_provider_bytes_observation(
+    tmp_path: Path, monkeypatch
+) -> None:
+    environment, task_id = _admitted_image_task(
+        tmp_path, monkeypatch, "image-worker-lost-after-http-response"
+    )
+    stores: list[StoredMedia] = []
+    http_calls: list[dict[str, object]] = []
+
+    class CancelAfterHttpResponseClient(_HttpClient):
+        async def request(self, method, url, *, headers=None, content=None, **kwargs):
+            response = await super().request(
+                method, url, headers=headers, content=content, **kwargs
+            )
+            _cancel_task(environment, task_id)
+            return response
+
+    runtime_config, _ = _runtime_configuration(
+        environment,
+        _provider_body(),
+        stores,
+        http_client_factory=lambda: _HttpClientContext(
+            CancelAfterHttpResponseClient(
+                _provider_body(), 200, calls=http_calls
+            )
+        ),
+    )
+    runtime = build_generation_worker_runtime(
+        GenerationWorkerConfiguration(runtime_config, environment.capabilities)
+    )
+    outcome = runtime.run_claimed_once("image-single")
+
+    assert outcome == "ownership_lost"
+    assert len(http_calls) == 1
+    assert stores == []
+    with Session(environment.engine) as reader:
+        task = reader.execute(
+            select(AITaskRow).where(AITaskRow.id == task_id)
+        ).scalar_one()
+        unit = reader.execute(
+            select(BillingUnitRow).where(BillingUnitRow.task_id == task_id)
+        ).scalar_one()
+        evidence = reader.execute(
+            select(ResultEvidenceRow).where(
+                ResultEvidenceRow.evidence_key.like("image-single-observation-v1:%")
+            )
+        ).scalar_one_or_none()
+        assert task.status == "cancelling"
+        assert unit.result_status == "pending"
+        assert unit.refunded_amount == 0
+        assert evidence is not None
+        assert evidence.validity == "unknown"
+        assert evidence.evidence_kind == "provider_image_bytes"
+        assert evidence.payload_digest == hashlib.sha256(_PNG).hexdigest()
+        assert evidence.result_location is None
+        assert reader.execute(
+            select(func.count()).select_from(GenerationResultReceiptRow)
+        ).scalar_one() == 0
+        assert reader.execute(
+            select(func.count()).select_from(CreditLogRow).where(
+                CreditLogRow.type == "refund"
+            )
         ).scalar_one() == 0
     environment.engine.dispose()
 
