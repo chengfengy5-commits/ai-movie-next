@@ -12,7 +12,11 @@ from typing import Literal
 from sqlalchemy import insert, select, update
 from sqlalchemy.orm import Session
 
-from haoai_backend.generation_contracts.types import ClaimAuthority, CommittedIntent
+from haoai_backend.generation_contracts.types import (
+    ClaimAuthority,
+    CommittedIntent,
+    ExternalOperationRef,
+)
 from haoai_backend.generation_credentials.application import CredentialRegistry
 from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 from haoai_backend.generation_credentials.video_execution_snapshot import (
@@ -35,6 +39,12 @@ _OPERATION = "video.single"
 _GRAPH_VERSION = "video-single-v1"
 _ORIGINAL_DEADLINE_SECONDS = 7200
 _CLAIMABLE_STATUS = frozenset({"processing", "reconciling"})
+_RECONCILING_RESULT = json.dumps(
+    {"message": "视频生成结果需要恢复确认", "status": "reconciling"},
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
 
 SessionFactory = Callable[[], Session]
 DbClock = Callable[[], datetime]
@@ -44,9 +54,12 @@ VideoSnapshotReader = Callable[..., VerifiedVideoExecutionInput | None]
 
 @dataclass(frozen=True, slots=True)
 class VideoSingleIntentPreparation:
-    disposition: Literal["committed", "existing", "unresolved", "ownership_lost"]
+    disposition: Literal[
+        "committed", "resume_query", "existing", "unresolved", "ownership_lost"
+    ]
     verified_input: VerifiedVideoExecutionInput | None = None
     intent: CommittedIntent | None = None
+    external_ref: ExternalOperationRef | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +79,16 @@ class _StagedIntent:
     intent: CommittedIntent
     submission_key: str
     request_snapshot: dict[str, object]
+    graph_digest: str
+
+
+@dataclass(frozen=True, slots=True)
+class _StagedQueryResume:
+    binding: PersistedVideoExecutionBinding
+    verified_input: VerifiedVideoExecutionInput
+    intent: CommittedIntent
+    external_ref: ExternalOperationRef
+    submission: dict[str, object]
     graph_digest: str
 
 
@@ -89,6 +112,9 @@ class SqlAlchemyVideoSingleIntents:
             return VideoSingleIntentPreparation("ownership_lost")
         if claim.scope.operation != _OPERATION or claim.local_lost_signal.is_set():
             return VideoSingleIntentPreparation("ownership_lost")
+        resume = self._prepare_existing_query(claim)
+        if resume is not None:
+            return resume
         staged = self._stage_and_commit(claim)
         if staged is None:
             return VideoSingleIntentPreparation("unresolved")
@@ -100,6 +126,138 @@ class SqlAlchemyVideoSingleIntents:
         return VideoSingleIntentPreparation(
             "committed", staged.verified_input, confirmed
         )
+
+    def _prepare_existing_query(
+        self, claim: ClaimAuthority
+    ) -> VideoSingleIntentPreparation | None:
+        staged: _StagedQueryResume | None = None
+        try:
+            with self.session_factory() as session:
+                with session.begin():
+                    graph = self._lock_graph(session, claim)
+                    now = self._server_now()
+                    if graph is None or not _claim_is_current(graph.task, claim, now):
+                        return VideoSingleIntentPreparation("ownership_lost")
+                    if not graph.existing_submissions:
+                        return None
+                    staged = self._stage_query_resume(session, graph, now)
+        except Exception:
+            return VideoSingleIntentPreparation("unresolved")
+        if staged is None:
+            return VideoSingleIntentPreparation("unresolved")
+        if not self._confirm_query_resume(claim, staged):
+            return VideoSingleIntentPreparation("unresolved")
+        return VideoSingleIntentPreparation(
+            "resume_query",
+            staged.verified_input,
+            staged.intent,
+            staged.external_ref,
+        )
+
+    def _stage_query_resume(
+        self,
+        session: Session,
+        graph: _LockedVideoGraph,
+        now: datetime,
+    ) -> _StagedQueryResume | None:
+        if not _query_resume_graph_is_valid(graph, now):
+            return None
+        binding = _execution_binding(graph)
+        if binding is None:
+            return None
+        try:
+            if self.snapshot_reader is read_original_video_single_execution_input:
+                verified = self.snapshot_reader(
+                    session,
+                    binding,
+                    registry=self.registry,
+                    crypto=self.crypto,
+                    proof_authority=self.proof_authority,
+                    credential_purpose="query",
+                )
+            else:
+                verified = self.snapshot_reader(
+                    session, binding, credential_purpose="query"
+                )
+        except Exception:
+            return None
+        if (
+            verified is None
+            or verified.task_id != binding.task_id
+            or verified.unit_id != binding.unit_id
+            or verified.step_id != binding.step_id
+            or verified.server_attempt_id != binding.server_attempt_id
+        ):
+            return None
+        row = graph.existing_submissions[0]
+        intent = _intent_from_existing_submission(row, binding, verified)
+        if intent is None:
+            return None
+        try:
+            request_snapshot = _safe_intent_snapshot(binding, graph, verified)
+        except (KeyError, TypeError, ValueError):
+            return None
+        if row.get("request_snapshot") != request_snapshot:
+            return None
+        external_ref = ExternalOperationRef(
+            intent_id=str(row["id"]),
+            attempt_id=binding.server_attempt_id,
+            provider=intent.provider,
+            external_id=str(row["external_task_id"]),
+            create_outcome="submitted",
+        )
+        graph_digest = _original_graph_digest(graph)
+        if graph_digest is None:
+            return None
+        return _StagedQueryResume(
+            binding=binding,
+            verified_input=verified,
+            intent=intent,
+            external_ref=external_ref,
+            submission=dict(row),
+            graph_digest=graph_digest,
+        )
+
+    def _confirm_query_resume(
+        self,
+        claim: ClaimAuthority,
+        staged: _StagedQueryResume,
+    ) -> bool:
+        try:
+            with self.session_factory() as session:
+                with session.begin():
+                    graph = self._lock_graph(session, claim)
+                    now = self._server_now()
+                    if (
+                        graph is None
+                        or not _claim_is_current(graph.task, claim, now)
+                        or not _query_resume_graph_is_valid(graph, now)
+                        or len(graph.existing_submissions) != 1
+                        or _execution_binding(graph) != staged.binding
+                        or _original_graph_digest(graph) != staged.graph_digest
+                        or graph.existing_submissions[0] != staged.submission
+                    ):
+                        return False
+                    intent = _intent_from_existing_submission(
+                        graph.existing_submissions[0],
+                        staged.binding,
+                        staged.verified_input,
+                    )
+                    return bool(
+                        intent == staged.intent
+                        and staged.external_ref.intent_id == staged.intent.external_submission_id
+                        and staged.external_ref.attempt_id == staged.intent.attempt_id
+                        and staged.external_ref.provider == staged.intent.provider
+                        and staged.external_ref.external_id
+                        == graph.existing_submissions[0].get("external_task_id")
+                        and staged.external_ref.create_outcome == "submitted"
+                        and graph.existing_submissions[0].get("request_snapshot")
+                        == _safe_intent_snapshot(
+                            staged.binding, graph, staged.verified_input
+                        )
+                    )
+        except Exception:
+            return False
 
     def _stage_and_commit(
         self, claim: ClaimAuthority
@@ -506,6 +664,157 @@ def _execution_binding(
     ):
         return None
     return binding
+
+
+def _query_resume_graph_is_valid(
+    graph: _LockedVideoGraph, now: datetime
+) -> bool:
+    if len(graph.existing_submissions) != 1:
+        return False
+    task = graph.task
+    unit = graph.unit
+    step = graph.step
+    row = graph.existing_submissions[0]
+    status = row.get("submission_status")
+    if status == "submitted":
+        state_matches = (
+            task.get("result") is None
+            and unit.get("result_status") == "pending"
+            and step.get("execution_status") == "submitting"
+        )
+    elif status == "unknown":
+        state_matches = (
+            task.get("result") == _RECONCILING_RESULT
+            and unit.get("result_status") == "unknown"
+            and step.get("execution_status") == "reconciling"
+        )
+    else:
+        return False
+
+    external_id = row.get("external_task_id")
+    intent_at = row.get("intent_at")
+    submitted_at = row.get("submitted_at")
+    deadline_at = row.get("deadline_at")
+    first_intent_at = unit.get("first_intent_at")
+    unit_deadline_at = unit.get("deadline_at")
+    if (
+        not _safe_provider_id(external_id)
+        or not all(
+            isinstance(value, datetime)
+            for value in (
+                intent_at,
+                submitted_at,
+                deadline_at,
+                first_intent_at,
+                unit_deadline_at,
+            )
+        )
+        or not _known_id_submission_is_valid(row)
+    ):
+        return False
+    try:
+        intent = _aware_utc(intent_at)
+        submitted = _aware_utc(submitted_at)
+        deadline = _aware_utc(deadline_at)
+        first_intent = _aware_utc(first_intent_at)
+        unit_deadline = _aware_utc(unit_deadline_at)
+    except (TypeError, ValueError):
+        return False
+    return all(
+        (
+            task.get("status") in _CLAIMABLE_STATUS,
+            task.get("user_cancelled_at") is None,
+            unit.get("user_cancelled_at") is None,
+            unit.get("success_confirmed_at") is None,
+            unit.get("billing_status") in {"charged", "no_charge"},
+            task.get("billing_status") == unit.get("billing_status"),
+            unit.get("refunded_amount") == 0,
+            state_matches,
+            row.get("step_id") == step.get("id"),
+            row.get("submission_key")
+            == _intent_submission_key(str(unit.get("id")), str(step.get("id"))),
+            row.get("provider") in {"xai", "manxiaobai"},
+            _nonempty_string(row.get("model_ref")),
+            row.get("request_digest") == unit.get("input_digest"),
+            intent == first_intent,
+            deadline == unit_deadline,
+            deadline == first_intent + timedelta(seconds=_ORIGINAL_DEADLINE_SECONDS),
+            first_intent <= submitted < deadline,
+            now < deadline,
+        )
+    )
+
+
+def _intent_from_existing_submission(
+    row: dict[str, object],
+    binding: PersistedVideoExecutionBinding,
+    verified: VerifiedVideoExecutionInput,
+) -> CommittedIntent | None:
+    intent_at = row.get("intent_at")
+    deadline_at = row.get("deadline_at")
+    submitted_at = row.get("submitted_at")
+    external_id = row.get("external_task_id")
+    try:
+        if (
+            not _safe_provider_id(external_id)
+            or not isinstance(intent_at, datetime)
+            or not isinstance(deadline_at, datetime)
+            or not isinstance(submitted_at, datetime)
+            or not _known_id_submission_is_valid(row)
+        ):
+            return None
+        committed_at = _aware_utc(intent_at)
+        deadline = _aware_utc(deadline_at)
+        submitted = _aware_utc(submitted_at)
+    except (TypeError, ValueError):
+        return None
+    if (
+        deadline != committed_at + timedelta(seconds=_ORIGINAL_DEADLINE_SECONDS)
+        or not committed_at <= submitted < deadline
+        or row.get("id") is None
+        or row.get("step_id") != binding.step_id
+        or row.get("submission_key")
+        != _intent_submission_key(binding.unit_id, binding.step_id)
+        or row.get("provider") != verified.snapshot.model_ref.provider
+        or row.get("model_ref") != verified.snapshot.model_ref.model_id
+        or row.get("request_digest") != binding.request_digest
+        or verified.snapshot.model_ref.provider not in {"xai", "manxiaobai"}
+    ):
+        return None
+    return CommittedIntent(
+        step_id=binding.step_id,
+        attempt_id=binding.server_attempt_id,
+        external_submission_id=str(row["id"]),
+        provider=verified.snapshot.model_ref.provider,
+        model_id=verified.snapshot.model_ref.model_id,
+        request_digest=binding.request_digest,
+        snapshot_ref=_execution_snapshot_ref(binding),
+        committed_at=committed_at,
+        first_intent_at=committed_at,
+        deadline_at=deadline,
+    )
+
+
+def _safe_provider_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and value == value.strip()
+        and len(value.encode("utf-8")) <= 255
+        and not any(ord(character) < 0x20 for character in value)
+    )
+
+
+def _known_id_submission_is_valid(row: dict[str, object]) -> bool:
+    return bool(
+        row.get("submission_status") in {"submitted", "unknown"}
+        and _safe_provider_id(row.get("external_task_id"))
+        and isinstance(row.get("submitted_at"), datetime)
+    )
+
+
+def _nonempty_string(value: object) -> bool:
+    return isinstance(value, str) and bool(value)
 
 
 def _unit_can_create_intent(unit: dict[str, object]) -> bool:

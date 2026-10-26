@@ -836,6 +836,12 @@ class SqlAlchemyVideoSingleResults:
                         task_values["recovery_status"] = "reconciling"
                     if expected.kind == "failure":
                         task_values["billing_status"] = expected.task_billing_status
+                    original_task_result = graph.task.get("result")
+                    task_result_predicate = (
+                        task_table.c.result.is_(None)
+                        if original_task_result is None
+                        else task_table.c.result == original_task_result
+                    )
                     task_change = session.execute(
                         update(task_table)
                         .where(
@@ -853,7 +859,7 @@ class SqlAlchemyVideoSingleResults:
                             ),
                             task_table.c.lease_until > _database_datetime(now),
                             task_table.c.request_data == graph.task["request_data"],
-                            task_table.c.result.is_(None),
+                            task_result_predicate,
                         )
                         .values(**task_values)
                     )
@@ -879,7 +885,7 @@ class SqlAlchemyVideoSingleResults:
                             unit_table.c.step_graph_version == _GRAPH_VERSION,
                             unit_table.c.item_key == verified.server_attempt_id,
                             unit_table.c.input_digest == intent.request_digest,
-                            unit_table.c.result_status == "pending",
+                            unit_table.c.result_status == graph.unit.get("result_status"),
                             unit_table.c.billing_status.in_(("charged", "no_charge")),
                             unit_table.c.user_cancelled_at.is_(None),
                             unit_table.c.success_confirmed_at.is_(None),
@@ -931,7 +937,8 @@ class SqlAlchemyVideoSingleResults:
                                 graph.step["input_snapshot"],
                             ),
                             ExecutionStepRow.required == graph.step["required"],
-                            ExecutionStepRow.execution_status == "submitting",
+                            ExecutionStepRow.execution_status
+                            == graph.step.get("execution_status"),
                         )
                         .values(
                             execution_status=expected.step_status,
@@ -2155,10 +2162,12 @@ def _graph_matches(
     ):
         return False
     if terminal is None:
+        if not _active_execution_state_matches(graph):
+            return False
         expected_task_status = {"processing", "reconciling"}
-        expected_task_result = None
-        expected_unit_status = "pending"
-        expected_step_status = "submitting"
+        expected_task_result = task.get("result")
+        expected_unit_status = unit.get("result_status")
+        expected_step_status = step.get("execution_status")
         expected_submission_status = submission.get("submission_status")
         expected_task_billing = unit.get("billing_status")
         expected_unit_billing = unit.get("billing_status")
@@ -2166,12 +2175,26 @@ def _graph_matches(
     else:
         expected_task_status = {terminal.task_status}
         expected_task_result = terminal.result_value
-        expected_unit_status = "pending" if task_only else terminal.unit_status
-        expected_step_status = "submitting" if task_only else terminal.step_status
         original_submission = (
             terminal.original_graph.submission
             if terminal.original_graph is not None
             else submission
+        )
+        original_unit = (
+            terminal.original_graph.unit
+            if terminal.original_graph is not None
+            else unit
+        )
+        original_step = (
+            terminal.original_graph.step
+            if terminal.original_graph is not None
+            else step
+        )
+        expected_unit_status = (
+            original_unit.get("result_status") if task_only else terminal.unit_status
+        )
+        expected_step_status = (
+            original_step.get("execution_status") if task_only else terminal.step_status
         )
         expected_submission_status = (
             original_submission.get("submission_status")
@@ -2180,10 +2203,14 @@ def _graph_matches(
         )
         expected_task_billing = terminal.task_billing_status
         expected_unit_billing = (
-            graph.unit.get("billing_status") if task_only else terminal.unit_billing_status
+            original_unit.get("billing_status")
+            if task_only
+            else terminal.unit_billing_status
         )
         expected_refunded_amount = (
-            graph.unit.get("refunded_amount") if task_only else terminal.refunded_amount
+            original_unit.get("refunded_amount")
+            if task_only
+            else terminal.refunded_amount
         )
     manifest_digest = step_snapshot.get("ordered_manifest_digest")
     expected_ref = (
@@ -2268,6 +2295,41 @@ def _graph_matches(
             binding.row_id == snapshot.model_ref.model_id,
             binding.owner_or_system == snapshot.model_ref.owner_id,
         )
+    )
+
+
+def _active_execution_state_matches(graph: _LockedVideoGraph) -> bool:
+    task = graph.task
+    unit = graph.unit
+    step = graph.step
+    submission = graph.submission
+    task_status = task.get("status")
+    fresh = (
+        task_status in {"processing", "reconciling"}
+        and task.get("result") is None
+        and unit.get("result_status") == "pending"
+        and step.get("execution_status") == "submitting"
+        and submission.get("submission_status") in {"submitting", "submitted"}
+        and _valid_submission_state(submission)
+    )
+    resumable = (
+        task_status in {"processing", "reconciling"}
+        and task.get("result") == _UNRESOLVED_RESULT
+        and unit.get("result_status") == "unknown"
+        and step.get("execution_status") == "reconciling"
+        and submission.get("submission_status") == "unknown"
+        and _safe_text(submission.get("external_task_id"), 255)
+        and isinstance(submission.get("submitted_at"), datetime)
+        and _valid_submission_state(submission)
+    )
+    return bool(
+        task.get("user_cancelled_at") is None
+        and unit.get("user_cancelled_at") is None
+        and unit.get("success_confirmed_at") is None
+        and unit.get("billing_status") in {"charged", "no_charge"}
+        and task.get("billing_status") == unit.get("billing_status")
+        and unit.get("refunded_amount") == 0
+        and (fresh or resumable)
     )
 
 
