@@ -1,3 +1,5 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+import { CanvasOwnedImageError, type CanvasOwnedImageRun } from "../../../shared/api/canvasOwnedImage";
 import type { CanvasOwnedResultItem } from "../../../shared/api/canvasOwnedResults";
 import type { CanvasResultApplicationLookup } from "../../../shared/api/canvasResultApplications";
 import type {
@@ -37,6 +39,9 @@ export interface CanvasGenerationResultsDialogProps {
     readonly targetRevision: string;
     readonly committedAt: string;
   } | null;
+  readonly imagePreviewAvailable: boolean;
+  readonly imagePreviewScopeKey: string;
+  readonly imagePreviewServiceIdentity: object;
   onClose(): void;
   onRefresh(): void;
   onLoadMore(): void;
@@ -45,6 +50,53 @@ export interface CanvasGenerationResultsDialogProps {
   onLookupPendingIntent(): void;
   onRetryPendingIntent(): void;
   onAcquireLock(): void;
+  onBeginImagePreview(item: CanvasOwnedResultItem): CanvasOwnedImageRun | null;
+}
+
+type ImagePreviewState =
+  | { readonly kind: "loading"; readonly itemKey: string; readonly requestId: number }
+  | { readonly kind: "ready"; readonly itemKey: string; readonly requestId: number; readonly objectUrl: string }
+  | { readonly kind: "error"; readonly itemKey: string; readonly requestId: number; readonly message: string };
+
+interface ImagePreviewRequest {
+  readonly id: number;
+  readonly itemKey: string;
+  readonly controller: AbortController;
+  readonly scopeKey: string;
+  readonly serviceIdentity: object;
+  run: CanvasOwnedImageRun | null;
+  objectUrl: string | null;
+}
+
+function imagePreviewItemKey(item: Pick<CanvasOwnedResultItem, "task_id" | "result_ref">): string {
+  return JSON.stringify([item.task_id, item.result_ref]);
+}
+
+function imagePreviewFailureMessage(cause: unknown): string {
+  if (cause instanceof CanvasOwnedImageError) {
+    switch (cause.kind) {
+      case "not-sent": return "登录或画布状态已变化，图片未显示。请重新打开记录后重试。";
+      case "unauthorized": return "登录状态已失效，请重新登录后查看图片。";
+      case "forbidden": return "当前账号无权读取这张图片。";
+      case "not-found": return "原图片记录暂不可用，请点击“重试查看图片”。";
+      case "unready": return "图片记录尚未就绪，请稍后重试。";
+      case "unavailable": return "图片读取服务暂不可用，请稍后重试。";
+      case "read-error":
+      case "invalid-response": return "图片读取失败，请点击“重试查看图片”。";
+    }
+  }
+  return "图片无法读取或显示，请点击“重试查看图片”。";
+}
+
+function revokeImagePreviewUrl(request: ImagePreviewRequest): void {
+  if (request.objectUrl === null) return;
+  const objectUrl = request.objectUrl;
+  request.objectUrl = null;
+  try {
+    URL.revokeObjectURL(objectUrl);
+  } catch {
+    // Releasing one preview must not prevent the dialog from continuing to work.
+  }
 }
 
 function eligibilityLabel(item: CanvasOwnedResultItem): string {
@@ -107,8 +159,171 @@ export function CanvasGenerationResultsDialog({
   onLookupPendingIntent,
   onRetryPendingIntent,
   onAcquireLock,
+  imagePreviewAvailable,
+  imagePreviewScopeKey,
+  imagePreviewServiceIdentity,
+  onBeginImagePreview,
 }: CanvasGenerationResultsDialogProps) {
   const focus = useSeriesDialogFocus({ active: true, canDismiss: true, onDismiss: onClose });
+  const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null);
+  const activeImagePreviewRef = useRef<ImagePreviewRequest | null>(null);
+  const imagePreviewSequenceRef = useRef(0);
+  const itemsRef = useRef(items);
+  itemsRef.current = items;
+  const imagePreviewScopeKeyRef = useRef(imagePreviewScopeKey);
+  imagePreviewScopeKeyRef.current = imagePreviewScopeKey;
+  const imagePreviewServiceIdentityRef = useRef(imagePreviewServiceIdentity);
+  imagePreviewServiceIdentityRef.current = imagePreviewServiceIdentity;
+
+  const clearImagePreview = useCallback((updateState = true) => {
+    const active = activeImagePreviewRef.current;
+    activeImagePreviewRef.current = null;
+    imagePreviewSequenceRef.current += 1;
+    if (active !== null) {
+      active.controller.abort();
+      revokeImagePreviewUrl(active);
+    }
+    if (updateState) setImagePreview(null);
+  }, []);
+
+  const itemIsReadable = useCallback((itemKey: string) => itemsRef.current.some((item) =>
+    imagePreviewItemKey(item) === itemKey && item.eligibility !== "unready"), []);
+
+  const previewRequestBelongsToDialog = useCallback((request: ImagePreviewRequest) => (
+    activeImagePreviewRef.current === request
+      && !request.controller.signal.aborted
+      && imagePreviewScopeKeyRef.current === request.scopeKey
+      && imagePreviewServiceIdentityRef.current === request.serviceIdentity
+      && itemIsReadable(request.itemKey)
+  ), [itemIsReadable]);
+
+  const previewRequestIsCurrent = useCallback((request: ImagePreviewRequest) => {
+    if (activeImagePreviewRef.current !== request
+      || request.controller.signal.aborted
+      || imagePreviewScopeKeyRef.current !== request.scopeKey
+      || imagePreviewServiceIdentityRef.current !== request.serviceIdentity
+      || !itemIsReadable(request.itemKey)) return false;
+    try {
+      return request.run?.isCurrent() ?? false;
+    } catch {
+      return false;
+    }
+  }, [itemIsReadable]);
+
+  const beginImagePreview = useCallback((item: CanvasOwnedResultItem) => {
+    if (item.eligibility === "unready" || !itemsRef.current.includes(item)) return;
+
+    clearImagePreview();
+    const request: ImagePreviewRequest = {
+      id: ++imagePreviewSequenceRef.current,
+      itemKey: imagePreviewItemKey(item),
+      controller: new AbortController(),
+      scopeKey: imagePreviewScopeKey,
+      serviceIdentity: imagePreviewServiceIdentity,
+      run: null,
+      objectUrl: null,
+    };
+    activeImagePreviewRef.current = request;
+    setImagePreview({ kind: "loading", itemKey: request.itemKey, requestId: request.id });
+
+    const readImage = async () => {
+      let run: CanvasOwnedImageRun | null;
+      try {
+        run = onBeginImagePreview(item);
+      } catch (cause) {
+        if (!previewRequestBelongsToDialog(request)) return;
+        request.controller.abort();
+        setImagePreview({
+          kind: "error",
+          itemKey: request.itemKey,
+          requestId: request.id,
+          message: imagePreviewFailureMessage(cause),
+        });
+        return;
+      }
+
+      request.run = run;
+      if (run === null) {
+        if (!previewRequestBelongsToDialog(request)) return;
+        request.controller.abort();
+        setImagePreview({
+          kind: "error",
+          itemKey: request.itemKey,
+          requestId: request.id,
+          message: imagePreviewFailureMessage(new CanvasOwnedImageError("not-sent", "图片读取上下文已变化。", null)),
+        });
+        return;
+      }
+      if (!previewRequestIsCurrent(request)) {
+        if (activeImagePreviewRef.current === request) clearImagePreview();
+        return;
+      }
+
+      try {
+        const blob = await run.read({ taskId: item.task_id, resultRef: item.result_ref }, request.controller.signal);
+        if (!previewRequestIsCurrent(request)) {
+          if (activeImagePreviewRef.current === request) clearImagePreview();
+          return;
+        }
+
+        const objectUrl = URL.createObjectURL(blob);
+        request.objectUrl = objectUrl;
+        if (!previewRequestIsCurrent(request)) {
+          revokeImagePreviewUrl(request);
+          if (activeImagePreviewRef.current === request) clearImagePreview();
+          return;
+        }
+        setImagePreview({
+          kind: "ready",
+          itemKey: request.itemKey,
+          requestId: request.id,
+          objectUrl,
+        });
+      } catch (cause) {
+        if (activeImagePreviewRef.current !== request || request.controller.signal.aborted) return;
+        if (!previewRequestIsCurrent(request)) {
+          clearImagePreview();
+          return;
+        }
+        request.controller.abort();
+        setImagePreview({
+          kind: "error",
+          itemKey: request.itemKey,
+          requestId: request.id,
+          message: imagePreviewFailureMessage(cause),
+        });
+      }
+    };
+
+    void readImage();
+  }, [clearImagePreview, imagePreviewScopeKey, imagePreviewServiceIdentity, onBeginImagePreview, previewRequestBelongsToDialog, previewRequestIsCurrent]);
+
+  const failImagePreview = useCallback((requestId: number, message: string) => {
+    const request = activeImagePreviewRef.current;
+    if (request === null || request.id !== requestId) return;
+    revokeImagePreviewUrl(request);
+    request.controller.abort();
+    activeImagePreviewRef.current = null;
+    setImagePreview({ kind: "error", itemKey: request.itemKey, requestId, message });
+  }, []);
+
+  useEffect(() => {
+    clearImagePreview();
+    return () => clearImagePreview(false);
+  }, [clearImagePreview, imagePreviewScopeKey, imagePreviewServiceIdentity]);
+
+  useEffect(() => {
+    const request = activeImagePreviewRef.current;
+    if (request !== null && !itemIsReadable(request.itemKey)) clearImagePreview();
+  }, [clearImagePreview, items, itemIsReadable]);
+
+  const activeImagePreview = activeImagePreviewRef.current;
+  const currentImagePreview = imagePreview?.kind === "ready"
+    && activeImagePreview !== null
+    && activeImagePreview.id === imagePreview.requestId
+    && previewRequestIsCurrent(activeImagePreview)
+    ? imagePreview
+    : null;
 
   return (
     <div className="canvas-generation-backdrop" role="presentation">
@@ -218,6 +433,18 @@ export function CanvasGenerationResultsDialog({
                   </div>
                 )}
                 <div className="canvas-generation-actions">
+                  <button
+                    disabled={!imagePreviewAvailable || item.eligibility === "unready"
+                      || (imagePreview?.kind === "loading" && imagePreview.itemKey === imagePreviewItemKey(item))}
+                    onClick={() => beginImagePreview(item)}
+                    type="button"
+                  >
+                    {imagePreview?.kind === "loading" && imagePreview.itemKey === imagePreviewItemKey(item)
+                      ? "正在读取图片…"
+                      : imagePreview?.kind === "error" && imagePreview.itemKey === imagePreviewItemKey(item)
+                        ? "重试查看图片"
+                        : "查看图片"}
+                  </button>
                   {item.eligibility === "ready" && item.expected_target !== null && item.application_key !== null && (
                     <button disabled={applyDisabled} onClick={() => onApply(item)} type="button">
                       应用到当前目标
@@ -229,6 +456,38 @@ export function CanvasGenerationResultsDialog({
                     </button>
                   )}
                 </div>
+                {item.eligibility === "unready" && (
+                  <p className="canvas-generation-image-preview-hint">记录尚未就绪，暂时不能读取图片。</p>
+                )}
+                {!imagePreviewAvailable && item.eligibility !== "unready" && (
+                  <p className="canvas-generation-image-preview-hint">当前暂不支持图片预览。</p>
+                )}
+                {imagePreview?.itemKey === imagePreviewItemKey(item) && imagePreview.kind === "loading" && (
+                  <p className="canvas-generation-image-preview-hint" role="status">正在读取历史图片…</p>
+                )}
+                {imagePreview?.itemKey === imagePreviewItemKey(item) && imagePreview.kind === "error" && (
+                  <p className="canvas-generation-error" role="alert">{imagePreview.message}</p>
+                )}
+                {currentImagePreview?.itemKey === imagePreviewItemKey(item) && (
+                  <figure aria-label="历史图片预览" className="canvas-generation-image-preview">
+                    <img
+                      alt="生成结果图片预览"
+                      onError={() => failImagePreview(currentImagePreview.requestId, "图片无法解码或显示，请点击“重试查看图片”。")}
+                      onLoad={(event) => {
+                        const request = activeImagePreviewRef.current;
+                        if (request === null || request.id !== currentImagePreview.requestId) return;
+                        if (event.currentTarget.naturalWidth <= 0 || event.currentTarget.naturalHeight <= 0) {
+                          failImagePreview(currentImagePreview.requestId, "图片没有可显示的像素，请点击“重试查看图片”。");
+                        } else if (!previewRequestIsCurrent(request)) {
+                          failImagePreview(currentImagePreview.requestId, "画布状态已变化，图片已关闭。请重新打开记录后重试。");
+                        }
+                      }}
+                      src={currentImagePreview.objectUrl}
+                    />
+                    <figcaption>历史图片预览，不会应用到当前目标。</figcaption>
+                    <button onClick={() => clearImagePreview()} type="button">关闭图片预览</button>
+                  </figure>
+                )}
               </article>
             );
           })}
