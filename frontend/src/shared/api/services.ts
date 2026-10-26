@@ -74,6 +74,7 @@ import {
   parseChapterResponse,
   parseCharacterList,
   parseErrorDetail,
+  parseFusedAssetList,
   parseLoginResponse,
   parsePropList,
   parseSeries,
@@ -89,6 +90,7 @@ import {
   type CreateChapterInput,
   type ReorderChaptersInput,
   type Credentials,
+  type FusedAsset,
   type Prop,
   type Scene,
   type Series,
@@ -275,6 +277,7 @@ export interface WorkspaceServices {
   listCharacters(seriesId: string, signal: AbortSignal): Promise<Character[]>;
   listScenes(seriesId: string, signal: AbortSignal): Promise<Scene[]>;
   listProps(seriesId: string, signal: AbortSignal): Promise<Prop[]>;
+  listFusedAssets?(seriesId: string, signal: AbortSignal): Promise<FusedAsset[]>;
   createCharacter?(seriesId: string, input: CharacterCreateInput, signal: AbortSignal): Promise<Character>;
   updateCharacter?(seriesId: string, assetId: string, update: CharacterUpdateInput, signal: AbortSignal): Promise<Character>;
   deleteCharacter?(assetId: string, signal: AbortSignal): Promise<void>;
@@ -1459,6 +1462,16 @@ export function createDemoServices(storage: StorageLike = browserStorage()): Wor
         aliases: prop.aliases === null ? null : [...prop.aliases],
       }));
     },
+    async listFusedAssets(seriesId, signal) {
+      if (signal.aborted) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      ensureDemoSession(storage);
+      if (findDemoAssetData(seriesId) === null) {
+        throw demoNotFound();
+      }
+      return [];
+    },
     async createCharacter(seriesId, input, signal) {
       if (signal.aborted) {
         throw new ApiError("aborted", "Request was cancelled.");
@@ -2071,6 +2084,7 @@ type ApiEndpoint =
   | "characters"
   | "scenes"
   | "props"
+  | "fusedAssets"
   | "createCharacter"
   | "updateCharacter"
   | "deleteCharacter"
@@ -2375,6 +2389,9 @@ function apiRequestDefinition(
       path: "/series/" + seriesId + "/storyboard-assets?" + query.toString(),
       method: "GET",
     };
+  }
+  if (endpoint === "fusedAssets") {
+    return { path: "/series/" + seriesId + "/fused-assets", method: "GET" };
   }
   return { path: "/series/" + seriesId + "/" + endpoint, method: "GET" };
 }
@@ -3305,6 +3322,13 @@ export function createApiServices(
       }
       return parsePropList(
         await request("props", token, signal, undefined, { seriesId }),
+        seriesId,
+      );
+    },
+    async listFusedAssets(seriesId, signal) {
+      const token = requireApiToken(storage);
+      return parseFusedAssetList(
+        await requestForCurrentApiSession("fusedAssets", token, signal, undefined, { seriesId }),
         seriesId,
       );
     },

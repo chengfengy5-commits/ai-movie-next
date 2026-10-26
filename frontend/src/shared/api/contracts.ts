@@ -135,6 +135,20 @@ export interface Prop extends AssetNamingFields, SeriesAssetFields {
   name: string;
 }
 
+export interface FusedAsset {
+  id: string;
+  series_id: string;
+  member_type: string;
+  members: unknown[] | null;
+  name: string;
+  image_url: string | null;
+  size: string | null;
+  status: string;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
 export type AssetLibraryType = "characters" | "scenes" | "props";
 
 export class InvalidResponseError extends Error {
@@ -617,6 +631,37 @@ export function parseSceneList(value: unknown, expectedSeriesId: string): Scene[
 
 export function parsePropList(value: unknown, expectedSeriesId: string): Prop[] {
   return parseAssetList(value, expectedSeriesId, "道具", parseProp);
+}
+
+export function parseFusedAssetList(value: unknown, expectedSeriesId: string): FusedAsset[] {
+  if (!Array.isArray(value)) {
+    throw new InvalidResponseError("服务器返回的融合素材列表格式无效。");
+  }
+  return value.map((entry) => {
+    if (!isRecord(entry)) {
+      throw new InvalidResponseError("融合素材列表中包含格式无效的项目。");
+    }
+    if (entry.members !== null && !Array.isArray(entry.members)) {
+      throw new InvalidResponseError("融合素材中的 members 字段格式无效。");
+    }
+    const asset: FusedAsset = {
+      id: requiredString(entry, "id", "融合素材"),
+      series_id: requiredString(entry, "series_id", "融合素材"),
+      member_type: schemaString(entry, "member_type", "融合素材"),
+      members: entry.members === null ? null : [...entry.members],
+      name: schemaString(entry, "name", "融合素材"),
+      image_url: requiredNullableString(entry, "image_url", "融合素材"),
+      size: requiredNullableString(entry, "size", "融合素材"),
+      status: schemaString(entry, "status", "融合素材"),
+      error_message: requiredNullableString(entry, "error_message", "融合素材"),
+      created_at: requiredTimestamp(entry, "created_at", "融合素材"),
+      updated_at: requiredTimestamp(entry, "updated_at", "融合素材"),
+    };
+    if (asset.series_id !== expectedSeriesId) {
+      throw new InvalidResponseError("服务器返回了不属于当前剧集的融合素材。");
+    }
+    return asset;
+  });
 }
 
 export function parseLoginResponse(value: unknown): { token: string; user: User } {
