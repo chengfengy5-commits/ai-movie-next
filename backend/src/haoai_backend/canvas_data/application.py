@@ -10,7 +10,6 @@ from .domain import (
     CanvasSaveGuard,
     empty_canvas_document,
     exceeds_document_limit,
-    next_document_version,
     serialize_document,
 )
 from .errors import (
@@ -131,7 +130,6 @@ def save_chapter_canvas(
             stored_document = current.document_json
             uow.update_canvas_document(
                 document_id,
-                version=next_document_version(current.version),
                 user_id=actor.user_id,
                 document_json=serialized,
                 update_document_json=stored_document != serialized,

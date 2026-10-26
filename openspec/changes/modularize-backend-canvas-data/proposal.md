@@ -28,5 +28,5 @@
 ## Non-Goals
 
 - 不新增画布前端、TypeScript 消费者、渲染器、图结构校验或额外路由。
-- 不改变认证、会员、series access、剧集/章节权限、锁策略或画布并发语义。
+- 不增加画布内容并发保护：legacy 仍按已读快照校验并按 id 盲写，允许晚到内容覆盖。为防止与 guarded-v1 复用 revision，legacy 更新版本改为按数据库当前列应用旧递增公式；这是有意限定在 revision 的并发语义修订。
 - 不迁移旧全站 ORM/schema，不声称完成真实 PostgreSQL 并发、生产部署或外部 Grillme 审查。

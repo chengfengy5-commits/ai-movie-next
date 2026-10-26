@@ -81,10 +81,6 @@ def exceeds_document_limit(serialized: str) -> bool:
     return len(serialized) > 1_000_000
 
 
-def next_document_version(current_version: int | None) -> int:
-    return (current_version or 1) + 1
-
-
 def canvas_save_receipt(record: CanvasDocumentRecord) -> dict[str, Any]:
     """Project the identity and revision produced by one guarded write."""
     return {

@@ -8,6 +8,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from haoai_backend.canvas_data.application import get_chapter_canvas, save_chapter_canvas
+from haoai_backend.canvas_data.domain import CanvasSaveGuard
+from haoai_backend.canvas_data.errors import CanvasDataConflict
 from haoai_backend.canvas_data.persistence import SqlAlchemyCanvasDataUnitOfWork
 from haoai_backend.canvas_data.tables import canvas_documents
 from haoai_backend.shared.identity import TrustedActor
@@ -76,7 +78,6 @@ def test_real_update_zero_rows_is_not_reported_as_success(canvas_db: CanvasDatab
         with pytest.raises(RuntimeError, match="exactly one row"):
             uow.update_canvas_document(
                 "doc-a",
-                version=2,
                 user_id="user-a",
                 document_json='{"lost":true}',
                 update_document_json=True,
@@ -234,6 +235,28 @@ def test_existing_same_content_put_still_updates_version_and_timestamp(canvas_db
         assert stored["document_json"] == '{"same": true}'
 
 
+@pytest.mark.parametrize(("stored_version", "expected_version"), [(0, 2), (-4, -3)])
+def test_atomic_legacy_increment_preserves_zero_fallback_and_negative_values(
+    canvas_db: CanvasDatabase,
+    stored_version: int,
+    expected_version: int,
+) -> None:
+    seed_document(canvas_db, version=stored_version)
+
+    result = save_chapter_canvas(
+        lambda: SqlAlchemyCanvasDataUnitOfWork(canvas_db.session_factory()),
+        TrustedActor("user-a"),
+        "chapter-a",
+        {"value": "updated"},
+        version=stored_version,
+    )
+
+    assert result["version"] == expected_version
+    with canvas_db.session_factory() as session:
+        stored = session.execute(select(canvas_documents)).mappings().one()
+        assert stored["version"] == expected_version
+
+
 
 def test_same_raw_document_snapshot_preserves_concurrent_document_and_actor(canvas_db: CanvasDatabase) -> None:
     seed_document(canvas_db, version=1, document_json='{"winner": "A"}')
@@ -245,22 +268,20 @@ def test_same_raw_document_snapshot_preserves_concurrent_document_and_actor(canv
     session_a = Session(bind=connection_a, expire_on_commit=False)
     session_b = Session(bind=connection_b, expire_on_commit=False)
     preserved_before = canvas_db.snapshot_preserved_rows()
-    concurrent_update = {"completed": False}
+    concurrent_update = {"completed": False, "guarded_result": None}
 
     class SnapshotThenConcurrentUpdate(SqlAlchemyCanvasDataUnitOfWork):
         def load_canvas_document(self, chapter_id: str):
             record = super().load_canvas_document(chapter_id)
             if record is not None and not concurrent_update["completed"]:
                 concurrent_update["completed"] = True
-                SqlAlchemyCanvasDataUnitOfWork(session_b).update_canvas_document(
-                    record.id,
-                    version=2,
-                    user_id="user-b",
-                    document_json='{"winner":"B"}',
-                    update_document_json=True,
-                    update_updated_by=True,
+                concurrent_update["guarded_result"] = save_chapter_canvas(
+                    lambda: SqlAlchemyCanvasDataUnitOfWork(session_b),
+                    TrustedActor("user-b"),
+                    "chapter-a",
+                    {"winner": "B"},
+                    save_guard=CanvasSaveGuard("guarded-v1", "doc-a", 1),
                 )
-                session_b.commit()
             return record
 
     captured_updates: list[str] = []
@@ -279,7 +300,12 @@ def test_same_raw_document_snapshot_preserves_concurrent_document_and_actor(canv
             version=1,
         )
         assert concurrent_update["completed"] is True
-        assert result["version"] == 2
+        assert concurrent_update["guarded_result"]["save_receipt"] == {
+            "mode": "guarded-v1",
+            "id": "doc-a",
+            "version": 2,
+        }
+        assert result["version"] == 3
         assert result["updated_by"] == "user-b"
         assert result["document_json"] == {"winner": "A"}
         assert captured_updates
@@ -294,7 +320,7 @@ def test_same_raw_document_snapshot_preserves_concurrent_document_and_actor(canv
             TrustedActor("user-a"),
             "chapter-a",
         )
-        assert stored["version"] == 2
+        assert stored["version"] == 3
         assert stored["updated_by"] == "user-b"
         assert stored["document_json"] == {"winner": "B"}
     finally:
@@ -305,7 +331,55 @@ def test_same_raw_document_snapshot_preserves_concurrent_document_and_actor(canv
         connection_b.close()
 
 
-def test_two_connections_preserve_snapshot_based_overwrite_without_database_cas(canvas_db: CanvasDatabase) -> None:
+def test_two_legacy_snapshots_both_succeed_and_advance_database_revision(canvas_db: CanvasDatabase) -> None:
+    seed_document(canvas_db, version=1, document_json='{"winner":"initial"}')
+    connection_a = canvas_db.engine.connect()
+    connection_b = canvas_db.engine.connect()
+    assert connection_a.connection.driver_connection is not connection_b.connection.driver_connection
+    session_a = Session(bind=connection_a, expire_on_commit=False)
+    session_b = Session(bind=connection_b, expire_on_commit=False)
+    second_result = {}
+
+    class SnapshotThenSecondLegacySave(SqlAlchemyCanvasDataUnitOfWork):
+        def load_canvas_document(self, chapter_id: str):
+            record = super().load_canvas_document(chapter_id)
+            if record is not None and not second_result:
+                second_result["payload"] = save_chapter_canvas(
+                    lambda: SqlAlchemyCanvasDataUnitOfWork(session_b),
+                    TrustedActor("user-b"),
+                    "chapter-a",
+                    {"winner": "B"},
+                    version=1,
+                )
+            return record
+
+    try:
+        first_result = save_chapter_canvas(
+            lambda: SnapshotThenSecondLegacySave(session_a),
+            TrustedActor("user-a"),
+            "chapter-a",
+            {"winner": "A"},
+            version=1,
+        )
+
+        assert second_result["payload"]["version"] == 2
+        assert first_result["version"] == 3
+        stored = get_chapter_canvas(
+            lambda: SqlAlchemyCanvasDataUnitOfWork(canvas_db.session_factory()),
+            TrustedActor("user-a"),
+            "chapter-a",
+        )
+        assert stored["version"] == 3
+        assert stored["document_json"] == {"winner": "A"}
+        assert stored["updated_by"] == "user-b"
+    finally:
+        session_a.close()
+        session_b.close()
+        connection_a.close()
+        connection_b.close()
+
+
+def test_late_legacy_overwrite_advances_revision_and_stale_guard_rejects(canvas_db: CanvasDatabase) -> None:
     seed_document(canvas_db, version=1, document_json='{"winner":"initial"}')
     connection_a = canvas_db.engine.connect()
     connection_b = canvas_db.engine.connect()
@@ -315,23 +389,20 @@ def test_two_connections_preserve_snapshot_based_overwrite_without_database_cas(
     session_a = Session(bind=connection_a, expire_on_commit=False)
     session_b = Session(bind=connection_b, expire_on_commit=False)
     preserved_before = canvas_db.snapshot_preserved_rows()
-    concurrent_update = {"completed": False}
+    concurrent_update = {"completed": False, "guarded_result": None}
 
     class SnapshotThenConcurrentUpdate(SqlAlchemyCanvasDataUnitOfWork):
         def load_canvas_document(self, chapter_id: str):
             record = super().load_canvas_document(chapter_id)
             if record is not None and not concurrent_update["completed"]:
                 concurrent_update["completed"] = True
-                second_uow = SqlAlchemyCanvasDataUnitOfWork(session_b)
-                second_uow.update_canvas_document(
-                    record.id,
-                    version=2,
-                    user_id="user-b",
-                    document_json='{"winner":"B"}',
-                    update_document_json=True,
-                    update_updated_by=True,
+                concurrent_update["guarded_result"] = save_chapter_canvas(
+                    lambda: SqlAlchemyCanvasDataUnitOfWork(session_b),
+                    TrustedActor("user-b"),
+                    "chapter-a",
+                    {"winner": "B"},
+                    save_guard=CanvasSaveGuard("guarded-v1", "doc-a", 1),
                 )
-                session_b.commit()
             return record
 
     captured_updates: list[str] = []
@@ -350,7 +421,12 @@ def test_two_connections_preserve_snapshot_based_overwrite_without_database_cas(
             version=1,
         )
         assert concurrent_update["completed"] is True
-        assert result["version"] == 2
+        assert concurrent_update["guarded_result"]["save_receipt"] == {
+            "mode": "guarded-v1",
+            "id": "doc-a",
+            "version": 2,
+        }
+        assert result["version"] == 3
         assert result["updated_by"] == "user-b"
         assert result["document_json"] == {"winner": "A"}
         assert captured_updates
@@ -360,12 +436,21 @@ def test_two_connections_preserve_snapshot_based_overwrite_without_database_cas(
         assert "version = ?" not in captured_updates[-1].split(" WHERE ", 1)[1]
         assert canvas_db.snapshot_preserved_rows() == preserved_before
 
+        with pytest.raises(CanvasDataConflict):
+            save_chapter_canvas(
+                lambda: SqlAlchemyCanvasDataUnitOfWork(canvas_db.session_factory()),
+                TrustedActor("user-a"),
+                "chapter-a",
+                {"winner": "stale guarded write"},
+                save_guard=CanvasSaveGuard("guarded-v1", "doc-a", 2),
+            )
+
         stored = get_chapter_canvas(
             lambda: SqlAlchemyCanvasDataUnitOfWork(canvas_db.session_factory()),
             TrustedActor("user-a"),
             "chapter-a",
         )
-        assert stored["version"] == 2
+        assert stored["version"] == 3
         assert stored["updated_by"] == "user-b"
         assert stored["document_json"] == {"winner": "A"}
     finally:

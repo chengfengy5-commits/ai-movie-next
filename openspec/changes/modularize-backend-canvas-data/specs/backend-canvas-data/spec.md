@@ -84,9 +84,9 @@ PUT MUST 在大小及版本检查之前，在同一业务 Session 中尝试续�
 
 ### Requirement: 创建与更新保留版本行为
 
-首次保存 MUST 忽略请求携带的 version，创建 version 1。已有画布时，只有请求 version 非 null 才与已读快照版本比较；不匹配返回原有 409。匹配或未提供时，更新版本为 (current_version or 1) + 1。成功写入一次业务 commit。相同内容的成功 PUT 仍递增版本。
+首次保存 MUST 忽略请求携带的 version，创建 version 1。已有画布时，只有请求 version 非 null 才与已读快照版本比较；不匹配返回原有 409。通过比较后，legacy UPDATE MUST 在数据库中基于当前 version 列原子应用旧公式：当前列为 0 或 NULL 时写 2，否则写当前列加 1；不得把已读快照算出的 literal version 作为 UPDATE 值。成功写入一次业务 commit。相同内容的成功 PUT 仍递增版本。该修订使晚到 legacy 写入在 guarded-v1 已提交 v2 后写 v3，从而不复用 guarded 已消费的 revision。
 
-实现 MUST 保留基于已读快照的比较与按记录主键更新，不增加数据库 WHERE version 条件或其他数据库 CAS，以免悄悄改变现有并发覆盖行为。
+实现 MUST 保留基于已读快照的请求版本比较与按记录主键盲写；晚到 legacy 仍可覆盖较新的内容。实现 MUST NOT 增加数据库 WHERE version 条件、SELECT FOR UPDATE、显式互斥、自动重试或其他并发覆盖保护。revision 原子递增只防止成功写入复用已消费版本，不构成内容 CAS。
 
 #### Scenario: 创建携带任意版本
 
