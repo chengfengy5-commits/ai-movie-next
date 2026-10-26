@@ -38,6 +38,9 @@ from haoai_backend.generation_credentials.application import (
 )
 from haoai_backend.generation_credentials.snapshot_producer import SnapshotVersions
 from haoai_backend.generation_runtime.assembly import GenerationWorkerConfiguration
+from haoai_backend.generation_runtime.image_batch_assembly import (
+    ImageBatchWorkerConfiguration,
+)
 from haoai_backend.media_storage.aiohttp_library import AiohttpMatureHttpLibrary
 from haoai_backend.media_storage.owned_media_runtime import (
     OwnedMediaDependencies,
@@ -68,25 +71,57 @@ from .http import AiohttpAsyncHttpClientFactory
 
 
 class ImageGenerationHostConfigurationError(RuntimeError):
-    """An enabled image.single host cannot be assembled without secrets."""
+    """An enabled image host cannot be assembled without its dependencies."""
 
 
 @dataclass(frozen=True, slots=True)
 class ImageGenerationHostConfiguration:
-    """The admission, worker and lazily owned media runtime for image.single."""
+    """Shared admission and media dependencies for opt-in image workers."""
 
     admission_configuration: ChatMediaAdmissionConfiguration | None
     generation_worker_configuration: GenerationWorkerConfiguration | None
     media_runtime: OwnedMediaRuntime | None = field(default=None, repr=False)
+    image_batch_worker_configuration: ImageBatchWorkerConfiguration | None = None
 
     def __post_init__(self) -> None:
-        configured = (
-            self.admission_configuration is not None,
-            self.generation_worker_configuration is not None,
-            self.media_runtime is not None,
+        if self.admission_configuration is None:
+            if any(
+                value is not None
+                for value in (
+                    self.generation_worker_configuration,
+                    self.image_batch_worker_configuration,
+                    self.media_runtime,
+                )
+            ):
+                raise ValueError("disabled image host cannot own worker resources")
+            return
+        if (
+            self.media_runtime is None
+            or (
+                self.generation_worker_configuration is None
+                and self.image_batch_worker_configuration is None
+            )
+        ):
+            raise ValueError(
+                "enabled image host dependencies must be assembled together"
+            )
+        worker_configurations = tuple(
+            worker
+            for worker in (
+                self.generation_worker_configuration,
+                self.image_batch_worker_configuration,
+            )
+            if worker is not None
         )
-        if any(configured) and not all(configured):
-            raise ValueError("image.single host dependencies must be assembled together")
+        if any(
+            worker.runtime is not worker_configurations[0].runtime
+            or worker.registry_capabilities
+            is not worker_configurations[0].registry_capabilities
+            for worker in worker_configurations[1:]
+        ):
+            raise ValueError(
+                "image workers must share one runtime and credential registry"
+            )
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -112,10 +147,16 @@ def build_image_generation_host_configuration(
         raise ImageGenerationHostConfigurationError(
             "an explicit server configuration is required"
         )
-    if not configuration.image_single_enabled:
+    image_single_enabled = configuration.image_single_enabled
+    image_batch_enabled = configuration.image_batch_enabled
+    if not image_single_enabled and not image_batch_enabled:
         return ImageGenerationHostConfiguration(None, None, None)
 
-    credentials_path = configuration.image_single_credentials_file
+    credentials_path = (
+        configuration.image_batch_credentials_file
+        if image_batch_enabled and not image_single_enabled
+        else configuration.image_single_credentials_file
+    )
     r2_configuration = configuration.r2_configuration
     if (
         credentials_path is None
@@ -128,7 +169,16 @@ def build_image_generation_host_configuration(
         or not callable(session_factory)
     ):
         raise ImageGenerationHostConfigurationError(
-            "image.single credentials and object storage are required"
+            "enabled image workers require credentials and object storage"
+        )
+    if (
+        image_single_enabled
+        and image_batch_enabled
+        and configuration.image_single_credentials_file
+        != configuration.image_batch_credentials_file
+    ):
+        raise ImageGenerationHostConfigurationError(
+            "image workers must use the same credentials file"
         )
 
     db_clock = _database_clock(session_factory)
@@ -150,7 +200,7 @@ def build_image_generation_host_configuration(
     def media_store_factory() -> SynchronousMediaStore:
         if media_runtime is None:
             raise ImageGenerationHostConfigurationError(
-                "image.single media runtime is unavailable"
+                "image media runtime is unavailable"
             )
         return SynchronousMediaStore(
             media_runtime,
@@ -163,7 +213,7 @@ def build_image_generation_host_configuration(
     def public_media_fetcher_factory() -> PublicMediaFetcher:
         if media_runtime is None:
             raise ImageGenerationHostConfigurationError(
-                "image.single media runtime is unavailable"
+                "image media runtime is unavailable"
             )
         return _OwnedRuntimePublicMediaFetcher(
             media_runtime,
@@ -208,7 +258,16 @@ def build_image_generation_host_configuration(
             thread_factory=threading.Thread,
             executor_factory=concurrent.futures.ThreadPoolExecutor,
         )
-        worker = GenerationWorkerConfiguration(runtime, capabilities)
+        single_worker = (
+            GenerationWorkerConfiguration(runtime, capabilities)
+            if image_single_enabled
+            else None
+        )
+        batch_worker = (
+            ImageBatchWorkerConfiguration(runtime, capabilities)
+            if image_batch_enabled
+            else None
+        )
         admission = ChatMediaAdmissionConfiguration(
             registry_capabilities=capabilities,
             server_id_factory=id_factory,
@@ -227,7 +286,14 @@ def build_image_generation_host_configuration(
                 projector="server-image-single-projector-v1",
                 reference_policy="server-image-single-reference-policy-v1",
             ),
-            enabled_operations=frozenset({"image.single"}),
+            enabled_operations=frozenset(
+                operation
+                for operation, enabled in (
+                    ("image.single", image_single_enabled),
+                    ("image.batch", image_batch_enabled),
+                )
+                if enabled
+            ),
             image_references_enabled=False,
         )
     except BaseException:
@@ -235,7 +301,12 @@ def build_image_generation_host_configuration(
             media_runtime.close()
         raise
 
-    return ImageGenerationHostConfiguration(admission, worker, media_runtime)
+    return ImageGenerationHostConfiguration(
+        admission_configuration=admission,
+        generation_worker_configuration=single_worker,
+        media_runtime=media_runtime,
+        image_batch_worker_configuration=batch_worker,
+    )
 
 
 def _image_media_policy() -> SafeMediaPolicy:

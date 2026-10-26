@@ -411,6 +411,14 @@ def test_server_host_opt_in_wires_image_single_admission_and_worker(
         assert image_host is not None
         assert image_host.media_runtime is not None
         assert image_host.media_runtime.state == "new"
+        from backend.server.image_generation import ImageGenerationHostConfiguration
+
+        legacy_positional_configuration = ImageGenerationHostConfiguration(
+            image_host.admission_configuration,
+            image_host.generation_worker_configuration,
+            image_host.media_runtime,
+        )
+        assert legacy_positional_configuration.image_batch_worker_configuration is None
         assert admission.image_references_enabled is False
         assert worker.runtime.timeout_settings.public_media_fetch_seconds == 600
         assert worker.runtime.concurrency_settings.public_media_fetches == 2
@@ -423,30 +431,34 @@ def test_server_host_disabled_image_single_does_not_load_bundle_or_create_runtim
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from backend.server import application as server_application
-    from backend.server import credentials as server_credentials
+    from backend.server import image_generation as image_generation_module
 
     credentials_path = tmp_path / "missing-image-single-bundle.json"
+    batch_credentials_path = tmp_path / "missing-image-batch-bundle.json"
     configuration = load_server_configuration(
         {
             "ENVIRONMENT": "test",
             "DATABASE_URL": f"sqlite:///{tmp_path / 'image-single-disabled.sqlite'}",
             "SECRET_KEY": "synthetic-server-secret",
             "IMAGE_SINGLE_CREDENTIALS_FILE": str(credentials_path),
+            "IMAGE_BATCH_CREDENTIALS_FILE": str(batch_credentials_path),
         }
     )
     monkeypatch.setattr(
-        server_credentials,
+        image_generation_module,
         "load_registry_capabilities",
         lambda *_args, **_kwargs: pytest.fail(
-            "disabled image.single must not read its credentials file"
+            "disabled image workers must not load a credential registry"
         ),
     )
 
     host = server_application.create_server_host(configuration)
     try:
         assert host.app.state.server_image_generation_configuration is None
+        assert host.app.state.server_image_batch_worker_configuration is None
         assert host.app.state.generation_worker_runtime is None
         assert not credentials_path.exists()
+        assert not batch_credentials_path.exists()
     finally:
         host.close()
 
