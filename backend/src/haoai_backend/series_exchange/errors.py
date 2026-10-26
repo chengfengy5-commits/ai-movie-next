@@ -18,6 +18,11 @@ class SeriesExchangeNotFound(BusinessError):
         super().__init__(404, detail)
 
 
+class SeriesExchangeWriteConflict(BusinessError):
+    def __init__(self, detail: str = "融合资产或章节内容已发生变化") -> None:
+        super().__init__(409, detail)
+
+
 class SeriesExchangeUnavailable(BusinessError):
     def __init__(self, detail: str = "剧集交换服务尚未接线") -> None:
         super().__init__(503, detail)

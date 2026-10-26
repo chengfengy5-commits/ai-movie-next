@@ -10,7 +10,9 @@ from uuid import uuid4
 from sqlalchemy import delete, insert, select, update
 from sqlalchemy.orm import Session
 
+from haoai_backend.asset_data.persistence import SqlAlchemyAssetDataUnitOfWork
 from haoai_backend.series_access.persistence import SqlAlchemySeriesAccessReader
+from haoai_backend.shared.identity import TrustedActor
 from haoai_backend.series_data.tables import (
     chapters,
     characters,
@@ -40,6 +42,11 @@ class SqlAlchemySeriesExchangeUnitOfWork(SeriesExchangeUnitOfWork):
         self._now = now or datetime.utcnow
         self._new_id = new_id or (lambda: str(uuid4()))
         self._access_reader = SqlAlchemySeriesAccessReader(session)
+        self._asset_data = SqlAlchemyAssetDataUnitOfWork(
+            session,
+            now=self._now,
+            new_id=self._new_id,
+        )
 
     def load_series(self, series_id: str):
         return self._access_reader.load_series(series_id)
@@ -84,9 +91,44 @@ class SqlAlchemySeriesExchangeUnitOfWork(SeriesExchangeUnitOfWork):
             .values(**dict(values), updated_at=self.current_time())
         )
 
-    def delete_fused_asset(self, asset_id: str) -> None:
-        self._session.execute(
+    def delete_fused_asset(self, asset_id: str) -> bool:
+        result = self._session.execute(
             delete(fused_assets).where(fused_assets.c.id == asset_id)
+        )
+        return result.rowcount == 1
+
+    def list_chapters(self, series_id: str) -> Sequence[Mapping[str, Any]]:
+        return self._asset_data.list_chapters(series_id)
+
+    def lock_chapters(self, chapter_ids: Sequence[str]) -> Sequence[Mapping[str, Any]]:
+        return self._asset_data.lock_chapters(chapter_ids)
+
+    def update_chapter_content(
+        self,
+        chapter_id: str,
+        expected_content: object,
+        content: str,
+        *,
+        updated_at: datetime,
+    ) -> bool:
+        return self._asset_data.update_chapter_content(
+            chapter_id,
+            expected_content,
+            content,
+            updated_at=updated_at,
+        )
+
+    def reconcile_chapter_media(
+        self,
+        chapter: Mapping[str, Any],
+        actor: TrustedActor,
+        *,
+        content_override: object | None = None,
+    ) -> None:
+        self._asset_data.reconcile_chapter_media(
+            chapter,
+            actor,
+            content_override=content_override,
         )
 
     def load_series_for_export(self, series_id: str) -> Mapping[str, Any] | None:
