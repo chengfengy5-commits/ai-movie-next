@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from sqlalchemy import Column, MetaData, String, Table, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
+from starlette.types import ASGIApp
 
 from haoai_backend.authentication import AuthenticationRuntime
 from haoai_backend.chat_text_generation import ChatTextGenerationConfiguration
@@ -53,6 +54,7 @@ from haoai_backend.storyboard_asset_generation.openai_runtime import (
 )
 from haoai_backend.generation_runtime.worker_capacity import WorkerCapacityBootstrap
 
+from .browser_cors import ServerBrowserCorsApp
 from .configuration import ServerConfiguration, ServerConfigurationError
 from .generation import (
     _database_clock,
@@ -104,6 +106,7 @@ class _ServerAuthenticationRuntime(AuthenticationRuntime):
 @dataclass(frozen=True, slots=True)
 class ServerHost:
     app: Any
+    asgi_app: ASGIApp
     session_factory: Callable[[], Any] = field(repr=False)
     _resources: _OwnedResources = field(repr=False, compare=False)
 
@@ -396,8 +399,14 @@ def create_server_host(
             chat_text_generation_configuration
         )
         _compose_host_lifespan(app, resources)
+        asgi_app = ServerBrowserCorsApp(
+            app,
+            session_factory=session_factory,
+            fallback_origins=configuration.allowed_origins,
+        )
         return ServerHost(
             app=app,
+            asgi_app=asgi_app,
             session_factory=session_factory,
             _resources=resources,
         )

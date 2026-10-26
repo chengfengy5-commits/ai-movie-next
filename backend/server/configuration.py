@@ -40,6 +40,7 @@ class ServerConfiguration:
     text_chat_enabled: bool = False
     video_single_enabled: bool = False
     video_single_credentials_file: Path | None = field(default=None, repr=False)
+    allowed_origins: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.user_task_max_concurrency) is not int:
@@ -52,6 +53,10 @@ class ServerConfiguration:
             raise ServerConfigurationError("TEXT_CHAT_ENABLED must be explicit")
         if type(self.video_single_enabled) is not bool:
             raise ServerConfigurationError("VIDEO_SINGLE_ENABLED must be explicit")
+        if not isinstance(self.allowed_origins, tuple) or any(
+            not isinstance(origin, str) for origin in self.allowed_origins
+        ):
+            raise ServerConfigurationError("ALLOWED_ORIGINS must be comma-separated text")
         if self.image_single_credentials_file is not None and (
             not isinstance(self.image_single_credentials_file, Path)
             or not self.image_single_credentials_file.is_absolute()
@@ -155,6 +160,16 @@ def load_server_configuration(
     environment = _required(values, "ENVIRONMENT")
     if environment not in {"development", "test", "production"}:
         raise ServerConfigurationError("ENVIRONMENT is unsupported")
+    allowed_origins_value = values.get("ALLOWED_ORIGINS", "")
+    if allowed_origins_value is None:
+        allowed_origins_value = ""
+    if not isinstance(allowed_origins_value, str):
+        raise ServerConfigurationError("ALLOWED_ORIGINS must be comma-separated text")
+    allowed_origins = tuple(
+        origin.strip()
+        for origin in allowed_origins_value.split(",")
+        if origin.strip()
+    )
 
     database_url = _required(values, "DATABASE_URL")
     _validate_database_url(database_url, environment)
@@ -270,6 +285,7 @@ def load_server_configuration(
             text_chat_enabled=text_chat_enabled,
             video_single_enabled=video_single_enabled,
             video_single_credentials_file=video_single_credentials_file,
+            allowed_origins=allowed_origins,
         )
 
     missing = tuple(
@@ -327,6 +343,7 @@ def load_server_configuration(
         text_chat_enabled=text_chat_enabled,
         video_single_enabled=video_single_enabled,
         video_single_credentials_file=video_single_credentials_file,
+        allowed_origins=allowed_origins,
     )
 
 

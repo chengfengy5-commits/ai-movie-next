@@ -1129,7 +1129,7 @@ def test_shutdown_retries_only_pending_close_and_never_repeats_put(
     assert engine.pool is not original_pool
 
 
-def test_cli_passes_the_composed_app_and_closes_after_runner_failure(
+def test_cli_passes_the_serving_app_and_closes_after_runner_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1154,7 +1154,7 @@ def test_cli_passes_the_composed_app_and_closes_after_runner_failure(
         server_cli.main(_environment(tmp_path, storage=False), runner=runner)
 
     assert len(created) == 1
-    assert seen["app"] is created[0].app
+    assert seen["app"] is created[0].asgi_app
     assert seen["kwargs"] == {
         "host": "127.0.0.1",
         "port": 8000,
@@ -1460,9 +1460,33 @@ def test_cli_surfaces_lifespan_cleanup_failure_swallowed_by_uvicorn(
 
     def uvicorn_like_runner(app: Any, **_kwargs: Any) -> None:
         async def serve_lifespan() -> None:
+            incoming: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+            outgoing: asyncio.Queue[dict[str, str]] = asyncio.Queue()
+
+            async def receive() -> dict[str, str]:
+                return await incoming.get()
+
+            async def send(message: dict[str, str]) -> None:
+                await outgoing.put(message)
+
+            task = asyncio.create_task(
+                app(
+                    {"type": "lifespan", "asgi": {"version": "3.0"}},
+                    receive,
+                    send,
+                )
+            )
+            await incoming.put({"type": "lifespan.startup"})
+            startup = await asyncio.wait_for(outgoing.get(), timeout=2)
+            assert startup["type"] == "lifespan.startup.complete"
+            await incoming.put({"type": "lifespan.shutdown"})
+            shutdown = await asyncio.wait_for(outgoing.get(), timeout=2)
+            if shutdown["type"] == "lifespan.shutdown.failed":
+                runner_state["swallowed"] = RuntimeError(
+                    shutdown.get("message", "server resource cleanup failed")
+                )
             try:
-                async with app.router.lifespan_context(app):
-                    pass
+                await asyncio.wait_for(task, timeout=2)
             except BaseException as error:
                 # Uvicorn 0.24 logs an ASGI lifespan shutdown failure and returns.
                 runner_state["swallowed"] = error

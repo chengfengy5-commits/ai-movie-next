@@ -37,7 +37,7 @@ def main(
     try:
         run = runner if runner is not None else _load_uvicorn_runner()
         run(
-            host.app,
+            host.asgi_app,
             host="127.0.0.1",
             port=8000,
             workers=1,

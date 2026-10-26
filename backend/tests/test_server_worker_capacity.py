@@ -234,6 +234,7 @@ def test_server_main_passes_the_named_worker_environment_to_host(monkeypatch) ->
 
     class Host:
         app = object()
+        asgi_app = object()
 
         def close(self) -> None:
             return None

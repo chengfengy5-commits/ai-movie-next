@@ -20,6 +20,8 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 
 `backend.server` 是唯一的后端启动组合根。帧优化默认关闭；只有显式设置 `FRAME_OPTIMIZE_ENABLED=true` 且提供绝对路径 `FRAME_OPTIMIZE_CREDENTIALS_FILE` 后，host 才把已验证的 Root 能力接到现有 `create_app`。统一用户任务并发上限读取 `AI_USER_MAX_CONCURRENT`，默认 `0`（关闭），非正数也保持关闭；正数由同一用户任务行策略限制各注册 Worker 任务。旧变量 `FRAME_OPTIMIZE_MAX_USER_CONCURRENCY` 作为兼容别名，在新变量未设置时提供相同的全局上限；两者同时设置为不同值时配置加载失败。配置加载不读 `.env`、shell profile 或云 SDK 环境文件；不设置开关时，原应用继续不启动帧优化 worker。
 
+显式服务 host 的 `ALLOWED_ORIGINS` 是逗号分隔的 CORS 回退来源，并在构造 host 时验证。ASGI lifespan 启动时只读取一次 `system_configs.allowed_origins`；数据库值非空且全部有效时优先使用，并在该进程生命周期内固定。数据库值缺失、为空、读取失败或超时才使用回退；非空但无有效来源或含无效来源时关闭 CORS，不回退到环境值，也不热更新。读取超时不会终止同步 SQL；迟到结果会被忽略，Session 会在查询结束后关闭。CLI 运行 `host.asgi_app` 以应用该策略；`host.app` 仍是 FastAPI 实例，并保留原 `app.state`。
+
 Root 首先在受保护的 owner-only 输入文件中明确提供 `haoai-root-enrollment-input-v1` 数据。顶层字段为 `format`、`proof_key`、`guard_key`、`aead_key` 和 `records`；三类 key 对象均包含稳定 `key_id` 与 Base64 密钥，AEAD 对象还要包含 `algorithm_version: "aes-256-gcm-v1"`。每条 record 需要 `record_id`、稳定 principal UUID、嵌套 `scope`（`source`、`row_id`、`owner_or_system`、`provider`）、`issuer_namespace`、`stable_account_subject`、`key_generation`、`material_ref`、`provider_secret`、`evidence_ref`、`evidence_version`、UTC `valid_from`、可空 `valid_until`/`revoked_at` 和 `endpoint_policy`（origin、API base path、允许的 content path 与 policy version）。可选 `rotation_attestations` 必须已经由同一 Root proof key 签名。proof/guard 密钥至少 32 字节，AES-GCM 密钥恰为 32 字节，三把密钥和 key ID 都必须互不相同。每个 scope 和材料引用须显式提供，预配工具不会扫描数据库或从模型密钥推导 principal。输入文件必须是当前用户拥有的普通文件、无硬链接、无组/其他权限，且不超过 2 MiB。
 
 从仓库根目录执行离线预配时，输入和输出都使用绝对路径。输出只能新建，权限固定为 `0600`；已有目标会拒绝覆盖。provider secret 以 AES-256-GCM 加密保存，material reference 和用途进入 AAD，proof 和 guard 各使用独立密钥。输出不含 provider secret 明文，命令只显示记录数，不回显密钥或文件内容：

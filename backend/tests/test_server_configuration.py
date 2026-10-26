@@ -45,6 +45,7 @@ def test_nonproduction_without_storage_is_explicit_and_repr_is_redacted(
     tmp_path: Path,
 ) -> None:
     environment = _base_environment(tmp_path)
+    environment["ALLOWED_ORIGINS"] = "https://app.example.test, http://localhost:5173"
     environment["AWS_ACCESS_KEY_ID"] = "ambient-access-secret"
     environment["AWS_SECRET_ACCESS_KEY"] = "ambient-secret-value"
 
@@ -61,6 +62,10 @@ def test_nonproduction_without_storage_is_explicit_and_repr_is_redacted(
     assert configuration.image_single_credentials_file is None
     assert configuration.image_batch_enabled is False
     assert configuration.image_batch_credentials_file is None
+    assert configuration.allowed_origins == (
+        "https://app.example.test",
+        "http://localhost:5173",
+    )
 
 
 def test_frame_optimize_is_opt_in_and_requires_an_absolute_bundle_path(
