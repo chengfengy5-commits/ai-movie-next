@@ -10,6 +10,9 @@ import { createCanvasDataHttpPort } from "../shared/api/canvasDataHttp";
 import { createApiServices, createDemoServices, type WorkspaceServices } from "../shared/api/services";
 import { API_TOKEN_KEY, API_USER_KEY, type StorageLike } from "../shared/api/storage";
 
+const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+const originalRevokeObjectUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+
 function memoryStorage(): StorageLike {
   const values = new Map<string, string>();
   return {
@@ -33,6 +36,12 @@ interface GenerationWorkspaceHarnessOptions {
   readonly imageSubmitReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
   readonly imageLookupReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
   readonly deferredImageSubmit?: boolean;
+  readonly ownedImageReplies?: readonly {
+    readonly status: number;
+    readonly contentType?: string;
+    readonly bytes?: readonly number[];
+  }[];
+  readonly deferredOwnedImageRead?: boolean;
   readonly freshSourceVersion?: string;
   readonly failSourceReadAt?: number;
 }
@@ -202,12 +211,22 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     unknown: { preserve: true },
   };
   const originalDocumentJson = JSON.parse(JSON.stringify(documentJson)) as typeof documentJson;
-  const requests: Array<{ url: URL; method: string; body: unknown; headers: Headers }> = [];
+  const requests: Array<{
+    url: URL;
+    method: string;
+    body: unknown;
+    headers: Headers;
+    signal: AbortSignal | null;
+  }> = [];
   const putReplies = [...(options.putReplies ?? [])];
   const lookupReplies = [...(options.lookupReplies ?? [])];
   const imageSubmitReplies = [...(options.imageSubmitReplies ?? [])];
   const imageLookupReplies = [...(options.imageLookupReplies ?? [])];
+  const ownedImageReplies = [...(options.ownedImageReplies ?? [])];
   let sourceReadCount = 0;
+  let freshSourceVersion = options.freshSourceVersion;
+  let ownedResultVisible = true;
+  let activeChapter = currentChapter;
   let lockAcquired = false;
   let lockPostCount = 0;
   let imageSubmissionNumber = 0;
@@ -219,6 +238,11 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   let releaseDeferredPage: ((response: Response) => void) | null = null;
   let markDeferredPageStarted: (() => void) | null = null;
   const deferredPageStarted = new Promise<void>((resolve) => { markDeferredPageStarted = resolve; });
+  let releaseDeferredOwnedImageRead: ((response: Response) => void) | null = null;
+  let markDeferredOwnedImageReadStarted: (() => void) | null = null;
+  const deferredOwnedImageReadStarted = new Promise<void>((resolve) => {
+    markDeferredOwnedImageReadStarted = resolve;
+  });
   let deferredPageUsed = false;
   const validLockExpiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
   const lockState = () => options.lockMode === "foreign"
@@ -233,9 +257,9 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     const method = init?.method ?? "GET";
     const body = init?.body === undefined ? null : JSON.parse(String(init.body)) as unknown;
     const headers = new Headers(init?.headers);
-    requests.push({ url, method, body, headers });
+    requests.push({ url, method, body, headers, signal: init?.signal ?? null });
     if (method === "GET" && url.pathname === `/api/series/${currentSeries.id}/chapters`) {
-      return Response.json([currentChapter]);
+      return Response.json([activeChapter]);
     }
     if (method === "GET" && url.pathname === "/api/models") {
       return Response.json([
@@ -295,21 +319,28 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
         billing_status: "unbilled",
       });
     }
-    if (method === "GET" && url.pathname === `/api/chapters/${currentChapter.id}/canvas-source`) {
+    if (method === "GET" && url.pathname === `/api/chapters/${activeChapter.id}/canvas-source`) {
       sourceReadCount += 1;
       if (sourceReadCount === options.failSourceReadAt) return new Response("source unavailable", { status: 503 });
-      if (sourceReadCount > 1 && options.freshSourceVersion !== undefined) {
-        return Response.json({ ...sourceSnapshot, version: options.freshSourceVersion });
+      const chapterSource = activeChapter.id === currentChapter.id
+        ? sourceSnapshot
+        : {
+          ...sourceSnapshot,
+          chapter_id: activeChapter.id,
+          chapter: { ...currentChapter, id: activeChapter.id },
+        };
+      if (sourceReadCount > 1 && freshSourceVersion !== undefined) {
+        return Response.json({ ...chapterSource, version: freshSourceVersion });
       }
-      return Response.json(sourceSnapshot);
+      return Response.json(chapterSource);
     }
-    if (method === "GET" && url.pathname === `/api/chapters/${currentChapter.id}/canvas`) {
+    if (method === "GET" && url.pathname === `/api/chapters/${activeChapter.id}/canvas`) {
       return Response.json({
-        id: "generation-canvas", chapter_id: currentChapter.id, version: 1, document_json: documentJson,
+        id: "generation-canvas", chapter_id: activeChapter.id, version: 1, document_json: documentJson,
         updated_by: "demo-user", updated_at: timestamp, save_capability: "guarded-v1",
       });
     }
-    if (method === "GET" && url.pathname === `/api/chapters/${currentChapter.id}/canvas-owned-results`) {
+    if (method === "GET" && url.pathname === `/api/chapters/${activeChapter.id}/canvas-owned-results`) {
       if (url.searchParams.has("cursor") && options.deferredNextPage && !deferredPageUsed) {
         deferredPageUsed = true;
         return new Promise<Response>((resolve) => {
@@ -339,7 +370,24 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       const item = url.searchParams.has("cursor")
         ? { ...pageItem, result_ref: "generation-page-two" }
         : pageItem;
-      return Response.json({ chapter_id: currentChapter.id, target: pageTarget, items: [item], next_cursor: nextCursor });
+      return Response.json({
+        chapter_id: activeChapter.id,
+        target: { ...pageTarget, chapter_id: activeChapter.id },
+        items: ownedResultVisible ? [item] : [],
+        next_cursor: nextCursor,
+      });
+    }
+    if (method === "GET" && /^\/api\/chapters\/[^/]+\/canvas-owned-results\/[^/]+\/image$/.test(url.pathname)) {
+      if (options.deferredOwnedImageRead) {
+        markDeferredOwnedImageReadStarted?.();
+        return new Promise<Response>((resolve) => { releaseDeferredOwnedImageRead = resolve; });
+      }
+      const reply = ownedImageReplies.shift() ?? { status: 200, contentType: "image/png", bytes: [137, 80, 78, 71] };
+      if (reply.status !== 200) return new Response("owned image is unavailable", { status: reply.status });
+      return new Response(new Uint8Array(reply.bytes ?? [137, 80, 78, 71]), {
+        status: 200,
+        headers: { "Content-Type": reply.contentType ?? "image/png" },
+      });
     }
     if (method === "GET" && url.pathname.endsWith(`/canvas-owned-results/${ownedResult.result_ref}/application`)) {
       const reply = lookupReplies.shift() ?? { status: "not_applied" as const };
@@ -352,7 +400,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
           : null,
       });
     }
-    if (url.pathname === `/api/chapters/${currentChapter.id}/lock`) {
+    if (url.pathname === `/api/chapters/${activeChapter.id}/lock`) {
       if (method === "GET") return Response.json(lockState());
       if (method === "POST") {
         lockPostCount += 1;
@@ -360,7 +408,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
         return Response.json(lockState());
       }
     }
-    if (method === "PUT" && url.pathname === `/api/chapters/${currentChapter.id}`) {
+    if (method === "PUT" && url.pathname === `/api/chapters/${activeChapter.id}`) {
       const reply = putReplies.shift() ?? { status: 200, resultStatus: "applied" as const };
       if (reply.status !== 200) return new Response("write outcome is not confirmed", { status: reply.status });
       const generationApplication = (body as { generation_application: { task_id: string; result_ref: string } }).generation_application;
@@ -382,9 +430,9 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   const onUnauthorized = vi.fn();
   const canvasPort = services.canvasData;
   if (canvasPort === undefined) throw new Error("API services did not expose the canvas port.");
-  const workspace = (sessionGeneration = 2) => (
+  const workspace = (sessionGeneration = 2, actorId = "demo-user", chapter = activeChapter) => (
     <CanvasWorkspace
-      chapter={currentChapter}
+      chapter={chapter}
       onClose={vi.fn()}
       onUnauthorized={onUnauthorized}
       onSourceChanged={onSourceChanged}
@@ -392,7 +440,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       series={currentSeries}
       services={services}
       sessionGeneration={sessionGeneration}
-      userId="demo-user"
+      userId={actorId}
     />
   );
   const view = render(workspace());
@@ -410,7 +458,14 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     onSourceChanged,
     onUnauthorized,
     token: () => storage.getItem(API_TOKEN_KEY),
-    rerender: (sessionGeneration: number) => view.rerender(workspace(sessionGeneration)),
+    setToken(value: string) { storage.setItem(API_TOKEN_KEY, value); },
+    setStoredActor(value: string) { storage.setItem(API_USER_KEY, JSON.stringify({ id: value })); },
+    setFreshSourceVersion(value: string | undefined) { freshSourceVersion = value; },
+    setOwnedResultVisible(value: boolean) { ownedResultVisible = value; },
+    rerender(sessionGeneration: number, actorId = "demo-user", chapter = activeChapter) {
+      activeChapter = chapter;
+      view.rerender(workspace(sessionGeneration, actorId, chapter));
+    },
     deferredImageSubmitStarted,
     deferredImageResponseHandled,
     resolveDeferredImageSubmit(payload: unknown) {
@@ -434,14 +489,38 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     },
     deferredPageStarted,
     resolveDeferredPage(payload: unknown) { releaseDeferredPage?.(Response.json(payload)); },
+    deferredOwnedImageReadStarted,
+    resolveDeferredOwnedImageRead(response: Response = new Response(new Uint8Array([137, 80, 78, 71]), {
+      status: 200,
+      headers: { "Content-Type": "image/png" },
+    })) { releaseDeferredOwnedImageRead?.(response); },
     lockPostCount: () => lockPostCount,
   };
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  if (originalCreateObjectUrl === undefined) Reflect.deleteProperty(URL, "createObjectURL");
+  else Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+  if (originalRevokeObjectUrl === undefined) Reflect.deleteProperty(URL, "revokeObjectURL");
+  else Object.defineProperty(URL, "revokeObjectURL", originalRevokeObjectUrl);
+});
 
 function generationResultsDialog() {
   return within(screen.getByRole("dialog", { name: "生成图片记录" }));
+}
+
+function ownedImageRequests(harness: ReturnType<typeof mountGenerationWorkspace>) {
+  return harness.requests.filter((request) => request.method === "GET"
+    && /^\/api\/chapters\/[^/]+\/canvas-owned-results\/[^/]+\/image$/u.test(request.url.pathname));
+}
+
+async function openGenerationResultsFor(nodeName = "分镜 1") {
+  fireEvent.click(await screen.findByRole("article", { name: nodeName }));
+  fireEvent.click(await screen.findByRole("button", { name: "生成图片记录" }));
+  const dialog = generationResultsDialog();
+  await dialog.findByRole("article");
+  return dialog;
 }
 
 async function waitForImageModelOption(dialog: HTMLElement) {
@@ -1025,6 +1104,135 @@ describe("selected chapter to canvas integration", () => {
     expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(1);
     expect(harness.requests.filter((request) => request.url.pathname.endsWith("/canvas-owned-results/generation-result/application"))).toHaveLength(1);
     expect(harness.requests.filter((request) => request.url.pathname.endsWith("/lock"))).toHaveLength(0);
+  });
+
+  it("reads the selected historical image only on demand without a lock or canvas write", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      eligibility: "stale",
+      requiresLock: true,
+      lockMode: "unlocked",
+      ownedImageReplies: [{ status: 200, contentType: "image/webp", bytes: [1, 2, 3, 4] }],
+    });
+    const createObjectURL = vi.fn((_blob: Blob) => "blob:owned-canvas-image");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+
+    const dialog = await openGenerationResultsFor();
+    expect(ownedImageRequests(harness)).toHaveLength(0);
+    expect(dialog.getByRole("button", { name: "查看图片" })).toBeEnabled();
+
+    fireEvent.click(dialog.getByRole("button", { name: "查看图片" }));
+    const image = await screen.findByRole("img", { name: "生成结果图片预览" });
+    expect(image.getAttribute("src")).toBe("blob:owned-canvas-image");
+    const reads = ownedImageRequests(harness);
+    expect(reads).toHaveLength(1);
+    expect(reads[0]?.url.pathname).toBe(
+      `/api/chapters/${harness.currentChapter.id}/canvas-owned-results/generation-result/image`,
+    );
+    expect(reads[0]?.url.searchParams.get("task_id")).toBe("generation-task");
+    expect(reads[0]?.url.searchParams.get("result_ref")).toBeNull();
+    expect(reads[0]?.body).toBeNull();
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    const blob = createObjectURL.mock.calls[0]?.[0];
+    expect(blob?.type).toBe("image/webp");
+    expect([...new Uint8Array(await blob!.arrayBuffer())]).toEqual([1, 2, 3, 4]);
+    expect(harness.requests.filter((request) => request.url.pathname.endsWith("/lock"))).toHaveLength(0);
+    expect(harness.requests.some((request) => request.method === "POST" || request.method === "PUT")).toBe(false);
+    expect(harness.documentJson).toEqual(harness.originalDocumentJson);
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭生成图片记录" }));
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:owned-canvas-image"));
+    expect(revokeObjectURL).toHaveBeenCalledOnce();
+  });
+
+  it("keeps unready owned images unavailable and requires an explicit retry after read failure", async () => {
+    const unreadyHarness = mountGenerationWorkspace({ targetKind: "stable-frame", eligibility: "unready" });
+    const unreadyDialog = await openGenerationResultsFor();
+    expect(unreadyDialog.getByRole("button", { name: "查看图片" })).toBeDisabled();
+    expect(unreadyDialog.getByText("记录尚未就绪，暂时不能读取图片。")).toBeTruthy();
+    expect(ownedImageRequests(unreadyHarness)).toHaveLength(0);
+    cleanup();
+
+    const retryHarness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      eligibility: "already_applied",
+      ownedImageReplies: [
+        { status: 503 },
+        { status: 200, contentType: "image/png", bytes: [9, 8, 7] },
+      ],
+    });
+    const createObjectURL = vi.fn((_blob: Blob) => "blob:retried-canvas-image");
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    const retryDialog = await openGenerationResultsFor();
+    fireEvent.click(retryDialog.getByRole("button", { name: "查看图片" }));
+
+    expect(await retryDialog.findByText("图片读取服务暂不可用，请稍后重试。", { selector: "p" })).toBeTruthy();
+    expect(ownedImageRequests(retryHarness)).toHaveLength(1);
+    expect(createObjectURL).not.toHaveBeenCalled();
+
+    fireEvent.click(retryDialog.getByRole("button", { name: "重试查看图片" }));
+    expect(await screen.findByRole("img", { name: "生成结果图片预览" })).toBeTruthy();
+    expect(ownedImageRequests(retryHarness)).toHaveLength(2);
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    expect(retryHarness.requests.filter((request) => request.method === "POST" || request.method === "PUT")).toHaveLength(0);
+  });
+
+  it.each(["session", "actor", "chapter", "source", "close"] as const)(
+    "aborts an owned image read and rejects its late blob after %s scope changes",
+    async (changedScope) => {
+      const harness = mountGenerationWorkspace({ targetKind: "stable-frame", deferredOwnedImageRead: true });
+      const createObjectURL = vi.fn((_blob: Blob) => "blob:late-canvas-image");
+      Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+      const dialog = await openGenerationResultsFor();
+      fireEvent.click(dialog.getByRole("button", { name: "查看图片" }));
+      await harness.deferredOwnedImageReadStarted;
+      const pendingRead = ownedImageRequests(harness)[0];
+      expect(pendingRead?.signal).not.toBeNull();
+      expect(pendingRead?.signal?.aborted).toBe(false);
+
+      if (changedScope === "session") {
+        harness.rerender(3);
+      } else if (changedScope === "actor") {
+        harness.setStoredActor("other-user");
+        harness.rerender(2, "other-user");
+      } else if (changedScope === "chapter") {
+        harness.rerender(2, "demo-user", { ...harness.currentChapter, id: "replacement-chapter" });
+      } else if (changedScope === "source") {
+        harness.setFreshSourceVersion("f".repeat(64));
+        fireEvent.click(dialog.getByRole("button", { name: "重新读取当前页" }));
+      } else {
+        fireEvent.click(screen.getByRole("button", { name: "关闭生成图片记录" }));
+      }
+
+      await waitFor(() => expect(pendingRead?.signal?.aborted).toBe(true));
+      await act(async () => {
+        harness.resolveDeferredOwnedImageRead();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+      });
+      expect(createObjectURL).not.toHaveBeenCalled();
+      expect(screen.queryByRole("img", { name: "生成结果图片预览" })).toBeNull();
+      expect(harness.requests.filter((request) => request.method === "POST" || request.method === "PUT")).toHaveLength(0);
+    },
+  );
+
+  it("releases the owned object URL when a candidate disappears from the refreshed page", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame" });
+    const createObjectURL = vi.fn((_blob: Blob) => "blob:removed-candidate-image");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    const dialog = await openGenerationResultsFor();
+    fireEvent.click(dialog.getByRole("button", { name: "查看图片" }));
+    await screen.findByRole("img", { name: "生成结果图片预览" });
+    expect(revokeObjectURL).not.toHaveBeenCalled();
+
+    harness.setOwnedResultVisible(false);
+    fireEvent.click(dialog.getByRole("button", { name: "重新读取当前页" }));
+    await waitFor(() => expect(dialog.getByText("当前目标没有可显示的图片生成记录。")).toBeTruthy());
+    await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:removed-candidate-image"));
+    expect(screen.queryByRole("img", { name: "生成结果图片预览" })).toBeNull();
   });
 
   it("reads an application proof without lock traffic even when the chapter requires a lock for writes", async () => {

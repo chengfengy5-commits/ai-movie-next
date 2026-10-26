@@ -7,6 +7,7 @@ import {
   type CanvasGenerationApplicationCandidate,
   type CanvasGenerationApplicationDestination,
 } from "../../shared/api/canvasGenerationApplications";
+import type { CanvasOwnedImageRun } from "../../shared/api/canvasOwnedImage";
 import { CanvasOwnedResultsError, type CanvasOwnedResultItem, type CanvasOwnedResultsTarget } from "../../shared/api/canvasOwnedResults";
 import { CanvasResultApplicationError, type CanvasResultApplicationLookup } from "../../shared/api/canvasResultApplications";
 import {
@@ -1808,6 +1809,18 @@ export function CanvasWorkspace({
       : imageGeneration.state.mode === "receipt"
         ? imageGeneration.state.receipt?.targetLabel ?? imageGeneration.state.target?.targetLabel
         : undefined;
+  const generationImagePreviewScopeKey = generationDialog === null
+    ? ""
+    : JSON.stringify([
+      scopeKey,
+      generationDialog.id,
+      generationDialog.selectedRef,
+      generationDialog.sourceVersion,
+      selectedNode,
+      sources?.version ?? null,
+      generationWorkspaceEpochRef.current,
+      scopeEpochRef.current,
+    ]);
 
   function generationDialogScope(dialog: CanvasGenerationDialogModel): GenerationWorkspaceScope {
     return createGenerationWorkspaceScope({
@@ -2336,6 +2349,32 @@ export function CanvasWorkspace({
     }
   }
 
+  function beginGenerationImagePreview(item: CanvasOwnedResultItem): CanvasOwnedImageRun | null {
+    const dialog = generationDialogRef.current;
+    const port = services.canvasOwnedImage;
+    if (dialog === null || port === undefined || item.eligibility === "unready"
+      || !dialog.items.some((candidate) => candidate.task_id === item.task_id
+        && candidate.result_ref === item.result_ref)) return null;
+
+    const dialogScope = generationDialogScope(dialog);
+    const scope: GenerationWorkspaceScope = {
+      ...dialogScope,
+      selectedRef: dialog.selectedRef ?? selectedNodeRef.current,
+      ...(dialogScope.sourceVersion !== undefined || sourcesRef.current === null
+        ? {}
+        : { sourceVersion: sourcesRef.current.version }),
+    };
+    if (!isGenerationDialogScopeCurrent(scope)) return null;
+
+    const run = port.beginRun({
+      actorId: scope.actorId,
+      seriesId: scope.seriesId,
+      chapterId: scope.chapterId,
+      isContextCurrent: () => isGenerationDialogScopeCurrent(scope),
+    });
+    return run.isCurrent() ? run : null;
+  }
+
   async function lookupPendingGenerationIntent(): Promise<void> {
     const dialog = generationDialogRef.current;
     const intent = generationIntentRef.current;
@@ -2724,6 +2763,9 @@ export function CanvasWorkspace({
             busy={generationBusy}
             confirmedProof={generationConfirmedProof}
             error={generationDialog.error}
+            imagePreviewAvailable={services.canvasOwnedImage !== undefined}
+            imagePreviewScopeKey={generationImagePreviewScopeKey}
+            imagePreviewServiceIdentity={serviceIdentity}
             historyLookups={generationHistoryLookups}
             intentOnly={generationDialog.selectedRef === null}
             items={generationDialog.items}
@@ -2736,6 +2778,7 @@ export function CanvasWorkspace({
             nextCursor={generationDialog.nextCursor}
             onAcquireLock={() => void acquireGenerationEditLock()}
             onApply={applyGenerationItem}
+            onBeginImagePreview={beginGenerationImagePreview}
             onClose={closeGenerationDialog}
             onLoadMore={() => {
               const current = generationDialogRef.current;

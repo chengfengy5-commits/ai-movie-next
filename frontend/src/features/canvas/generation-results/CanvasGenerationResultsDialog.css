@@ -52,7 +52,8 @@
 .canvas-generation-close,
 .canvas-generation-actions button,
 .canvas-generation-footer button,
-.canvas-generation-alert button {
+.canvas-generation-alert button,
+.canvas-generation-image-preview button {
   min-height: 36px;
   padding: 7px 11px;
   border: 1px solid #cbd5e1;
@@ -177,6 +178,39 @@
   overflow-wrap: anywhere;
 }
 
+.canvas-generation-image-preview-hint {
+  color: #64748b;
+  font-size: 12px;
+}
+
+.canvas-generation-item .canvas-generation-error {
+  margin: 10px 0 0;
+}
+
+.canvas-generation-image-preview {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 10px;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+  background: #f8fafc;
+}
+
+.canvas-generation-image-preview img {
+  display: block;
+  max-width: 100%;
+  max-height: min(360px, 45vh);
+  margin: 0 auto;
+  object-fit: contain;
+}
+
+.canvas-generation-image-preview figcaption {
+  color: #64748b;
+  font-size: 12px;
+}
+
 .canvas-generation-footer {
   justify-content: flex-end;
   padding: 12px 18px;
@@ -208,5 +242,9 @@
 
   .canvas-generation-footer button {
     flex: 1;
+  }
+
+  .canvas-generation-image-preview img {
+    max-height: 40vh;
   }
 }

@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
-import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { CanvasOwnedImageError, type CanvasOwnedImageRun, type CanvasOwnedImageSelector } from "../../../shared/api/canvasOwnedImage";
 import type { CanvasOwnedResultItem, CanvasOwnedResultTargetSnapshot } from "../../../shared/api/canvasOwnedResults";
 import type { CanvasGenerationApplicationCandidate } from "../../../shared/api/canvasGenerationApplications";
 import type { CanvasResultApplicationLookup } from "../../../shared/api/canvasResultApplications";
@@ -65,6 +66,21 @@ const candidate: CanvasGenerationApplicationCandidate = {
   application_key: "c".repeat(64),
 };
 
+const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+const originalRevokeObjectUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+const previewServiceIdentity = {};
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((complete) => { resolve = complete; });
+  return { promise, resolve };
+}
+
+function restoreUrlMethod(name: "createObjectURL" | "revokeObjectURL", descriptor: PropertyDescriptor | undefined) {
+  if (descriptor === undefined) Reflect.deleteProperty(URL, name);
+  else Object.defineProperty(URL, name, descriptor);
+}
+
 function pendingIntent(
   state: PendingCanvasGenerationIntent["state"],
   lookup: CanvasResultApplicationLookup | null = null,
@@ -94,6 +110,9 @@ function renderDialog(overrides: Partial<CanvasGenerationResultsDialogProps> = {
     lockPending: false,
     lockMessage: null,
     confirmedProof: null,
+    imagePreviewAvailable: true,
+    imagePreviewScopeKey: "scope-a",
+    imagePreviewServiceIdentity: previewServiceIdentity,
     onClose: vi.fn(),
     onRefresh: vi.fn(),
     onLoadMore: vi.fn(),
@@ -102,12 +121,20 @@ function renderDialog(overrides: Partial<CanvasGenerationResultsDialogProps> = {
     onLookupPendingIntent: vi.fn(),
     onRetryPendingIntent: vi.fn(),
     onAcquireLock: vi.fn(),
+    onBeginImagePreview: vi.fn(() => ({
+      isCurrent: () => true,
+      read: vi.fn(async () => new Blob(["preview"], { type: "image/png" })),
+    }) satisfies CanvasOwnedImageRun),
     ...overrides,
   };
   return { ...render(<CanvasGenerationResultsDialog {...props} />), props };
 }
 
-afterEach(() => cleanup());
+afterEach(() => {
+  cleanup();
+  restoreUrlMethod("createObjectURL", originalCreateObjectUrl);
+  restoreUrlMethod("revokeObjectURL", originalRevokeObjectUrl);
+});
 
 describe("CanvasGenerationResultsDialog", () => {
   it("shows apply only for ready results and history verification for already-applied results", () => {
@@ -203,5 +230,140 @@ describe("CanvasGenerationResultsDialog", () => {
     expect(applicationReferences.every((reference) => reference.closest("details")?.open === false)).toBe(true);
     expect(screen.getByRole("button", { name: "核对应用记录" })).toBeEnabled();
     expect(screen.queryByRole("button", { name: "应用到当前目标" })).toBeNull();
+  });
+
+  it("allows explicit previews for stale history and disables image reads for unready records", () => {
+    const stale = result("stale", "stale-result");
+    const deleted = result("target_deleted", "deleted-result");
+    const unready = result("unready", "unready-result");
+    const onBeginImagePreview = vi.fn(() => ({
+      isCurrent: () => true,
+      read: vi.fn(async () => new Blob(["preview"], { type: "image/png" })),
+    }) satisfies CanvasOwnedImageRun);
+    const queries = renderDialog({ items: [stale, deleted, unready], onBeginImagePreview }).container;
+    const articles = within(queries).getAllByRole("article");
+
+    expect(within(articles[0]!).getByRole("button", { name: "查看图片" })).toBeEnabled();
+    expect(within(articles[1]!).getByRole("button", { name: "查看图片" })).toBeEnabled();
+    expect(within(articles[2]!).getByRole("button", { name: "查看图片" })).toBeDisabled();
+    expect(within(articles[2]!).getByText("记录尚未就绪，暂时不能读取图片。")).toBeTruthy();
+    expect(onBeginImagePreview).not.toHaveBeenCalled();
+  });
+
+  it("cancels the previous read before switching previews and ignores its late blob", async () => {
+    const urls = ["blob:canvas-result-1", "blob:canvas-result-2"];
+    let nextUrl = 0;
+    const createObjectURL = vi.fn((_blob: Blob) => urls[nextUrl++]!);
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    const reads: Array<{ pending: ReturnType<typeof deferred<Blob>>; signal: AbortSignal }> = [];
+    const onBeginImagePreview = vi.fn(() => ({
+      isCurrent: () => true,
+      read: vi.fn((_selector: CanvasOwnedImageSelector, signal: AbortSignal) => {
+        const pending = deferred<Blob>();
+        reads.push({ pending, signal });
+        return pending.promise;
+      }),
+    }) satisfies CanvasOwnedImageRun);
+    const items = [result("stale", "stale-result"), result("already_applied", "applied-result")];
+    renderDialog({ items, onBeginImagePreview });
+    const articles = within(screen.getByRole("dialog", { name: "生成图片记录" })).getAllByRole("article");
+
+    fireEvent.click(within(articles[0]!).getByRole("button", { name: "查看图片" }));
+    expect(reads).toHaveLength(1);
+    await act(async () => { reads[0]!.pending.resolve(new Blob(["first"], { type: "image/png" })); });
+    expect(await screen.findByRole("img", { name: "生成结果图片预览" })).toHaveAttribute("src", urls[0]);
+
+    fireEvent.click(within(articles[1]!).getByRole("button", { name: "查看图片" }));
+    expect(revokeObjectURL.mock.calls).toEqual([[urls[0]]]);
+    expect(reads).toHaveLength(2);
+    fireEvent.click(within(articles[0]!).getByRole("button", { name: "查看图片" }));
+    expect(reads[1]!.signal.aborted).toBe(true);
+    expect(reads).toHaveLength(3);
+
+    await act(async () => { reads[1]!.pending.resolve(new Blob(["late"], { type: "image/png" })); });
+    expect(createObjectURL).toHaveBeenCalledTimes(1);
+    await act(async () => { reads[2]!.pending.resolve(new Blob(["third"], { type: "image/png" })); });
+    await waitFor(() => expect(createObjectURL).toHaveBeenCalledTimes(2));
+    expect(await screen.findByRole("img", { name: "生成结果图片预览" })).toHaveAttribute("src", urls[1]);
+
+    cleanup();
+    expect(revokeObjectURL.mock.calls).toEqual([[urls[0]], [urls[1]]]);
+  });
+
+  it("releases a failed image URL and retries only after an explicit action", async () => {
+    const urls = ["blob:broken-canvas-image", "blob:retried-canvas-image"];
+    let nextUrl = 0;
+    const createObjectURL = vi.fn(() => urls[nextUrl++]!);
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    const onBeginImagePreview = vi.fn(() => ({
+      isCurrent: () => true,
+      read: vi.fn(async () => new Blob(["image"], { type: "image/png" })),
+    }) satisfies CanvasOwnedImageRun);
+    renderDialog({ onBeginImagePreview });
+
+    fireEvent.click(screen.getByRole("button", { name: "查看图片" }));
+    const brokenImage = await screen.findByRole("img", { name: "生成结果图片预览" });
+    expect(brokenImage).toHaveAttribute("src", urls[0]);
+    fireEvent.error(brokenImage);
+    expect(await screen.findByText("图片无法解码或显示，请点击“重试查看图片”。")).toBeTruthy();
+    expect(revokeObjectURL.mock.calls).toEqual([[urls[0]]]);
+    expect(onBeginImagePreview).toHaveBeenCalledOnce();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试查看图片" }));
+    expect(await screen.findByRole("img", { name: "生成结果图片预览" })).toHaveAttribute("src", urls[1]);
+    expect(onBeginImagePreview).toHaveBeenCalledTimes(2);
+    expect(createObjectURL).toHaveBeenCalledTimes(2);
+  });
+
+  it("reports object URL creation failures and retries only after an explicit action", async () => {
+    const createObjectURL = vi.fn()
+      .mockImplementationOnce(() => { throw new Error("object URL unavailable"); })
+      .mockReturnValue("blob:created-after-retry");
+    const read = vi.fn(async () => new Blob(["image"], { type: "image/png" }));
+    const onBeginImagePreview = vi.fn(() => ({
+      isCurrent: () => true,
+      read,
+    }) satisfies CanvasOwnedImageRun);
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    renderDialog({ onBeginImagePreview });
+
+    fireEvent.click(screen.getByRole("button", { name: "查看图片" }));
+    expect(await screen.findByText("图片无法读取或显示，请点击“重试查看图片”。")).toBeTruthy();
+    expect(read).toHaveBeenCalledOnce();
+    expect(createObjectURL).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("img", { name: "生成结果图片预览" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "重试查看图片" }));
+    expect(await screen.findByRole("img", { name: "生成结果图片预览" })).toHaveAttribute("src", "blob:created-after-retry");
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(createObjectURL).toHaveBeenCalledTimes(2);
+  });
+
+  it("shows a safe alert when beginning an owned image read throws a not-sent error", async () => {
+    const onBeginImagePreview = vi.fn(() => {
+      throw new CanvasOwnedImageError("not-sent", "private session detail");
+    });
+    renderDialog({ onBeginImagePreview });
+
+    fireEvent.click(screen.getByRole("button", { name: "查看图片" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("登录或画布状态已变化，图片未显示。请重新打开记录后重试。");
+    expect(screen.queryByText("private session detail")).toBeNull();
+    expect(onBeginImagePreview).toHaveBeenCalledOnce();
+  });
+
+  it("shows a safe alert when the current dialog cannot create an image read run", async () => {
+    const onBeginImagePreview = vi.fn(() => null);
+    renderDialog({ onBeginImagePreview });
+
+    fireEvent.click(screen.getByRole("button", { name: "查看图片" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("登录或画布状态已变化，图片未显示。请重新打开记录后重试。");
+    expect(onBeginImagePreview).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("img", { name: "生成结果图片预览" })).toBeNull();
   });
 });
