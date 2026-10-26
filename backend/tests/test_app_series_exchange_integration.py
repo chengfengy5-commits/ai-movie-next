@@ -25,6 +25,11 @@ from haoai_backend.authentication.tables import (
     users as authentication_users,
 )
 from haoai_backend.authentication.tokens import JoseTokenCodec
+from haoai_backend.personal_production.notes.tables import (
+    metadata as notes_metadata,
+    personal_production_notes,
+    storyboard_media_states,
+)
 from haoai_backend.series_data.tables import (
     chapters,
     characters,
@@ -107,6 +112,10 @@ def _build_system(database_path: Path) -> AppSystem:
         tables=[series, chapters, characters, scenes, props, storyboard_assets],
     )
     exchange_metadata.create_all(engine)
+    notes_metadata.create_all(
+        engine,
+        tables=[storyboard_media_states, personal_production_notes],
+    )
 
     now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
     events: list[tuple[str, int]] = []
@@ -578,7 +587,7 @@ def test_app_fused_and_import_export_roundtrip_use_one_worker_session(
         assert session.execute(
             select(chapters.c.content).where(chapters.c.id == "chapter-owned")
         ).scalar_one() == json.dumps(
-            [{"text": "keep", "fused": ["fused-old"]}]
+            [{"text": "keep", "fused": []}]
         )
         assert session.execute(
             select(storyboard_assets.c.id).where(

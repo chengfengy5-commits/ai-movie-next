@@ -15,7 +15,7 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from jose import jwt
-from sqlalchemy import event, insert, select
+from sqlalchemy import event, insert, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from haoai_backend.asset_data.naming import dump_aliases, make_key
@@ -35,6 +35,12 @@ from haoai_backend.series_data.tables import (
     scenes,
     series,
     storyboard_assets,
+)
+from haoai_backend.personal_production.notes.facade import stage_media_reconciliation
+from haoai_backend.personal_production.notes.tables import (
+    metadata as notes_metadata,
+    personal_production_notes,
+    storyboard_media_states,
 )
 from haoai_backend.series_exchange.http import build_series_exchange_router
 from haoai_backend.series_exchange.persistence import series_exchange_uow_factory
@@ -145,6 +151,10 @@ def _build_system(
         ],
     )
     exchange_metadata.create_all(engine)
+    notes_metadata.create_all(
+        engine,
+        tables=[storyboard_media_states, personal_production_notes],
+    )
 
     events: list[tuple[str, int]] = []
     auth_sessions: list[ObservedSession] = []
@@ -724,11 +734,105 @@ def test_fused_wire_projection_order_update_and_empty_or_same_value_put(
         system.engine.dispose()
 
 
-def test_delete_returns_204_and_does_not_touch_frames_or_storyboard_assets(
+def test_delete_returns_204_and_cleans_fused_references_atomically(
     tmp_path: Path,
 ) -> None:
     system = _build_system(tmp_path / "series-exchange-delete.sqlite")
     try:
+        original_frames = [
+            {
+                "text": "keep",
+                "fused": ["fused-old", "fused-new", "fused-old"],
+                "character": ["character-keep"],
+                "storyboard": ["storyboard-existing"],
+                "custom": {"preserve": True},
+            },
+            {
+                "text": "also keep",
+                "fused": ["fused-old", "fused-old"],
+                "prop": ["prop-keep"],
+            },
+        ]
+        second_chapter_frames = [{"text": "second", "fused": ["fused-old"]}]
+        outside_series_frames = [
+            {"text": "outside", "fused": ["fused-old"], "scene": ["scene-keep"]}
+        ]
+        with Session(system.engine, future=True) as session:
+            session.execute(
+                update(chapters)
+                .where(chapters.c.id == "chapter-private")
+                .values(content=json.dumps(original_frames, ensure_ascii=False))
+            )
+            session.execute(
+                insert(chapters).values(
+                    id="chapter-private-2",
+                    series_id="series-private",
+                    title="Second chapter",
+                    content=json.dumps(second_chapter_frames, ensure_ascii=False),
+                    order=2,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            session.execute(
+                insert(chapters).values(
+                    id="chapter-team-reference",
+                    series_id="series-team",
+                    title="Another series",
+                    content=json.dumps(outside_series_frames, ensure_ascii=False),
+                    order=1,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            stage_media_reconciliation(session, "chapter-private")
+            session.commit()
+
+        with Session(system.engine, future=True) as session:
+            media_state = session.execute(
+                select(storyboard_media_states).where(
+                    storyboard_media_states.c.chapter_id == "chapter-private",
+                    storyboard_media_states.c.storyboard_asset_id == "storyboard-existing",
+                )
+            ).mappings().one()
+            session.execute(
+                insert(personal_production_notes).values(
+                    id="notes-private",
+                    chapter_id="chapter-private",
+                    user_id="owner",
+                    revision=2,
+                    frame_notes={
+                        "storyboard-existing": {
+                            "status": "approved",
+                            "approved_media_revision": media_state["media_revision"],
+                            "needs_reconfirmation": False,
+                        }
+                    },
+                    resume_frame_id=None,
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            session.commit()
+
+        with Session(system.engine, future=True) as session:
+            media_state_before = dict(
+                session.execute(
+                    select(storyboard_media_states).where(
+                        storyboard_media_states.c.chapter_id == "chapter-private",
+                        storyboard_media_states.c.storyboard_asset_id
+                        == "storyboard-existing",
+                    )
+                ).mappings().one()
+            )
+            notes_before = dict(
+                session.execute(
+                    select(personal_production_notes).where(
+                        personal_production_notes.c.id == "notes-private"
+                    )
+                ).mappings().one()
+            )
+
         response = _http_request(
             system.app,
             "DELETE",
@@ -737,6 +841,7 @@ def test_delete_returns_204_and_does_not_touch_frames_or_storyboard_assets(
         )
         assert response.status_code == 204
         assert response.content == b""
+        assert len(system.business_sessions) == 1
         assert system.business_sessions[-1].commit_count == 1
 
         with Session(system.engine, future=True) as session:
@@ -748,16 +853,173 @@ def test_delete_returns_204_and_does_not_touch_frames_or_storyboard_assets(
                     chapters.c.id == "chapter-private"
                 )
             ).scalar_one()
+            second_chapter_content = session.execute(
+                select(chapters.c.content).where(
+                    chapters.c.id == "chapter-private-2"
+                )
+            ).scalar_one()
+            outside_series_content = session.execute(
+                select(chapters.c.content).where(
+                    chapters.c.id == "chapter-team-reference"
+                )
+            ).scalar_one()
             storyboard = session.execute(
                 select(storyboard_assets.c.id).where(
                     storyboard_assets.c.id == "storyboard-existing"
                 )
             ).scalar_one_or_none()
+            media_state_after = dict(
+                session.execute(
+                    select(storyboard_media_states).where(
+                        storyboard_media_states.c.chapter_id == "chapter-private",
+                        storyboard_media_states.c.storyboard_asset_id
+                        == "storyboard-existing",
+                    )
+                ).mappings().one()
+            )
+            notes_after = dict(
+                session.execute(
+                    select(personal_production_notes).where(
+                        personal_production_notes.c.id == "notes-private"
+                    )
+                ).mappings().one()
+            )
         assert fused is None
         assert json.loads(chapter_content) == [
-            {"text": "keep", "fused": ["fused-old"]}
+            {
+                "text": "keep",
+                "fused": ["fused-new"],
+                "character": ["character-keep"],
+                "storyboard": ["storyboard-existing"],
+                "custom": {"preserve": True},
+            },
+            {"text": "also keep", "fused": [], "prop": ["prop-keep"]},
         ]
+        assert json.loads(second_chapter_content) == [
+            {"text": "second", "fused": []}
+        ]
+        assert json.loads(outside_series_content) == outside_series_frames
         assert storyboard == "storyboard-existing"
+        assert media_state_after == media_state_before
+        assert notes_after == notes_before
+        assert system.business_sessions[-1].rollback_count == 0
+    finally:
+        system.engine.dispose()
+
+
+def test_delete_rolls_back_all_chapters_when_later_content_cas_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    system = _build_system(tmp_path / "series-exchange-delete-cas.sqlite")
+    second_frames = [{"text": "second", "fused": ["fused-old"]}]
+    with Session(system.engine, future=True) as session:
+        session.execute(
+            insert(chapters).values(
+                id="chapter-private-2",
+                series_id="series-private",
+                title="Second chapter",
+                content=json.dumps(second_frames, ensure_ascii=False),
+                order=2,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    from haoai_backend.asset_data.persistence import SqlAlchemyAssetDataUnitOfWork
+
+    original_update = SqlAlchemyAssetDataUnitOfWork.update_chapter_content
+
+    def race_second_chapter(
+        uow: SqlAlchemyAssetDataUnitOfWork,
+        chapter_id: str,
+        expected_content: object,
+        content: str,
+        *,
+        updated_at: datetime,
+    ) -> bool:
+        if chapter_id == "chapter-private-2":
+            uow._session.execute(
+                update(chapters)
+                .where(chapters.c.id == chapter_id)
+                .values(content='[{"text":"concurrent edit","fused":["fused-old"]}]')
+            )
+        return original_update(
+            uow,
+            chapter_id,
+            expected_content,
+            content,
+            updated_at=updated_at,
+        )
+
+    monkeypatch.setattr(
+        SqlAlchemyAssetDataUnitOfWork,
+        "update_chapter_content",
+        race_second_chapter,
+    )
+
+    try:
+        response = _http_request(
+            system.app,
+            "DELETE",
+            "/api/fused-assets/fused-old",
+            headers=_auth_header(system),
+        )
+        assert response.status_code == 409
+        assert system.business_sessions[-1].commit_count == 0
+        assert system.business_sessions[-1].rollback_count == 1
+        with Session(system.engine, future=True) as session:
+            fused = session.execute(
+                select(fused_assets.c.id).where(fused_assets.c.id == "fused-old")
+            ).scalar_one_or_none()
+            first_content = session.execute(
+                select(chapters.c.content).where(chapters.c.id == "chapter-private")
+            ).scalar_one()
+            second_content = session.execute(
+                select(chapters.c.content).where(
+                    chapters.c.id == "chapter-private-2"
+                )
+            ).scalar_one()
+        assert fused == "fused-old"
+        assert json.loads(first_content) == [{"text": "keep", "fused": ["fused-old"]}]
+        assert json.loads(second_content) == second_frames
+    finally:
+        system.engine.dispose()
+
+
+def test_delete_refuses_nonempty_unreadable_chapter_without_writes(
+    tmp_path: Path,
+) -> None:
+    system = _build_system(tmp_path / "series-exchange-delete-unreadable.sqlite")
+    malformed = "{not-a-frame-array"
+    with Session(system.engine, future=True) as session:
+        session.execute(
+            update(chapters)
+            .where(chapters.c.id == "chapter-private")
+            .values(content=malformed)
+        )
+        session.commit()
+
+    try:
+        response = _http_request(
+            system.app,
+            "DELETE",
+            "/api/fused-assets/fused-old",
+            headers=_auth_header(system),
+        )
+        assert response.status_code == 409
+        assert system.business_sessions[-1].commit_count == 0
+        assert system.business_sessions[-1].rollback_count == 1
+        with Session(system.engine, future=True) as session:
+            fused = session.execute(
+                select(fused_assets.c.id).where(fused_assets.c.id == "fused-old")
+            ).scalar_one_or_none()
+            content = session.execute(
+                select(chapters.c.content).where(chapters.c.id == "chapter-private")
+            ).scalar_one()
+        assert fused == "fused-old"
+        assert content == malformed
     finally:
         system.engine.dispose()
 

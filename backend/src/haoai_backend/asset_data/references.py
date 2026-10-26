@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
+from typing import Literal
 
 from .domain import AssetKind, ReferenceRemoval
 
 
 def remove_asset_references(
     content: object,
-    asset_kind: AssetKind,
+    asset_kind: AssetKind | Literal["fused"],
     asset_id: str,
 ) -> ReferenceRemoval:
     """Remove every exact ID from the requested list on dict frames.

@@ -6,6 +6,7 @@ import json
 from collections.abc import Callable, Mapping
 from typing import Any, TypeVar
 
+from haoai_backend.asset_data.references import remove_asset_references
 from haoai_backend.series_access.application import require_series_access
 from haoai_backend.series_access.domain import ActorIdentity
 from haoai_backend.series_access.errors import SeriesAccessDenied, SeriesNotFound
@@ -21,6 +22,7 @@ from .errors import (
     SeriesExchangeForbidden,
     SeriesExchangeNotFound,
     SeriesExchangeUnavailable,
+    SeriesExchangeWriteConflict,
 )
 from .ports import SeriesExchangeUnitOfWorkFactory
 
@@ -120,10 +122,82 @@ def delete_fused_asset(
         if current is None:
             raise SeriesExchangeNotFound("融合资产不存在")
         _require_access(uow, actor, current.series_id)
-        uow.delete_fused_asset(asset_id)
+
+        candidates = sorted(
+            uow.list_chapters(current.series_id),
+            key=lambda chapter: str(chapter["id"]),
+        )
+        affected_ids: list[str] = []
+        for chapter in candidates:
+            _require_readable_fused_chapter(chapter["content"])
+            if remove_asset_references(
+                chapter["content"],
+                "fused",
+                asset_id,
+            ).changed:
+                affected_ids.append(str(chapter["id"]))
+
+        locked_chapters = uow.lock_chapters(affected_ids)
+        locked_ids = [str(chapter["id"]) for chapter in locked_chapters]
+        if len(locked_ids) != len(set(locked_ids)) or set(locked_ids) != set(affected_ids):
+            raise SeriesExchangeWriteConflict("章节在融合资产引用清理期间已变化")
+
+        replacements: list[tuple[Mapping[str, Any], str]] = []
+        for chapter in sorted(locked_chapters, key=lambda row: str(row["id"])):
+            _require_readable_fused_chapter(chapter["content"])
+            removal = remove_asset_references(
+                chapter["content"],
+                "fused",
+                asset_id,
+            )
+            if not removal.changed:
+                continue
+            content = str(removal.content)
+            try:
+                uow.reconcile_chapter_media(
+                    chapter,
+                    actor,
+                    content_override=content,
+                )
+            except Exception as error:
+                raise SeriesExchangeWriteConflict(
+                    "章节媒体状态无法与融合资产删除同步"
+                ) from error
+            replacements.append((chapter, content))
+
+        for chapter, content in replacements:
+            if not uow.update_chapter_content(
+                str(chapter["id"]),
+                chapter["content"],
+                content,
+                updated_at=uow.current_time(),
+            ):
+                raise SeriesExchangeWriteConflict(
+                    "章节内容在融合资产引用清理期间已变化"
+                )
+
+        if not uow.delete_fused_asset(asset_id):
+            raise SeriesExchangeWriteConflict("融合资产在删除前已发生变化")
         uow.commit()
 
     _run(factory, remove)
+
+
+def _require_readable_fused_chapter(content: object) -> None:
+    if content is None or content == "":
+        return
+    frames = content
+    if isinstance(content, str):
+        try:
+            frames = json.loads(content)
+        except (json.JSONDecodeError, TypeError) as error:
+            raise SeriesExchangeWriteConflict(
+                "章节内容无法读取，无法安全清理融合资产引用"
+            ) from error
+    if not isinstance(frames, list):
+        raise SeriesExchangeWriteConflict(
+            "章节内容无法读取，无法安全清理融合资产引用"
+        )
 
 
 def export_series(
