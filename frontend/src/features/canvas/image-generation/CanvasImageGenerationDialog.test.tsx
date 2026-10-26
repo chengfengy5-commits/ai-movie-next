@@ -127,6 +127,7 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     onPauseTaskObservation: vi.fn(),
     onContinueTaskObservation: vi.fn(),
     onRefreshTaskObservation: vi.fn(),
+    onViewTaskResult: vi.fn(() => null),
     ...overrides,
   };
   return { ...render(<CanvasImageGenerationDialog {...props} />), props };
@@ -243,9 +244,9 @@ describe("CanvasImageGenerationDialog", () => {
     expect(notFound.props.onRetry).toHaveBeenCalledOnce();
   });
 
-  it("shows a server-reported task status without claiming the image was applied", () => {
+  it("shows the explicit result entry for a completed task without claiming it was applied", () => {
     const receipt = receiptView();
-    renderDialog({
+    const rendered = renderDialog({
       mode: "receipt",
       receipt,
       batch: {
@@ -272,6 +273,30 @@ describe("CanvasImageGenerationDialog", () => {
     expect(screen.queryByText(/图像生成已完成|图片已应用到画布/)).toBeNull();
     const taskId = screen.getByText("任务编号：task-a");
     expect(taskId.closest("details")?.open).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "查看本张结果" }));
+    expect(rendered.props.onViewTaskResult).toHaveBeenCalledWith(receipt.idempotencyKey);
+  });
+
+  it("withholds result entry until an unknown sibling submission is checked", () => {
+    const accepted = receiptView();
+    renderDialog({
+      mode: "intent",
+      pendingIntent: pendingIntent("unknown"),
+      receipt: accepted,
+      batch: {
+        requestedCount: 2,
+        referenceNames: [],
+        acceptedReceipts: [accepted],
+        notSentCount: 1,
+        activeOrdinal: null,
+        stoppedOrdinal: 2,
+        outcome: "unknown",
+      },
+      taskObservations: {},
+    });
+
+    expect(screen.getByText(/请先核对本轮未确认的图片提交/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "查看本张结果" })).toBeNull();
   });
 
   it("keeps accepted task observation controls attached to the original receipt key", () => {
