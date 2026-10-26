@@ -9,10 +9,11 @@ import {
 import type { CanvasOwnedResultsTarget } from "../../../shared/api/canvasOwnedResults";
 import type { CreatorPrompt, CreatorSettingsServicePort } from "../../../shared/api/creatorSettings";
 import type {
+  CanvasImageGenerationBatchReceiptView,
+  CanvasImageGenerationBatchView,
   CanvasImageGenerationIntentView,
   CanvasImageGenerationModelOption,
   CanvasImageGenerationPromptTemplateOption,
-  CanvasImageGenerationReceiptView,
 } from "./CanvasImageGenerationDialog";
 
 export interface CanvasImageGenerationWorkspaceContext {
@@ -43,7 +44,7 @@ export interface CanvasImageGenerationWorkspaceIntent extends CanvasImageGenerat
   readonly target: CanvasImageGenerationTarget;
 }
 
-export interface CanvasImageGenerationWorkspaceReceipt extends CanvasImageGenerationReceiptView {
+export interface CanvasImageGenerationWorkspaceReceipt extends CanvasImageGenerationBatchReceiptView {
   readonly target: CanvasImageGenerationTarget;
 }
 
@@ -52,6 +53,8 @@ export interface CanvasImageGenerationControllerState {
   readonly target: CanvasImageGenerationTarget | null;
   readonly models: readonly CanvasImageGenerationModelOption[];
   readonly selectedModelId: string;
+  readonly selectedCount: number;
+  readonly countSelectionInvalid: boolean;
   readonly selectedSize: string;
   readonly sizeSelectionInvalid: boolean;
   readonly promptTemplates: readonly CanvasImageGenerationPromptTemplateOption[];
@@ -69,6 +72,7 @@ export interface CanvasImageGenerationControllerState {
   readonly lockPending: boolean;
   readonly intent: CanvasImageGenerationWorkspaceIntent | null;
   readonly receipt: CanvasImageGenerationWorkspaceReceipt | null;
+  readonly batch: CanvasImageGenerationBatchView | null;
 }
 
 export interface CanvasImageGenerationControllerOptions {
@@ -90,11 +94,31 @@ interface ActionHandle {
   readonly kind: ActionKind;
 }
 
+interface FrozenImageGenerationRequest {
+  readonly ordinal: number;
+  readonly input: CanvasImageGenerationSubmitInput;
+}
+
+interface FrozenImageGenerationBatch {
+  readonly target: CanvasImageGenerationTarget;
+  readonly modelName: string;
+  readonly serviceIdentity: object;
+  readonly port: CanvasImageGenerationPort;
+  readonly requests: readonly FrozenImageGenerationRequest[];
+  readonly acceptedReceipts: readonly CanvasImageGenerationWorkspaceReceipt[];
+  readonly notSentCount: number;
+  readonly activeOrdinal: number | null;
+  readonly stoppedOrdinal: number | null;
+  readonly outcome: CanvasImageGenerationBatchView["outcome"];
+}
+
 const EMPTY_STATE: CanvasImageGenerationControllerState = {
   mode: null,
   target: null,
   models: [],
   selectedModelId: "",
+  selectedCount: 1,
+  countSelectionInvalid: false,
   selectedSize: "",
   sizeSelectionInvalid: false,
   promptTemplates: [],
@@ -112,6 +136,7 @@ const EMPTY_STATE: CanvasImageGenerationControllerState = {
   lockPending: false,
   intent: null,
   receipt: null,
+  batch: null,
 };
 
 function errorMessage(cause: unknown): string {
@@ -136,6 +161,7 @@ function receiptView(
   input: CanvasImageGenerationSubmitInput,
   modelName: string,
   receipt: CanvasImageGenerationReceipt,
+  ordinal: number,
 ): CanvasImageGenerationWorkspaceReceipt {
   return {
     target,
@@ -146,6 +172,8 @@ function receiptView(
     size: input.size ?? null,
     receipt,
     targetLabel: target.targetLabel,
+    ordinal,
+    idempotencyKey: input.idempotencyKey,
   };
 }
 
@@ -154,6 +182,8 @@ function intentView(
   input: CanvasImageGenerationSubmitInput,
   modelName: string,
   state: CanvasImageGenerationWorkspaceIntent["state"],
+  batch: CanvasImageGenerationBatchView,
+  ordinal: number,
 ): CanvasImageGenerationWorkspaceIntent {
   return {
     target,
@@ -164,8 +194,21 @@ function intentView(
     prompt: input.prompt,
     size: input.size ?? null,
     targetLabel: target.targetLabel,
+    ordinal,
+    batch,
     input,
     state,
+  };
+}
+
+function batchView(batch: FrozenImageGenerationBatch): CanvasImageGenerationBatchView {
+  return {
+    requestedCount: batch.requests.length,
+    acceptedReceipts: batch.acceptedReceipts,
+    notSentCount: batch.notSentCount,
+    activeOrdinal: batch.activeOrdinal,
+    stoppedOrdinal: batch.stoppedOrdinal,
+    outcome: batch.outcome,
   };
 }
 
@@ -341,6 +384,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
   stateRef.current = state;
   const intentRef = useRef<CanvasImageGenerationWorkspaceIntent | null>(state.intent);
   intentRef.current = state.intent;
+  const batchRef = useRef<FrozenImageGenerationBatch | null>(null);
+  const stopBatchAfterCurrentRef = useRef(false);
   const busyRef = useRef(state.busy);
   busyRef.current = state.busy;
   const optionsRef = useRef(options);
@@ -405,6 +450,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     promptTemplateControllerRef.current = null;
 
     const action = actionRef.current;
+    if (action?.kind === "submit" && batchRef.current !== null) {
+      stopBatchAfterCurrentRef.current = true;
+    }
     if (action !== null && (action.kind !== "submit" && action.kind !== "retry"
       || !requestDispatchedRef.current)) {
       action.controller.abort();
@@ -423,22 +471,86 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     update((current) => ({ ...current, target: intent.target }));
   }, [setIntent, update]);
 
-  const completeWithReceipt = useCallback((intent: CanvasImageGenerationWorkspaceIntent, receipt: CanvasImageGenerationReceipt) => {
+  const publishBatch = useCallback((batch: FrozenImageGenerationBatch) => {
+    batchRef.current = batch;
+    update((current) => ({ ...current, batch: batchView(batch) }));
+  }, [update]);
+
+  const stopBatch = useCallback((
+    batch: FrozenImageGenerationBatch,
+    outcome: "unknown" | "stopped",
+    stoppedOrdinal: number,
+    notSentCount: number,
+    error: string | null,
+    message: string | null,
+    pendingIntent: CanvasImageGenerationWorkspaceIntent | null,
+    keepForm = false,
+  ) => {
+    const nextBatch: FrozenImageGenerationBatch = {
+      ...batch,
+      outcome,
+      activeOrdinal: null,
+      stoppedOrdinal,
+      notSentCount,
+    };
+    batchRef.current = nextBatch;
+    intentRef.current = pendingIntent;
+    update((current) => ({
+      ...current,
+      mode: current.mode === null
+        ? null
+        : pendingIntent !== null
+          ? "intent"
+          : keepForm && nextBatch.acceptedReceipts.length === 0 && current.mode === "form"
+            ? "form"
+            : "receipt",
+      target: batch.target,
+      intent: pendingIntent,
+      receipt: nextBatch.acceptedReceipts[nextBatch.acceptedReceipts.length - 1] ?? null,
+      batch: batchView(nextBatch),
+      error,
+      message,
+    }));
+    notifyGuard();
+  }, [notifyGuard, update]);
+
+  const recordBatchReceipt = useCallback((
+    batch: FrozenImageGenerationBatch,
+    intent: CanvasImageGenerationWorkspaceIntent,
+    receipt: CanvasImageGenerationReceipt,
+    complete: boolean,
+  ) => {
     if (!intent.target.context.isCurrent()
       || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
-    const confirmed = receiptView(intent.target, intent.input, intent.modelName, receipt);
+    const confirmed = receiptView(intent.target, intent.input, intent.modelName, receipt, intent.ordinal);
+    const remainingCount = batch.requests.length - batch.acceptedReceipts.length - 1;
+    const allComplete = complete && remainingCount === 0;
+    const nextBatch: FrozenImageGenerationBatch = {
+      ...batch,
+      acceptedReceipts: Object.freeze([...batch.acceptedReceipts, confirmed]),
+      notSentCount: allComplete ? 0 : remainingCount,
+      activeOrdinal: null,
+      stoppedOrdinal: allComplete ? null : intent.ordinal,
+      outcome: allComplete ? "complete" : complete ? "stopped" : "submitting",
+    };
+    batchRef.current = nextBatch;
     intentRef.current = null;
     update((current) => ({
       ...current,
-      mode: current.mode === null ? null : "receipt",
+      mode: current.mode === null ? null : complete ? "receipt" : "form",
       target: intent.target,
       intent: null,
       receipt: confirmed,
+      batch: batchView(nextBatch),
       error: null,
-      message: "任务受理记录已确认。画布仍未自动应用图片。",
-      lockMessage: null,
-      lockReady: false,
-      lockPending: false,
+      message: complete
+        ? allComplete
+          ? "本轮图片任务受理记录已确认。画布仍未自动应用图片。"
+          : "原图片任务已确认；本轮后续请求保持未发送。"
+        : null,
+      lockMessage: complete ? null : current.lockMessage,
+      lockReady: complete ? false : current.lockReady,
+      lockPending: complete ? false : current.lockPending,
     }));
     notifyGuard();
   }, [notifyGuard, update]);
@@ -594,6 +706,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       target,
       models: [],
       selectedModelId: "",
+      selectedCount: 1,
+      countSelectionInvalid: false,
       selectedSize: "",
       sizeSelectionInvalid: false,
       promptTemplates: [],
@@ -608,7 +722,12 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       lockMessage: null,
       lockReady: false,
       lockPending: false,
+      intent: null,
+      receipt: null,
+      batch: null,
     }));
+    batchRef.current = null;
+    stopBatchAfterCurrentRef.current = false;
     notifyGuard();
     loadModels(target);
     loadPromptTemplates(target);
@@ -633,8 +752,10 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
 
   const openReceipt = useCallback((): boolean => {
     const receipt = stateRef.current.receipt;
-    if (receipt === null || busyRef.current || !receipt.target.context.isCurrent()) return false;
-    update((current) => ({ ...current, mode: "receipt", target: receipt.target, error: null }));
+    const batch = batchRef.current;
+    const target = receipt?.target ?? batch?.target ?? null;
+    if (intentRef.current !== null || target === null || busyRef.current || !target.context.isCurrent()) return false;
+    update((current) => ({ ...current, mode: "receipt", target, error: null }));
     notifyGuard();
     return true;
   }, [notifyGuard, update]);
@@ -648,6 +769,18 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       selectedModelId: modelId,
       selectedSize: model.defaultSize ?? "",
       sizeSelectionInvalid: false,
+      error: null,
+    }));
+  }, [update]);
+
+  const setSelectedCount = useCallback((value: string) => {
+    const count = Number(value);
+    const valid = Number.isInteger(count) && count >= 1 && count <= 4;
+    if (stateRef.current.mode !== "form" || busyRef.current) return;
+    update((current) => ({
+      ...current,
+      selectedCount: count,
+      countSelectionInvalid: !valid,
       error: null,
     }));
   }, [update]);
@@ -698,8 +831,16 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     update((current) => ({ ...current, prompt, error: null }));
   }, [update]);
 
-  const createRun = useCallback((intent: CanvasImageGenerationWorkspaceIntent) => {
-    const port = optionsRef.current.port;
+  const createRun = useCallback((
+    intent: CanvasImageGenerationWorkspaceIntent,
+    batch: FrozenImageGenerationBatch | null = batchRef.current,
+  ) => {
+    const currentOptions = optionsRef.current;
+    if (batch !== null && (currentOptions.serviceIdentity !== batch.serviceIdentity
+      || currentOptions.port !== batch.port)) {
+      throw new CanvasImageGenerationError("not-sent", "图片服务已变化，没有发送新的任务。", null);
+    }
+    const port = batch?.port ?? currentOptions.port;
     if (port === undefined) throw new CanvasImageGenerationError("not-sent", "当前服务没有接入图片任务提交。", null);
     const context = receiptRunContext(intent);
     const run = port.beginRun(context);
@@ -709,17 +850,21 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     return run;
   }, []);
 
-  const finishSubmission = useCallback(async (
-    intent: CanvasImageGenerationWorkspaceIntent,
-    action: ActionHandle,
-  ) => {
-    const run = createRun(intent);
-    if (action.controller.signal.aborted || !intent.target.context.isCurrent()) return;
-    requestDispatchedRef.current = true;
-    const receipt = await run.submit(intent.input, action.controller.signal);
-    if (action.controller.signal.aborted || !intent.target.context.isCurrent()) return;
-    completeWithReceipt(intent, receipt);
-  }, [completeWithReceipt, createRun]);
+  const isBatchContextCurrent = useCallback((batch: FrozenImageGenerationBatch, action: ActionHandle): boolean => {
+    const currentOptions = optionsRef.current;
+    return !action.controller.signal.aborted
+      && batch.target.context.isCurrent()
+      && currentOptions.serviceIdentity === batch.serviceIdentity
+      && currentOptions.port === batch.port;
+  }, []);
+
+  const isBatchSnapshotCurrent = useCallback((batch: FrozenImageGenerationBatch): boolean => {
+    const currentOptions = optionsRef.current;
+    return batchRef.current?.requests === batch.requests
+      && batch.target.context.isCurrent()
+      && currentOptions.serviceIdentity === batch.serviceIdentity
+      && currentOptions.port === batch.port;
+  }, []);
 
   const submitNew = useCallback(async () => {
     const current = stateRef.current;
@@ -727,6 +872,11 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const model = current.models.find((option) => option.id === current.selectedModelId);
     if (current.mode !== "form" || target === null || model === undefined
       || current.modelsLoading || busyRef.current || intentRef.current !== null) return;
+    if (!Number.isInteger(current.selectedCount) || current.selectedCount < 1 || current.selectedCount > 4
+      || current.countSelectionInvalid) {
+      update((latest) => ({ ...latest, countSelectionInvalid: true, error: "请选择1至4张，未发送图片任务。" }));
+      return;
+    }
     if (model.sizeConfigurationError !== null) return;
     const size = model.sizeOptions.length > 0 ? current.selectedSize : undefined;
     if (model.sizeOptions.length > 0
@@ -762,70 +912,166 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const prompt = composeImagePrompt(current.prompt, target.promptSeed, selectedTemplate);
     const modelId = model.id;
     const modelName = model.name;
-    const idempotencyKey = globalThis.crypto?.randomUUID?.();
-    if (idempotencyKey === undefined) {
-      update((latest) => ({ ...latest, error: "当前环境无法生成安全的请求编号，未发送任务。" }));
+    const serviceIdentity = optionsRef.current.serviceIdentity;
+    const port = optionsRef.current.port;
+    if (port === undefined) {
+      update((latest) => ({ ...latest, error: "当前服务没有接入图片任务提交。" }));
       return;
     }
-    const input: CanvasImageGenerationSubmitInput = Object.freeze({
-      modelId,
-      prompt,
-      destination: target.destination,
-      ...(size === undefined ? {} : { size }),
-      idempotencyKey,
-    });
-    const intent = intentView(target, input, modelName, "unknown");
+    const destination = Object.freeze({ ...target.destination });
+    const idempotencyKeys = new Set<string>();
+    const requests: FrozenImageGenerationRequest[] = [];
+    for (let ordinal = 1; ordinal <= current.selectedCount; ordinal += 1) {
+      const idempotencyKey = globalThis.crypto?.randomUUID?.();
+      if (idempotencyKey === undefined || idempotencyKeys.has(idempotencyKey)) {
+        update((latest) => ({ ...latest, error: "当前环境无法为每张图片生成独立安全编号，未发送任务。" }));
+        return;
+      }
+      idempotencyKeys.add(idempotencyKey);
+      const input: CanvasImageGenerationSubmitInput = Object.freeze({
+        modelId,
+        prompt,
+        destination,
+        ...(size === undefined ? {} : { size }),
+        idempotencyKey,
+      });
+      requests.push(Object.freeze({ ordinal, input }));
+    }
 
     const action = beginAction("submit");
     if (action === null) return;
+    stopBatchAfterCurrentRef.current = false;
+    let batch: FrozenImageGenerationBatch = {
+      target,
+      modelName,
+      serviceIdentity,
+      port,
+      requests: Object.freeze(requests),
+      acceptedReceipts: Object.freeze([]),
+      notSentCount: requests.length,
+      activeOrdinal: null,
+      stoppedOrdinal: null,
+      outcome: "submitting",
+    };
+    publishBatch(batch);
+    update((latest) => ({ ...latest, receipt: null, message: null, error: null }));
     try {
-      if (!target.context.isCurrent() || !await optionsRef.current.validateTarget(target, action.controller.signal, true)) {
-        if (!action.controller.signal.aborted && target.context.isCurrent()) {
-          update((latest) => ({ ...latest, error: "当前分镜或素材版本已变化，未提交图片任务。请重新选择目标。" }));
+      for (const request of batch.requests) {
+        if (stopBatchAfterCurrentRef.current) {
+          stopBatch(batch, "stopped", request.ordinal, batch.requests.length - batch.acceptedReceipts.length,
+            null, "本轮已停止派发后续请求。客户端停止派发不代表服务端取消或退款。", null);
+          return;
         }
-        return;
-      }
-      const lock = await optionsRef.current.checkEditLock(target, action.controller.signal);
-      if (action.controller.signal.aborted || !target.context.isCurrent()) return;
-      update((latest) => ({ ...latest, lockReady: lock.status === "ready", lockMessage: lock.message }));
-      if (lock.status !== "ready") return;
+        requestDispatchedRef.current = false;
+        batch = {
+          ...batch,
+          activeOrdinal: request.ordinal,
+          notSentCount: batch.requests.length - batch.acceptedReceipts.length,
+          stoppedOrdinal: null,
+          outcome: "submitting",
+        };
+        publishBatch(batch);
+        const optionsBeforeValidation = optionsRef.current;
+        const targetIsValid = isBatchContextCurrent(batch, action)
+          && optionsBeforeValidation.selectedTargetKey === target.targetKey
+          && await optionsBeforeValidation.validateTarget(target, action.controller.signal, true);
+        if (!targetIsValid || !isBatchContextCurrent(batch, action)
+          || optionsRef.current.selectedTargetKey !== target.targetKey) {
+          if (!isBatchSnapshotCurrent(batch)) return;
+          stopBatch(batch, "stopped", request.ordinal, batch.requests.length - batch.acceptedReceipts.length,
+            "当前分镜或素材版本已变化，未发送本张图片任务。", "本轮已停止，未发送的后续请求不会自动补发。", null);
+          return;
+        }
+        const lock = await optionsRef.current.checkEditLock(target, action.controller.signal);
+        if (!isBatchContextCurrent(batch, action)) {
+          if (isBatchSnapshotCurrent(batch)) {
+            stopBatch(batch, "stopped", request.ordinal, batch.requests.length - batch.acceptedReceipts.length,
+              null, "表单已关闭或状态已变化，本轮剩余请求未发送。", null);
+          }
+          return;
+        }
+        update((latest) => ({ ...latest, lockReady: lock.status === "ready", lockMessage: lock.message }));
+        if (lock.status !== "ready") {
+          stopBatch(batch, "stopped", request.ordinal, batch.requests.length - batch.acceptedReceipts.length,
+            null, lock.message || "当前编辑锁未通过，本轮后续请求未发送。", null, true);
+          return;
+        }
+        if (stopBatchAfterCurrentRef.current
+          || optionsRef.current.selectedTargetKey !== target.targetKey
+          || !isBatchContextCurrent(batch, action)) {
+          if (!isBatchSnapshotCurrent(batch)) return;
+          stopBatch(batch, "stopped", request.ordinal, batch.requests.length - batch.acceptedReceipts.length,
+            null, "目标或表单状态已变化，本轮后续请求未发送。", null);
+          return;
+        }
 
-      updateIntent(intent);
-      update((latest) => ({ ...latest, error: null, message: null, mode: "form" }));
-      await finishSubmission(intent, action);
+        const activeBatch: FrozenImageGenerationBatch = {
+          ...batch,
+          notSentCount: batch.requests.length - batch.acceptedReceipts.length - 1,
+          outcome: "submitting",
+        };
+        batch = activeBatch;
+        publishBatch(batch);
+        const intent = intentView(target, request.input, modelName, "unknown", batchView(batch), request.ordinal);
+        updateIntent(intent);
+        const run = createRun(intent, batch);
+        if (!isBatchContextCurrent(batch, action)) return;
+        requestDispatchedRef.current = true;
+        const receipt = await run.submit(request.input, action.controller.signal);
+        if (!isBatchContextCurrent(batch, action)) return;
+
+        const isLastRequest = request.ordinal === batch.requests.length;
+        recordBatchReceipt(batch, intent, receipt, isLastRequest);
+        const updatedBatch = batchRef.current;
+        if (updatedBatch === null) return;
+        batch = updatedBatch;
+        requestDispatchedRef.current = false;
+        if (isLastRequest) return;
+        if (stopBatchAfterCurrentRef.current || optionsRef.current.selectedTargetKey !== target.targetKey) {
+          stopBatch(batch, "stopped", request.ordinal + 1, batch.requests.length - batch.acceptedReceipts.length,
+            null, "本轮已停止派发后续请求。客户端停止派发不代表服务端取消或退款。", null);
+          return;
+        }
+      }
     } catch (cause) {
-      if (!target.context.isCurrent()) return;
+      const activeBatch = batchRef.current;
+      if (activeBatch === null || activeBatch.requests !== batch.requests || !isBatchSnapshotCurrent(activeBatch)) return;
       const kind = errorKind(cause);
       const sent = requestDispatchedRef.current;
-      if (!sent || kind === "not-sent") {
-        if (readCurrentIntent()?.target === target) setIntent(null);
-        update((latest) => ({ ...latest, error: errorMessage(cause), message: null }));
-      } else if (kind === "rejected") {
-        setIntent(null);
-        update((latest) => ({
-          ...latest,
-          mode: latest.mode === null ? null : "form",
-          error: errorMessage(cause),
-          message: null,
-        }));
+      const activeRequest = activeBatch.requests.find((request) => request.ordinal === activeBatch.activeOrdinal);
+      if (activeRequest === undefined) return;
+      if (!sent || kind === "not-sent" || kind === "rejected") {
+        const wasSentAndRejected = sent && kind === "rejected";
+        stopBatch(activeBatch, "stopped", activeRequest.ordinal,
+          activeBatch.requests.length - activeBatch.acceptedReceipts.length - (wasSentAndRejected ? 1 : 0),
+          errorMessage(cause), wasSentAndRejected
+            ? `第 ${activeRequest.ordinal} 张未被服务接受；未发送的后续请求不会自动补发。`
+            : `第 ${activeRequest.ordinal} 张未发送；本轮后续请求未发送。`, null,
+          activeBatch.acceptedReceipts.length === 0);
       } else {
         const existing = readCurrentIntent();
-        if (existing !== null) updateIntent({ ...existing, state: "unknown" });
-        update((latest) => ({
-          ...latest,
-          mode: latest.mode === null ? null : "intent",
-          error: null,
-          message: "上次提交结果暂时无法确认。原请求已保留，请明确核对后再决定下一步。",
-        }));
+        if (existing === null || existing.input.idempotencyKey !== activeRequest.input.idempotencyKey) return;
+        const unknownBatch: FrozenImageGenerationBatch = {
+          ...activeBatch,
+          activeOrdinal: null,
+          stoppedOrdinal: activeRequest.ordinal,
+          notSentCount: activeBatch.requests.length - activeBatch.acceptedReceipts.length - 1,
+          outcome: "unknown",
+        };
+        const unknownIntent = { ...existing, batch: batchView(unknownBatch), state: "unknown" as const };
+        stopBatch(unknownBatch, "unknown", activeRequest.ordinal, unknownBatch.notSentCount,
+          null, `第 ${activeRequest.ordinal} 张结果暂时无法确认；后续请求未发送。请先核对这张原任务。`, unknownIntent);
       }
     } finally {
       finishAction(action, target.context.isCurrent);
     }
-  }, [beginAction, finishAction, finishSubmission, readCurrentIntent, setIntent, update, updateIntent]);
+  }, [beginAction, createRun, finishAction, isBatchContextCurrent, isBatchSnapshotCurrent, publishBatch, readCurrentIntent, recordBatchReceipt, stopBatch, update, updateIntent]);
 
   const lookupPendingIntent = useCallback(async () => {
     const intent = intentRef.current;
     if (intent === null || busyRef.current || !intent.target.context.isCurrent()) return;
+    const batch = batchRef.current;
+    if (batch === null) return;
     const port = optionsRef.current.port;
     if (port === undefined) {
       update((current) => ({ ...current, error: "当前服务没有接入原任务核对。" }));
@@ -834,12 +1080,12 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const action = beginAction("lookup");
     if (action === null) return;
     try {
-      const run = createRun(intent);
+      const run = createRun(intent, batch);
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()) return;
       const receipt = await run.lookup(intent.input.idempotencyKey, action.controller.signal);
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()
         || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
-      completeWithReceipt(intent, receipt);
+      recordBatchReceipt(batch, intent, receipt, true);
     } catch (cause) {
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()
         || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
@@ -849,7 +1095,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
           ...current,
           mode: "intent",
           error: null,
-          message: "暂未查到任务记录。之前的请求仍可能稍后完成；原提交内容已保留。",
+          message: null,
         }));
       } else {
         update((current) => ({ ...current, mode: "intent", error: errorMessage(cause), message: null }));
@@ -857,12 +1103,14 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     } finally {
       finishAction(action, intent.target.context.isCurrent);
     }
-  }, [beginAction, completeWithReceipt, createRun, finishAction, update, updateIntent]);
+  }, [beginAction, createRun, finishAction, recordBatchReceipt, update, updateIntent]);
 
   const retryOriginalIntent = useCallback(async () => {
     const intent = intentRef.current;
     if (intent === null || intent.state !== "not-found" || busyRef.current
       || !intent.target.context.isCurrent()) return;
+    const batch = batchRef.current;
+    if (batch === null) return;
     const action = beginAction("retry");
     if (action === null) return;
     try {
@@ -880,13 +1128,13 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       update((current) => ({ ...current, lockReady: lock.status === "ready", lockMessage: lock.message }));
       if (lock.status !== "ready") return;
 
-      const run = createRun(intent);
+      const run = createRun(intent, batch);
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()) return;
       updateIntent({ ...intent, state: "unknown" });
       requestDispatchedRef.current = true;
       const receipt = await run.submit(intent.input, action.controller.signal);
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()) return;
-      completeWithReceipt(intent, receipt);
+      recordBatchReceipt(batch, intent, receipt, true);
     } catch (cause) {
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()
         || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
@@ -913,7 +1161,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     } finally {
       finishAction(action, intent.target.context.isCurrent);
     }
-  }, [beginAction, completeWithReceipt, createRun, finishAction, setIntent, update, updateIntent]);
+  }, [beginAction, createRun, finishAction, recordBatchReceipt, setIntent, update, updateIntent]);
 
   const acquireLock = useCallback(async () => {
     const current = stateRef.current;
@@ -949,6 +1197,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     actionRef.current?.controller.abort();
     actionRef.current = null;
     requestDispatchedRef.current = false;
+    batchRef.current = null;
+    stopBatchAfterCurrentRef.current = false;
     intentRef.current = null;
     busyRef.current = false;
     stateRef.current = EMPTY_STATE;
@@ -982,6 +1232,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     openReceipt,
     close,
     setSelectedModelId,
+    setSelectedCount,
     setSelectedSize,
     setSelectedPromptTemplateId,
     setPrompt,

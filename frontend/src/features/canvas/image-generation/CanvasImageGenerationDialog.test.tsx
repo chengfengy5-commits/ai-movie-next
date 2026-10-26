@@ -3,9 +3,10 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { CanvasImageGenerationReceipt } from "../../../shared/api/canvasImageGeneration";
 import {
   CanvasImageGenerationDialog,
+  type CanvasImageGenerationBatchReceiptView,
+  type CanvasImageGenerationBatchView,
   type CanvasImageGenerationDialogProps,
   type CanvasImageGenerationIntentView,
-  type CanvasImageGenerationReceiptView,
 } from "./CanvasImageGenerationDialog";
 
 const destination = {
@@ -15,6 +16,14 @@ const destination = {
 } as const;
 
 function pendingIntent(state: CanvasImageGenerationIntentView["state"]): CanvasImageGenerationIntentView {
+  const batch: CanvasImageGenerationBatchView = {
+    requestedCount: 3,
+    acceptedReceipts: [],
+    notSentCount: 1,
+    activeOrdinal: null,
+    stoppedOrdinal: 2,
+    outcome: "unknown",
+  };
   return {
     destination,
     idempotencyKey: "idempotency-key-a",
@@ -23,11 +32,13 @@ function pendingIntent(state: CanvasImageGenerationIntentView["state"]): CanvasI
     prompt: "保留的原始提示词",
     size: "quality:high",
     targetLabel: "分镜 1",
+    ordinal: 2,
     state,
+    batch,
   };
 }
 
-function receiptView(): CanvasImageGenerationReceiptView {
+function receiptView(): CanvasImageGenerationBatchReceiptView {
   const receipt: CanvasImageGenerationReceipt = {
     submissionId: "submission-a",
     operation: "image.single",
@@ -45,6 +56,8 @@ function receiptView(): CanvasImageGenerationReceiptView {
     size: null,
     receipt,
     targetLabel: "分镜 1",
+    ordinal: 1,
+    idempotencyKey: "idempotency-key-a",
   };
 }
 
@@ -60,6 +73,8 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
       sizeConfigurationError: null,
     }],
     selectedModelId: "image-model-a",
+    selectedCount: 1,
+    countSelectionInvalid: false,
     selectedSize: "",
     sizeSelectionInvalid: false,
     promptTemplates: [{
@@ -84,8 +99,10 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     lockPending: false,
     pendingIntent: null,
     receipt: null,
+    batch: overrides.batch ?? overrides.pendingIntent?.batch ?? null,
     onClose: vi.fn(),
     onSelectModel: vi.fn(),
+    onSelectCount: vi.fn(),
     onSelectSize: vi.fn(),
     onSelectPromptTemplate: vi.fn(),
     onChangePrompt: vi.fn(),
@@ -107,6 +124,9 @@ describe("CanvasImageGenerationDialog", () => {
     const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
 
     expect(dialog.getByRole("combobox", { name: "图片模型" })).toBeTruthy();
+    expect((dialog.getByRole("combobox", { name: "生成数量" }) as HTMLSelectElement).value).toBe("1");
+    expect(Array.from((dialog.getByRole("combobox", { name: "生成数量" }) as HTMLSelectElement).options)
+      .map((option) => option.value)).toEqual(["1", "2", "3", "4"]);
     expect(dialog.getByRole("option", { name: "图片模型 A" })).toBeTruthy();
     expect(dialog.getByRole("combobox", { name: "提示词模板" })).toBeTruthy();
     expect(dialog.getByRole("option", { name: "无（纯画面描述）" })).toBeTruthy();
@@ -125,6 +145,16 @@ describe("CanvasImageGenerationDialog", () => {
     expect(prompt.value).toBe("当前分镜文本");
     expect(rendered.props.onSelectPromptTemplate).toHaveBeenCalledWith("template-a");
     expect(dialog.getByText("留空时使用当前内容；选用模板后可清空描述，仅使用模板。")).toBeTruthy();
+  });
+
+  it("blocks an invalid generation count instead of keeping the previous selection", () => {
+    const rendered = renderDialog({ selectedCount: 0, countSelectionInvalid: true });
+    const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
+
+    expect(dialog.getByText("请选择1至4张，未发送图片任务。")).toBeTruthy();
+    expect(dialog.getByRole("button", { name: "提交0张图片任务" })).toBeDisabled();
+    fireEvent.change(dialog.getByRole("combobox", { name: "生成数量" }), { target: { value: "0" } });
+    expect(rendered.props.onSelectCount).toHaveBeenCalledWith("0");
   });
 
   it("offers configured sizes in the form and reports an invalid selection", () => {
@@ -176,7 +206,19 @@ describe("CanvasImageGenerationDialog", () => {
   });
 
   it("shows a server-reported task status without claiming the image was applied", () => {
-    renderDialog({ mode: "receipt", receipt: receiptView() });
+    const receipt = receiptView();
+    renderDialog({
+      mode: "receipt",
+      receipt,
+      batch: {
+        requestedCount: 1,
+        acceptedReceipts: [receipt],
+        notSentCount: 0,
+        activeOrdinal: null,
+        stoppedOrdinal: null,
+        outcome: "complete",
+      },
+    });
 
     expect(screen.getByText("任务当前状态为已完成；该回执不表示图像已经应用到画布。")).toBeTruthy();
     expect(screen.getByText("任务状态：已完成")).toBeTruthy();

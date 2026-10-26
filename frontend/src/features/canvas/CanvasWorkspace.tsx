@@ -2487,7 +2487,7 @@ export function CanvasWorkspace({
             <button disabled={imageGenerationEntryDisabled} onClick={openImageGeneration} type="button">生成图片</button>
             <button disabled={generationEntryDisabled} onClick={openGenerationResults} type="button">生成图片记录</button>
             {imageGeneration.busy && (
-              <span className="canvas-save-status" role="status">正在确认单张图片任务状态。请等待本次操作结束。</span>
+              <span className="canvas-save-status" role="status">正在按顺序处理本轮图片任务。请等待当前操作结束。</span>
             )}
             {imageGeneration.intent !== null && (
               <>
@@ -2501,12 +2501,27 @@ export function CanvasWorkspace({
                 </button>
               </>
             )}
-            {imageGeneration.receipt !== null && imageGeneration.state.mode === null && (
+            {imageGeneration.intent === null && imageGeneration.receipt !== null && imageGeneration.state.mode === null && (
               <>
-                <span className="canvas-save-status" role="status">最近的单张图片任务已有受理记录。</span>
-                <button onClick={openImageGenerationReceipt} type="button">查看生成任务状态</button>
+                <span className="canvas-save-status" role="status">
+                  {imageGeneration.state.batch?.requestedCount === 1
+                    ? "最近的单张图片任务已有受理记录。"
+                    : `本轮已受理 ${imageGeneration.state.batch?.acceptedReceipts.length ?? 1} 张图片任务。`}
+                </span>
+                <button onClick={openImageGenerationReceipt} type="button">
+                  {imageGeneration.state.batch?.requestedCount === 1 ? "查看生成任务状态" : "查看本轮图片任务"}
+                </button>
               </>
             )}
+            {imageGeneration.intent === null && imageGeneration.state.batch !== null && imageGeneration.receipt === null
+              && imageGeneration.state.mode === null && (
+                <>
+                  <span className="canvas-save-status" role="status">
+                    本轮图片任务记录已保留；未发送 {imageGeneration.state.batch.notSentCount} 张。
+                  </span>
+                  <button onClick={openImageGenerationReceipt} type="button">查看本轮图片任务</button>
+                </>
+              )}
             {(services.creatorSettings === undefined || services.canvasImageGeneration === undefined) && (
               <span className="canvas-save-status" role="status">单张图片任务服务未接入。</span>
             )}
@@ -2806,10 +2821,12 @@ export function CanvasWorkspace({
             lockReady={imageGeneration.state.lockReady}
             lockRequired={imageGeneration.state.target?.requiresLock ?? false}
             lockActionAvailable={services.getChapterEditLock !== undefined && services.acquireChapterEditLock !== undefined}
-            message={imageGeneration.state.lockMessage ?? imageGeneration.state.message}
+            message={imageGeneration.state.lockMessage || imageGeneration.state.message}
             mode={imageGeneration.state.mode}
             models={imageGeneration.state.models}
             modelsLoading={imageGeneration.state.modelsLoading}
+            selectedCount={imageGeneration.state.selectedCount}
+            countSelectionInvalid={imageGeneration.state.countSelectionInvalid}
             promptTemplates={imageGeneration.state.promptTemplates}
             promptTemplatesLoading={imageGeneration.state.promptTemplatesLoading}
             promptTemplateError={imageGeneration.state.promptTemplateError}
@@ -2823,6 +2840,7 @@ export function CanvasWorkspace({
             onLookup={() => void imageGeneration.lookupPendingIntent()}
             onRetry={() => void imageGeneration.retryOriginalIntent()}
             onSelectModel={imageGeneration.setSelectedModelId}
+            onSelectCount={imageGeneration.setSelectedCount}
             onSelectSize={imageGeneration.setSelectedSize}
             onSelectPromptTemplate={imageGeneration.setSelectedPromptTemplateId}
             onStartNew={startAnotherImageGeneration}
@@ -2830,6 +2848,7 @@ export function CanvasWorkspace({
             pendingIntent={imageGeneration.state.intent}
             prompt={imageGeneration.state.prompt}
             receipt={imageGeneration.state.receipt}
+            batch={imageGeneration.state.batch}
             selectedModelId={imageGeneration.state.selectedModelId}
             targetLabel={imageGenerationDialogTargetLabel ?? "单张图片任务"}
           />
