@@ -17,7 +17,10 @@ import type {
 import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { CreatorSettingsPage } from "./CreatorSettingsPage";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 class MemoryStorage implements StorageLike {
   private readonly values = new Map<string, string>();
@@ -252,11 +255,11 @@ function makeService() {
   };
 }
 
-function renderPage(service: CreatorSettingsServicePort, userId = ownerId) {
+function renderPage(service: CreatorSettingsServicePort, userId = ownerId, isSuperuser = false) {
   const onUnauthorized = vi.fn();
   const onBack = vi.fn();
-  render(<CreatorSettingsPage onBack={onBack} onUnauthorized={onUnauthorized} service={service} userId={userId} />);
-  return { onUnauthorized, onBack };
+  const view = render(<CreatorSettingsPage isSuperuser={isSuperuser} onBack={onBack} onUnauthorized={onUnauthorized} service={service} userId={userId} />);
+  return { onUnauthorized, onBack, view };
 }
 
 describe("creator settings", () => {
@@ -858,6 +861,147 @@ describe("creator settings", () => {
     expect(service.createModel).not.toHaveBeenCalled();
     expect(service.updateModel).not.toHaveBeenCalled();
     expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("converts personal and system models through their new IDs and verifies the empty-body API routes", async () => {
+    const user = userEvent.setup();
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "model-conversion-session");
+    let serverModels: Array<CreatorModel & { api_key: string }> = [
+      { ...model("personal-original", { name: "待转换模型", provider: "openai" }), api_key: "conversion-secret" },
+    ];
+    const requests: Array<{ path: string; method: string; authorization: string | null; body: BodyInit | null }> = [];
+    const respond = (status: number, value: unknown) => new Response(JSON.stringify(value), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      requests.push({
+        path: url.pathname,
+        method: init?.method ?? "GET",
+        authorization: new Headers(init?.headers).get("Authorization"),
+        body: init?.body ?? null,
+      });
+      if (init?.method === "GET" && url.pathname === "/api/models") {
+        return respond(200, serverModels);
+      }
+      if (init?.method === "POST" && url.pathname === "/api/models/personal-original/promote-to-system") {
+        const source = serverModels.find((item) => item.id === "personal-original");
+        if (source === undefined) return respond(404, { detail: "not found" });
+        const promoted = { ...source, id: "system-promoted", user_id: "system", is_system: true };
+        serverModels = [promoted];
+        return respond(200, promoted);
+      }
+      if (init?.method === "POST" && url.pathname === "/api/models/system-promoted/demote-to-personal") {
+        const source = serverModels.find((item) => item.id === "system-promoted");
+        if (source === undefined) return respond(404, { detail: "not found" });
+        const personal = { ...source, id: "personal-demoted", user_id: ownerId, is_system: false };
+        serverModels = [personal];
+        return respond(200, personal);
+      }
+      return respond(404, { detail: "unexpected route" });
+    }) as typeof fetch;
+    const apiServices = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const service = apiServices.creatorSettings;
+    if (service?.promoteModelToSystem === undefined || service.demoteModelToPersonal === undefined) {
+      throw new Error("API creator settings model conversion ports are unavailable");
+    }
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { onUnauthorized } = renderPage(service, ownerId, true);
+
+    await user.click(await screen.findByRole("button", { name: "设为系统" }));
+    expect(await screen.findByText("个人模型已按新 ID 转为系统模型，原记录已移除并回读确认。"))
+      .toBeInTheDocument();
+    expect(await screen.findByText("系统只读")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "转为个人" }));
+    expect(await screen.findByText("系统模型已按新 ID 转为当前个人模型，原记录已移除并回读确认。"))
+      .toBeInTheDocument();
+    const demotedCard = (await screen.findByText("待转换模型")).closest("article");
+    expect(demotedCard).not.toBeNull();
+    expect(within(demotedCard!).getByText("个人配置")).toBeInTheDocument();
+
+    const posts = requests.filter((request) => request.method === "POST");
+    expect(posts.map(({ path, body }) => ({ path, body }))).toEqual([
+      { path: "/api/models/personal-original/promote-to-system", body: null },
+      { path: "/api/models/system-promoted/demote-to-personal", body: null },
+    ]);
+    expect(posts.every((request) => request.authorization === "Bearer model-conversion-session")).toBe(true);
+    expect(requests.filter((request) => request.method === "GET" && request.path === "/api/models")).toHaveLength(3);
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(serverModels[0]?.id).toBe("personal-demoted");
+    expect(document.body).not.toHaveTextContent("conversion-secret");
+    expect(onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("hides conversion from regular users and keeps an administrator signed in after 403", async () => {
+    const user = userEvent.setup();
+    const { service } = makeService();
+    service.promoteModelToSystem = vi.fn(async () => {
+      throw new ApiError("http", "Forbidden", 403);
+    });
+    const regularUser = renderPage(service, ownerId, false);
+    const personalCard = (await screen.findByText("我的文本模型")).closest("article");
+    expect(personalCard).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "设为系统" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "转为个人" })).not.toBeInTheDocument();
+    expect(service.promoteModelToSystem).not.toHaveBeenCalled();
+
+    cleanup();
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const administrator = renderPage(service, ownerId, true);
+    const adminPersonalCard = (await screen.findByText("我的文本模型")).closest("article");
+    expect(adminPersonalCard).not.toBeNull();
+    await user.click(within(adminPersonalCard!).getByRole("button", { name: "设为系统" }));
+    expect(await screen.findByText("服务端拒绝了此转换，当前账号仍保持登录。"))
+      .toBeInTheDocument();
+    expect(service.promoteModelToSystem).toHaveBeenCalledTimes(1);
+    expect(administrator.onUnauthorized).not.toHaveBeenCalled();
+    expect(screen.queryByRole("button", { name: "停止本地核对" })).not.toBeInTheDocument();
+    expect(regularUser.onUnauthorized).not.toHaveBeenCalled();
+    expect(confirmSpy).toHaveBeenCalledTimes(1);
+  });
+
+  it("treats HTTP 408 as unknown, allows stopping local tracking, and ignores the late old-actor receipt", async () => {
+    const user = userEvent.setup();
+    const { service } = makeService();
+    const lateReceipt = deferred<CreatorModel>();
+    service.promoteModelToSystem = vi.fn()
+      .mockRejectedValueOnce(new ApiError("http", "Request timeout", 408))
+      .mockImplementationOnce(() => lateReceipt.promise);
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { onUnauthorized, view } = renderPage(service, ownerId, true);
+
+    await user.click(await screen.findByRole("button", { name: "设为系统" }));
+    await user.click(await screen.findByRole("button", { name: "停止本地核对" }));
+    expect(await screen.findByText("已停止本地核对；服务端转换可能已生效，请先刷新列表并确认状态。"))
+      .toBeInTheDocument();
+    expect(service.promoteModelToSystem).toHaveBeenCalledTimes(1);
+    expect(service.listModels).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("button", { name: "设为系统" })).toBeEnabled();
+
+    await user.click(screen.getByRole("button", { name: "设为系统" }));
+    expect(service.promoteModelToSystem).toHaveBeenCalledTimes(2);
+    view.rerender(
+      <CreatorSettingsPage
+        isSuperuser={false}
+        onBack={vi.fn()}
+        onUnauthorized={onUnauthorized}
+        service={service}
+        userId={otherOwnerId}
+      />,
+    );
+    await screen.findByText("系统文本模型");
+    await act(async () => {
+      lateReceipt.resolve(model("late-system-model", { is_system: true, user_id: "system" }));
+      await lateReceipt.promise;
+    });
+    expect(screen.queryByText("转换请求已返回，正在只读核对原记录和新记录…")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "设为系统" })).not.toBeInTheDocument();
+    expect(service.promoteModelToSystem).toHaveBeenCalledTimes(2);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(confirmSpy).toHaveBeenCalledTimes(3);
   });
 
   it("drops api_key values from model response projections", () => {
