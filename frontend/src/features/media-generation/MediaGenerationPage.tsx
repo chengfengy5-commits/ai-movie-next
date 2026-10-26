@@ -12,13 +12,24 @@ import {
   type MediaGenerationRun,
   type MediaGenerationSingleTarget,
 } from "../../shared/api/mediaGeneration";
+import {
+  MediaReferenceUploadError,
+  type MediaReferenceKind,
+} from "../../shared/api/mediaReferenceUpload";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import type { CreatorModel, CreatorPrompt } from "../../shared/api/creatorSettings";
 import "./mediaGeneration.css";
 
 type MediaMode = "image" | "video" | "batch";
 type SingleTargetMode = "standalone" | "frame_message" | "asset_message";
+type ReferenceUploadStatusKind = "uploading" | "uploaded" | "failed" | "unknown";
 type LibraryAsset = Character | Scene | Prop | StoryboardAsset;
+
+interface ReferenceUploadStatus {
+  readonly kind: MediaReferenceKind;
+  readonly status: ReferenceUploadStatusKind;
+  readonly message: string;
+}
 
 interface AssetChoice {
   readonly type: MediaGenerationAssetType;
@@ -45,6 +56,21 @@ const IMAGE_PROMPT_CATEGORIES = new Set([
   "fuse",
   "frame",
 ]);
+const REFERENCE_FILE_ACCEPT: Readonly<Record<MediaReferenceKind, string>> = {
+  image: ".jpg,.jpeg,.png,.gif,.webp,.bmp",
+  audio: ".mp3,.wav,.ogg,.m4a,.aac,.flac,.wma",
+  video: ".mp4,.webm,.mov,.m4v,.avi,.mkv",
+};
+const REFERENCE_KIND_LABELS: Readonly<Record<MediaReferenceKind, string>> = {
+  image: "图片",
+  audio: "音频",
+  video: "视频",
+};
+const REFERENCE_COUNT_LIMIT: Readonly<Record<MediaReferenceKind, number>> = {
+  image: 64,
+  audio: 5,
+  video: 5,
+};
 
 interface ModelOptions {
   readonly sizes: readonly string[];
@@ -146,7 +172,8 @@ function libraryChoices(
 }
 
 function isUnauthorized(error: unknown): boolean {
-  return (error instanceof MediaGenerationError && error.kind === "unauthorized")
+  return (error instanceof MediaReferenceUploadError && error.kind === "unauthorized")
+    || (error instanceof MediaGenerationError && error.kind === "unauthorized")
     || (error instanceof ApiError && error.status === 401);
 }
 
@@ -162,6 +189,7 @@ function receiptMessage(receipt: MediaGenerationReceipt): string {
 
 function describeFailure(error: unknown): string {
   if (error instanceof MediaGenerationError) return error.message;
+  if (error instanceof MediaReferenceUploadError) return error.message;
   const normalized = normalizeApiError(error);
   if (normalized.status === 503) return normalized.detail ?? "该媒体生成操作当前未启用。";
   return normalized.detail ?? normalized.message;
@@ -205,6 +233,11 @@ export function MediaGenerationPage({
   const [videoReferenceAudios, setVideoReferenceAudios] = useState("");
   const [videoReferenceVideos, setVideoReferenceVideos] = useState("");
   const [batchReferenceImages, setBatchReferenceImages] = useState("");
+  const [referenceFiles, setReferenceFiles] = useState<Partial<Record<MediaReferenceKind, File>>>({});
+  const [referenceUploadStatus, setReferenceUploadStatus] = useState<ReferenceUploadStatus | null>(null);
+  const [uploadingReference, setUploadingReference] = useState(false);
+  const uploadInProgressRef = useRef(false);
+  const referenceFileInputs = useRef<Partial<Record<MediaReferenceKind, HTMLInputElement | null>>>({});
   const [loading, setLoading] = useState(true);
   const [chapterLoading, setChapterLoading] = useState(false);
   const [directoryLoading, setDirectoryLoading] = useState(false);
@@ -275,6 +308,14 @@ export function MediaGenerationPage({
       mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    setReferenceFiles({});
+    setReferenceUploadStatus(null);
+    Object.values(referenceFileInputs.current).forEach((input) => {
+      if (input !== null && input !== undefined) input.value = "";
+    });
+  }, [services, sessionGeneration, userId]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -424,9 +465,10 @@ export function MediaGenerationPage({
   }, [singleAssetChoices, singleAssetId, singleStoryboardAssetId, storyboardAssets]);
 
   const setModeSafely = (value: MediaMode) => {
-    if (pendingRef.current !== null || requestingRef.current) return;
+    if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current) return;
     setMode(value);
     setOutcome(null);
+    setReferenceUploadStatus(null);
   };
 
   const applyReceipt = (signature: string, receipt: MediaGenerationReceipt) => {
@@ -470,6 +512,108 @@ export function MediaGenerationPage({
         && identityRef.current.sessionGeneration === capturedSessionGeneration
         && identityRef.current.signature === capturedSignature,
     });
+  };
+
+  const makeReferenceUploadRun = () => {
+    const capturedSignature = formSignature;
+    const capturedUserId = userId;
+    const capturedServices = services;
+    const capturedSessionGeneration = sessionGeneration;
+    const port = services.mediaReferenceUpload;
+    if (port === undefined) throw new MediaReferenceUploadError("not-sent", "参考素材上传服务尚未接入。");
+    return port.beginRun({
+      actorId: userId,
+      isContextCurrent: () => mountedRef.current
+        && identityRef.current.userId === capturedUserId
+        && identityRef.current.services === capturedServices
+        && identityRef.current.sessionGeneration === capturedSessionGeneration
+        && identityRef.current.signature === capturedSignature,
+    });
+  };
+
+  const setReferenceFile = (kind: MediaReferenceKind, file: File | undefined) => {
+    setReferenceFiles((current) => {
+      const next = { ...current };
+      if (file === undefined) delete next[kind];
+      else next[kind] = file;
+      return next;
+    });
+    setReferenceUploadStatus((current) => current?.kind === kind ? null : current);
+  };
+
+  const appendReferenceUrl = (kind: MediaReferenceKind, url: string) => {
+    const append = (current: string) => `${current}${current === "" || current.endsWith("\n") ? "" : "\n"}${url}`;
+    if (kind === "image" && mode === "image") setImageReferenceImages(append);
+    else if (kind === "image" && mode === "video") setVideoReferenceImages(append);
+    else if (kind === "image") setBatchReferenceImages(append);
+    else if (kind === "audio") setVideoReferenceAudios(append);
+    else setVideoReferenceVideos(append);
+  };
+
+  const referenceCount = (kind: MediaReferenceKind) => {
+    const value = kind === "image"
+      ? mode === "image" ? imageReferenceImages : mode === "video" ? videoReferenceImages : batchReferenceImages
+      : kind === "audio" ? videoReferenceAudios : videoReferenceVideos;
+    return splitReferences(value).length;
+  };
+
+  const uploadReference = async (kind: MediaReferenceKind) => {
+    if (uploadInProgressRef.current || pendingRef.current !== null || requestingRef.current) return;
+    const file = referenceFiles[kind];
+    if (file === undefined) return;
+    if (referenceCount(kind) >= REFERENCE_COUNT_LIMIT[kind]) {
+      setReferenceUploadStatus({
+        kind,
+        status: "failed",
+        message: `参考${REFERENCE_KIND_LABELS[kind]}已达到 ${REFERENCE_COUNT_LIMIT[kind]} 项上限，请先调整列表。`,
+      });
+      return;
+    }
+    const signature = formSignature;
+    let run: ReturnType<typeof makeReferenceUploadRun>;
+    try {
+      run = makeReferenceUploadRun();
+    } catch (error) {
+      setReferenceUploadStatus({ kind, status: "failed", message: describeFailure(error) });
+      return;
+    }
+
+    uploadInProgressRef.current = true;
+    setUploadingReference(true);
+    setReferenceUploadStatus({ kind, status: "uploading", message: `正在上传${REFERENCE_KIND_LABELS[kind]}…` });
+    try {
+      const url = await run.upload(kind, file, new AbortController().signal);
+      if (!run.isCurrent() || identityRef.current.signature !== signature) return;
+      appendReferenceUrl(kind, url);
+      setReferenceUploadStatus({ kind, status: "uploaded", message: `已上传并添加到当前参考${REFERENCE_KIND_LABELS[kind]}列表。` });
+      setReferenceFiles((current) => {
+        const next = { ...current };
+        delete next[kind];
+        return next;
+      });
+      const input = referenceFileInputs.current[kind];
+      if (input !== null && input !== undefined) input.value = "";
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        onUnauthorized();
+        return;
+      }
+      if (!run.isCurrent() || identityRef.current.signature !== signature) return;
+      const unknown = error instanceof MediaReferenceUploadError && error.kind === "unknown";
+      setReferenceUploadStatus({
+        kind,
+        status: unknown ? "unknown" : "failed",
+        message: unknown
+          ? `${describeFailure(error)}系统不会自动重传；如需重试，请再次明确点击上传。`
+          : describeFailure(error),
+      });
+    } finally {
+      uploadInProgressRef.current = false;
+      setUploadingReference(false);
+      if (!run.isCurrent() || identityRef.current.signature !== signature) {
+        setReferenceUploadStatus((current) => current?.status === "uploading" ? null : current);
+      }
+    }
   };
 
   const singleTarget = (): MediaGenerationSingleTarget => {
@@ -677,7 +821,48 @@ export function MediaGenerationPage({
   const singlePromptOptions = isImageMode ? currentImagePromptOptions : currentVideoPromptOptions;
   const singleReferences = isImageMode ? imageReferenceImages : videoReferenceImages;
   const singleReferenceSetter = isImageMode ? setImageReferenceImages : setVideoReferenceImages;
-  const isFrozen = pending !== null || requesting;
+  const isFrozen = pending !== null || requesting || uploadingReference;
+
+  const renderReferenceUploader = (kind: MediaReferenceKind) => {
+    const label = REFERENCE_KIND_LABELS[kind];
+    const status = referenceUploadStatus?.kind === kind ? referenceUploadStatus : null;
+    return (
+      <>
+        <label className="media-generation-wide">
+          <span>选择参考{label}文件</span>
+          <input
+            accept={REFERENCE_FILE_ACCEPT[kind]}
+            aria-label={`选择${label}文件`}
+            disabled={isFrozen}
+            onChange={(event) => setReferenceFile(kind, event.currentTarget.files?.[0])}
+            ref={(element) => { referenceFileInputs.current[kind] = element; }}
+            type="file"
+          />
+        </label>
+        <button
+          className="secondary-button media-generation-wide"
+          disabled={isFrozen || referenceFiles[kind] === undefined || services.mediaReferenceUpload === undefined
+            || referenceCount(kind) >= REFERENCE_COUNT_LIMIT[kind]}
+          onClick={() => void uploadReference(kind)}
+          type="button"
+        >
+          {uploadingReference && status?.status === "uploading" ? "上传中…" : `上传并添加${label}到参考列表`}
+        </button>
+        {status !== null && (
+          <p className={`media-generation-note media-generation-wide${status.status === "failed" ? " media-generation-alert" : ""}`}
+            role={status.status === "failed" ? "alert" : "status"}>{status.message}</p>
+        )}
+        {referenceCount(kind) >= REFERENCE_COUNT_LIMIT[kind] && (
+          <p className="media-generation-note media-generation-wide" role="status">
+            参考{label}最多 {REFERENCE_COUNT_LIMIT[kind]} 项，请先调整列表后再上传。
+          </p>
+        )}
+        {services.mediaReferenceUpload === undefined && (
+          <p className="media-generation-note media-generation-wide" role="status">参考素材上传服务尚未接入。</p>
+        )}
+      </>
+    );
+  };
 
   return (
     <section className="media-generation-page" aria-labelledby="media-generation-title">
@@ -795,9 +980,23 @@ export function MediaGenerationPage({
                 {selectedAssetForSingle !== undefined && <p className="media-generation-wide media-generation-target-detail">{selectedAssetForSingle.description || "该素材没有描述。"}</p>}
               </>
             )}
-            <label><span>参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => singleReferenceSetter(event.target.value)} rows={3} value={singleReferences} /></label>
-            {!isImageMode && <label><span>参考音频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setVideoReferenceAudios(event.target.value)} rows={3} value={videoReferenceAudios} /></label>}
-            {!isImageMode && <label className="media-generation-wide"><span>参考视频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setVideoReferenceVideos(event.target.value)} rows={3} value={videoReferenceVideos} /></label>}
+            <label><span>参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
+              singleReferenceSetter(event.target.value);
+              setReferenceUploadStatus((current) => current?.kind === "image" ? null : current);
+            }} rows={3} value={singleReferences} /></label>
+            {renderReferenceUploader("image")}
+            {!isImageMode && <>
+              <label><span>参考音频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
+                setVideoReferenceAudios(event.target.value);
+                setReferenceUploadStatus((current) => current?.kind === "audio" ? null : current);
+              }} rows={3} value={videoReferenceAudios} /></label>
+              {renderReferenceUploader("audio")}
+              <label className="media-generation-wide"><span>参考视频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
+                setVideoReferenceVideos(event.target.value);
+                setReferenceUploadStatus((current) => current?.kind === "video" ? null : current);
+              }} rows={3} value={videoReferenceVideos} /></label>
+              {renderReferenceUploader("video")}
+            </>}
           </div>
           {chapterError !== null && <p className="media-generation-alert" role="alert">章节读取失败：{chapterError}</p>}
           {directoryError !== null && <p className="media-generation-alert" role="alert">章节素材读取失败：{directoryError}</p>}
@@ -840,7 +1039,11 @@ export function MediaGenerationPage({
                 {imageOptions.sizes.map((size) => <option key={size} value={size}>{size}</option>)}
               </select></label>
             )}
-            <label className="media-generation-wide"><span>公共参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setBatchReferenceImages(event.target.value)} rows={3} value={batchReferenceImages} /></label>
+            <label className="media-generation-wide"><span>公共参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
+              setBatchReferenceImages(event.target.value);
+              setReferenceUploadStatus((current) => current?.kind === "image" ? null : current);
+            }} rows={3} value={batchReferenceImages} /></label>
+            {renderReferenceUploader("image")}
           </div>
           {chapterError !== null && <p className="media-generation-alert" role="alert">章节读取失败：{chapterError}</p>}
           {directoryError !== null && <p className="media-generation-alert" role="alert">章节素材读取失败：{directoryError}</p>}

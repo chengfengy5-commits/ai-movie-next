@@ -19,6 +19,8 @@ import { createCanvasImageGenerationHttpPort } from "./canvasImageGenerationHttp
 import type { CanvasImageGenerationPort } from "./canvasImageGeneration";
 import { createMediaGenerationHttpPort } from "./mediaGenerationHttp";
 import type { MediaGenerationPort } from "./mediaGeneration";
+import { createMediaReferenceUploadHttpPort } from "./mediaReferenceUploadHttp";
+import type { MediaReferenceUploadPort } from "./mediaReferenceUpload";
 import { createCanvasOwnedImageHttpPort } from "./canvasOwnedImageHttp";
 import type { CanvasOwnedImagePort } from "./canvasOwnedImage";
 import {
@@ -232,6 +234,7 @@ export interface WorkspaceServices {
   readonly canvasGenerationApplications?: CanvasGenerationApplicationsPort;
   readonly canvasImageGeneration?: CanvasImageGenerationPort;
   readonly mediaGeneration?: MediaGenerationPort;
+  readonly mediaReferenceUpload?: MediaReferenceUploadPort;
   readonly canvasOwnedImage?: CanvasOwnedImagePort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
@@ -2957,6 +2960,12 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     mediaGeneration: createMediaGenerationHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    mediaReferenceUpload: createMediaReferenceUploadHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,

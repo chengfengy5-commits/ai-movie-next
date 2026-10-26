@@ -1,8 +1,9 @@
-import { cleanup, render, screen, within } from "@testing-library/react";
+import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Series, StoryboardAsset } from "../../shared/api/contracts";
 import type { MediaGenerationPort, MediaGenerationRun } from "../../shared/api/mediaGeneration";
+import type { MediaReferenceUploadPort, MediaReferenceUploadRun } from "../../shared/api/mediaReferenceUpload";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { MediaGenerationPage } from "./MediaGenerationPage";
@@ -102,6 +103,17 @@ function generationPort(
   return { beginRun: vi.fn(() => run) };
 }
 
+function referenceUploadPort(
+  upload: MediaReferenceUploadRun["upload"] = vi.fn(async () => "https://cdn.example.test/reference.png"),
+): MediaReferenceUploadPort {
+  return {
+    beginRun: vi.fn((context) => ({
+      isCurrent: () => context.isContextCurrent(),
+      upload,
+    })),
+  };
+}
+
 function chapterFixture(): Chapter {
   return {
     id: "chapter-926",
@@ -186,11 +198,13 @@ describe("MediaGenerationPage", () => {
       quotedAmount: 4,
       billingStatus: "charged",
     }));
+    const uploadReference = vi.fn<MediaReferenceUploadRun["upload"]>(async () => "https://cdn.example.test/uploaded-reference.png");
     const onOpenTasks = vi.fn();
     const services: WorkspaceServices = {
       ...createDemoServices(window.localStorage),
       creatorSettings: creatorSettings(),
       mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+      mediaReferenceUpload: referenceUploadPort(uploadReference),
       listSeries: vi.fn(async () => [series]),
       listChapters: vi.fn(async () => [chapter]),
       listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
@@ -217,6 +231,11 @@ describe("MediaGenerationPage", () => {
     await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
     await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
     await user.type(screen.getByLabelText("参考图片 URL（每行一项）"), "https://example.test/ref-a.png\nhttps://example.test/ref-b.png");
+    await user.upload(screen.getByLabelText("选择图片文件"), new File(["image"], "reference.png", { type: "image/png" }));
+    await user.click(screen.getByRole("button", { name: "上传并添加图片到参考列表" }));
+    await screen.findByText("已上传并添加到当前参考图片列表。");
+    expect(uploadReference).toHaveBeenCalledOnce();
+    expect(submitImage).not.toHaveBeenCalled();
     await user.click(screen.getByRole("button", { name: "提交图片任务" }));
 
     await screen.findByText(/图片任务已受理/);
@@ -226,12 +245,52 @@ describe("MediaGenerationPage", () => {
       prompt: "保持设定一致\n\n细节清晰",
       target: { kind: "frame_message", chapter_id: chapter.id, storyboard_asset_id: "storyboard-926" },
       size: "1:1",
-      referenceImages: ["https://example.test/ref-a.png", "https://example.test/ref-b.png"],
+      referenceImages: [
+        "https://example.test/ref-a.png",
+        "https://example.test/ref-b.png",
+        "https://cdn.example.test/uploaded-reference.png",
+      ],
     });
     expect(submitImage.mock.calls[0]![0].idempotencyKey).toEqual(expect.any(String));
 
     await user.click(screen.getByRole("button", { name: "查看我的任务" }));
     expect(onOpenTasks).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not add a late upload URL after the page session scope changes", async () => {
+    const user = userEvent.setup();
+    let finishUpload: ((url: string) => void) | undefined;
+    const uploadReference = vi.fn<MediaReferenceUploadRun["upload"]>(() => new Promise((resolve) => {
+      finishUpload = resolve;
+    }));
+    const onUnauthorized = vi.fn();
+    const onOpenTasks = vi.fn();
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] }))),
+      mediaReferenceUpload: referenceUploadPort(uploadReference),
+    };
+    const props = {
+      services,
+      userId: "actor-926",
+      onUnauthorized,
+      onOpenTasks,
+    };
+    const { rerender } = render(<MediaGenerationPage {...props} sessionGeneration={4} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.upload(screen.getByLabelText("选择图片文件"), new File(["image"], "reference.png", { type: "image/png" }));
+    await user.click(screen.getByRole("button", { name: "上传并添加图片到参考列表" }));
+    await screen.findByText("正在上传图片…");
+
+    rerender(<MediaGenerationPage {...props} sessionGeneration={5} />);
+    finishUpload?.("https://cdn.example.test/late-reference.png");
+
+    const references = screen.getByLabelText("参考图片 URL（每行一项）");
+    await waitFor(() => expect(references).toHaveValue(""));
+    await waitFor(() => expect(screen.queryByText("正在上传图片…")).not.toBeInTheDocument());
+    expect(uploadReference).toHaveBeenCalledOnce();
   });
 
   it("offers a current-chapter storyboard as a video asset-message target", async () => {
