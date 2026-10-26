@@ -42,6 +42,11 @@ import {
   type FrameAssetReferenceOwner,
 } from "./FrameAssetReferencesPanel";
 import {
+  ChapterProductionChecklistPanel,
+  type ChapterProductionChecklistFrameTarget,
+  type ChapterProductionChecklistOwner,
+} from "./ChapterProductionChecklistPanel";
+import {
   PersonalProductionNotesPanel,
   type PersonalProductionNoteFrameTarget,
   type PersonalProductionNoteReadIdentity,
@@ -123,6 +128,13 @@ interface ChapterBrowserScope {
   userId: string;
   services: WorkspaceServices;
   seriesId: string;
+}
+
+interface ChapterProductionChecklistContext {
+  owner: ChapterProductionChecklistOwner;
+  requestGeneration: number;
+  sessionGeneration: number | undefined;
+  openEpoch: number;
 }
 
 interface StoryboardGenerationDialogOwner {
@@ -848,6 +860,10 @@ export function ChapterBrowser({
   const personalNotesReadWatermarkRef = useRef<PersonalNotesReadWatermark>({ owner: null, requestGeneration: -1, invalidatedGenerations: new Set() });
   const [personalNoteFrameFeedback, setPersonalNoteFrameFeedback] = useState<PersonalNoteFrameNavigationFeedback | null>(null);
   const [frameAssetReferenceOwner, setFrameAssetReferenceOwner] = useState<FrameAssetReferenceOwner | null>(null);
+  const [productionChecklistContext, setProductionChecklistContext] = useState<ChapterProductionChecklistContext | null>(null);
+  const productionChecklistContextRef = useRef<ChapterProductionChecklistContext | null>(productionChecklistContext);
+  productionChecklistContextRef.current = productionChecklistContext;
+  const productionChecklistOpenEpoch = useRef(0);
   const [personalRoughCutContext, setPersonalRoughCutContext] = useState<PersonalRoughCutContext | null>(null);
   const [mediaExportOwner, setMediaExportOwner] = useState<MediaExportDialogOwner | null>(null);
   const mediaExportOwnerRef = useRef<MediaExportDialogOwner | null>(mediaExportOwner);
@@ -900,6 +916,9 @@ export function ChapterBrowser({
     personalNotesReadRegistrationRef.current = null;
     personalNotesReadWatermarkRef.current = { owner: null, requestGeneration: -1, invalidatedGenerations: new Set() };
     frameAssetReferenceOwnerRef.current = null;
+    productionChecklistContextRef.current = null;
+    productionChecklistOpenEpoch.current += 1;
+    setProductionChecklistContext(null);
     personalNotesOpenEpoch.current += 1;
     frameAssetReferencesOpenEpoch.current += 1;
     roughCutContextRef.current = null;
@@ -986,6 +1005,14 @@ export function ChapterBrowser({
     frameAssetReferencesOpenEpoch.current += 1;
     frameAssetReferenceOwnerRef.current = null;
     setFrameAssetReferenceOwner(null);
+  }, []);
+
+  const closeChapterProductionChecklist = useCallback((expectedContext?: ChapterProductionChecklistContext) => {
+    const context = productionChecklistContextRef.current;
+    if (context === null || (expectedContext !== undefined && context !== expectedContext)) return;
+    productionChecklistOpenEpoch.current += 1;
+    productionChecklistContextRef.current = null;
+    setProductionChecklistContext(null);
   }, []);
 
   useEffect(() => {
@@ -1208,6 +1235,23 @@ export function ChapterBrowser({
   }
   const frameAssetReferencesOpen = frameAssetReferenceOwner !== null
     && frameAssetReferenceScopeMatches;
+  const productionChecklistOpen = productionChecklistContext !== null
+    && productionChecklistContextRef.current === productionChecklistContext
+    && productionChecklistContext.owner.userId === userId
+    && productionChecklistContext.owner.seriesId === series.id
+    && productionChecklistContext.owner.services === services
+    && productionChecklistContext.owner.chapter === selectedChapter
+    && productionChecklistContext.requestGeneration === chapterRequestGeneration.current
+    && productionChecklistContext.requestGeneration === chapterDirectoryRef.current.requestGeneration
+    && sameChapterBrowserScope(chapterDirectoryRef.current.scope, activeScopeRef.current)
+    && chapterDirectoryRef.current.chapters?.find((chapter) => chapter.id === selectedChapter.id) === selectedChapter
+    && productionChecklistContext.sessionGeneration === sessionGeneration;
+
+  useEffect(() => {
+    if (productionChecklistContext !== null && !productionChecklistOpen) {
+      closeChapterProductionChecklist(productionChecklistContext);
+    }
+  }, [closeChapterProductionChecklist, productionChecklistContext, productionChecklistOpen]);
 
   useEffect(() => {
     const owner = mediaExportOwnerRef.current;
@@ -1774,6 +1818,7 @@ export function ChapterBrowser({
     pendingFrameNavigationRef.current = null;
     setPendingFrameNavigation(null);
     setFrameNavigationFeedback(null);
+    closeChapterProductionChecklist();
     closePersonalNotes();
     closeFrameAssetReferences();
     closePersonalRoughCut();
@@ -1898,6 +1943,7 @@ export function ChapterBrowser({
     pendingFrameNavigationRef.current = null;
     setPendingFrameNavigation(null);
     setFrameNavigationFeedback(null);
+    closeChapterProductionChecklist();
     assetRequestGeneration.current += 1;
     closeMediaExport();
     closePersonalNotes();
@@ -2004,6 +2050,75 @@ export function ChapterBrowser({
     setFrameAssetReferenceOwner(owner);
   }
 
+  function openChapterProductionChecklist(): void {
+    if (selectedChapter === null || chapterPanelsOpen || chapterManagement !== null || chaptersLoading) return;
+    const context: ChapterProductionChecklistContext = {
+      owner: { userId, seriesId: series.id, services, chapter: selectedChapter },
+      requestGeneration: chapterRequestGeneration.current,
+      sessionGeneration,
+      openEpoch: ++productionChecklistOpenEpoch.current,
+    };
+    productionChecklistContextRef.current = context;
+    setProductionChecklistContext(context);
+  }
+
+  function isCurrentChapterProductionChecklist(context: ChapterProductionChecklistContext): boolean {
+    const directory = chapterDirectoryRef.current;
+    return productionChecklistContextRef.current === context
+      && context.openEpoch === productionChecklistOpenEpoch.current
+      && context.owner.userId === userId
+      && context.owner.seriesId === series.id
+      && context.owner.services === services
+      && context.owner.chapter === selectedChapter
+      && context.requestGeneration === chapterRequestGeneration.current
+      && context.requestGeneration === directory.requestGeneration
+      && sameChapterBrowserScope(directory.scope, activeScopeRef.current)
+      && context.sessionGeneration === sessionGenerationRef.current
+      && selectedChapterIdRef.current === context.owner.chapter.id
+      && directory.chapters?.filter((chapter) => chapter.id === context.owner.chapter.id).length === 1
+      && directory.chapters?.find((chapter) => chapter.id === context.owner.chapter.id) === context.owner.chapter;
+  }
+
+  function locateChapterProductionChecklistFrame(
+    context: ChapterProductionChecklistContext,
+    target: ChapterProductionChecklistFrameTarget,
+  ): boolean {
+    if (!isCurrentChapterProductionChecklist(context) || !target.isCurrent()) return false;
+    const storyboardAssetId = target.storyboardAssetId.trim();
+    const content = context.owner.chapter.content;
+    if (storyboardAssetId === "" || !Array.isArray(content)) return false;
+    const positions = content.flatMap((frame, index) => {
+      if (typeof frame !== "object" || frame === null || Array.isArray(frame)) return [];
+      const storyboard = (frame as Record<string, unknown>).storyboard;
+      if (!Array.isArray(storyboard)) return [];
+      const rawId = storyboard[0];
+      const normalizedId = typeof rawId === "string" ? rawId.trim()
+        : typeof rawId === "number" && Number.isFinite(rawId) ? String(rawId) : "";
+      return normalizedId === storyboardAssetId ? [index + 1] : [];
+    });
+    if (positions.length !== 1) return false;
+    const position = positions[0];
+    if (position === undefined || !frameViews.some((frame) => frame.position === position)) return false;
+    const list = storyboardListElement.current;
+    const element = storyboardFrameElements.current.get(position);
+    if (list === null || element === undefined || !element.isConnected || !list.contains(element)
+      || !isVisibleStoryboardElement(element)) return false;
+    try {
+      element.focus({ preventScroll: true });
+    } catch {
+      return false;
+    }
+    if (document.activeElement !== element || !isCurrentChapterProductionChecklist(context)
+      || !target.isCurrent() || storyboardFrameElements.current.get(position) !== element
+      || !isVisibleStoryboardElement(element) || !list.contains(element)) return false;
+    try {
+      element.scrollIntoView?.({ behavior: "auto", block: "center" });
+    } catch {
+      return false;
+    }
+    return true;
+  }
+
   function openPersonalNotes() {
     if (
       selectedChapter === null
@@ -2067,6 +2182,7 @@ export function ChapterBrowser({
     pendingFrameNavigationRef.current = null;
     setPendingFrameNavigation(null);
     setFrameNavigationFeedback(null);
+    closeChapterProductionChecklist();
     closeMediaExport();
     closePersonalNotes();
     closeFrameAssetReferences();
@@ -3181,7 +3297,7 @@ export function ChapterBrowser({
   }
 
   const selectedIndex = chapters?.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
-  const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen;
+  const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen || productionChecklistOpen;
   const chapterManagementBlocked = chapterPanelsOpen
     || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null || frameEditOpening
     || storyboardGenerationDialog !== null || frameReviewDialog !== null
@@ -4662,7 +4778,7 @@ export function ChapterBrowser({
                   {!personalNotesOpen && (
                     <button
                       className="text-button personal-production-open-button"
-                      disabled={currentAssetResult === null || currentAssetResult.status === "loading"}
+                      disabled={chapterManagementBlocked || currentAssetResult === null || currentAssetResult.status === "loading"}
                       onClick={openPersonalNotes}
                       type="button"
                     >
@@ -4672,11 +4788,21 @@ export function ChapterBrowser({
                   {!personalRoughCutOpen && (
                     <button
                       className="text-button personal-rough-cut-open-button"
+                      disabled={chapterManagementBlocked || chapterManagement !== null}
                       onClick={openPersonalRoughCut}
                       type="button"
                     >
                       查看我的粗剪草稿
                     </button>
+                  )}
+                  {!productionChecklistOpen && (
+                    <button
+                      className="text-button chapter-production-checklist-open-button"
+                      disabled={chapterManagementBlocked || chapterManagement !== null || chaptersLoading}
+                      onClick={openChapterProductionChecklist}
+                      title={chapterPanelsOpen ? "请先关闭当前制作记录或素材引用面板" : undefined}
+                      type="button"
+                    >制作缺项</button>
                   )}
                 </div>
               </header>
@@ -4687,6 +4813,28 @@ export function ChapterBrowser({
                   ? "可以编辑各镜头文字；原文、分镜素材关系和其他镜头字段会保留。"
                   : "此页面提供只读展示。"}</span>
               </div>
+
+              {productionChecklistOpen && productionChecklistContext !== null && selectedChapter !== null && (
+                <ChapterProductionChecklistPanel
+                  key={`${productionChecklistContext.owner.userId}:${productionChecklistContext.owner.seriesId}:${productionChecklistContext.owner.chapter.id}:${productionChecklistContext.requestGeneration}:${productionChecklistContext.openEpoch}`}
+                  isCurrent={() => isCurrentChapterProductionChecklist(productionChecklistContext)}
+                  onClose={() => closeChapterProductionChecklist(productionChecklistContext)}
+                  onLocateFrame={(target) => locateChapterProductionChecklistFrame(productionChecklistContext, target)}
+                  onUnauthorized={() => {
+                    if (isCurrentChapterProductionChecklist(productionChecklistContext)) onUnauthorized();
+                  }}
+                  owner={productionChecklistContext.owner}
+                  {...(onNavigateToAsset === undefined || !series.can_enter
+                    ? {}
+                    : {
+                      onNavigateToAsset: (target: FrameAssetReferenceAssetTarget) => {
+                        if (isCurrentChapterProductionChecklist(productionChecklistContext)
+                          && target.seriesId === series.id
+                          && target.isCurrent()) onNavigateToAsset(target);
+                      },
+                    })}
+                />
+              )}
 
               {lockMessage !== null && (
                 <div className="chapter-lock-note" role="note">
@@ -4967,6 +5115,7 @@ export function ChapterBrowser({
                               {sourceFrame !== undefined && !isReferenceOwner && (
                                 <button
                                   className="text-button frame-asset-references-open-button"
+                                  disabled={chapterManagementBlocked || chapterManagement !== null}
                                   onClick={() => openFrameAssetReferences(sourceFrame, frame.position)}
                                   type="button"
                                 >

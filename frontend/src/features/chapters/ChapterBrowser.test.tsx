@@ -11,6 +11,8 @@ import {
   type PersonalProductionSnapshot,
 } from "../../shared/api/personalProductionNotes";
 import type { WorkspaceServices } from "../../shared/api/services";
+import { createApiServices } from "../../shared/api/services";
+import { API_TOKEN_KEY } from "../../shared/api/storage";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
 import type {
   StoryboardAssetGenerationServicePort,
@@ -195,6 +197,7 @@ function makeServices(
   const listStoryboardAssets = vi.fn(async (_seriesId: string, chapterId: string) => (
     assetsByChapter[chapterId] ?? []
   ));
+  const listFusedAssets = vi.fn(async () => []);
   const createChapter = vi.fn(async (seriesId: string, input: CreateChapterInput) => {
     const created = chapter("chapter-created", input.title, input.content, { series_id: seriesId, order: 3 });
     currentChapters = [...currentChapters, created];
@@ -259,6 +262,7 @@ function makeServices(
     listCharacters: async () => [],
     listScenes: async () => [],
     listProps: async () => [],
+    listFusedAssets,
         getPersonalProductionNotes: async () => { throw new Error("Unexpected personal notes request."); },
         getPersonalRoughCut: async () => { throw new Error("Unexpected personal rough-cut request."); },
         listMyTasks: async () => ({ total: 0, page: 1, page_size: 10, tasks: [] }),
@@ -268,6 +272,7 @@ function makeServices(
     services,
     listChapters,
     listStoryboardAssets,
+    listFusedAssets,
     createChapter,
     updateChapter,
     deleteChapter,
@@ -5697,6 +5702,62 @@ describe("read-only chapter browser", () => {
     });
 
     expect(personalNotesBridge.assets).toEqual([newScopeAsset]);
+  });
+
+  it("aggregates chapter omissions and locates only the original unique storyboard identity", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-production-checklist", "制作缺项章节", [
+      {
+        text: "镜头一",
+        storyboard: ["checklist-frame-1"],
+        character: ["missing-character"],
+        fused: ["fused-with-empty-name"],
+      },
+      { text: "镜头二", storyboard: ["checklist-frame-2"], character: ["missing-character"] },
+    ]);
+    const firstFrameAsset = { ...asset("checklist-frame-1", current.id), frame_index: 0 };
+    const secondFrameAsset = { ...asset("checklist-frame-2", current.id), frame_index: 1 };
+    const frame = makeServices([current], { [current.id]: [firstFrameAsset, secondFrameAsset] });
+    let fusedAssetsUrl = "";
+    const authenticatedFusedServices = createApiServices(apiBaseUrl, {
+      storage: {
+        getItem: (key) => key === API_TOKEN_KEY ? "checklist-token" : null,
+        setItem: () => undefined,
+        removeItem: () => undefined,
+      },
+      fetcher: async (input) => {
+        fusedAssetsUrl = String(input);
+        return new Response(JSON.stringify([{
+          id: "fused-with-empty-name",
+          series_id: series.id,
+          member_type: "",
+          members: null,
+          name: "",
+          image_url: null,
+          size: null,
+          status: "",
+          error_message: null,
+          created_at: "2026-10-01T00:00:00",
+          updated_at: "2026-10-02T00:00:00",
+        }]), { status: 200, headers: { "Content-Type": "application/json" } });
+      },
+    });
+    frame.services.listFusedAssets = authenticatedFusedServices.listFusedAssets!;
+    renderBrowser(frame.services);
+
+    await screen.findByRole("heading", { name: "制作缺项章节" });
+    await user.click(screen.getByRole("button", { name: "制作缺项" }));
+
+    const issue = await screen.findByText(
+      "角色「未命名素材」：引用未在当前已读取资产中找到（关联：分镜 1、分镜 2）",
+    );
+    expect(await screen.findByText("融合素材「未命名素材」：缺少图片（关联：分镜 1）")).toBeTruthy();
+    const issueRow = issue.closest("li");
+    expect(issueRow).not.toBeNull();
+    await waitFor(() => expect(fusedAssetsUrl).toBe(`${apiBaseUrl}/series/${series.id}/fused-assets`));
+    await user.click(within(issueRow!).getByRole("button", { name: "定位分镜" }));
+
+    expect(document.activeElement).toBe(screen.getByLabelText("制作缺项章节 · 镜头 1"));
   });
 
 });
