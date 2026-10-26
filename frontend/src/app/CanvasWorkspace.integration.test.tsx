@@ -37,6 +37,8 @@ interface GenerationWorkspaceHarnessOptions {
   readonly imageSubmitReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
   readonly imageLookupReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
   readonly promptRows?: readonly unknown[];
+  readonly imageModelParams?: string | null;
+  readonly additionalImageModels?: readonly unknown[];
   readonly promptListStatus?: number;
   readonly deferredPromptList?: boolean;
   readonly deferredImageModels?: boolean;
@@ -294,12 +296,15 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       provider: "private-provider-value",
       model: "private-model-value",
       base_url: "https://private-model.example.invalid",
-      params: "private-params-value",
+      params: options.imageModelParams === undefined
+        ? JSON.stringify({ private: "private-params-value", image_size: { enabled: false } })
+        : options.imageModelParams,
       api_key: "private-api-key-value",
       sort_order: 0,
       is_system: false,
       user_id: "demo-user",
     },
+    ...(options.additionalImageModels ?? []),
     {
       id: "video-model-id",
       category: "video",
@@ -609,6 +614,195 @@ describe("selected chapter to canvas integration", () => {
     expect(harness.requests.filter((request) => request.method === "POST")).toHaveLength(0);
   });
 
+  it("uses the configured model image size and submits the exact selected value", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageModelParams: JSON.stringify({
+        private: "private-params-value",
+        image_size: {
+          enabled: true,
+          options: ["1024x1024", "16:9", "quality:high"],
+          default: "16:9",
+        },
+      }),
+      additionalImageModels: [{
+        id: "image-model-fallback-size",
+        category: "image",
+        name: "回退尺寸模型",
+        provider: "private-provider-value",
+        model: "private-model-value",
+        base_url: "https://private-model.example.invalid",
+        params: JSON.stringify({ image_size: { enabled: true, default: "16:10" } }),
+        api_key: "private-api-key-value",
+        sort_order: 1,
+        is_system: false,
+        user_id: "demo-user",
+      }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    const sizeSelect = await dialogQueries.findByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement;
+
+    expect(sizeSelect.value).toBe("16:9");
+    expect(Array.from(sizeSelect.options).map((option) => option.value)).toEqual([
+      "1024x1024", "16:9", "quality:high",
+    ]);
+    expect(dialog.innerHTML).not.toContain("private-params-value");
+    fireEvent.change(dialogQueries.getByRole("combobox", { name: "图片模型" }), {
+      target: { value: "image-model-fallback-size" },
+    });
+    expect((dialogQueries.getByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement).value).toBe("1024x1024");
+    expect(Array.from((dialogQueries.getByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement).options)
+      .map((option) => option.value)).toEqual(["1024x1024", "1792x1024", "1024x1792", "1216x832", "832x1216"]);
+    fireEvent.change(dialogQueries.getByRole("combobox", { name: "图片模型" }), {
+      target: { value: "image-model-private-id" },
+    });
+    expect((dialogQueries.getByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement).value).toBe("16:9");
+
+    const staleSizeOption = document.createElement("option");
+    staleSizeOption.value = "retired-size";
+    staleSizeOption.textContent = "已移除尺寸";
+    sizeSelect.append(staleSizeOption);
+    fireEvent.change(sizeSelect, { target: { value: "retired-size" } });
+    expect(dialogQueries.getByText("请选择当前模型提供的有效尺寸，未发送图片任务。")).toBeTruthy();
+    expect(dialogQueries.getByRole("button", { name: "提交单张图片任务" })).toBeDisabled();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+
+    fireEvent.change(sizeSelect, { target: { value: "quality:high" } });
+    expect(dialogQueries.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled();
+    fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), {
+      target: { value: "电影海报构图" },
+    });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submission = harness.requests.find((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({
+      model_id: "image-model-private-id",
+      prompt: "电影海报构图",
+      size: "quality:high",
+    });
+    expect(await screen.findByText("图片尺寸：quality:high")).toBeTruthy();
+  });
+
+  it.each([
+    ["缺少尺寸配置", JSON.stringify({ private: "private-params-value" })],
+    ["尺寸功能已禁用", JSON.stringify({ image_size: { enabled: false } })],
+    ["模型未提供参数", null],
+  ] as const)("hides the size control and omits size when %s", async (_name, imageModelParams) => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", imageModelParams });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    expect(dialogQueries.queryByRole("combobox", { name: "图片尺寸" })).toBeNull();
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submission = harness.requests.find((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).not.toHaveProperty("size");
+    expect(Object.keys(submission?.body as object)).toEqual(["model_id", "prompt", "target"]);
+  });
+
+  it.each([
+    ["空字符串 params", ""],
+    ["null image_size", JSON.stringify({ image_size: null })],
+    ["缺省 enabled", JSON.stringify({ image_size: { default: "16:9" } })],
+    ["null enabled", JSON.stringify({ image_size: { enabled: null } })],
+  ] as const)("accepts legacy creator model params with %s as model default", async (_name, imageModelParams) => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", imageModelParams });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = within(dialog);
+    await dialogQueries.findByRole("option", { name: "画布单图模型" });
+
+    expect(dialogQueries.queryByRole("combobox", { name: "图片尺寸" })).toBeNull();
+    const submit = dialogQueries.getByRole("button", { name: "提交单张图片任务" });
+    expect(submit).toBeEnabled();
+    fireEvent.click(submit);
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submission = harness.requests.find((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).not.toHaveProperty("size");
+    expect(Object.keys(submission?.body as object)).toEqual(["model_id", "prompt", "target"]);
+  });
+
+  it("uses legacy options when enabled image size has null options and default", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageModelParams: JSON.stringify({ image_size: { enabled: true, options: null, default: null } }),
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = within(dialog);
+    await dialogQueries.findByRole("option", { name: "画布单图模型" });
+
+    const sizeSelect = await dialogQueries.findByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement;
+    expect(sizeSelect.value).toBe("1024x1024");
+    expect(Array.from(sizeSelect.options).map((option) => option.value)).toEqual([
+      "1024x1024", "1792x1024", "1024x1792", "1216x832", "832x1216",
+    ]);
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submission = harness.requests.find((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ size: "1024x1024" });
+  });
+
+  it("deduplicates valid image sizes in order and treats null default as absent", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageModelParams: JSON.stringify({
+        image_size: { enabled: true, options: ["16:9", "16:9", "quality:high"], default: null },
+      }),
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = within(dialog);
+    await dialogQueries.findByRole("option", { name: "画布单图模型" });
+
+    const sizeSelect = await dialogQueries.findByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement;
+    expect(sizeSelect.value).toBe("16:9");
+    expect(Array.from(sizeSelect.options).map((option) => option.value)).toEqual(["16:9", "quality:high"]);
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submission = harness.requests.find((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ size: "16:9" });
+  });
+
+  it.each([
+    ["损坏的 JSON", "{private-params-value,broken"],
+    ["非对象 JSON", "[]"],
+    ["非对象尺寸配置", JSON.stringify({ image_size: [] })],
+    ["非布尔 enabled", JSON.stringify({ image_size: { enabled: "true" } })],
+    ["非字符串选项", JSON.stringify({ image_size: { enabled: true, options: "1024x1024" } })],
+    ["无效 default", JSON.stringify({ image_size: { enabled: true, default: "   " } })],
+    ["不匹配的 default", JSON.stringify({ image_size: { enabled: true, options: ["16:9"], default: "quality:high" } })],
+  ] as const)("blocks submission with a safe error for %s model configuration", async (_name, imageModelParams) => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", imageModelParams });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = within(dialog);
+    await dialogQueries.findByRole("option", { name: "画布单图模型" });
+
+    expect(await dialogQueries.findByText("该图片模型的尺寸配置无效，无法安全提交。")).toBeTruthy();
+    expect(dialogQueries.queryByRole("combobox", { name: "图片尺寸" })).toBeNull();
+    expect(dialog.innerHTML).not.toContain("private-params-value");
+    expect(dialog.innerHTML).not.toContain("private-api-key-value");
+    expect(dialogQueries.getByRole("button", { name: "提交单张图片任务" })).toBeDisabled();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
+      .toHaveLength(0);
+  });
+
   it("loads a prompt template through the real creator-settings factory and submits its composed prompt", async () => {
     const harness = mountGenerationWorkspace({
       targetKind: "stable-frame",
@@ -889,6 +1083,9 @@ describe("selected chapter to canvas integration", () => {
     const harness = mountGenerationWorkspace({
       targetKind: "stable-frame",
       promptRows: [promptRow("original-template", "character-design", "原模板", "原系统段落", "原用户段落")],
+      imageModelParams: JSON.stringify({
+        image_size: { enabled: true, options: ["16:9", "quality:high"], default: "16:9" },
+      }),
       imageSubmitReplies: [{ status: 503 }],
       imageLookupReplies: [{ status: 404 }],
     });
@@ -896,6 +1093,9 @@ describe("selected chapter to canvas integration", () => {
     fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
     let dialog = await screen.findByRole("dialog", { name: "生成图片" });
     let dialogQueries = await waitForImageModelOption(dialog);
+    fireEvent.change(await dialogQueries.findByRole("combobox", { name: "图片尺寸" }), {
+      target: { value: "quality:high" },
+    });
     fireEvent.change(await dialogQueries.findByRole("combobox", { name: "提示词模板" }), {
       target: { value: "original-template" },
     });
@@ -905,6 +1105,7 @@ describe("selected chapter to canvas integration", () => {
     dialogQueries = within(dialog);
     const frozenPrompt = dialogQueries.getByText("提示词：原系统段落 原用户段落 原补充描述");
     expect(frozenPrompt.textContent).toBe("提示词：原系统段落\n原用户段落\n原补充描述");
+    expect(dialogQueries.getByText("图片尺寸：quality:high")).toBeTruthy();
     expect(dialogQueries.queryByRole("combobox", { name: "提示词模板" })).toBeNull();
 
     harness.setPromptRows([promptRow("replacement-template", "style", "新模板", "新提示词")]);
@@ -914,12 +1115,15 @@ describe("selected chapter to canvas integration", () => {
     expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
 
     const promptReads = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/prompts");
+    const modelReads = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/models");
     const lookups = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single");
     const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
     expect(promptReads).toHaveLength(1);
+    expect(modelReads).toHaveLength(1);
     expect(lookups).toHaveLength(1);
     expect(submissions).toHaveLength(2);
     expect(submissions[0]?.body).toEqual(submissions[1]?.body);
+    expect(submissions[0]?.body).toMatchObject({ size: "quality:high" });
     expect(submissions[0]?.headers.get("Idempotency-Key")).toBe(submissions[1]?.headers.get("Idempotency-Key"));
     expect(submissions[0]?.body).toMatchObject({ prompt: "原系统段落\n原用户段落\n原补充描述" });
     expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
@@ -1125,13 +1329,22 @@ describe("selected chapter to canvas integration", () => {
   });
 
   it("ignores a late image receipt after closing the form and changing session scope", async () => {
-    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", deferredImageSubmit: true });
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      deferredImageSubmit: true,
+      imageModelParams: JSON.stringify({ image_size: { enabled: true, options: ["16:9"], default: "16:9" } }),
+    });
     fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
     fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
     const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    expect((await dialog.findByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement).value).toBe("16:9");
     fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
     await harness.deferredImageSubmitStarted;
-    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    const startedSubmission = harness.requests.find((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    expect(startedSubmission?.body).toMatchObject({ size: "16:9" });
 
     fireEvent.click(screen.getByRole("button", { name: "关闭生成图片" }));
     harness.rerender(3);

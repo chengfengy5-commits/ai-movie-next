@@ -197,6 +197,30 @@ describe("Canvas image generation HTTP port", () => {
     assertSecurityOptions(init);
   });
 
+  it("passes a safe configured size verbatim and omits an explicitly undefined size", async () => {
+    for (const size of ["16:9", "quality:high"]) {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(receiptWire()));
+      const harness = createHarness(fetcher);
+      const input = makeInput({ size });
+
+      await harness.run.submit(input, new AbortController().signal);
+
+      const { init } = requestParts(fetcher);
+      expect(JSON.parse(String(init.body))).toEqual({
+        model_id: input.modelId,
+        prompt: input.prompt,
+        size,
+        target: { kind: "canvas_apply", destination: input.destination },
+      });
+    }
+
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(receiptWire()));
+    const harness = createHarness(fetcher);
+    const inputWithUndefinedSize = { ...makeInput(), size: undefined };
+    await harness.run.submit(inputWithUndefinedSize as unknown as CanvasImageGenerationSubmitInput, new AbortController().signal);
+    expect(JSON.parse(String(requestParts(fetcher).init.body))).not.toHaveProperty("size");
+  });
+
   it.each([
     "queued",
     "processing",
@@ -278,7 +302,13 @@ describe("Canvas image generation HTTP port", () => {
       { ...base, destination: { ...noIdFrame, expected_chapter_digest: "not-a-digest" } },
       { ...base, destination: { ...characterImage, asset_type: "storyboard" } },
       { ...base, reference_images: ["https://invalid.example/ref.png"] },
-      { ...base, size: "large" },
+      { ...base, size: null },
+      { ...base, size: 42 },
+      { ...base, size: "" },
+      { ...base, size: "   " },
+      { ...base, size: "s".repeat(101) },
+      { ...base, size: "https://invalid.example/size" },
+      { ...base, size: "bad\nsize" },
     ];
 
     for (const input of invalidInputs) {

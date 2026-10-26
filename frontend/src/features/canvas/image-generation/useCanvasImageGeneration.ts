@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   CanvasImageGenerationError,
+  isValidCanvasImageGenerationSize,
   type CanvasImageGenerationPort,
   type CanvasImageGenerationReceipt,
   type CanvasImageGenerationSubmitInput,
@@ -51,6 +52,8 @@ export interface CanvasImageGenerationControllerState {
   readonly target: CanvasImageGenerationTarget | null;
   readonly models: readonly CanvasImageGenerationModelOption[];
   readonly selectedModelId: string;
+  readonly selectedSize: string;
+  readonly sizeSelectionInvalid: boolean;
   readonly promptTemplates: readonly CanvasImageGenerationPromptTemplateOption[];
   readonly selectedPromptTemplateId: string;
   readonly promptTemplateSelectionInvalid: boolean;
@@ -92,6 +95,8 @@ const EMPTY_STATE: CanvasImageGenerationControllerState = {
   target: null,
   models: [],
   selectedModelId: "",
+  selectedSize: "",
+  sizeSelectionInvalid: false,
   promptTemplates: [],
   selectedPromptTemplateId: "",
   promptTemplateSelectionInvalid: false,
@@ -138,6 +143,7 @@ function receiptView(
     modelId: input.modelId,
     modelName,
     prompt: input.prompt,
+    size: input.size ?? null,
     receipt,
     targetLabel: target.targetLabel,
   };
@@ -156,6 +162,7 @@ function intentView(
     modelId: input.modelId,
     modelName,
     prompt: input.prompt,
+    size: input.size ?? null,
     targetLabel: target.targetLabel,
     input,
     state,
@@ -193,9 +200,87 @@ const IMAGE_PROMPT_TEMPLATE_CATEGORIES = new Set([
   "fuse",
   "frame",
 ]);
+const LEGACY_IMAGE_SIZE_OPTIONS = Object.freeze([
+  "1024x1024",
+  "1792x1024",
+  "1024x1792",
+  "1216x832",
+  "832x1216",
+]);
+const INVALID_IMAGE_SIZE_CONFIGURATION = "该图片模型的尺寸配置无效，无法安全提交。";
+
+interface ImageSizeConfiguration {
+  readonly sizeOptions: readonly string[];
+  readonly defaultSize: string | null;
+  readonly sizeConfigurationError: string | null;
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function imageSizeConfiguration(params: string | null): ImageSizeConfiguration {
+  const noSize = Object.freeze({
+    sizeOptions: Object.freeze([]) as readonly string[],
+    defaultSize: null,
+    sizeConfigurationError: null,
+  });
+  if (params === null || params === "") return noSize;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(params) as unknown;
+  } catch {
+    return Object.freeze({ ...noSize, sizeConfigurationError: INVALID_IMAGE_SIZE_CONFIGURATION });
+  }
+  if (!isRecord(parsed)) {
+    return Object.freeze({ ...noSize, sizeConfigurationError: INVALID_IMAGE_SIZE_CONFIGURATION });
+  }
+  if (!Object.prototype.hasOwnProperty.call(parsed, "image_size")) return noSize;
+
+  const config = parsed.image_size;
+  if (config === null) return noSize;
+  if (!isRecord(config)) {
+    return Object.freeze({ ...noSize, sizeConfigurationError: INVALID_IMAGE_SIZE_CONFIGURATION });
+  }
+  if (config.enabled === false || config.enabled === null || config.enabled === undefined) return noSize;
+  if (config.enabled !== true) {
+    return Object.freeze({ ...noSize, sizeConfigurationError: INVALID_IMAGE_SIZE_CONFIGURATION });
+  }
+
+  const hasOptions = config.options !== null && config.options !== undefined;
+  let configuredOptions: readonly string[];
+  if (hasOptions) {
+    if (!Array.isArray(config.options) || config.options.length === 0
+      || !config.options.every(isValidCanvasImageGenerationSize)) {
+      return Object.freeze({ ...noSize, sizeConfigurationError: INVALID_IMAGE_SIZE_CONFIGURATION });
+    }
+    configuredOptions = Object.freeze([...new Set(config.options)]);
+  } else {
+    configuredOptions = LEGACY_IMAGE_SIZE_OPTIONS;
+  }
+
+  const hasDefault = config.default !== null && config.default !== undefined;
+  let configuredDefault: string | null = null;
+  if (hasDefault) {
+    const value = config.default;
+    if (!isValidCanvasImageGenerationSize(value)) {
+      return Object.freeze({ ...noSize, sizeConfigurationError: INVALID_IMAGE_SIZE_CONFIGURATION });
+    }
+    configuredDefault = value;
+  }
+  if (hasOptions && configuredDefault !== null && !configuredOptions.includes(configuredDefault)) {
+    return Object.freeze({ ...noSize, sizeConfigurationError: INVALID_IMAGE_SIZE_CONFIGURATION });
+  }
+
+  const defaultSize = configuredDefault !== null && configuredOptions.includes(configuredDefault)
+    ? configuredDefault
+    : configuredOptions[0] ?? null;
+  return Object.freeze({
+    sizeOptions: configuredOptions,
+    defaultSize,
+    sizeConfigurationError: null,
+  });
 }
 
 function isPromptText(value: unknown): value is string | null | undefined {
@@ -364,7 +449,15 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     modelControllerRef.current?.abort();
     const controller = new AbortController();
     modelControllerRef.current = controller;
-    update((current) => ({ ...current, modelsLoading: true, models: [], selectedModelId: "", error: null }));
+    update((current) => ({
+      ...current,
+      modelsLoading: true,
+      models: [],
+      selectedModelId: "",
+      selectedSize: "",
+      sizeSelectionInvalid: false,
+      error: null,
+    }));
 
     const settings = optionsRef.current.creatorSettings;
     if (settings === undefined) {
@@ -384,11 +477,17 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
         if (model.category !== "image" || model.id.trim() === "" || model.name.trim() === "" || seen.has(model.id)) return false;
         seen.add(model.id);
         return true;
-      }).map((model) => ({ id: model.id, name: model.name }));
+      }).map((model) => ({
+        id: model.id,
+        name: model.name,
+        ...imageSizeConfiguration(model.params),
+      }));
       update((current) => current.target?.targetKey !== target.targetKey ? current : {
         ...current,
         models,
         selectedModelId: models[0]?.id ?? "",
+        selectedSize: models[0]?.defaultSize ?? "",
+        sizeSelectionInvalid: false,
         error: null,
       });
     }).catch(() => {
@@ -397,6 +496,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
         ...current,
         models: [],
         selectedModelId: "",
+        selectedSize: "",
+        sizeSelectionInvalid: false,
         error: "图片模型暂时无法读取，请稍后重试。",
       });
     }).finally(() => {
@@ -493,6 +594,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       target,
       models: [],
       selectedModelId: "",
+      selectedSize: "",
+      sizeSelectionInvalid: false,
       promptTemplates: [],
       selectedPromptTemplateId: "",
       promptTemplateSelectionInvalid: false,
@@ -538,8 +641,26 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
 
   const setSelectedModelId = useCallback((modelId: string) => {
     const current = stateRef.current;
-    if (current.busy || !current.models.some((model) => model.id === modelId)) return;
-    update((latest) => ({ ...latest, selectedModelId: modelId, error: null }));
+    const model = current.models.find((option) => option.id === modelId);
+    if (current.busy || model === undefined) return;
+    update((latest) => ({
+      ...latest,
+      selectedModelId: modelId,
+      selectedSize: model.defaultSize ?? "",
+      sizeSelectionInvalid: false,
+      error: null,
+    }));
+  }, [update]);
+
+  const setSelectedSize = useCallback((size: string) => {
+    const current = stateRef.current;
+    const model = current.models.find((option) => option.id === current.selectedModelId);
+    if (current.mode !== "form" || current.busy || model === undefined || model.sizeOptions.length === 0) return;
+    if (!model.sizeOptions.includes(size)) {
+      update((latest) => ({ ...latest, selectedSize: size, sizeSelectionInvalid: true }));
+      return;
+    }
+    update((latest) => ({ ...latest, selectedSize: size, sizeSelectionInvalid: false, error: null }));
   }, [update]);
 
   const setSelectedPromptTemplateId = useCallback((promptTemplateId: string) => {
@@ -606,6 +727,14 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const model = current.models.find((option) => option.id === current.selectedModelId);
     if (current.mode !== "form" || target === null || model === undefined
       || current.modelsLoading || busyRef.current || intentRef.current !== null) return;
+    if (model.sizeConfigurationError !== null) return;
+    const size = model.sizeOptions.length > 0 ? current.selectedSize : undefined;
+    if (model.sizeOptions.length > 0
+      && (current.sizeSelectionInvalid || !model.sizeOptions.includes(current.selectedSize)
+        || !isValidCanvasImageGenerationSize(current.selectedSize))) {
+      update((latest) => ({ ...latest, sizeSelectionInvalid: true }));
+      return;
+    }
     if (current.promptTemplateSelectionInvalid) {
       update((latest) => ({
         ...latest,
@@ -633,6 +762,19 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     const prompt = composeImagePrompt(current.prompt, target.promptSeed, selectedTemplate);
     const modelId = model.id;
     const modelName = model.name;
+    const idempotencyKey = globalThis.crypto?.randomUUID?.();
+    if (idempotencyKey === undefined) {
+      update((latest) => ({ ...latest, error: "当前环境无法生成安全的请求编号，未发送任务。" }));
+      return;
+    }
+    const input: CanvasImageGenerationSubmitInput = Object.freeze({
+      modelId,
+      prompt,
+      destination: target.destination,
+      ...(size === undefined ? {} : { size }),
+      idempotencyKey,
+    });
+    const intent = intentView(target, input, modelName, "unknown");
 
     const action = beginAction("submit");
     if (action === null) return;
@@ -648,18 +790,6 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       update((latest) => ({ ...latest, lockReady: lock.status === "ready", lockMessage: lock.message }));
       if (lock.status !== "ready") return;
 
-      const idempotencyKey = globalThis.crypto?.randomUUID?.();
-      if (idempotencyKey === undefined) {
-        update((latest) => ({ ...latest, error: "当前环境无法生成安全的请求编号，未发送任务。" }));
-        return;
-      }
-      const input: CanvasImageGenerationSubmitInput = Object.freeze({
-        modelId,
-        prompt,
-        destination: target.destination,
-        idempotencyKey,
-      });
-      const intent = intentView(target, input, modelName, "unknown");
       updateIntent(intent);
       update((latest) => ({ ...latest, error: null, message: null, mode: "form" }));
       await finishSubmission(intent, action);
@@ -852,6 +982,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     openReceipt,
     close,
     setSelectedModelId,
+    setSelectedSize,
     setSelectedPromptTemplateId,
     setPrompt,
     submitNew,

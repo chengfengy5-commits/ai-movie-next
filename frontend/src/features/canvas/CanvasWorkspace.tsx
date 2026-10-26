@@ -2815,12 +2815,15 @@ export function CanvasWorkspace({
             promptTemplateError={imageGeneration.state.promptTemplateError}
             promptTemplateSelectionInvalid={imageGeneration.state.promptTemplateSelectionInvalid}
             selectedPromptTemplateId={imageGeneration.state.selectedPromptTemplateId}
+            selectedSize={imageGeneration.state.selectedSize}
+            sizeSelectionInvalid={imageGeneration.state.sizeSelectionInvalid}
             onAcquireLock={() => void imageGeneration.acquireLock()}
             onChangePrompt={imageGeneration.setPrompt}
             onClose={imageGeneration.close}
             onLookup={() => void imageGeneration.lookupPendingIntent()}
             onRetry={() => void imageGeneration.retryOriginalIntent()}
             onSelectModel={imageGeneration.setSelectedModelId}
+            onSelectSize={imageGeneration.setSelectedSize}
             onSelectPromptTemplate={imageGeneration.setSelectedPromptTemplateId}
             onStartNew={startAnotherImageGeneration}
             onSubmit={() => void imageGeneration.submitNew()}

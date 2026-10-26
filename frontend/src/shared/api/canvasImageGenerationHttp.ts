@@ -1,6 +1,7 @@
 import { ApiConfigurationError, resolveApiBaseUrl } from "./config";
 import {
   CanvasImageGenerationError,
+  isValidCanvasImageGenerationSize,
   type CanvasImageGenerationBillingStatus,
   type CanvasImageGenerationPort,
   type CanvasImageGenerationReceipt,
@@ -61,6 +62,7 @@ interface NormalizedSubmitInput {
   readonly modelId: string;
   readonly prompt: string;
   readonly destination: CanvasOwnedResultsTarget;
+  readonly size?: string;
   readonly idempotencyKey: string;
 }
 
@@ -197,10 +199,14 @@ function parseDestination(value: unknown, chapterId: string): CanvasOwnedResults
 }
 
 function normalizeSubmitInput(value: unknown, chapterId: string): NormalizedSubmitInput | null {
+  const hasSize = isRecord(value) && Object.prototype.hasOwnProperty.call(value, "size");
   if (!isRecord(value)
-    || !hasExactKeys(value, ["modelId", "prompt", "destination", "idempotencyKey"])
+    || !hasExactKeys(value, hasSize
+      ? ["modelId", "prompt", "destination", "size", "idempotencyKey"]
+      : ["modelId", "prompt", "destination", "idempotencyKey"])
     || !isNonBlankText(value.modelId, 255)
     || !isNonBlankText(value.prompt)
+    || (value.size !== undefined && !isValidCanvasImageGenerationSize(value.size))
     || !isValidIdempotencyKey(value.idempotencyKey)) {
     return null;
   }
@@ -211,6 +217,7 @@ function normalizeSubmitInput(value: unknown, chapterId: string): NormalizedSubm
     modelId: value.modelId,
     prompt: value.prompt,
     destination,
+    ...(value.size === undefined ? {} : { size: value.size }),
     idempotencyKey: value.idempotencyKey,
   });
 }
@@ -589,6 +596,7 @@ export function createCanvasImageGenerationHttpPort(
             ? JSON.stringify({
               model_id: input?.modelId,
               prompt: input?.prompt,
+              ...(input?.size === undefined ? {} : { size: input.size }),
               target: { kind: "canvas_apply", destination: input?.destination },
             })
             : undefined;

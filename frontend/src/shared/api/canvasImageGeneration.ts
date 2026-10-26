@@ -31,8 +31,19 @@ export interface CanvasImageGenerationSubmitInput {
   readonly modelId: string;
   readonly prompt: string;
   readonly destination: CanvasOwnedResultsTarget;
+  readonly size?: string;
   /** Exact key chosen by the caller for this explicit submission. */
   readonly idempotencyKey: string;
+}
+
+const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
+
+export function isValidCanvasImageGenerationSize(value: unknown): value is string {
+  return typeof value === "string"
+    && Array.from(value).length <= 100
+    && value.trim() !== ""
+    && !value.includes("://")
+    && !CONTROL_CHARACTERS.test(value);
 }
 
 export interface CanvasImageGenerationRunContext {
