@@ -6,6 +6,7 @@ import {
   type MediaGenerationAssetType,
   type MediaGenerationBatchInput,
   type MediaGenerationFailureKind,
+  type MediaGenerationImageInput,
   type MediaGenerationLookupExpectation,
   type MediaGenerationOperation,
   type MediaGenerationPort,
@@ -14,9 +15,12 @@ import {
   type MediaGenerationRunContext,
   type MediaGenerationTaskStatus,
   type MediaGenerationBillingStatus,
+  type MediaGenerationSingleTarget,
   type MediaGenerationVideoInput,
+  type ImageGenerationReceipt,
   type VideoGenerationReceipt,
 } from "./mediaGeneration";
+import { isValidCanvasImageReference } from "./canvasImageGeneration";
 import {
   API_TOKEN_KEY,
   API_USER_KEY,
@@ -26,7 +30,7 @@ import {
 } from "./storage";
 
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
-const VIDEO_RECEIPT_KEYS = [
+const SINGLE_RECEIPT_KEYS = [
   "submission_id",
   "operation",
   "task_id",
@@ -54,6 +58,9 @@ const BILLING_STATUSES: readonly MediaGenerationBillingStatus[] = [
 ];
 const ASSET_TYPES: readonly MediaGenerationAssetType[] = ["character", "scene", "prop", "storyboard"];
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
+const IMAGE_REFERENCE_COUNT = 64;
+const IMAGE_REFERENCE_BYTES = 8 * 1024 * 1024;
+const IMAGE_REFERENCE_TOTAL_BYTES = 32 * 1024 * 1024;
 
 export interface MediaGenerationHttpOptions {
   readonly storage?: StorageLike;
@@ -131,10 +138,13 @@ function storedActorId(storage: StorageLike): string | null {
   }
 }
 
-function parseVideoReceipt(value: unknown): VideoGenerationReceipt | null {
-  if (!isRecord(value) || !hasExactKeys(value, VIDEO_RECEIPT_KEYS)
+function parseSingleReceipt(
+  value: unknown,
+  operation: "image.single" | "video.single",
+): ImageGenerationReceipt | VideoGenerationReceipt | null {
+  if (!isRecord(value) || !hasExactKeys(value, SINGLE_RECEIPT_KEYS)
     || !isIdentifier(value.submission_id)
-    || value.operation !== "video.single"
+    || value.operation !== operation
     || !isIdentifier(value.task_id)
     || (value.message_id !== null && !isIdentifier(value.message_id))
     || !TASK_STATUSES.includes(value.status as MediaGenerationTaskStatus)
@@ -144,7 +154,7 @@ function parseVideoReceipt(value: unknown): VideoGenerationReceipt | null {
     || !BILLING_STATUSES.includes(value.billing_status as MediaGenerationBillingStatus)) return null;
 
   return Object.freeze({
-    operation: "video.single",
+    operation,
     submissionId: value.submission_id,
     taskId: value.task_id,
     messageId: value.message_id,
@@ -152,6 +162,42 @@ function parseVideoReceipt(value: unknown): VideoGenerationReceipt | null {
     quotedAmount: value.quoted_amount,
     billingStatus: value.billing_status as MediaGenerationBillingStatus,
   });
+}
+
+function isValidSingleTarget(value: unknown): value is MediaGenerationSingleTarget {
+  if (!isRecord(value)) return false;
+  if (value.kind === "standalone") return hasExactKeys(value, ["kind"]);
+  if (value.kind === "frame_message") {
+    return hasExactKeys(value, ["kind", "chapter_id", "storyboard_asset_id"])
+      && isIdentifier(value.chapter_id)
+      && isIdentifier(value.storyboard_asset_id);
+  }
+  return value.kind === "asset_message"
+    && hasExactKeys(value, ["kind", "chapter_id", "asset_type", "asset_id"])
+    && isIdentifier(value.chapter_id)
+    && ASSET_TYPES.includes(value.asset_type as MediaGenerationAssetType)
+    && isIdentifier(value.asset_id);
+}
+
+function normalizedImageReferences(values: readonly string[]): readonly string[] {
+  if (!Array.isArray(values) || values.length > IMAGE_REFERENCE_COUNT) {
+    fail("not-sent", "参考图片列表无效，未发送请求。");
+  }
+  let totalBytes = 0;
+  for (const value of values) {
+    if (!isValidCanvasImageReference(value)) {
+      fail("not-sent", "参考图片地址无效，未发送请求。");
+    }
+    const byteLength = new TextEncoder().encode(value).byteLength;
+    if (byteLength > IMAGE_REFERENCE_BYTES) {
+      fail("not-sent", "单张参考图片超过服务限制，未发送请求。");
+    }
+    totalBytes += byteLength;
+    if (totalBytes > IMAGE_REFERENCE_TOTAL_BYTES) {
+      fail("not-sent", "参考图片总量超过服务限制，未发送请求。");
+    }
+  }
+  return Object.freeze([...values]);
 }
 
 function parseBatchReceipt(
@@ -281,7 +327,8 @@ export function createMediaGenerationHttpPort(
         const pending = createPendingRequest(signal, timeoutMs);
         const url = new URL(
           `${resolvedApiBaseUrl}/${method === "POST"
-            ? operation === "video.single" ? "chat/video" : "chat/batch-generate-images"
+            ? operation === "image.single" ? "chat/image"
+              : operation === "video.single" ? "chat/video" : "chat/batch-generate-images"
             : `chat/submissions/${operation}`}`,
         );
         if (method === "GET") url.searchParams.set("idempotency_key", idempotencyKey);
@@ -345,8 +392,8 @@ export function createMediaGenerationHttpPort(
             );
           }
 
-          const receipt = operation === "video.single"
-            ? parseVideoReceipt(payload)
+          const receipt = operation === "image.single" || operation === "video.single"
+            ? parseSingleReceipt(payload, operation)
             : parseBatchReceipt(payload, expectedBatchAssets);
           if (receipt === null) {
             fail(
@@ -388,23 +435,26 @@ export function createMediaGenerationHttpPort(
 
       return {
         isCurrent,
+        submitImage(input: MediaGenerationImageInput, signal: AbortSignal) {
+          if (!isValidSingleTarget(input.target)) {
+            fail("not-sent", "图片生成目标无效，未发送请求。");
+          }
+          if (!isIdentifier(input.modelId) || typeof input.prompt !== "string" || input.prompt.trim() === ""
+            || (input.size !== undefined && typeof input.size !== "string")) {
+            fail("not-sent", "图片生成参数无效，未发送请求。");
+          }
+          const referenceImages = normalizedImageReferences(input.referenceImages);
+          const body = {
+            model_id: input.modelId,
+            prompt: input.prompt,
+            target: input.target,
+            ...(input.size === undefined ? {} : { size: input.size }),
+            reference_images: referenceImages,
+          };
+          return request("POST", "image.single", input.idempotencyKey, signal, body) as Promise<ImageGenerationReceipt>;
+        },
         submitVideo(input: MediaGenerationVideoInput, signal: AbortSignal) {
-          if (!isRecord(input.target)) fail("not-sent", "视频目标无效，未发送请求。");
-          if (input.target.kind === "standalone") {
-            if (!hasExactKeys(input.target, ["kind"])) fail("not-sent", "独立视频目标无效，未发送请求。");
-          } else if (input.target.kind === "frame_message") {
-            if (!hasExactKeys(input.target, ["kind", "chapter_id", "storyboard_asset_id"])
-              || !isIdentifier(input.target.chapter_id) || !isIdentifier(input.target.storyboard_asset_id)) {
-              fail("not-sent", "视频分镜目标无效，未发送请求。");
-            }
-          } else if (input.target.kind === "asset_message") {
-            if (!hasExactKeys(input.target, ["kind", "chapter_id", "asset_type", "asset_id"])
-              || !isIdentifier(input.target.chapter_id)
-              || !ASSET_TYPES.includes(input.target.asset_type as MediaGenerationAssetType)
-              || !isIdentifier(input.target.asset_id)) {
-              fail("not-sent", "视频素材目标无效，未发送请求。");
-            }
-          } else {
+          if (!isValidSingleTarget(input.target)) {
             fail("not-sent", "视频生成不支持此目标类型，未发送请求。");
           }
           if (!isIdentifier(input.modelId) || typeof input.prompt !== "string" || input.prompt.trim() === ""
@@ -469,7 +519,8 @@ export function createMediaGenerationHttpPort(
           return request("POST", "image.batch", input.idempotencyKey, signal, body, expected) as Promise<BatchImageGenerationReceipt>;
         },
         lookup(expectation: MediaGenerationLookupExpectation, signal: AbortSignal) {
-          if (expectation.operation !== "video.single" && expectation.operation !== "image.batch") {
+          if (expectation.operation !== "image.single" && expectation.operation !== "video.single"
+            && expectation.operation !== "image.batch") {
             fail("read-error", "原提交操作无效，无法读取回执。", null);
           }
           if (expectation.operation === "image.batch" && expectation.batchAssets === undefined) {

@@ -42,6 +42,18 @@ function videoReceipt() {
   };
 }
 
+function imageReceipt() {
+  return {
+    submission_id: "submission-image-936",
+    operation: "image.single",
+    task_id: "task-image-936",
+    message_id: "message-image-936",
+    status: "queued",
+    quoted_amount: 4,
+    billing_status: "charged",
+  };
+}
+
 describe("media generation HTTP port", () => {
   it("is exposed by the authenticated API services factory", () => {
     const services = createApiServices("http://127.0.0.1:4175/api", {
@@ -103,6 +115,69 @@ describe("media generation HTTP port", () => {
     const [lookupInput, lookupInit] = fetcher.mock.calls[1]!;
     const lookupUrl = new URL(String(lookupInput));
     expect(lookupUrl.pathname).toBe("/api/chat/submissions/video.single");
+    expect(lookupUrl.searchParams.get("idempotency_key")).toBe(input.idempotencyKey);
+    expect(lookupInit?.method).toBe("GET");
+  });
+
+  it("sends image.single without video-only fields and reads its flat receipt", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(imageReceipt()));
+    const port = createMediaGenerationHttpPort("http://127.0.0.1:4175/api", {
+      storage: authenticatedStorage(),
+      fetcher,
+    });
+    const run = port.beginRun(runContext());
+    const input = {
+      modelId: "model-image-936",
+      prompt: "雨巷分镜的静帧插画",
+      target: { kind: "frame_message" as const, chapter_id: "chapter-936", storyboard_asset_id: "frame-936" },
+      size: "1024x1024",
+      referenceImages: ["https://example.test/first.png", "https://example.test/second.png"],
+      idempotencyKey: "image-original-key-936",
+    };
+
+    await expect(run.submitImage(input, new AbortController().signal)).resolves.toMatchObject({
+      operation: "image.single",
+      taskId: "task-image-936",
+      quotedAmount: 4,
+    });
+
+    const [postInput, postInit] = fetcher.mock.calls[0]!;
+    expect(new URL(String(postInput)).pathname).toBe("/api/chat/image");
+    expect(postInit?.method).toBe("POST");
+    expect(new Headers(postInit?.headers).get("Idempotency-Key")).toBe(input.idempotencyKey);
+    expect(JSON.parse(String(postInit?.body))).toEqual({
+      model_id: input.modelId,
+      prompt: input.prompt,
+      target: input.target,
+      size: input.size,
+      reference_images: input.referenceImages,
+    });
+  });
+
+  it("looks up an uncertain image.single submission only with its original key", async () => {
+    const fetcher = vi.fn<typeof fetch>()
+      .mockRejectedValueOnce(new TypeError("offline"))
+      .mockResolvedValueOnce(Response.json(imageReceipt()));
+    const port = createMediaGenerationHttpPort("http://127.0.0.1:4175/api", {
+      storage: authenticatedStorage(),
+      fetcher,
+    });
+    const run = port.beginRun(runContext());
+    const input = {
+      modelId: "model-image-936",
+      prompt: "雾港的独立插画",
+      target: { kind: "standalone" as const },
+      referenceImages: [],
+      idempotencyKey: "image-uncertain-key-936",
+    };
+
+    await expect(run.submitImage(input, new AbortController().signal)).rejects.toMatchObject({ kind: "unknown-outcome" });
+    await expect(run.lookup({ operation: "image.single", idempotencyKey: input.idempotencyKey }, new AbortController().signal))
+      .resolves.toMatchObject({ operation: "image.single", taskId: "task-image-936" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const [lookupInput, lookupInit] = fetcher.mock.calls[1]!;
+    const lookupUrl = new URL(String(lookupInput));
+    expect(lookupUrl.pathname).toBe("/api/chat/submissions/image.single");
     expect(lookupUrl.searchParams.get("idempotency_key")).toBe(input.idempotencyKey);
     expect(lookupInit?.method).toBe("GET");
   });

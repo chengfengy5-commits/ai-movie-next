@@ -76,9 +76,19 @@ function generationPort(
     quotedAmount: 3,
     billingStatus: "charged" as const,
   })),
+  submitImage: MediaGenerationRun["submitImage"] = vi.fn(async () => ({
+    operation: "image.single" as const,
+    submissionId: "image-submission-936",
+    taskId: "image-task-936",
+    messageId: "image-message-936",
+    status: "queued" as const,
+    quotedAmount: 4,
+    billingStatus: "charged" as const,
+  })),
 ): MediaGenerationPort {
   const run: MediaGenerationRun = {
     isCurrent: () => true,
+    submitImage,
     submitVideo,
     submitBatch,
     lookup: vi.fn(async () => ({
@@ -163,6 +173,67 @@ function storyboardFixture(): StoryboardAsset {
 }
 
 describe("MediaGenerationPage", () => {
+  it("submits a normal image to the selected storyboard message and links it to My Tasks", async () => {
+    const user = userEvent.setup();
+    const series = seriesFixture();
+    const chapter = chapterFixture();
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => ({
+      operation: "image.single",
+      submissionId: "image-submission-936",
+      taskId: "image-task-936",
+      messageId: "image-message-936",
+      status: "queued",
+      quotedAmount: 4,
+      billingStatus: "charged",
+    }));
+    const onOpenTasks = vi.fn();
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+
+    render(
+      <MediaGenerationPage
+        services={services}
+        userId="actor-926"
+        sessionGeneration={4}
+        onUnauthorized={vi.fn()}
+        onOpenTasks={onOpenTasks}
+      />,
+    );
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.selectOptions(screen.getByLabelText("提示词目录"), "image-prompt-926");
+    await user.selectOptions(screen.getByLabelText("图片目标"), "frame_message");
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
+    await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
+    await user.type(screen.getByLabelText("参考图片 URL（每行一项）"), "https://example.test/ref-a.png\nhttps://example.test/ref-b.png");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+
+    await screen.findByText(/图片任务已受理/);
+    expect(submitImage).toHaveBeenCalledTimes(1);
+    expect(submitImage.mock.calls[0]![0]).toMatchObject({
+      modelId: "image-model-926",
+      prompt: "保持设定一致\n\n细节清晰",
+      target: { kind: "frame_message", chapter_id: chapter.id, storyboard_asset_id: "storyboard-926" },
+      size: "1:1",
+      referenceImages: ["https://example.test/ref-a.png", "https://example.test/ref-b.png"],
+    });
+    expect(submitImage.mock.calls[0]![0].idempotencyKey).toEqual(expect.any(String));
+
+    await user.click(screen.getByRole("button", { name: "查看我的任务" }));
+    expect(onOpenTasks).toHaveBeenCalledTimes(1);
+  });
+
   it("offers a current-chapter storyboard as a video asset-message target", async () => {
     const user = userEvent.setup();
     const series = seriesFixture();

@@ -3,21 +3,21 @@ import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset } from ".
 import { ApiError } from "../../shared/api/errors";
 import {
   MediaGenerationError,
-  type BatchImageGenerationReceipt,
+  type MediaGenerationImageInput,
   type MediaGenerationAssetType,
   type MediaGenerationBatchAssetInput,
   type MediaGenerationLookupExpectation,
   type MediaGenerationOperation,
   type MediaGenerationReceipt,
   type MediaGenerationRun,
-  type MediaGenerationVideoTarget,
+  type MediaGenerationSingleTarget,
 } from "../../shared/api/mediaGeneration";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import type { CreatorModel, CreatorPrompt } from "../../shared/api/creatorSettings";
 import "./mediaGeneration.css";
 
-type MediaMode = "video" | "batch";
-type VideoTargetMode = "standalone" | "frame_message" | "asset_message";
+type MediaMode = "image" | "video" | "batch";
+type SingleTargetMode = "standalone" | "frame_message" | "asset_message";
 type LibraryAsset = Character | Scene | Prop | StoryboardAsset;
 
 interface AssetChoice {
@@ -34,6 +34,17 @@ const ASSET_TYPE_LABELS: Record<MediaGenerationAssetType, string> = {
   prop: "道具",
   storyboard: "分镜",
 };
+const IMAGE_PROMPT_CATEGORIES = new Set([
+  "character-design",
+  "scene-design",
+  "prop-design",
+  "storyboard-design",
+  "image",
+  "style",
+  "fused",
+  "fuse",
+  "frame",
+]);
 
 interface ModelOptions {
   readonly sizes: readonly string[];
@@ -140,6 +151,9 @@ function isUnauthorized(error: unknown): boolean {
 }
 
 function receiptMessage(receipt: MediaGenerationReceipt): string {
+  if (receipt.operation === "image.single") {
+    return `图片任务已受理：${receipt.status} · 服务报价 ${receipt.quotedAmount} 积分 · 计费状态 ${receipt.billingStatus}。`;
+  }
   if (receipt.operation === "video.single") {
     return `视频任务已受理：${receipt.status} · 服务报价 ${receipt.quotedAmount} 积分 · 计费状态 ${receipt.billingStatus}。`;
   }
@@ -172,18 +186,21 @@ export function MediaGenerationPage({
   const [prompts, setPrompts] = useState<CreatorPrompt[]>([]);
   const [selectedVideoModelId, setSelectedVideoModelId] = useState("");
   const [selectedImageModelId, setSelectedImageModelId] = useState("");
+  const [selectedImagePromptId, setSelectedImagePromptId] = useState("");
   const [selectedVideoPromptId, setSelectedVideoPromptId] = useState("");
   const [selectedBatchPromptId, setSelectedBatchPromptId] = useState("");
+  const [imagePrompt, setImagePrompt] = useState("");
   const [videoPrompt, setVideoPrompt] = useState("");
   const [videoSize, setVideoSize] = useState("");
   const [videoDuration, setVideoDuration] = useState("");
   const [videoResolution, setVideoResolution] = useState("");
   const [imageSize, setImageSize] = useState("");
-  const [videoTargetMode, setVideoTargetMode] = useState<VideoTargetMode>("standalone");
-  const [videoAssetType, setVideoAssetType] = useState<MediaGenerationAssetType>("character");
-  const [videoAssetId, setVideoAssetId] = useState("");
-  const [videoStoryboardAssetId, setVideoStoryboardAssetId] = useState("");
+  const [singleTargetMode, setSingleTargetMode] = useState<SingleTargetMode>("standalone");
+  const [singleAssetType, setSingleAssetType] = useState<MediaGenerationAssetType>("character");
+  const [singleAssetId, setSingleAssetId] = useState("");
+  const [singleStoryboardAssetId, setSingleStoryboardAssetId] = useState("");
   const [selectedBatchKeys, setSelectedBatchKeys] = useState<string[]>([]);
+  const [imageReferenceImages, setImageReferenceImages] = useState("");
   const [videoReferenceImages, setVideoReferenceImages] = useState("");
   const [videoReferenceAudios, setVideoReferenceAudios] = useState("");
   const [videoReferenceVideos, setVideoReferenceVideos] = useState("");
@@ -208,7 +225,7 @@ export function MediaGenerationPage({
   const videoOptions = useMemo(() => modelOptions(selectedVideoModel), [selectedVideoModel]);
   const imageOptions = useMemo(() => modelOptions(selectedImageModel), [selectedImageModel]);
   const sortedChapters = useMemo(() => [...chapters].sort((left, right) => left.order - right.order), [chapters]);
-  const videoAssetChoices = assetChoices.filter((asset) => asset.type === videoAssetType);
+  const singleAssetChoices = assetChoices.filter((asset) => asset.type === singleAssetType);
   const selectedBatchAssets = selectedBatchKeys.flatMap((key) => {
     const asset = assetChoices.find((choice) => `${choice.type}:${choice.id}` === key);
     return asset === undefined ? [] : [asset];
@@ -219,18 +236,21 @@ export function MediaGenerationPage({
     selectedChapterId,
     selectedVideoModelId,
     selectedImageModelId,
+    selectedImagePromptId,
     selectedVideoPromptId,
     selectedBatchPromptId,
+    imagePrompt,
     videoPrompt,
     videoSize,
     videoDuration,
     videoResolution,
     imageSize,
-    videoTargetMode,
-    videoAssetType,
-    videoAssetId,
-    videoStoryboardAssetId,
+    singleTargetMode,
+    singleAssetType,
+    singleAssetId,
+    singleStoryboardAssetId,
     selectedBatchKeys,
+    imageReferenceImages,
     videoReferenceImages,
     videoReferenceAudios,
     videoReferenceVideos,
@@ -383,19 +403,25 @@ export function MediaGenerationPage({
   }, [onUnauthorized, selectedChapterId, selectedSeriesId, services]);
 
   useEffect(() => {
+    if (selectedImagePromptId === "") return;
+    const prompt = prompts.find((candidate) => candidate.id === selectedImagePromptId);
+    if (prompt !== undefined) setImagePrompt(promptText(prompt));
+  }, [prompts, selectedImagePromptId]);
+
+  useEffect(() => {
     if (selectedVideoPromptId === "") return;
     const prompt = prompts.find((candidate) => candidate.id === selectedVideoPromptId);
     if (prompt !== undefined) setVideoPrompt(promptText(prompt));
   }, [prompts, selectedVideoPromptId]);
 
   useEffect(() => {
-    if (videoAssetId !== "" && !videoAssetChoices.some((asset) => asset.id === videoAssetId)) {
-      setVideoAssetId("");
+    if (singleAssetId !== "" && !singleAssetChoices.some((asset) => asset.id === singleAssetId)) {
+      setSingleAssetId("");
     }
-    if (videoStoryboardAssetId !== "" && !storyboardAssets.some((asset) => asset.id === videoStoryboardAssetId)) {
-      setVideoStoryboardAssetId("");
+    if (singleStoryboardAssetId !== "" && !storyboardAssets.some((asset) => asset.id === singleStoryboardAssetId)) {
+      setSingleStoryboardAssetId("");
     }
-  }, [storyboardAssets, videoAssetChoices, videoAssetId, videoStoryboardAssetId]);
+  }, [singleAssetChoices, singleAssetId, singleStoryboardAssetId, storyboardAssets]);
 
   const setModeSafely = (value: MediaMode) => {
     if (pendingRef.current !== null || requestingRef.current) return;
@@ -446,13 +472,68 @@ export function MediaGenerationPage({
     });
   };
 
+  const singleTarget = (): MediaGenerationSingleTarget => {
+    if (singleTargetMode === "standalone") return Object.freeze({ kind: "standalone" });
+    if (singleTargetMode === "frame_message") {
+      return Object.freeze({ kind: "frame_message", chapter_id: selectedChapterId, storyboard_asset_id: singleStoryboardAssetId });
+    }
+    return Object.freeze({ kind: "asset_message", chapter_id: selectedChapterId, asset_type: singleAssetType, asset_id: singleAssetId });
+  };
+
+  const submitImage = async () => {
+    if (pendingRef.current !== null || requestingRef.current || selectedImageModel === null || imagePrompt.trim() === "") return;
+    const rawKey = crypto.randomUUID();
+    const signature = formSignature;
+    let run: MediaGenerationRun;
+    try {
+      run = makeRun();
+    } catch (error) {
+      setOutcome({ signature, message: describeFailure(error) });
+      return;
+    }
+    const input: MediaGenerationImageInput = Object.freeze({
+      modelId: selectedImageModel.id,
+      prompt: imagePrompt,
+      target: singleTarget(),
+      ...(imageSize === "" ? {} : { size: imageSize }),
+      referenceImages: Object.freeze(splitReferences(imageReferenceImages)),
+      idempotencyKey: rawKey,
+    });
+    const controller = new AbortController();
+    setOutcome(null);
+    updateRequesting(true);
+    try {
+      const receipt = await run.submitImage(input, controller.signal);
+      if (run.isCurrent()) applyReceipt(signature, receipt);
+    } catch (error) {
+      if (isUnauthorized(error)) {
+        onUnauthorized();
+        return;
+      }
+      if (!run.isCurrent()) return;
+      if (error instanceof MediaGenerationError && error.kind === "unknown-outcome") {
+        const submission: PendingSubmission = {
+          operation: "image.single",
+          idempotencyKey: rawKey,
+          expectation: { operation: "image.single", idempotencyKey: rawKey },
+          run,
+          signature,
+          submissionMessage: describeFailure(error),
+        };
+        updatePending(submission);
+        setOutcome({ signature, message: `${describeFailure(error)} 提交状态待确认，正在核对本次提交；不会自动重新提交。`, pendingLookup: true });
+        await lookupPending(submission);
+        return;
+      }
+      setOutcome({ signature, message: describeFailure(error) });
+    } finally {
+      updateRequesting(false);
+    }
+  };
+
   const submitVideo = async () => {
     if (pendingRef.current !== null || requestingRef.current || selectedVideoModel === null || videoPrompt.trim() === "") return;
-    const target: MediaGenerationVideoTarget = videoTargetMode === "standalone"
-      ? Object.freeze({ kind: "standalone" })
-      : videoTargetMode === "frame_message"
-        ? Object.freeze({ kind: "frame_message", chapter_id: selectedChapterId, storyboard_asset_id: videoStoryboardAssetId })
-        : Object.freeze({ kind: "asset_message", chapter_id: selectedChapterId, asset_type: videoAssetType, asset_id: videoAssetId });
+    const target = singleTarget();
     const rawKey = crypto.randomUUID();
     const signature = formSignature;
     let run: MediaGenerationRun;
@@ -567,6 +648,11 @@ export function MediaGenerationPage({
     }
   };
 
+  const selectImagePrompt = (id: string) => {
+    setSelectedImagePromptId(id);
+    if (id === "") setImagePrompt("");
+  };
+
   const selectVideoPrompt = (id: string) => {
     setSelectedVideoPromptId(id);
     if (id === "") setVideoPrompt("");
@@ -579,23 +665,33 @@ export function MediaGenerationPage({
     });
   };
 
-  const selectedAssetForVideo = videoAssetChoices.find((asset) => asset.id === videoAssetId);
+  const selectedAssetForSingle = singleAssetChoices.find((asset) => asset.id === singleAssetId);
   const currentBatchPromptOptions = prompts;
+  const currentImagePromptOptions = prompts.filter((prompt) => IMAGE_PROMPT_CATEGORIES.has(prompt.category));
   const currentVideoPromptOptions = prompts.filter((prompt) => prompt.category === "video-design");
+  const isImageMode = mode === "image";
+  const singleModel = isImageMode ? selectedImageModel : selectedVideoModel;
+  const singleOptions = isImageMode ? imageOptions : videoOptions;
+  const singlePrompt = isImageMode ? imagePrompt : videoPrompt;
+  const singlePromptId = isImageMode ? selectedImagePromptId : selectedVideoPromptId;
+  const singlePromptOptions = isImageMode ? currentImagePromptOptions : currentVideoPromptOptions;
+  const singleReferences = isImageMode ? imageReferenceImages : videoReferenceImages;
+  const singleReferenceSetter = isImageMode ? setImageReferenceImages : setVideoReferenceImages;
   const isFrozen = pending !== null || requesting;
 
   return (
     <section className="media-generation-page" aria-labelledby="media-generation-title">
       <header className="media-generation-heading">
         <div>
-          <p className="eyebrow">视频与批量图片</p>
+          <p className="eyebrow">图片与视频生成</p>
           <h1 id="media-generation-title">AI 生成</h1>
-          <p>按所选模型提交视频或一次性批量生成章节素材。任务受理后可到“我的任务”查看。</p>
+          <p>按所选模型提交图片、视频或一次性批量生成章节素材。任务受理后可到“我的任务”查看。</p>
         </div>
         <button className="secondary-button" onClick={onOpenTasks} type="button">我的任务</button>
       </header>
 
       <nav className="media-generation-tabs" aria-label="生成类型">
+        <button aria-pressed={mode === "image"} disabled={isFrozen} onClick={() => setModeSafely("image")} type="button">普通图片</button>
         <button aria-pressed={mode === "video"} disabled={isFrozen} onClick={() => setModeSafely("video")} type="button">普通视频</button>
         <button aria-pressed={mode === "batch"} disabled={isFrozen} onClick={() => setModeSafely("batch")} type="button">批量素材生图</button>
       </nav>
@@ -606,57 +702,65 @@ export function MediaGenerationPage({
         <p className="media-generation-note" role="status">当前服务没有接入媒体生成提交接口，页面不会模拟生成结果。</p>
       )}
 
-      {mode === "video" ? (
+      {mode !== "batch" ? (
         <div className="media-generation-card">
           <div className="media-generation-section-heading">
-            <div><p className="eyebrow">视频生成</p><h2>普通视频</h2></div>
+            <div><p className="eyebrow">{isImageMode ? "图片生成" : "视频生成"}</p><h2>{isImageMode ? "普通图片" : "普通视频"}</h2></div>
             <span>提交前会固定模型、目标与参考素材。</span>
           </div>
           <div className="media-generation-fields">
             <label>
-              <span>视频模型</span>
-              <select disabled={loading || isFrozen} onChange={(event) => setSelectedVideoModelId(event.target.value)} value={selectedVideoModelId}>
-                <option value="">选择视频模型</option>
-                {videoModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
+              <span>{isImageMode ? "图片模型" : "视频模型"}</span>
+              <select disabled={loading || isFrozen} onChange={(event) => isImageMode
+                ? setSelectedImageModelId(event.target.value)
+                : setSelectedVideoModelId(event.target.value)} value={isImageMode ? selectedImageModelId : selectedVideoModelId}>
+                <option value="">{isImageMode ? "选择图片模型" : "选择视频模型"}</option>
+                {(isImageMode ? imageModels : videoModels).map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
               </select>
             </label>
             <label>
               <span>提示词目录</span>
-              <select disabled={isFrozen} onChange={(event) => selectVideoPrompt(event.target.value)} value={selectedVideoPromptId}>
+              <select disabled={isFrozen} onChange={(event) => isImageMode
+                ? selectImagePrompt(event.target.value)
+                : selectVideoPrompt(event.target.value)} value={singlePromptId}>
                 <option value="">手动输入</option>
-                {currentVideoPromptOptions.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name}</option>)}
+                {singlePromptOptions.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name}</option>)}
               </select>
             </label>
             <label className="media-generation-wide">
-              <span>视频提示词</span>
-              <textarea disabled={isFrozen} onChange={(event) => setVideoPrompt(event.target.value)} rows={5} value={videoPrompt} />
+              <span>{isImageMode ? "图片提示词" : "视频提示词"}</span>
+              <textarea disabled={isFrozen} onChange={(event) => isImageMode
+                ? setImagePrompt(event.target.value)
+                : setVideoPrompt(event.target.value)} rows={5} value={singlePrompt} />
             </label>
 
-            {videoOptions.sizes.length > 0 && (
-              <label><span>画面比例</span><select disabled={isFrozen} onChange={(event) => setVideoSize(event.target.value)} value={videoSize}>
-                {videoOptions.sizes.map((size) => <option key={size} value={size}>{size}</option>)}
+            {singleOptions.sizes.length > 0 && (
+              <label><span>{isImageMode ? "图片尺寸" : "画面比例"}</span><select disabled={isFrozen} onChange={(event) => isImageMode
+                ? setImageSize(event.target.value)
+                : setVideoSize(event.target.value)} value={isImageMode ? imageSize : videoSize}>
+                {singleOptions.sizes.map((size) => <option key={size} value={size}>{size}</option>)}
               </select></label>
             )}
-            {videoOptions.durations.length > 0 && (
+            {!isImageMode && videoOptions.durations.length > 0 && (
               <label><span>时长（秒）</span><select disabled={isFrozen} onChange={(event) => setVideoDuration(event.target.value)} value={videoDuration}>
                 {videoOptions.durations.map((duration) => <option key={duration} value={String(duration)}>{duration}</option>)}
               </select></label>
             )}
-            {videoOptions.resolutions.length > 0 && (
+            {!isImageMode && videoOptions.resolutions.length > 0 && (
               <label><span>分辨率</span><select disabled={isFrozen} onChange={(event) => setVideoResolution(event.target.value)} value={videoResolution}>
                 {videoOptions.resolutions.map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
               </select></label>
             )}
 
             <label>
-              <span>视频目标</span>
-              <select disabled={isFrozen} onChange={(event) => setVideoTargetMode(event.target.value as VideoTargetMode)} value={videoTargetMode}>
-                <option value="standalone">独立视频</option>
+              <span>{isImageMode ? "图片目标" : "视频目标"}</span>
+              <select disabled={isFrozen} onChange={(event) => setSingleTargetMode(event.target.value as SingleTargetMode)} value={singleTargetMode}>
+                <option value="standalone">{isImageMode ? "独立图片" : "独立视频"}</option>
                 <option value="frame_message">章节分镜消息</option>
                 <option value="asset_message">章节素材消息</option>
               </select>
             </label>
-            {videoTargetMode !== "standalone" && (
+            {singleTargetMode !== "standalone" && (
               <>
                 <label><span>剧集</span><select disabled={isFrozen} onChange={(event) => setSelectedSeriesId(event.target.value)} value={selectedSeriesId}>
                   <option value="">选择剧集</option>
@@ -664,45 +768,48 @@ export function MediaGenerationPage({
                 </select></label>
                 <label><span>章节</span><select disabled={isFrozen || chapterLoading || selectedSeriesId === ""} onChange={(event) => {
                   setSelectedChapterId(event.target.value);
-                  setVideoAssetId("");
-                  setVideoStoryboardAssetId("");
+                  setSingleAssetId("");
+                  setSingleStoryboardAssetId("");
                 }} value={selectedChapterId}>
                   <option value="">选择章节</option>
                   {sortedChapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.title}</option>)}
                 </select></label>
               </>
             )}
-            {videoTargetMode === "frame_message" && (
-              <label className="media-generation-wide"><span>分镜目标</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => setVideoStoryboardAssetId(event.target.value)} value={videoStoryboardAssetId}>
+            {singleTargetMode === "frame_message" && (
+              <label className="media-generation-wide"><span>分镜目标</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => setSingleStoryboardAssetId(event.target.value)} value={singleStoryboardAssetId}>
                 <option value="">选择章节分镜</option>
                 {storyboardAssets.map((asset) => <option key={asset.id} value={asset.id}>第 {asset.frame_index + 1} 镜 · {asset.name}</option>)}
               </select></label>
             )}
-            {videoTargetMode === "asset_message" && (
+            {singleTargetMode === "asset_message" && (
               <>
-                <label><span>素材类型</span><select disabled={isFrozen} onChange={(event) => setVideoAssetType(event.target.value as MediaGenerationAssetType)} value={videoAssetType}>
+                <label><span>素材类型</span><select disabled={isFrozen} onChange={(event) => setSingleAssetType(event.target.value as MediaGenerationAssetType)} value={singleAssetType}>
                   <option value="character">角色</option><option value="scene">场景</option><option value="prop">道具</option>
                   <option value="storyboard">分镜</option>
                 </select></label>
-                <label><span>目标素材</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => setVideoAssetId(event.target.value)} value={videoAssetId}>
+                <label><span>目标素材</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => setSingleAssetId(event.target.value)} value={singleAssetId}>
                   <option value="">选择素材</option>
-                  {videoAssetChoices.map((asset) => <option key={asset.id} value={asset.id}>{asset.label}</option>)}
+                  {singleAssetChoices.map((asset) => <option key={asset.id} value={asset.id}>{asset.label}</option>)}
                 </select></label>
-                {selectedAssetForVideo !== undefined && <p className="media-generation-wide media-generation-target-detail">{selectedAssetForVideo.description || "该素材没有描述。"}</p>}
+                {selectedAssetForSingle !== undefined && <p className="media-generation-wide media-generation-target-detail">{selectedAssetForSingle.description || "该素材没有描述。"}</p>}
               </>
             )}
-            <label><span>参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setVideoReferenceImages(event.target.value)} rows={3} value={videoReferenceImages} /></label>
-            <label><span>参考音频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setVideoReferenceAudios(event.target.value)} rows={3} value={videoReferenceAudios} /></label>
-            <label className="media-generation-wide"><span>参考视频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setVideoReferenceVideos(event.target.value)} rows={3} value={videoReferenceVideos} /></label>
+            <label><span>参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => singleReferenceSetter(event.target.value)} rows={3} value={singleReferences} /></label>
+            {!isImageMode && <label><span>参考音频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setVideoReferenceAudios(event.target.value)} rows={3} value={videoReferenceAudios} /></label>}
+            {!isImageMode && <label className="media-generation-wide"><span>参考视频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => setVideoReferenceVideos(event.target.value)} rows={3} value={videoReferenceVideos} /></label>}
           </div>
           {chapterError !== null && <p className="media-generation-alert" role="alert">章节读取失败：{chapterError}</p>}
           {directoryError !== null && <p className="media-generation-alert" role="alert">章节素材读取失败：{directoryError}</p>}
-          {videoTargetMode !== "standalone" && directoryLoading && <p role="status">正在读取章节分镜和素材目录…</p>}
+          {singleTargetMode !== "standalone" && directoryLoading && <p role="status">正在读取章节分镜和素材目录…</p>}
           <div className="media-generation-actions">
-            <button className="primary-button" disabled={loading || isFrozen || selectedVideoModel === null || videoPrompt.trim() === ""
-              || (videoTargetMode === "frame_message" && (selectedChapterId === "" || videoStoryboardAssetId === ""))
-              || (videoTargetMode === "asset_message" && (selectedChapterId === "" || videoAssetId === ""))}
-              onClick={() => void submitVideo()} type="button">{pending?.operation === "video.single" ? "等待回执…" : "提交视频任务"}</button>
+            <button className="primary-button" disabled={loading || isFrozen || singleModel === null || singlePrompt.trim() === ""
+              || (singleTargetMode === "frame_message" && (selectedChapterId === "" || singleStoryboardAssetId === ""))
+              || (singleTargetMode === "asset_message" && (selectedChapterId === "" || singleAssetId === ""))}
+              onClick={() => void (isImageMode ? submitImage() : submitVideo())} type="button">
+              {pending?.operation === (isImageMode ? "image.single" : "video.single")
+                ? "等待回执…" : isImageMode ? "提交图片任务" : "提交视频任务"}
+            </button>
           </div>
         </div>
       ) : (
@@ -781,10 +888,10 @@ export function MediaGenerationPage({
           <p>{displayedOutcome.message}</p>
           {displayedOutcome.receipt !== undefined && (
             <>
-              {displayedOutcome.receipt.operation === "video.single" ? (
+              {displayedOutcome.receipt.operation === "image.single" || displayedOutcome.receipt.operation === "video.single" ? (
                 <dl><div><dt>任务编号</dt><dd>{displayedOutcome.receipt.taskId}</dd></div><div><dt>消息编号</dt><dd>{displayedOutcome.receipt.messageId ?? "—"}</dd></div></dl>
               ) : (
-                <ol>{(displayedOutcome.receipt as BatchImageGenerationReceipt).tasks.map((task) => <li key={`${task.type}:${task.assetId}`}>{task.assetName} · {task.taskId}</li>)}</ol>
+                <ol>{displayedOutcome.receipt.tasks.map((task) => <li key={`${task.type}:${task.assetId}`}>{task.assetName} · {task.taskId}</li>)}</ol>
               )}
               <button className="secondary-button" onClick={onOpenTasks} type="button">查看我的任务</button>
             </>

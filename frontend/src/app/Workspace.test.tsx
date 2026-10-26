@@ -842,6 +842,7 @@ describe("read-only workspace", () => {
     const lookup = vi.fn<MediaGenerationRun["lookup"]>(() => new Promise(() => {}));
     const run: MediaGenerationRun = {
       isCurrent: () => isContextCurrent(),
+      submitImage: vi.fn<MediaGenerationRun["submitImage"]>(() => new Promise(() => {})),
       submitVideo,
       submitBatch: vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
       lookup,
