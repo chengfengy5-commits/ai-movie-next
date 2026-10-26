@@ -334,7 +334,7 @@ describe("Canvas image generation HTTP port", () => {
 
     expect(fetcher).toHaveBeenCalledTimes(1);
     const { url, init } = requestParts(fetcher);
-    expect(url.pathname).toBe("/api/submissions/image.single");
+    expect(url.pathname).toBe("/api/chat/submissions/image.single");
     expect(url.search).toBe("?idempotency_key=canvas%2Brun+1");
     expect(url.searchParams.get("idempotency_key")).toBe(key);
     expect(init.method).toBe("GET");

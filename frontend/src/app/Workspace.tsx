@@ -13,6 +13,7 @@ import type { FrameAssetReferenceAssetTarget } from "../features/chapters/FrameA
 import { SeriesPage } from "../features/series/SeriesPage";
 import { MyTasksPage } from "../features/tasks/MyTasksPage";
 import { CreatorSettingsPage } from "../features/creator-settings/CreatorSettingsPage";
+import { MediaGenerationPage } from "../features/media-generation/MediaGenerationPage";
 import { AccountPage } from "../features/account/AccountPage";
 import { TeamsPage } from "../features/teams/TeamsPage";
 import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
@@ -55,7 +56,8 @@ function Dashboard() {
     seriesShareGuardScopeRevisionRef.current += 1;
   }
   const [selectedSeries, setSelectedSeries] = useState<Series | null>(null);
-  const [selectedView, setSelectedView] = useState<"series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "account">("series");
+  const [selectedView, setSelectedView] = useState<"series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "media-generation" | "account">("series");
+  const [mediaGenerationVisited, setMediaGenerationVisited] = useState(false);
   const [teamDirectoryRevision, setTeamDirectoryRevision] = useState(0);
   const [seriesRevision, setSeriesRevision] = useState(0);
   const [teamGuardVersion, setTeamGuardVersion] = useState(0);
@@ -80,7 +82,7 @@ function Dashboard() {
     userId: string;
     services: typeof services;
     selectedSeries: Series | null;
-    selectedView: "series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "account";
+    selectedView: "series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "media-generation" | "account";
     scopeEpoch: number;
   } | null>(null);
 
@@ -146,6 +148,7 @@ function Dashboard() {
     setAssetNavigationIntent(null);
     setSelectedSeries(null);
     setSelectedView("series");
+    setMediaGenerationVisited(false);
   }
 
   const renderNavigationContext = {
@@ -194,6 +197,7 @@ function Dashboard() {
     clearAssetNavigationIntent();
     setSelectedSeries(null);
     setSelectedView("series");
+    setMediaGenerationVisited(false);
     logout();
   }
 
@@ -266,6 +270,15 @@ function Dashboard() {
     clearAssetNavigationIntent();
     setSelectedSeries(null);
     setSelectedView("creator-settings");
+  }
+
+  function navigateToMediaGeneration() {
+    if (selectedView === "media-generation" || !confirmLeaveCurrentView()) return;
+    clearChapterNavigationIntent();
+    clearAssetNavigationIntent();
+    setSelectedSeries(null);
+    setMediaGenerationVisited(true);
+    setSelectedView("media-generation");
   }
 
   function navigateToAccount() {
@@ -458,6 +471,15 @@ function Dashboard() {
             <span>我的任务</span>
           </button>
           <button
+            aria-current={selectedView === "media-generation" ? "page" : undefined}
+            className={selectedView === "media-generation" ? "nav-item active" : "nav-item"}
+            onClick={navigateToMediaGeneration}
+            type="button"
+          >
+            <span className="nav-icon" aria-hidden="true">✦</span>
+            <span>AI 生成</span>
+          </button>
+          <button
             aria-current={selectedView === "creator-settings" ? "page" : undefined}
             className={selectedView === "creator-settings" ? "nav-item active" : "nav-item"}
             onClick={navigateToCreatorSettings}
@@ -514,6 +536,8 @@ function Dashboard() {
             <span aria-hidden="true">/</span>
             <strong>{selectedView === "creator-settings"
               ? "创作者设置"
+              : selectedView === "media-generation"
+                ? "AI 生成"
               : selectedView === "account"
                 ? "我的账户"
                 : selectedView === "tasks"
@@ -538,6 +562,11 @@ function Dashboard() {
                 type="button"
               >
                 我的任务
+              </button>
+            )}
+            {selectedView !== "media-generation" && (
+              <button className="mobile-task-entry" onClick={navigateToMediaGeneration} type="button">
+                AI 生成
               </button>
             )}
             {selectedView !== "teams" && (
@@ -656,6 +685,22 @@ function Dashboard() {
               userId={state.user.id}
             />
           )}
+          {mediaGenerationVisited && (
+            <div
+              hidden={selectedView !== "media-generation"}
+              inert={selectedView !== "media-generation"}
+              aria-hidden={selectedView !== "media-generation"}
+            >
+              <MediaGenerationPage
+                key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
+                services={services}
+                userId={state.user.id}
+                sessionGeneration={sessionGeneration}
+                onUnauthorized={logoutFromWorkspace}
+                onOpenTasks={() => setSelectedView("tasks")}
+              />
+            </div>
+          )}
           {selectedView === "teams" && (
             <TeamsPage
               key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
@@ -717,6 +762,8 @@ function Dashboard() {
           <span>
             {selectedView === "creator-settings"
               ? "个人模型与提示词"
+              : selectedView === "media-generation"
+                ? "视频与批量图片任务"
               : selectedView === "account"
                 ? "本人资料、登录设备与密码"
               : selectedView === "tasks"

@@ -590,7 +590,7 @@ export function createCanvasImageGenerationHttpPort(
           control.check(false);
           const endpoint = mode === "submit"
             ? buildRequestUrl(resolvedApiBaseUrl, "/chat/image")
-            : buildRequestUrl(resolvedApiBaseUrl, "/submissions/image.single");
+            : buildRequestUrl(resolvedApiBaseUrl, "/chat/submissions/image.single");
           if (mode === "lookup") endpoint.searchParams.set("idempotency_key", idempotencyKey);
 
           const headers = new Headers({
