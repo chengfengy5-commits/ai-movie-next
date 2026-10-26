@@ -28,6 +28,10 @@ from haoai_backend.generation_contracts.types import (
     TargetSnapshot,
 )
 from haoai_backend.generation_runtime.registry import HAOAI_ATTEMPT_GROUP, operation_policy
+from haoai_backend.generation_task_concurrency import (
+    graph_tasks_match_shape,
+    task_shape_for_operation,
+)
 
 
 GraphOperation = str
@@ -203,8 +207,9 @@ def build_operation_graph_plan(
         raise _invalid("graph version does not match the selected server policy")
 
     count = len(frozen_inputs)
-    if operation in {"image.single", "video.single", "frame.review"} and count != 1:
-        raise _invalid("this operation requires exactly one graph item")
+    task_shape = task_shape_for_operation(operation, count)
+    if task_shape is None:
+        raise _invalid("operation has no supported user-task cardinality")
     if operation == "image.batch" and count > _MAX_BATCH_ITEMS:
         raise _invalid("image batches must contain at most 64 items")
     if operation == "frame.optimize" and count > _MAX_OPTIMIZE_FRAMES:
@@ -280,12 +285,8 @@ def build_operation_graph_plan(
                 raise _invalid("batch requests cannot repeat an asset type and id")
             batch_assets.add(asset_key)
 
-    if operation == "image.batch" and len(task_ids) != count:
-        raise _invalid("each batch item requires its own task")
-    if operation == "frame.optimize" and len(task_ids) != 1:
-        raise _invalid("frame optimization items must share one parent task")
-    if operation not in {"image.batch", "frame.optimize"} and len(task_ids) != count:
-        raise _invalid("graph items require distinct tasks for this operation")
+    if len(task_ids) != task_shape.task_count:
+        raise _invalid("graph task count does not match the user-task policy")
 
     expected_step_count = 3 if uses_attempt_group else 1
     if any(len(item.step_ids) != expected_step_count for item in frozen_inputs):
@@ -340,6 +341,8 @@ def build_operation_graph_plan(
         )
         for order, task_group in enumerate(task_inputs)
     )
+    if not graph_tasks_match_shape(operation, count, tasks):
+        raise _invalid("planned tasks do not match the user-task policy")
 
     units = tuple(
         GraphUnitPlan(

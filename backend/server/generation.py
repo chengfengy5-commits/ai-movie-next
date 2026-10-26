@@ -82,7 +82,7 @@ def build_frame_optimize_configuration(
     return FrameOptimizeWorkerConfiguration(
         runtime=runtime,
         registry_capabilities=capabilities,
-        max_user_concurrency=configuration.frame_optimize_max_user_concurrency,
+        max_user_concurrency=configuration.user_task_max_concurrency,
         enabled=configuration.frame_optimize_enabled,
     )
 

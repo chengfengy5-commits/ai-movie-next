@@ -26,6 +26,11 @@ from .admission_types import (
 )
 from .application import compose_batch_image_prompt, resolve_model, resolve_prompt, select_text_model
 from .domain import CatalogError, ModelCategory, ModelSource, PromptOperation, PromptSelection
+from haoai_backend.generation_task_concurrency import (
+    count_user_in_flight_tasks,
+    session_uses_fresh_postgres_statements,
+    task_shape_for_operation,
+)
 from .persistence import (
     AccountFacts,
     AdmissionPersistence,
@@ -139,12 +144,15 @@ def prepare_admission(
                         return receipt
                     return AdmissionReplay(fingerprint=context.fingerprint, receipt=receipt)
 
+            task_shape = None
             if policy.max_concurrent_tasks > 0:
-                return _refusal(
-                    503,
-                    "concurrency_policy_not_bound",
-                    "用户并发限额的任务类型绑定尚未完成",
-                )
+                task_shape = task_shape_for_operation(context.operation, len(plan.items))
+                if task_shape is None:
+                    return _refusal(
+                        503,
+                        "concurrency_policy_not_bound",
+                        "用户并发限额的任务类型绑定尚未完成",
+                    )
 
             if not _has_active_membership(account, now=now):
                 return _refusal(403, "membership_required", "需要有效会员才能提交新任务")
@@ -177,6 +185,21 @@ def prepare_admission(
                         409,
                         "optimize_already_running",
                         "该章节已有批量优化任务正在运行",
+                    )
+
+            if task_shape is not None:
+                if not session_uses_fresh_postgres_statements(session):
+                    return _refusal(
+                        503,
+                        "concurrency_isolation_unavailable",
+                        "数据库隔离级别无法安全确认用户并发限额",
+                    )
+                current = count_user_in_flight_tasks(session, account.user_id)
+                if current + task_shape.task_count > policy.max_concurrent_tasks:
+                    return _refusal(
+                        429,
+                        "concurrency_limit_reached",
+                        f"您同时在处理的任务已达上限（{policy.max_concurrent_tasks}），请等待部分完成后再提交",
                     )
 
             model_ids = tuple(item.model_id for item in plan.items if item.model_id)

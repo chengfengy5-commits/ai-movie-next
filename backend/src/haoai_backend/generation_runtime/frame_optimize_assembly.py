@@ -57,8 +57,8 @@ class FrameOptimizeWorkerConfiguration:
             raise TypeError("runtime must be an explicit GenerationRuntimeConfig")
         if not isinstance(self.registry_capabilities, RegistryCapabilities):
             raise TypeError("registry_capabilities must be explicit")
-        if type(self.max_user_concurrency) is not int or self.max_user_concurrency < 0:
-            raise ValueError("max_user_concurrency must be a non-negative integer")
+        if type(self.max_user_concurrency) is not int:
+            raise ValueError("max_user_concurrency must be an integer")
         if type(self.enabled) is not bool:
             raise TypeError("enabled must be an explicit boolean")
         capabilities = self.registry_capabilities

@@ -18,7 +18,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONPATH=backend/sr
 
 ## 帧优化 host 与 Root 凭据登记
 
-`backend.server` 是唯一的后端启动组合根。帧优化默认关闭；只有显式设置 `FRAME_OPTIMIZE_ENABLED=true` 且提供绝对路径 `FRAME_OPTIMIZE_CREDENTIALS_FILE` 后，host 才把已验证的 Root 能力接到现有 `create_app`。`FRAME_OPTIMIZE_MAX_USER_CONCURRENCY` 为非负整数，默认值为 `1`。配置加载不读 `.env`、shell profile 或云 SDK 环境文件；不设置开关时，原应用继续不启动帧优化 worker。
+`backend.server` 是唯一的后端启动组合根。帧优化默认关闭；只有显式设置 `FRAME_OPTIMIZE_ENABLED=true` 且提供绝对路径 `FRAME_OPTIMIZE_CREDENTIALS_FILE` 后，host 才把已验证的 Root 能力接到现有 `create_app`。统一用户任务并发上限读取 `AI_USER_MAX_CONCURRENT`，默认 `0`（关闭），非正数也保持关闭；正数由同一用户任务行策略限制各注册 Worker 任务。旧变量 `FRAME_OPTIMIZE_MAX_USER_CONCURRENCY` 作为兼容别名，在新变量未设置时提供相同的全局上限；两者同时设置为不同值时配置加载失败。配置加载不读 `.env`、shell profile 或云 SDK 环境文件；不设置开关时，原应用继续不启动帧优化 worker。
 
 Root 首先在受保护的 owner-only 输入文件中明确提供 `haoai-root-enrollment-input-v1` 数据。顶层字段为 `format`、`proof_key`、`guard_key`、`aead_key` 和 `records`；三类 key 对象均包含稳定 `key_id` 与 Base64 密钥，AEAD 对象还要包含 `algorithm_version: "aes-256-gcm-v1"`。每条 record 需要 `record_id`、稳定 principal UUID、嵌套 `scope`（`source`、`row_id`、`owner_or_system`、`provider`）、`issuer_namespace`、`stable_account_subject`、`key_generation`、`material_ref`、`provider_secret`、`evidence_ref`、`evidence_version`、UTC `valid_from`、可空 `valid_until`/`revoked_at` 和 `endpoint_policy`（origin、API base path、允许的 content path 与 policy version）。可选 `rotation_attestations` 必须已经由同一 Root proof key 签名。proof/guard 密钥至少 32 字节，AES-GCM 密钥恰为 32 字节，三把密钥和 key ID 都必须互不相同。每个 scope 和材料引用须显式提供，预配工具不会扫描数据库或从模型密钥推导 principal。输入文件必须是当前用户拥有的普通文件、无硬链接、无组/其他权限，且不超过 2 MiB。
 

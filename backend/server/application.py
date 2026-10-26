@@ -299,6 +299,8 @@ def _create_engine(database_url: str) -> Engine:
     options: dict[str, object] = {"future": True, "pool_pre_ping": True}
     if parsed.drivername in {"sqlite", "sqlite+pysqlite"}:
         options["connect_args"] = {"check_same_thread": False}
+    elif parsed.get_backend_name() == "postgresql":
+        options["isolation_level"] = "READ COMMITTED"
     return create_engine(database_url, **options)
 
 

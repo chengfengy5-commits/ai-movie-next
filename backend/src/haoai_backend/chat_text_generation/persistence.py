@@ -8,7 +8,7 @@ import json
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import func, insert, select, text, update
+from sqlalchemy import insert, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
@@ -16,6 +16,12 @@ from haoai_backend.admin_credit_queries.tables import CreditLogRow
 from haoai_backend.authentication.tables import user_credits, users
 from haoai_backend.chat_data.tables import chat_messages
 from haoai_backend.generation_core.base_schema import AITaskRow
+from haoai_backend.generation_task_concurrency import (
+    IN_FLIGHT_STATES as ACTIVE_TASK_STATES,
+    SOURCE_WORKER_TYPES as CONCURRENT_TASK_TYPES,
+    count_user_in_flight_tasks,
+    session_uses_fresh_postgres_statements,
+)
 from haoai_backend.generation_core.fee_phases import (
     StreamFeePlanInput,
     build_fee_phase_plan,
@@ -61,15 +67,7 @@ chapter_table = Table(
     Column("updated_at", DateTime, nullable=False),
 )
 
-ACTIVE_TASK_STATES = ("queued", "processing", "cancelling", "reconciling")
 BATCH_RUNNING_TASK_STATES = ("queued", "processing", "cancelling")
-CONCURRENT_TASK_TYPES = (
-    "batch-optimize",
-    "batch-image",
-    "image-single",
-    "video-single",
-    "ai-review",
-)
 
 
 def _begin_write(session: Session) -> None:
@@ -665,16 +663,9 @@ def _check_concurrency(
         return
     if not account_locked:
         _lock_account(session, user_id)
-    current = session.execute(
-        select(func.count())
-        .select_from(AITaskRow)
-        .where(
-            AITaskRow.user_id == user_id,
-            AITaskRow.type.in_(CONCURRENT_TASK_TYPES),
-            AITaskRow.status.in_(ACTIVE_TASK_STATES),
-            AITaskRow.billing_status != "refunded",
-        )
-    ).scalar_one()
+    if not session_uses_fresh_postgres_statements(session):
+        raise ChatTextGenerationError(503, "数据库隔离级别无法安全确认用户并发限额")
+    current = count_user_in_flight_tasks(session, user_id)
     if current + 1 > max_user_concurrency:
         raise ChatTextGenerationError(
             429,

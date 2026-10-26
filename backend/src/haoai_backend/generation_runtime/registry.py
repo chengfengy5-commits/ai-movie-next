@@ -11,6 +11,11 @@ from types import MappingProxyType
 from typing import Final, Mapping
 
 from haoai_backend.generation_contracts.types import OperationPolicy
+from haoai_backend.generation_task_concurrency import (
+    IN_FLIGHT_STATES,
+    SOURCE_WORKER_TYPES,
+    task_type_for_operation,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,20 +32,6 @@ class AttemptGroupPolicy:
     original_deadline_seconds: int
 
 
-SOURCE_WORKER_TYPES: Final[tuple[str, ...]] = (
-    "batch-optimize",
-    "batch-image",
-    "image-single",
-    "video-single",
-    "ai-review",
-)
-IN_FLIGHT_STATES: Final[tuple[str, ...]] = (
-    "queued",
-    "processing",
-    "cancelling",
-    "reconciling",
-)
-
 LOCAL_CONTINUATION_POLICY: Final[str] = "local_continuation_v1"
 STREAM_FEE_POLICY: Final[str] = "stream_debit_receipt_v1"
 HAOAI_POLL_POLICY: Final[str] = "haoai_poll_reservation_v1"
@@ -49,7 +40,7 @@ HAOAI_AUTH12_POLICY: Final[str] = "haoai_auth12_v1"
 _OPERATION_POLICIES: dict[str, OperationPolicy] = {
     "image.single": OperationPolicy(
         operation="image.single",
-        task_type="image-single",
+        task_type=task_type_for_operation("image.single"),
         graph_version="image-single-v1",
         execution_mode="claimed_worker",
         charge_phase="single_admission",
@@ -57,7 +48,7 @@ _OPERATION_POLICIES: dict[str, OperationPolicy] = {
     ),
     "video.single": OperationPolicy(
         operation="video.single",
-        task_type="video-single",
+        task_type=task_type_for_operation("video.single"),
         graph_version="video-single-v1",
         execution_mode="claimed_worker",
         charge_phase="single_admission",
@@ -66,7 +57,7 @@ _OPERATION_POLICIES: dict[str, OperationPolicy] = {
     ),
     "image.batch": OperationPolicy(
         operation="image.batch",
-        task_type="batch-image",
+        task_type=task_type_for_operation("image.batch"),
         graph_version="image-batch-v1",
         execution_mode="claimed_worker",
         charge_phase="batch_admission",
@@ -74,7 +65,7 @@ _OPERATION_POLICIES: dict[str, OperationPolicy] = {
     ),
     "frame.review": OperationPolicy(
         operation="frame.review",
-        task_type="ai-review",
+        task_type=task_type_for_operation("frame.review"),
         graph_version="frame-review-v1",
         execution_mode="claimed_worker",
         charge_phase="post_apply",
@@ -83,7 +74,7 @@ _OPERATION_POLICIES: dict[str, OperationPolicy] = {
     ),
     "frame.optimize": OperationPolicy(
         operation="frame.optimize",
-        task_type="batch-optimize",
+        task_type=task_type_for_operation("frame.optimize"),
         graph_version="frame-optimize-v1",
         execution_mode="claimed_worker",
         charge_phase="pre_apply",

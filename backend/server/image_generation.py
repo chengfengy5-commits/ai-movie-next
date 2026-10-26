@@ -213,9 +213,15 @@ def build_image_generation_host_configuration(
             registry_capabilities=capabilities,
             server_id_factory=id_factory,
             policies={
-                "image.single": AdmissionPolicy(max_concurrent_tasks=0),
-                "video.single": AdmissionPolicy(max_concurrent_tasks=0),
-                "image.batch": AdmissionPolicy(max_concurrent_tasks=0),
+                "image.single": AdmissionPolicy(
+                    max_concurrent_tasks=configuration.user_task_max_concurrency
+                ),
+                "video.single": AdmissionPolicy(
+                    max_concurrent_tasks=configuration.user_task_max_concurrency
+                ),
+                "image.batch": AdmissionPolicy(
+                    max_concurrent_tasks=configuration.user_task_max_concurrency
+                ),
             },
             versions=SnapshotVersions(
                 projector="server-image-single-projector-v1",
