@@ -1,4 +1,5 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ChapterBrowser } from "../features/chapters/ChapterBrowser";
 import { CanvasWorkspace } from "../features/canvas/CanvasWorkspace";
@@ -35,6 +36,11 @@ interface GenerationWorkspaceHarnessOptions {
   readonly lookupReplies?: readonly { status: "not_applied" | "applied" }[];
   readonly imageSubmitReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
   readonly imageLookupReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
+  readonly promptRows?: readonly unknown[];
+  readonly promptListStatus?: number;
+  readonly deferredPromptList?: boolean;
+  readonly deferredImageModels?: boolean;
+  readonly frameText?: string;
   readonly deferredImageSubmit?: boolean;
   readonly ownedImageReplies?: readonly {
     readonly status: number;
@@ -44,6 +50,25 @@ interface GenerationWorkspaceHarnessOptions {
   readonly deferredOwnedImageRead?: boolean;
   readonly freshSourceVersion?: string;
   readonly failSourceReadAt?: number;
+}
+
+function promptRow(
+  id: string,
+  category: string,
+  name: string,
+  systemPrompt?: string | null,
+  userPrompt?: string | null,
+): Record<string, unknown> {
+  return {
+    id,
+    category,
+    name,
+    system_prompt: systemPrompt,
+    user_prompt: userPrompt,
+    sort_order: 0,
+    is_system: false,
+    user_id: "demo-user",
+  };
 }
 
 function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
@@ -61,7 +86,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   const includesCharacter = stable || assetKind === "character";
   const timestamp = "2026-10-25T00:00:00Z";
   const frame = {
-    text: "等待图像记录",
+    text: options.frameText ?? "等待图像记录",
     character: includesCharacter ? [characterId] : [],
     scene: assetKind === "scene" ? [assetId] : [],
     prop: assetKind === "prop" ? [assetId] : [],
@@ -223,6 +248,9 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   const imageSubmitReplies = [...(options.imageSubmitReplies ?? [])];
   const imageLookupReplies = [...(options.imageLookupReplies ?? [])];
   const ownedImageReplies = [...(options.ownedImageReplies ?? [])];
+  let promptRows: readonly unknown[] = options.promptRows ?? [];
+  let promptListReadCount = 0;
+  let imageModelReadCount = 0;
   let sourceReadCount = 0;
   let freshSourceVersion = options.freshSourceVersion;
   let ownedResultVisible = true;
@@ -243,6 +271,12 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   const deferredOwnedImageReadStarted = new Promise<void>((resolve) => {
     markDeferredOwnedImageReadStarted = resolve;
   });
+  let releaseDeferredPromptList: ((response: Response) => void) | null = null;
+  let markDeferredPromptListStarted: (() => void) | null = null;
+  const deferredPromptListStarted = new Promise<void>((resolve) => { markDeferredPromptListStarted = resolve; });
+  let releaseDeferredImageModels: ((response: Response) => void) | null = null;
+  let markDeferredImageModelsStarted: (() => void) | null = null;
+  const deferredImageModelsStarted = new Promise<void>((resolve) => { markDeferredImageModelsStarted = resolve; });
   let deferredPageUsed = false;
   const validLockExpiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
   const lockState = () => options.lockMode === "foreign"
@@ -252,6 +286,31 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       : lockAcquired
         ? { locked: true, user_id: "demo-user", is_mine: true, expires_at: validLockExpiresAt }
         : { locked: false };
+  const imageModelsResponse = () => Response.json([
+    {
+      id: "image-model-private-id",
+      category: "image",
+      name: "画布单图模型",
+      provider: "private-provider-value",
+      model: "private-model-value",
+      base_url: "https://private-model.example.invalid",
+      params: "private-params-value",
+      api_key: "private-api-key-value",
+      sort_order: 0,
+      is_system: false,
+      user_id: "demo-user",
+    },
+    {
+      id: "video-model-id",
+      category: "video",
+      name: "不可选的视频模型",
+      provider: "video-provider",
+      params: null,
+      sort_order: 1,
+      is_system: false,
+      user_id: "demo-user",
+    },
+  ]);
   const fetcher = vi.fn<typeof fetch>(async (input, init) => {
     const url = new URL(String(input));
     const method = init?.method ?? "GET";
@@ -262,31 +321,23 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       return Response.json([activeChapter]);
     }
     if (method === "GET" && url.pathname === "/api/models") {
-      return Response.json([
-        {
-          id: "image-model-private-id",
-          category: "image",
-          name: "画布单图模型",
-          provider: "private-provider-value",
-          model: "private-model-value",
-          base_url: "https://private-model.example.invalid",
-          params: "private-params-value",
-          api_key: "private-api-key-value",
-          sort_order: 0,
-          is_system: false,
-          user_id: "demo-user",
-        },
-        {
-          id: "video-model-id",
-          category: "video",
-          name: "不可选的视频模型",
-          provider: "video-provider",
-          params: null,
-          sort_order: 1,
-          is_system: false,
-          user_id: "demo-user",
-        },
-      ]);
+      imageModelReadCount += 1;
+      if (options.deferredImageModels && imageModelReadCount === 1) {
+        markDeferredImageModelsStarted?.();
+        return new Promise<Response>((resolve) => { releaseDeferredImageModels = resolve; });
+      }
+      return imageModelsResponse();
+    }
+    if (method === "GET" && url.pathname === "/api/prompts") {
+      promptListReadCount += 1;
+      if (options.deferredPromptList && promptListReadCount === 1) {
+        markDeferredPromptListStarted?.();
+        return new Promise<Response>((resolve) => { releaseDeferredPromptList = resolve; });
+      }
+      if (options.promptListStatus !== undefined && options.promptListStatus !== 200) {
+        return new Response("prompt list is unavailable", { status: options.promptListStatus });
+      }
+      return Response.json(promptRows);
     }
     if (method === "POST" && url.pathname === "/api/chat/image") {
       imageSubmissionNumber += 1;
@@ -495,6 +546,11 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       headers: { "Content-Type": "image/png" },
     })) { releaseDeferredOwnedImageRead?.(response); },
     lockPostCount: () => lockPostCount,
+    setPromptRows(value: readonly unknown[]) { promptRows = value; },
+    deferredPromptListStarted,
+    resolveDeferredPromptList(response: Response = Response.json(promptRows)) { releaseDeferredPromptList?.(response); },
+    deferredImageModelsStarted,
+    resolveDeferredImageModels() { releaseDeferredImageModels?.(imageModelsResponse()); },
   };
 }
 
@@ -551,6 +607,372 @@ describe("selected chapter to canvas integration", () => {
     expect(dialog.innerHTML).not.toContain("private-api-key-value");
     expect(within(dialog).queryByText("不可选的视频模型")).toBeNull();
     expect(harness.requests.filter((request) => request.method === "POST")).toHaveLength(0);
+  });
+
+  it("loads a prompt template through the real creator-settings factory and submits its composed prompt", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [{
+        id: "character-design-film",
+        category: "character-design",
+        name: "角色电影光影",
+        system_prompt: "画面采用电影级柔和光线",
+        user_prompt: "角色形象保持连贯",
+        sort_order: 1,
+        is_system: false,
+        user_id: "demo-user",
+      }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    const templateSelect = await dialogQueries.findByRole("combobox", { name: "提示词模板" });
+    await dialogQueries.findByRole("option", { name: "角色电影光影" });
+    expect(dialogQueries.getByRole("option", { name: "无（纯画面描述）" })).toBeTruthy();
+
+    const promptField = dialogQueries.getByRole("textbox", { name: "提示词" }) as HTMLTextAreaElement;
+    fireEvent.change(promptField, { target: { value: " 侧逆光，突出轮廓 " } });
+    fireEvent.change(templateSelect, { target: { value: "character-design-film" } });
+    expect(promptField.value).toBe(" 侧逆光，突出轮廓 ");
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const promptReads = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/prompts");
+    expect(promptReads).toHaveLength(1);
+    expect(promptReads[0]?.url.search).toBe("");
+    const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]?.body).toMatchObject({
+      model_id: "image-model-private-id",
+      prompt: "画面采用电影级柔和光线\n角色形象保持连贯\n 侧逆光，突出轮廓",
+    });
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
+  it("filters prompt categories, rejects duplicate IDs as a group, and keeps the none option selected", async () => {
+    const rows = [
+      promptRow("character", "character-design", "角色设计", "角色模板"),
+      promptRow("scene", "scene-design", "场景设计"),
+      promptRow("prop", "prop-design", "道具设计"),
+      promptRow("storyboard", "storyboard-design", "分镜设计"),
+      promptRow("image", "image", "图片模板"),
+      promptRow("style", "style", "风格模板"),
+      promptRow("fused", "fused", "旧版融合模板"),
+      promptRow("fuse", "fuse", "融合模板"),
+      promptRow("frame", "frame", "画格模板", null, null),
+      promptRow("video", "video-design", "视频模板"),
+      promptRow("chat", "chat-assistant", "聊天模板"),
+      promptRow("duplicate", "character-design", "重复项一"),
+      promptRow("duplicate", "style", "重复项二"),
+    ];
+    const privatePrompt = { ...rows[0], api_key: "private-template-secret", provider: "private-template-provider" };
+    rows[0] = privatePrompt;
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", promptRows: rows });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    const templateSelect = await dialogQueries.findByRole("combobox", { name: "提示词模板" });
+    const optionNames = dialogQueries.getAllByRole("option").map((option) => option.textContent);
+
+    for (const name of ["角色设计", "场景设计", "道具设计", "分镜设计", "图片模板", "风格模板", "旧版融合模板", "融合模板", "画格模板"]) {
+      expect(optionNames).toContain(name);
+    }
+    for (const name of ["视频模板", "聊天模板", "重复项一", "重复项二"]) {
+      expect(optionNames).not.toContain(name);
+    }
+    expect((templateSelect as HTMLSelectElement).value).toBe("");
+    expect(dialog.innerHTML).not.toContain("private-template-secret");
+    expect(dialog.innerHTML).not.toContain("private-template-provider");
+    fireEvent.change(templateSelect, { target: { value: "frame" } });
+    fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), { target: { value: "" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ prompt: "等待图像记录" });
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/prompts")).toHaveLength(1);
+  });
+
+  it("composes selected template content once and preserves a template-only prompt", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [
+        promptRow("template-a", "character-design", "角色模板 A", "角色设定", "线稿风格"),
+        promptRow("template-b", "style", "风格模板 B", "水彩风格"),
+      ],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    const select = await dialogQueries.findByRole("combobox", { name: "提示词模板" });
+    const prompt = dialogQueries.getByRole("textbox", { name: "提示词" }) as HTMLTextAreaElement;
+    fireEvent.change(prompt, { target: { value: "用户补充" } });
+    fireEvent.change(select, { target: { value: "template-a" } });
+    fireEvent.change(select, { target: { value: "template-b" } });
+    fireEvent.change(select, { target: { value: "template-a" } });
+    fireEvent.change(select, { target: { value: "" } });
+    fireEvent.change(select, { target: { value: "template-a" } });
+    expect(prompt.value).toBe("用户补充");
+
+    fireEvent.change(prompt, { target: { value: "" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]?.body).toMatchObject({
+      prompt: "角色设定\n线稿风格",
+    });
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/prompts")).toHaveLength(1);
+  });
+
+  it("preserves truthy whitespace template pieces before trimming the composed prompt", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [promptRow("whitespace-template", "image", "空白分隔模板", "S", "   ")],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    fireEvent.change(await dialogQueries.findByRole("combobox", { name: "提示词模板" }), {
+      target: { value: "whitespace-template" },
+    });
+    fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), { target: { value: "U" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ prompt: "S\n   \nU" });
+  });
+
+  it("uses the legacy frame prompt when the none option is selected and the editor is empty", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", promptRows: [] });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    const select = await dialogQueries.findByRole("combobox", { name: "提示词模板" });
+    const prompt = dialogQueries.getByRole("textbox", { name: "提示词" });
+    expect((select as HTMLSelectElement).value).toBe("");
+    fireEvent.change(prompt, { target: { value: "" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ prompt: "等待图像记录" });
+  });
+
+  it("uses the fixed fallback when both the empty frame and editor have no prompt", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", frameText: "" });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), { target: { value: "" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ prompt: "生成一张高质量图片" });
+  });
+
+  it("keeps plain-description submission available when prompt templates cannot be read", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", promptListStatus: 503 });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    expect(await dialogQueries.findByText("提示词模板暂时无法读取；仍可填写描述生成。")).toBeTruthy();
+    fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), { target: { value: "直接填写的画面描述" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submissions).toHaveLength(1);
+    expect(submissions[0]?.body).toMatchObject({ prompt: "直接填写的画面描述" });
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/prompts")).toHaveLength(1);
+  });
+
+  it("does not stringify malformed prompt fields and keeps the plain form usable", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [
+        {
+          ...promptRow("malformed-template", "image", "无效模板"),
+          system_prompt: { secret: "do-not-render" },
+          user_prompt: ["not", "text"],
+        },
+      ],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    expect(await dialogQueries.findByText("提示词模板暂时无法读取；仍可填写描述生成。")).toBeTruthy();
+    expect(dialog.innerHTML).not.toContain("[object Object]");
+    expect(dialog.innerHTML).not.toContain("do-not-render");
+    fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), { target: { value: "安全的纯描述" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ prompt: "安全的纯描述" });
+  });
+
+  it("keeps prompt and model reads independent when the model response is delayed", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [promptRow("ready-template", "image", "已加载模板", "模板内容")],
+      deferredImageModels: true,
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = within(dialog);
+    await harness.deferredImageModelsStarted;
+    expect(await dialogQueries.findByRole("option", { name: "已加载模板" })).toBeTruthy();
+    expect(dialogQueries.getByRole("button", { name: "提交单张图片任务" })).toBeDisabled();
+    harness.resolveDeferredImageModels();
+    await dialogQueries.findByRole("option", { name: "画布单图模型" });
+    await waitFor(() => expect(dialogQueries.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled());
+  });
+
+  it("blocks an invalid stale template and recovers to None before posting", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [
+        promptRow("valid-template", "image", "有效模板", "有效模板内容"),
+        promptRow("duplicate-template", "image", "重复模板一", "错误内容一"),
+        promptRow("duplicate-template", "style", "重复模板二", "错误内容二"),
+      ],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(dialog);
+    const select = await dialogQueries.findByRole("combobox", { name: "提示词模板" }) as HTMLSelectElement;
+    const user = userEvent.setup();
+    await user.selectOptions(select, "valid-template");
+
+    const staleOption = document.createElement("option");
+    staleOption.value = "duplicate-template";
+    staleOption.textContent = "过期重复项";
+    select.append(staleOption);
+    expect(dialogQueries.getByRole("option", { name: "过期重复项" })).toBeTruthy();
+    await user.selectOptions(select, staleOption);
+    expect(await dialogQueries.findByText(/所选提示词模板无法唯一确认/)).toBeTruthy();
+    expect(select.value).toBe("duplicate-template");
+    expect(dialogQueries.getByRole("option", { name: "请选择有效模板" })).toBeTruthy();
+    await user.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    await waitFor(() => {
+      const blocked = dialogQueries.queryByText("请重新选择有效提示词模板或选择“无（纯画面描述）”，未发送图片任务。");
+      const accepted = screen.queryByText("任务已受理；图像尚未应用到画布。");
+      expect(blocked !== null || accepted !== null).toBe(true);
+    });
+    expect(dialogQueries.getByText("请重新选择有效提示词模板或选择“无（纯画面描述）”，未发送图片任务。")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image")).toHaveLength(0);
+
+    await user.selectOptions(dialogQueries.getByRole("combobox", { name: "提示词模板" }), "");
+    expect(select.value).toBe("");
+    expect(dialogQueries.queryByRole("option", { name: "请选择有效模板" })).toBeNull();
+    expect(dialogQueries.queryByText(/所选提示词模板无法唯一确认|请重新选择有效提示词模板或选择/)).toBeNull();
+    await user.clear(dialogQueries.getByRole("textbox", { name: "提示词" }));
+    await user.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+    const submission = harness.requests.find((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(submission?.body).toMatchObject({ prompt: "等待图像记录" });
+  });
+
+  it("keeps the original composed body and key across unknown lookup and explicit retry", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [promptRow("original-template", "character-design", "原模板", "原系统段落", "原用户段落")],
+      imageSubmitReplies: [{ status: 503 }],
+      imageLookupReplies: [{ status: 404 }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    let dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    let dialogQueries = await waitForImageModelOption(dialog);
+    fireEvent.change(await dialogQueries.findByRole("combobox", { name: "提示词模板" }), {
+      target: { value: "original-template" },
+    });
+    fireEvent.change(dialogQueries.getByRole("textbox", { name: "提示词" }), { target: { value: "原补充描述" } });
+    fireEvent.click(dialogQueries.getByRole("button", { name: "提交单张图片任务" }));
+    dialog = await screen.findByRole("dialog", { name: "核对原生成任务" });
+    dialogQueries = within(dialog);
+    const frozenPrompt = dialogQueries.getByText("提示词：原系统段落 原用户段落 原补充描述");
+    expect(frozenPrompt.textContent).toBe("提示词：原系统段落\n原用户段落\n原补充描述");
+    expect(dialogQueries.queryByRole("combobox", { name: "提示词模板" })).toBeNull();
+
+    harness.setPromptRows([promptRow("replacement-template", "style", "新模板", "新提示词")]);
+    fireEvent.click(dialogQueries.getByRole("button", { name: "继续核对原操作" }));
+    expect(await dialogQueries.findByText("暂未查到任务记录。之前的请求仍可能稍后完成，原提交内容和请求编号已保留。")).toBeTruthy();
+    fireEvent.click(dialogQueries.getByRole("button", { name: "重新提交原操作" }));
+    expect(await screen.findByText("任务已受理；图像尚未应用到画布。")).toBeTruthy();
+
+    const promptReads = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/prompts");
+    const lookups = harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single");
+    const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
+    expect(promptReads).toHaveLength(1);
+    expect(lookups).toHaveLength(1);
+    expect(submissions).toHaveLength(2);
+    expect(submissions[0]?.body).toEqual(submissions[1]?.body);
+    expect(submissions[0]?.headers.get("Idempotency-Key")).toBe(submissions[1]?.headers.get("Idempotency-Key"));
+    expect(submissions[0]?.body).toMatchObject({ prompt: "原系统段落\n原用户段落\n原补充描述" });
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
+  it("ignores a late prompt response after closing the form before a fresh open", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [promptRow("fresh-template", "image", "新表单模板", "新内容")],
+      deferredPromptList: true,
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    let dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    let dialogQueries = await waitForImageModelOption(dialog);
+    expect(dialogQueries.getByRole("combobox", { name: "提示词模板" })).toBeDisabled();
+    expect(dialogQueries.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled();
+    await harness.deferredPromptListStarted;
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "生成图片" })).toBeNull());
+    harness.resolveDeferredPromptList(Response.json([promptRow("stale-template", "image", "旧表单模板", "旧内容")]));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    dialogQueries = await waitForImageModelOption(dialog);
+    await dialogQueries.findByRole("option", { name: "新表单模板" });
+
+    expect(dialogQueries.queryByRole("option", { name: "旧表单模板" })).toBeNull();
+    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/prompts")).toHaveLength(2);
+  });
+
+  it("does not let a late prompt-list 401 clear a newer actor session", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      promptRows: [promptRow("new-actor-template", "image", "新身份模板", "新内容")],
+      deferredPromptList: true,
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await screen.findByRole("dialog", { name: "生成图片" });
+    await harness.deferredPromptListStarted;
+    fireEvent.click(within(dialog).getByRole("button", { name: "取消" }));
+    harness.setToken("new-actor-token");
+    harness.setStoredActor("new-user");
+    harness.rerender(3, "new-user");
+    harness.resolveDeferredPromptList(new Response("expired old session", { status: 401 }));
+    await waitFor(() => expect(harness.token()).toBe("new-actor-token"));
+
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const newDialog = await screen.findByRole("dialog", { name: "生成图片" });
+    const dialogQueries = await waitForImageModelOption(newDialog);
+    await dialogQueries.findByRole("option", { name: "新身份模板" });
+    expect(dialogQueries.queryByRole("option", { name: "旧身份模板" })).toBeNull();
+    expect(harness.token()).toBe("new-actor-token");
   });
 
   it("uses the newly selected target after a previous image task was accepted", async () => {
@@ -717,7 +1139,7 @@ describe("selected chapter to canvas integration", () => {
       expect(screen.queryByRole("button", { name: "继续核对原提交" })).toBeNull();
       expect(screen.queryByText(/上次图片任务提交结果暂时无法确认/)).toBeNull();
     });
-    expect(screen.getByRole("article", { name: "分镜 1" })).toBeTruthy();
+    expect(await screen.findByRole("article", { name: "分镜 1" })).toBeTruthy();
 
     await act(async () => {
       harness.resolveDeferredImageSubmit({

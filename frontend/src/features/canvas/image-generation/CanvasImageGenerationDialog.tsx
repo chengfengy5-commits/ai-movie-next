@@ -8,6 +8,14 @@ export interface CanvasImageGenerationModelOption {
   readonly name: string;
 }
 
+export interface CanvasImageGenerationPromptTemplateOption {
+  readonly id: string;
+  readonly name: string;
+  readonly category: string;
+  readonly systemPrompt: string | null;
+  readonly userPrompt: string | null;
+}
+
 export interface CanvasImageGenerationIntentView {
   readonly destination: CanvasOwnedResultsTarget;
   readonly idempotencyKey: string;
@@ -32,8 +40,13 @@ export interface CanvasImageGenerationDialogProps {
   readonly targetLabel: string;
   readonly models: readonly CanvasImageGenerationModelOption[];
   readonly selectedModelId: string;
+  readonly promptTemplates: readonly CanvasImageGenerationPromptTemplateOption[];
+  readonly selectedPromptTemplateId: string;
+  readonly promptTemplateSelectionInvalid: boolean;
   readonly prompt: string;
   readonly modelsLoading: boolean;
+  readonly promptTemplatesLoading: boolean;
+  readonly promptTemplateError: string | null;
   readonly busy: boolean;
   readonly error: string | null;
   readonly message: string | null;
@@ -45,6 +58,7 @@ export interface CanvasImageGenerationDialogProps {
   readonly receipt: CanvasImageGenerationReceiptView | null;
   onClose(): void;
   onSelectModel(modelId: string): void;
+  onSelectPromptTemplate(promptTemplateId: string): void;
   onChangePrompt(prompt: string): void;
   onSubmit(): void;
   onLookup(): void;
@@ -110,8 +124,13 @@ export function CanvasImageGenerationDialog({
   targetLabel,
   models,
   selectedModelId,
+  promptTemplates,
+  selectedPromptTemplateId,
+  promptTemplateSelectionInvalid,
   prompt,
   modelsLoading,
+  promptTemplatesLoading,
+  promptTemplateError,
   busy,
   error,
   message,
@@ -123,6 +142,7 @@ export function CanvasImageGenerationDialog({
   receipt,
   onClose,
   onSelectModel,
+  onSelectPromptTemplate,
   onChangePrompt,
   onSubmit,
   onLookup,
@@ -173,12 +193,37 @@ export function CanvasImageGenerationDialog({
               </select>
             </label>
             <label>
+              提示词模板
+              <select
+                aria-label="提示词模板"
+                disabled={promptTemplatesLoading || busy}
+                onChange={(event) => onSelectPromptTemplate(event.currentTarget.value)}
+                value={selectedPromptTemplateId}
+              >
+                {promptTemplateSelectionInvalid && (
+                  <option disabled value={selectedPromptTemplateId}>请选择有效模板</option>
+                )}
+                <option value="">无（纯画面描述）</option>
+                {promptTemplates.map((template) => (
+                  <option key={template.id} value={template.id}>{template.name}</option>
+                ))}
+              </select>
+            </label>
+            {promptTemplatesLoading && (
+              <p className="canvas-image-generation-message" role="status">正在读取提示词模板…</p>
+            )}
+            {promptTemplateError !== null && (
+              <p className="canvas-image-generation-message" role="status">{promptTemplateError}</p>
+            )}
+            <label>
               提示词
+              <span className="canvas-image-generation-prompt-hint">
+                留空时使用当前内容；选用模板后可清空描述，仅使用模板。
+              </span>
               <textarea
                 aria-label="提示词"
                 disabled={busy}
                 onChange={(event) => onChangePrompt(event.currentTarget.value)}
-                required
                 rows={6}
                 value={prompt}
               />
@@ -201,7 +246,7 @@ export function CanvasImageGenerationDialog({
             {error !== null && <p className="canvas-image-generation-error" role="alert">{error}</p>}
             {message !== null && <p className="canvas-image-generation-message" role="status">{message}</p>}
             <footer className="canvas-image-generation-footer">
-              <button disabled={busy || modelsLoading || models.length === 0 || selectedModelId === "" || prompt.trim() === ""} type="submit">
+              <button disabled={busy || modelsLoading || models.length === 0 || selectedModelId === ""} type="submit">
                 {busy ? "正在提交…" : "提交单张图片任务"}
               </button>
               <button disabled={busy} onClick={onClose} type="button">取消</button>

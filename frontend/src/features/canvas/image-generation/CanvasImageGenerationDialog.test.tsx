@@ -52,8 +52,19 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     targetLabel: "分镜 1",
     models: [{ id: "image-model-a", name: "图片模型 A" }],
     selectedModelId: "image-model-a",
+    promptTemplates: [{
+      id: "template-a",
+      name: "角色设计",
+      category: "character-design",
+      systemPrompt: "保持角色一致",
+      userPrompt: null,
+    }],
+    selectedPromptTemplateId: "",
+    promptTemplateSelectionInvalid: false,
     prompt: "当前分镜文本",
     modelsLoading: false,
+    promptTemplatesLoading: false,
+    promptTemplateError: null,
     busy: false,
     error: null,
     message: null,
@@ -65,6 +76,7 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     receipt: null,
     onClose: vi.fn(),
     onSelectModel: vi.fn(),
+    onSelectPromptTemplate: vi.fn(),
     onChangePrompt: vi.fn(),
     onSubmit: vi.fn(),
     onLookup: vi.fn(),
@@ -79,16 +91,36 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
 afterEach(() => cleanup());
 
 describe("CanvasImageGenerationDialog", () => {
-  it("offers a model select and required prompt without exposing model configuration", () => {
+  it("offers model and optional prompt template selects without exposing model configuration", () => {
     renderDialog();
     const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
 
     expect(dialog.getByRole("combobox", { name: "图片模型" })).toBeTruthy();
     expect(dialog.getByRole("option", { name: "图片模型 A" })).toBeTruthy();
+    expect(dialog.getByRole("combobox", { name: "提示词模板" })).toBeTruthy();
+    expect(dialog.getByRole("option", { name: "无（纯画面描述）" })).toBeTruthy();
     const prompt = dialog.getByRole("textbox", { name: "提示词" }) as HTMLTextAreaElement;
-    expect(prompt.required).toBe(true);
+    expect(prompt.required).toBe(false);
     expect(prompt.value).toBe("当前分镜文本");
     expect(dialog.getByRole("button", { name: "提交单张图片任务" })).toBeEnabled();
+  });
+
+  it("keeps template selection separate from the editable prompt", () => {
+    const rendered = renderDialog();
+    const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
+    const prompt = dialog.getByRole("textbox", { name: "提示词" }) as HTMLTextAreaElement;
+    fireEvent.change(dialog.getByRole("combobox", { name: "提示词模板" }), { target: { value: "template-a" } });
+
+    expect(prompt.value).toBe("当前分镜文本");
+    expect(rendered.props.onSelectPromptTemplate).toHaveBeenCalledWith("template-a");
+    expect(dialog.getByText("留空时使用当前内容；选用模板后可清空描述，仅使用模板。")).toBeTruthy();
+  });
+
+  it("does not expose template controls while inspecting a frozen operation", () => {
+    renderDialog({ mode: "intent", pendingIntent: pendingIntent("unknown") });
+
+    expect(screen.queryByRole("combobox", { name: "提示词模板" })).toBeNull();
+    expect(screen.getByText("提示词：保留的原始提示词")).toBeTruthy();
   });
 
   it("keeps unknown submissions read-only until an explicit lookup and same-operation retry", () => {
