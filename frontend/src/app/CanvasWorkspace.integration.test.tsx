@@ -35,7 +35,11 @@ interface GenerationWorkspaceHarnessOptions {
   readonly putReplies?: readonly { status: number; resultStatus?: "applied" | "already_applied" }[];
   readonly lookupReplies?: readonly { status: "not_applied" | "applied" }[];
   readonly imageSubmitReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
-  readonly imageLookupReplies?: readonly { status: number; receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed" }[];
+  readonly imageLookupReplies?: readonly {
+    status: number;
+    receiptStatus?: "queued" | "processing" | "cancelling" | "reconciling" | "completed" | "failed";
+    billingStatus?: "legacy_unreconciled" | "unbilled" | "charged" | "partially_refunded" | "refunded" | "no_charge";
+  }[];
   readonly promptRows?: readonly unknown[];
   readonly imageModelParams?: string | null;
   readonly additionalImageModels?: readonly unknown[];
@@ -50,6 +54,9 @@ interface GenerationWorkspaceHarnessOptions {
   readonly hiddenRelations?: readonly string[];
   readonly deferredImageSubmit?: boolean;
   readonly deferredImageSubmitOrdinal?: number;
+  readonly deferredImageLookup?: boolean;
+  readonly imageLookupTaskIds?: readonly string[];
+  readonly deferredLockCheckAfterImageSubmission?: number;
   readonly ownedImageReplies?: readonly {
     readonly status: number;
     readonly contentType?: string;
@@ -257,6 +264,8 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   const lookupReplies = [...(options.lookupReplies ?? [])];
   const imageSubmitReplies = [...(options.imageSubmitReplies ?? [])];
   const imageLookupReplies = [...(options.imageLookupReplies ?? [])];
+  const imageLookupTaskIds = [...(options.imageLookupTaskIds ?? [])];
+  const imageReceiptsByKey = new Map<string, Record<string, unknown>>();
   const ownedImageReplies = [...(options.ownedImageReplies ?? [])];
   let promptRows: readonly unknown[] = options.promptRows ?? [];
   let promptListReadCount = 0;
@@ -267,10 +276,17 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   let activeChapter = currentChapter;
   let lockAcquired = false;
   let lockPostCount = 0;
+  let releaseDeferredLockCheck: ((response: Response) => void) | null = null;
+  let markDeferredLockCheckStarted: (() => void) | null = null;
+  const deferredLockCheckStarted = new Promise<void>((resolve) => { markDeferredLockCheckStarted = resolve; });
   let imageSubmissionNumber = 0;
   let releaseDeferredImageSubmit: ((response: Response) => void) | null = null;
   let markDeferredImageSubmitStarted: (() => void) | null = null;
   const deferredImageSubmitStarted = new Promise<void>((resolve) => { markDeferredImageSubmitStarted = resolve; });
+  let releaseDeferredImageLookup: ((response: Response) => void) | null = null;
+  let markDeferredImageLookupStarted: (() => void) | null = null;
+  const deferredImageLookupStarted = new Promise<void>((resolve) => { markDeferredImageLookupStarted = resolve; });
+  let deferNextImageLookup = options.deferredImageLookup ?? false;
   let markDeferredImageResponseHandled: (() => void) | null = null;
   const deferredImageResponseHandled = new Promise<void>((resolve) => { markDeferredImageResponseHandled = resolve; });
   let releaseDeferredPage: ((response: Response) => void) | null = null;
@@ -361,7 +377,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       }
       const reply = imageSubmitReplies.shift() ?? { status: 200, receiptStatus: "queued" as const };
       if (reply.status !== 200) return new Response("image task admission is not confirmed", { status: reply.status });
-      return Response.json({
+      const receipt = {
         submission_id: `image-submission-${imageSubmissionNumber}`,
         operation: "image.single",
         task_id: `image-task-${imageSubmissionNumber}`,
@@ -369,19 +385,29 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
         status: reply.receiptStatus ?? "queued",
         quoted_amount: 12,
         billing_status: "unbilled",
-      });
+      };
+      const idempotencyKey = headers.get("Idempotency-Key");
+      if (idempotencyKey !== null) imageReceiptsByKey.set(idempotencyKey, receipt);
+      return Response.json(receipt);
     }
     if (method === "GET" && url.pathname === "/api/submissions/image.single") {
+      if (deferNextImageLookup) {
+        deferNextImageLookup = false;
+        markDeferredImageLookupStarted?.();
+        return new Promise<Response>((resolve) => { releaseDeferredImageLookup = resolve; });
+      }
       const reply = imageLookupReplies.shift() ?? { status: 404 };
       if (reply.status !== 200) return new Response("submission not observed", { status: reply.status });
+      const idempotencyKey = url.searchParams.get("idempotency_key");
+      const accepted = idempotencyKey === null ? undefined : imageReceiptsByKey.get(idempotencyKey);
       return Response.json({
-        submission_id: "image-submission-1",
-        operation: "image.single",
-        task_id: "image-task-1",
-        message_id: "image-message-1",
+        submission_id: accepted?.submission_id ?? "image-submission-1",
+        operation: accepted?.operation ?? "image.single",
+        task_id: imageLookupTaskIds.shift() ?? accepted?.task_id ?? "image-task-1",
+        message_id: accepted?.message_id ?? "image-message-1",
         status: reply.receiptStatus ?? "queued",
-        quoted_amount: 12,
-        billing_status: "unbilled",
+        quoted_amount: accepted?.quoted_amount ?? 12,
+        billing_status: reply.billingStatus ?? accepted?.billing_status ?? "unbilled",
       });
     }
     if (method === "GET" && url.pathname === `/api/chapters/${activeChapter.id}/canvas-source`) {
@@ -472,7 +498,13 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       });
     }
     if (url.pathname === `/api/chapters/${activeChapter.id}/lock`) {
-      if (method === "GET") return Response.json(lockState());
+      if (method === "GET") {
+        if (options.deferredLockCheckAfterImageSubmission === imageSubmissionNumber && imageSubmissionNumber > 0) {
+          markDeferredLockCheckStarted?.();
+          return new Promise<Response>((resolve) => { releaseDeferredLockCheck = resolve; });
+        }
+        return Response.json(lockState());
+      }
       if (method === "POST") {
         lockPostCount += 1;
         lockAcquired = true;
@@ -544,6 +576,8 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       view.rerender(workspace(sessionGeneration, actorId, chapter, servicesOverride));
     },
     deferredImageSubmitStarted,
+    deferredImageLookupStarted,
+    deferredLockCheckStarted,
     deferredImageResponseHandled,
     resolveDeferredImageSubmit(payload: unknown) {
       let delivered = false;
@@ -563,6 +597,18 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
         status: 200,
         headers: { "Content-Type": "application/json" },
       }));
+    },
+    resolveDeferredImageLookup(payload: unknown, status = 200) {
+      if (releaseDeferredImageLookup === null) throw new Error("No deferred image lookup is pending.");
+      releaseDeferredImageLookup(status === 200
+        ? Response.json(payload)
+        : new Response("image task lookup was rejected", { status }));
+      releaseDeferredImageLookup = null;
+    },
+    resolveDeferredLockCheck() {
+      if (releaseDeferredLockCheck === null) throw new Error("No deferred lock check is pending.");
+      releaseDeferredLockCheck(Response.json(lockState()));
+      releaseDeferredLockCheck = null;
     },
     deferredPageStarted,
     resolveDeferredPage(payload: unknown) { releaseDeferredPage?.(Response.json(payload)); },
@@ -1097,7 +1143,8 @@ describe("selected chapter to canvas integration", () => {
     fireEvent.click(pendingQueries.getByRole("button", { name: "继续核对原操作" }));
     expect(await pendingQueries.findByText(/之前的请求仍可能稍后完成/)).toBeTruthy();
     const lookup = harness.requests.find((request) => request.method === "GET"
-      && request.url.pathname === "/api/submissions/image.single");
+      && request.url.pathname === "/api/submissions/image.single"
+      && request.url.searchParams.get("idempotency_key") === unknownKey);
     expect(lookup?.url.searchParams.get("idempotency_key")).toBe(unknownKey);
     expect(harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image"))
       .toHaveLength(2);
@@ -1793,7 +1840,11 @@ describe("selected chapter to canvas integration", () => {
     const submissions = harness.requests.filter((request) => request.method === "POST" && request.url.pathname === "/api/chat/image");
     expect(promptReads).toHaveLength(1);
     expect(modelReads).toHaveLength(1);
-    expect(lookups).toHaveLength(1);
+    expect(lookups).toHaveLength(2);
+    expect(lookups.map((request) => request.url.searchParams.get("idempotency_key"))).toEqual([
+      submissions[0]?.headers.get("Idempotency-Key"),
+      submissions[1]?.headers.get("Idempotency-Key"),
+    ]);
     expect(submissions).toHaveLength(2);
     expect(submissions[0]?.body).toEqual(submissions[1]?.body);
     expect(submissions[0]?.body).toMatchObject({ size: "quality:high" });
@@ -1969,6 +2020,303 @@ describe("selected chapter to canvas integration", () => {
     expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
   });
 
+  it("observes an accepted image task and updates its existing receipt by the original key", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageLookupReplies: [
+        { status: 200, receiptStatus: "processing", billingStatus: "charged" },
+        { status: 200, receiptStatus: "processing", billingStatus: "partially_refunded" },
+        { status: 200, receiptStatus: "completed", billingStatus: "refunded" },
+      ],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText("任务状态：处理中")).toBeTruthy();
+    expect(receiptDialog.getByText("计费状态：已计费")).toBeTruthy();
+    const submissions = harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    const lookups = harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single");
+    expect(submissions).toHaveLength(1);
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]?.url.searchParams.get("idempotency_key"))
+      .toBe(submissions[0]?.headers.get("Idempotency-Key"));
+    fireEvent.click(receiptDialog.getByRole("button", { name: "暂停观察第 1 张" }));
+    expect(receiptDialog.getByText("状态观察：观察已暂停")).toBeTruthy();
+    await new Promise((resolve) => setTimeout(resolve, 2_550));
+    expect(harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single")).toHaveLength(1);
+    fireEvent.click(receiptDialog.getByRole("button", { name: "继续观察第 1 张" }));
+    await waitFor(() => {
+      expect(harness.requests.filter((request) => request.method === "GET"
+        && request.url.pathname === "/api/submissions/image.single")).toHaveLength(2);
+    });
+    expect(await receiptDialog.findByText("计费状态：部分退款")).toBeTruthy();
+    fireEvent.click(receiptDialog.getByRole("button", { name: "刷新第 1 张状态" }));
+    expect(await receiptDialog.findByText("任务状态：已完成")).toBeTruthy();
+    expect(receiptDialog.getByText("计费状态：已退款")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
+  });
+
+  it("polls an active task until a terminal failed and refunded server state", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageLookupReplies: [
+        { status: 200, receiptStatus: "processing" },
+        { status: 200, receiptStatus: "failed", billingStatus: "refunded" },
+        { status: 200, receiptStatus: "failed", billingStatus: "refunded" },
+      ],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText("任务状态：处理中")).toBeTruthy();
+    await waitFor(() => {
+      expect(receiptDialog.getByText("任务状态：失败")).toBeTruthy();
+    }, { timeout: 5_000 });
+    expect(receiptDialog.getByText("计费状态：已退款")).toBeTruthy();
+    expect(receiptDialog.queryByRole("button", { name: "继续观察第 1 张" })).toBeNull();
+    expect(receiptDialog.getByRole("button", { name: "刷新第 1 张状态" })).toBeTruthy();
+    const submissions = harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    const lookups = harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single");
+    expect(submissions).toHaveLength(1);
+    expect(lookups).toHaveLength(2);
+    expect(lookups.map((request) => request.url.searchParams.get("idempotency_key")))
+      .toEqual([submissions[0]?.headers.get("Idempotency-Key"), submissions[0]?.headers.get("Idempotency-Key")]);
+    fireEvent.click(receiptDialog.getByRole("button", { name: "刷新第 1 张状态" }));
+    await waitFor(() => {
+      expect(harness.requests.filter((request) => request.method === "GET"
+        && request.url.pathname === "/api/submissions/image.single")).toHaveLength(3);
+    });
+    expect(receiptDialog.getByText("任务状态：失败")).toBeTruthy();
+    expect(receiptDialog.getByText("计费状态：已退款")).toBeTruthy();
+  });
+
+  it("keeps lookup single-flight and stops at the bounded observation window until explicit continue", async () => {
+    let observationTime = performance.now();
+    vi.spyOn(performance, "now").mockImplementation(() => observationTime);
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      deferredImageLookup: true,
+      imageLookupReplies: [{ status: 200, receiptStatus: "completed" }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+    await harness.deferredImageLookupStarted;
+
+    await new Promise((resolve) => setTimeout(resolve, 2_550));
+    const lookups = () => harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single");
+    expect(lookups()).toHaveLength(1);
+    observationTime += 180_000;
+    harness.resolveDeferredImageLookup({
+      submission_id: "image-submission-1",
+      operation: "image.single",
+      task_id: "image-task-1",
+      message_id: "image-message-1",
+      status: "processing",
+      quoted_amount: 12,
+      billing_status: "unbilled",
+    });
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText("状态观察：本次观察时段已结束")).toBeTruthy();
+    expect(receiptDialog.getByText("任务编号：image-task-1 · 状态：处理中")).toBeTruthy();
+    await new Promise((resolve) => setTimeout(resolve, 2_550));
+    expect(lookups()).toHaveLength(1);
+
+    fireEvent.click(receiptDialog.getByRole("button", { name: "继续观察第 1 张" }));
+    await waitFor(() => expect(lookups()).toHaveLength(2));
+    expect(await receiptDialog.findByText("任务状态：已完成")).toBeTruthy();
+    const submissions = harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image");
+    expect(submissions).toHaveLength(1);
+    expect(lookups().map((request) => request.url.searchParams.get("idempotency_key")))
+      .toEqual([submissions[0]?.headers.get("Idempotency-Key"), submissions[0]?.headers.get("Idempotency-Key")]);
+  }, 15_000);
+
+  it("preserves a completed accepted sibling when a later image request finishes", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      deferredImageSubmitOrdinal: 2,
+      imageLookupReplies: [{ status: 200, receiptStatus: "completed" }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.change(form.getByRole("combobox", { name: "生成数量" }), { target: { value: "2" } });
+    fireEvent.click(form.getByRole("button", { name: "提交2张图片任务" }));
+    await harness.deferredImageSubmitStarted;
+
+    await waitFor(() => {
+      expect(harness.requests.filter((request) => request.method === "GET"
+        && request.url.pathname === "/api/submissions/image.single")).toHaveLength(1);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    harness.resolveDeferredImageSubmit({
+      submission_id: "image-submission-2",
+      operation: "image.single",
+      task_id: "image-task-2",
+      message_id: "image-message-2",
+      status: "queued",
+      quoted_amount: 12,
+      billing_status: "unbilled",
+    });
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(receiptDialog.getByText("任务编号：image-task-1 · 状态：已完成")).toBeTruthy();
+    expect(receiptDialog.getByText("任务编号：image-task-2 · 状态：排队中")).toBeTruthy();
+    expect(receiptDialog.getByText("本轮请求 2 张；已受理 2 张；未发送 0 张。")).toBeTruthy();
+  });
+
+  it("preserves an observed receipt when a later sibling stops during lock preflight", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      requiresLock: true,
+      lockMode: "unlocked",
+      deferredLockCheckAfterImageSubmission: 1,
+      imageLookupReplies: [{ status: 200, receiptStatus: "completed" }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.change(form.getByRole("combobox", { name: "生成数量" }), { target: { value: "2" } });
+    fireEvent.click(form.getByRole("button", { name: "提交2张图片任务" }));
+    expect(await form.findByText("当前账号尚未持有有效章节编辑锁。请明确取得锁后再次提交。")).toBeTruthy();
+    fireEvent.click(form.getByRole("button", { name: "取得编辑锁" }));
+    expect(await form.findByText("已取得并核实当前章节编辑锁。请再次明确提交图片任务。")).toBeTruthy();
+
+    fireEvent.click(form.getByRole("button", { name: "提交2张图片任务" }));
+    await harness.deferredLockCheckStarted;
+    expect(await form.findByText("任务编号：image-task-1 · 状态：已完成")).toBeTruthy();
+    harness.setLockMode("foreign");
+    harness.resolveDeferredLockCheck();
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(receiptDialog.getByText("任务编号：image-task-1 · 状态：已完成")).toBeTruthy();
+    expect(receiptDialog.getByText("本轮请求 2 张；已受理 1 张；未发送 1 张。")).toBeTruthy();
+    expect(receiptDialog.getByText("章节编辑锁由其他成员持有，未发送图片任务。")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+  });
+
+  it.each([
+    ["404", [{ status: 404 }], [], "暂未查到这条图片任务"],
+    ["identity mismatch", [{ status: 200, receiptStatus: "processing" }], ["unexpected-task"], "记录与已受理回执不匹配"],
+  ] as const)("retains the trusted receipt after an observation %s", async (_name, replies, taskIds, expectedError) => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageLookupReplies: replies,
+      imageLookupTaskIds: taskIds,
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const dialog = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(dialog.getByRole("button", { name: "提交单张图片任务" }));
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText(new RegExp(expectedError))).toBeTruthy();
+    expect(receiptDialog.getByText("任务状态：排队中")).toBeTruthy();
+    expect(receiptDialog.getByText("计费状态：未计费")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single")).toHaveLength(1);
+  });
+
+  it("requires an explicit continue after an accepted task lookup returns 404", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageLookupReplies: [
+        { status: 404 },
+        { status: 200, receiptStatus: "processing", billingStatus: "charged" },
+      ],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText(/暂未查到这条图片任务/)).toBeTruthy();
+    expect(receiptDialog.getByText("任务状态：排队中")).toBeTruthy();
+    fireEvent.click(receiptDialog.getByRole("button", { name: "继续观察第 1 张" }));
+    expect(await receiptDialog.findByText("任务状态：处理中")).toBeTruthy();
+    expect(receiptDialog.getByText("计费状态：已计费")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single")).toHaveLength(2);
+  });
+
+  it("aborts accepted task observation on close and ignores a late unauthorized response", async () => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", deferredImageLookup: true });
+    const tokenBeforeObservation = harness.token();
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+    await harness.deferredImageLookupStarted;
+
+    const lookup = harness.requests.find((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single");
+    expect(lookup).toBeDefined();
+    expect(lookup?.signal?.aborted).toBe(false);
+    fireEvent.click(screen.getByRole("button", { name: "关闭" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "生成任务状态" })).toBeNull());
+    expect(lookup?.signal?.aborted).toBe(true);
+
+    harness.resolveDeferredImageLookup(null, 401);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    fireEvent.click(screen.getByRole("button", { name: "查看生成任务状态" }));
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(receiptDialog.getByText("任务状态：排队中")).toBeTruthy();
+    expect(receiptDialog.getByText("状态观察：观察已暂停")).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.token()).toBe(tokenBeforeObservation);
+  });
+
+  it.each(["session", "service", "unmount"] as const)("cancels task observation after %s identity ends", async (reason) => {
+    const harness = mountGenerationWorkspace({ targetKind: "stable-frame", deferredImageLookup: true });
+    const tokenBeforeObservation = harness.token();
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(await screen.findByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+    await harness.deferredImageLookupStarted;
+
+    const lookup = harness.requests.find((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single");
+    if (reason === "session") harness.rerender(3, "another-user");
+    if (reason === "service") {
+      harness.rerender(2, "demo-user", harness.currentChapter, { ...harness.services });
+    }
+    if (reason === "unmount") cleanup();
+
+    expect(lookup?.signal?.aborted).toBe(true);
+    harness.resolveDeferredImageLookup(null, 401);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.token()).toBe(tokenBeforeObservation);
+  });
+
   it("keeps a no-ID frame without a canonical server digest disabled", async () => {
     const harness = mountGenerationWorkspace({ targetKind: "invalid-no-id" });
     fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
@@ -2101,7 +2449,11 @@ describe("selected chapter to canvas integration", () => {
     });
     expect(submissions[0]?.headers.get("Idempotency-Key")).toMatch(/^[0-9a-f-]{36}$/iu);
     expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
-    expect(harness.requests.filter((request) => request.method === "GET" && request.url.pathname === "/api/submissions/image.single")).toHaveLength(0);
+    const lookups = harness.requests.filter((request) => request.method === "GET"
+      && request.url.pathname === "/api/submissions/image.single");
+    expect(lookups).toHaveLength(1);
+    expect(lookups[0]?.url.searchParams.get("idempotency_key"))
+      .toBe(submissions[0]?.headers.get("Idempotency-Key"));
   });
 
   it("retains an uncertain admission across close and target changes, then explicitly checks and retries the exact request", async () => {

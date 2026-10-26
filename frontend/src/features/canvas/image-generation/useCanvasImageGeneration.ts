@@ -15,6 +15,8 @@ import type {
   CanvasImageGenerationIntentView,
   CanvasImageGenerationModelOption,
   CanvasImageGenerationPromptTemplateOption,
+  CanvasImageTaskObservationStatus,
+  CanvasImageTaskObservationView,
 } from "./CanvasImageGenerationDialog";
 import {
   CanvasImageReferencePreparationError,
@@ -86,6 +88,7 @@ export interface CanvasImageGenerationControllerState {
   readonly intent: CanvasImageGenerationWorkspaceIntent | null;
   readonly receipt: CanvasImageGenerationWorkspaceReceipt | null;
   readonly batch: CanvasImageGenerationBatchView | null;
+  readonly taskObservations: Readonly<Record<string, CanvasImageTaskObservationView>>;
 }
 
 export interface CanvasImageGenerationControllerOptions {
@@ -106,6 +109,21 @@ type ActionKind = "submit" | "retry" | "lookup" | "lock";
 interface ActionHandle {
   readonly controller: AbortController;
   readonly kind: ActionKind;
+}
+
+interface ImageTaskObserver {
+  readonly idempotencyKey: string;
+  readonly target: CanvasImageGenerationTarget;
+  readonly serviceIdentity: object;
+  readonly port: CanvasImageGenerationPort;
+  readonly run: ReturnType<CanvasImageGenerationPort["beginRun"]>;
+  readonly identity: CanvasImageGenerationReceipt;
+  startedAt: number;
+  status: CanvasImageTaskObservationStatus;
+  error: string | null;
+  inFlight: boolean;
+  timer: ReturnType<typeof setTimeout> | null;
+  controller: AbortController | null;
 }
 
 interface FrozenImageGenerationRequest {
@@ -158,7 +176,11 @@ const EMPTY_STATE: CanvasImageGenerationControllerState = {
   intent: null,
   receipt: null,
   batch: null,
+  taskObservations: Object.freeze({}),
 };
+
+const IMAGE_TASK_OBSERVATION_INTERVAL_MS = 2_500;
+const IMAGE_TASK_OBSERVATION_WINDOW_MS = 180_000;
 
 function errorMessage(cause: unknown): string {
   if (cause instanceof CanvasImageGenerationError) {
@@ -239,7 +261,7 @@ function batchView(batch: FrozenImageGenerationBatch): CanvasImageGenerationBatc
 }
 
 function receiptRunContext(
-  intent: CanvasImageGenerationWorkspaceIntent,
+  target: CanvasImageGenerationTarget,
 ): {
   actorId: string;
   seriesId: string;
@@ -247,11 +269,43 @@ function receiptRunContext(
   isContextCurrent(): boolean;
 } {
   return {
-    actorId: intent.target.context.actorId,
-    seriesId: intent.target.context.seriesId,
-    chapterId: intent.target.context.chapterId,
-    isContextCurrent: () => intent.target.context.isCurrent(),
+    actorId: target.context.actorId,
+    seriesId: target.context.seriesId,
+    chapterId: target.context.chapterId,
+    isContextCurrent: () => target.context.isCurrent(),
   };
+}
+
+function sameReceiptIdentity(
+  left: CanvasImageGenerationReceipt,
+  right: CanvasImageGenerationReceipt,
+): boolean {
+  return left.submissionId === right.submissionId
+    && left.taskId === right.taskId
+    && left.operation === right.operation
+    && left.messageId === right.messageId
+    && left.quotedAmount === right.quotedAmount;
+}
+
+function mergeLatestAcceptedReceiptStatus(
+  batch: FrozenImageGenerationBatch,
+  latest: FrozenImageGenerationBatch | null,
+): FrozenImageGenerationBatch {
+  if (latest === null || latest.requests !== batch.requests) return batch;
+  const latestByKey = new Map(latest.acceptedReceipts.map((item) => [item.idempotencyKey, item] as const));
+  const acceptedReceipts = batch.acceptedReceipts.map((item) => {
+    const current = latestByKey.get(item.idempotencyKey);
+    if (current === undefined || !sameReceiptIdentity(item.receipt, current.receipt)) return item;
+    return {
+      ...item,
+      receipt: {
+        ...item.receipt,
+        status: current.receipt.status,
+        billingStatus: current.receipt.billingStatus,
+      },
+    };
+  });
+  return { ...batch, acceptedReceipts: Object.freeze(acceptedReceipts) };
 }
 
 function errorKind(cause: unknown): CanvasImageGenerationError["kind"] | null {
@@ -437,6 +491,12 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
   const requestDispatchedRef = useRef(false);
   const modelRunIdRef = useRef(0);
   const promptTemplateRunIdRef = useRef(0);
+  const taskObserversRef = useRef(new Map<string, ImageTaskObserver>());
+  const observedReceiptKeysRef = useRef(new Set<string>());
+  const pauseTaskObservationsRef = useRef<() => void>(() => undefined);
+  const readTaskObservationRef = useRef<(observer: ImageTaskObserver, continueObserving: boolean) => Promise<void>>(
+    async () => undefined,
+  );
 
   const update = useCallback((change: (current: CanvasImageGenerationControllerState) => CanvasImageGenerationControllerState) => {
     const next = change(stateRef.current);
@@ -444,6 +504,38 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     setState(next);
     return next;
   }, []);
+
+  const publishTaskObservation = useCallback((observer: ImageTaskObserver) => {
+    if (taskObserversRef.current.get(observer.idempotencyKey) !== observer) return;
+    update((current) => ({
+      ...current,
+      taskObservations: {
+        ...current.taskObservations,
+        [observer.idempotencyKey]: {
+          status: observer.status,
+          error: observer.error,
+          inFlight: observer.inFlight,
+        },
+      },
+    }));
+  }, [update]);
+
+  const cancelTaskObservationWork = useCallback((observer: ImageTaskObserver) => {
+    if (observer.timer !== null) clearTimeout(observer.timer);
+    observer.timer = null;
+    observer.controller?.abort();
+    observer.controller = null;
+    observer.inFlight = false;
+  }, []);
+
+  const disposeTaskObservers = useCallback((clearViews: boolean) => {
+    for (const observer of taskObserversRef.current.values()) cancelTaskObservationWork(observer);
+    taskObserversRef.current.clear();
+    observedReceiptKeysRef.current.clear();
+    if (clearViews) {
+      update((current) => ({ ...current, taskObservations: Object.freeze({}) }));
+    }
+  }, [cancelTaskObservationWork, update]);
 
   const readCurrentIntent = useCallback((): CanvasImageGenerationWorkspaceIntent | null => intentRef.current, []);
 
@@ -498,6 +590,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       || !requestDispatchedRef.current)) {
       action.controller.abort();
     }
+    pauseTaskObservationsRef.current();
     update((current) => ({
       ...current,
       mode: null,
@@ -513,8 +606,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
   }, [setIntent, update]);
 
   const publishBatch = useCallback((batch: FrozenImageGenerationBatch) => {
-    batchRef.current = batch;
-    update((current) => ({ ...current, batch: batchView(batch) }));
+    const latestBatch = mergeLatestAcceptedReceiptStatus(batch, batchRef.current);
+    batchRef.current = latestBatch;
+    update((current) => ({ ...current, batch: batchView(latestBatch) }));
   }, [update]);
 
   const stopBatch = useCallback((
@@ -527,8 +621,9 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     pendingIntent: CanvasImageGenerationWorkspaceIntent | null,
     keepForm = false,
   ) => {
+    const latestBatch = mergeLatestAcceptedReceiptStatus(batch, batchRef.current);
     const nextBatch: FrozenImageGenerationBatch = {
-      ...batch,
+      ...latestBatch,
       outcome,
       activeOrdinal: null,
       stoppedOrdinal,
@@ -560,23 +655,26 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     intent: CanvasImageGenerationWorkspaceIntent,
     receipt: CanvasImageGenerationReceipt,
     complete: boolean,
+    alreadyObserved = false,
   ) => {
     if (!intent.target.context.isCurrent()
       || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
+    const baseBatch = mergeLatestAcceptedReceiptStatus(batch, batchRef.current);
     const confirmed = receiptView(
-      intent.target, intent.input, intent.modelName, batch.referenceNames, receipt, intent.ordinal,
+      intent.target, intent.input, intent.modelName, baseBatch.referenceNames, receipt, intent.ordinal,
     );
-    const remainingCount = batch.requests.length - batch.acceptedReceipts.length - 1;
+    const remainingCount = baseBatch.requests.length - baseBatch.acceptedReceipts.length - 1;
     const allComplete = complete && remainingCount === 0;
     const nextBatch: FrozenImageGenerationBatch = {
-      ...batch,
-      acceptedReceipts: Object.freeze([...batch.acceptedReceipts, confirmed]),
+      ...baseBatch,
+      acceptedReceipts: Object.freeze([...baseBatch.acceptedReceipts, confirmed]),
       notSentCount: allComplete ? 0 : remainingCount,
       activeOrdinal: null,
       stoppedOrdinal: allComplete ? null : intent.ordinal,
       outcome: allComplete ? "complete" : complete ? "stopped" : "submitting",
     };
     batchRef.current = nextBatch;
+    if (alreadyObserved) observedReceiptKeysRef.current.add(intent.input.idempotencyKey);
     intentRef.current = null;
     update((current) => ({
       ...current,
@@ -597,6 +695,196 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     }));
     notifyGuard();
   }, [notifyGuard, update]);
+
+  const isTaskObservationCurrent = useCallback((observer: ImageTaskObserver): boolean => {
+    const currentOptions = optionsRef.current;
+    const batch = batchRef.current;
+    const accepted = batch?.acceptedReceipts.find((item) => item.idempotencyKey === observer.idempotencyKey);
+    return taskObserversRef.current.get(observer.idempotencyKey) === observer
+      && stateRef.current.mode !== null
+      && observer.target.context.isCurrent()
+      && currentOptions.serviceIdentity === observer.serviceIdentity
+      && currentOptions.port === observer.port
+      && currentOptions.selectedTargetKey === observer.target.targetKey
+      && accepted !== undefined
+      && sameReceiptIdentity(accepted.receipt, observer.identity)
+      && observer.run.isCurrent();
+  }, []);
+
+  const updateAcceptedReceipt = useCallback((observer: ImageTaskObserver, receipt: CanvasImageGenerationReceipt): boolean => {
+    const batch = batchRef.current;
+    if (batch === null) return false;
+    const index = batch.acceptedReceipts.findIndex((item) => item.idempotencyKey === observer.idempotencyKey);
+    const current = batch.acceptedReceipts[index];
+    if (current === undefined || !sameReceiptIdentity(current.receipt, observer.identity)) return false;
+
+    const updated = { ...current, receipt };
+    const acceptedReceipts = [...batch.acceptedReceipts];
+    acceptedReceipts[index] = updated;
+    const nextBatch = { ...batch, acceptedReceipts: Object.freeze(acceptedReceipts) };
+    batchRef.current = nextBatch;
+    update((state) => ({
+      ...state,
+      batch: batchView(nextBatch),
+      receipt: state.receipt !== null && sameReceiptIdentity(state.receipt.receipt, observer.identity)
+        ? { ...state.receipt, receipt }
+        : state.receipt,
+    }));
+    return true;
+  }, [update]);
+
+  const scheduleTaskObservation = useCallback((observer: ImageTaskObserver) => {
+    if (observer.status !== "observing" || !isTaskObservationCurrent(observer)) return;
+    const remaining = IMAGE_TASK_OBSERVATION_WINDOW_MS - (performance.now() - observer.startedAt);
+    if (remaining <= 0) {
+      observer.status = "window-ended";
+      observer.error = null;
+      publishTaskObservation(observer);
+      return;
+    }
+    if (observer.timer !== null) clearTimeout(observer.timer);
+    observer.timer = setTimeout(() => {
+      observer.timer = null;
+      void readTaskObservationRef.current(observer, true);
+    }, Math.min(IMAGE_TASK_OBSERVATION_INTERVAL_MS, remaining));
+  }, [isTaskObservationCurrent, publishTaskObservation]);
+
+  const readTaskObservation = useCallback(async (
+    observer: ImageTaskObserver,
+    continueObserving: boolean,
+  ): Promise<void> => {
+    if (observer.controller !== null || !isTaskObservationCurrent(observer)) return;
+    if (continueObserving && performance.now() - observer.startedAt >= IMAGE_TASK_OBSERVATION_WINDOW_MS) {
+      observer.status = "window-ended";
+      observer.error = null;
+      publishTaskObservation(observer);
+      return;
+    }
+
+    const controller = new AbortController();
+    observer.controller = controller;
+    observer.inFlight = true;
+    publishTaskObservation(observer);
+    try {
+      const receipt = await observer.run.lookup(observer.idempotencyKey, controller.signal);
+      if (controller.signal.aborted || observer.controller !== controller || !isTaskObservationCurrent(observer)) return;
+      if (!sameReceiptIdentity(observer.identity, receipt)) {
+        observer.status = "read-error";
+        observer.error = "读取到的任务记录与已受理回执不匹配；已保留原回执并暂停观察。";
+        publishTaskObservation(observer);
+        return;
+      }
+      if (!updateAcceptedReceipt(observer, receipt)) {
+        observer.status = "read-error";
+        observer.error = "已受理任务记录已变化；已保留当前回执并暂停观察。";
+        publishTaskObservation(observer);
+        return;
+      }
+
+      observer.error = null;
+      if (receipt.status === "completed" || receipt.status === "failed") {
+        observer.status = "stopped";
+      } else if (continueObserving) {
+        observer.status = "observing";
+        scheduleTaskObservation(observer);
+      } else if (observer.status !== "observing") {
+        observer.status = "paused";
+      }
+      publishTaskObservation(observer);
+    } catch (cause) {
+      if (controller.signal.aborted || observer.controller !== controller || !isTaskObservationCurrent(observer)) return;
+      observer.status = "read-error";
+      observer.error = errorMessage(cause);
+      publishTaskObservation(observer);
+    } finally {
+      if (observer.controller === controller) {
+        observer.controller = null;
+        observer.inFlight = false;
+        if (!isTaskObservationCurrent(observer)) {
+          observer.status = "paused";
+          observer.error = null;
+        }
+        publishTaskObservation(observer);
+      }
+    }
+  }, [isTaskObservationCurrent, publishTaskObservation, scheduleTaskObservation, updateAcceptedReceipt]);
+  readTaskObservationRef.current = readTaskObservation;
+
+  const startTaskObservation = useCallback((
+    accepted: CanvasImageGenerationWorkspaceReceipt,
+    alreadyObserved: boolean,
+  ) => {
+    if (taskObserversRef.current.has(accepted.idempotencyKey)) return;
+    const batch = batchRef.current;
+    const currentOptions = optionsRef.current;
+    if (batch === null || batch.serviceIdentity !== currentOptions.serviceIdentity
+      || batch.port !== currentOptions.port || !accepted.target.context.isCurrent()
+      || currentOptions.selectedTargetKey !== accepted.target.targetKey) return;
+
+    const context = receiptRunContext(accepted.target);
+    const run = accepted.target.context.isCurrent() ? batch.port.beginRun(context) : null;
+    if (run === null || !run.isCurrent() || !context.isContextCurrent()) return;
+    const observer: ImageTaskObserver = {
+      idempotencyKey: accepted.idempotencyKey,
+      target: accepted.target,
+      serviceIdentity: batch.serviceIdentity,
+      port: batch.port,
+      run,
+      identity: accepted.receipt,
+      startedAt: performance.now(),
+      status: "observing",
+      error: null,
+      inFlight: false,
+      timer: null,
+      controller: null,
+    };
+    taskObserversRef.current.set(observer.idempotencyKey, observer);
+    if (observer.identity.status === "completed" || observer.identity.status === "failed") {
+      observer.status = "stopped";
+    }
+    publishTaskObservation(observer);
+    if (observer.status !== "observing") return;
+    if (alreadyObserved) scheduleTaskObservation(observer);
+    else void readTaskObservationRef.current(observer, true);
+  }, [publishTaskObservation, scheduleTaskObservation]);
+
+  const pauseTaskObservation = useCallback((idempotencyKey: string) => {
+    const observer = taskObserversRef.current.get(idempotencyKey);
+    if (observer === undefined || (observer.status !== "observing" && observer.controller === null)) return;
+    cancelTaskObservationWork(observer);
+    observer.status = "paused";
+    observer.error = null;
+    publishTaskObservation(observer);
+  }, [cancelTaskObservationWork, publishTaskObservation]);
+
+  const continueTaskObservation = useCallback((idempotencyKey: string) => {
+    const accepted = batchRef.current?.acceptedReceipts.find((item) => item.idempotencyKey === idempotencyKey);
+    if (accepted === undefined || !accepted.target.context.isCurrent()) return;
+    const previous = taskObserversRef.current.get(idempotencyKey);
+    if (previous?.status === "observing" || previous?.inFlight) return;
+    if (previous !== undefined) cancelTaskObservationWork(previous);
+    taskObserversRef.current.delete(idempotencyKey);
+    startTaskObservation(accepted, false);
+  }, [cancelTaskObservationWork, startTaskObservation]);
+
+  const refreshTaskObservation = useCallback((idempotencyKey: string) => {
+    const observer = taskObserversRef.current.get(idempotencyKey);
+    if (observer === undefined || observer.inFlight || !isTaskObservationCurrent(observer)) return;
+    if (observer.timer !== null) clearTimeout(observer.timer);
+    observer.timer = null;
+    void readTaskObservationRef.current(observer, observer.status === "observing");
+  }, [isTaskObservationCurrent]);
+
+  const pauseAllTaskObservations = useCallback(() => {
+    for (const observer of taskObserversRef.current.values()) {
+      if (observer.status !== "observing" && observer.controller === null && observer.timer === null) continue;
+      cancelTaskObservationWork(observer);
+      observer.status = "paused";
+      observer.error = null;
+      publishTaskObservation(observer);
+    }
+  }, [cancelTaskObservationWork, publishTaskObservation]);
+  pauseTaskObservationsRef.current = pauseAllTaskObservations;
 
   const loadModels = useCallback((target: CanvasImageGenerationTarget) => {
     modelRunIdRef.current += 1;
@@ -755,6 +1043,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     if (busyRef.current || intentRef.current !== null
       || target.targetKey !== optionsRef.current.selectedTargetKey
       || !target.context.isCurrent()) return false;
+    disposeTaskObservers(true);
     update((current) => ({
       ...current,
       mode: "form",
@@ -782,6 +1071,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       intent: null,
       receipt: null,
       batch: null,
+      taskObservations: Object.freeze({}),
     }));
     batchRef.current = null;
     stopBatchAfterCurrentRef.current = false;
@@ -789,7 +1079,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     loadModels(target);
     loadPromptTemplates(target);
     return true;
-  }, [loadModels, loadPromptTemplates, notifyGuard, update]);
+  }, [disposeTaskObservers, loadModels, loadPromptTemplates, notifyGuard, update]);
 
   const openPendingIntent = useCallback((): boolean => {
     const intent = intentRef.current;
@@ -951,7 +1241,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     }
     const port = batch?.port ?? currentOptions.port;
     if (port === undefined) throw new CanvasImageGenerationError("not-sent", "当前服务没有接入图片任务提交。", null);
-    const context = receiptRunContext(intent);
+    const context = receiptRunContext(intent.target);
     const run = port.beginRun(context);
     if (!run.isCurrent() || !context.isContextCurrent()) {
       throw new CanvasImageGenerationError("not-sent", "登录、章节或任务上下文已变化，没有发送请求。", null);
@@ -1286,7 +1576,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       const receipt = await run.lookup(intent.input.idempotencyKey, action.controller.signal);
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()
         || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
-      recordBatchReceipt(batch, intent, receipt, true);
+      recordBatchReceipt(batch, intent, receipt, true, true);
     } catch (cause) {
       if (action.controller.signal.aborted || !intent.target.context.isCurrent()
         || intentRef.current?.input.idempotencyKey !== intent.input.idempotencyKey) return;
@@ -1389,6 +1679,7 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
   const startNewFromReceipt = useCallback((target: CanvasImageGenerationTarget): boolean => openNew(target), [openNew]);
 
   useEffect(() => {
+    disposeTaskObservers(false);
     modelRunIdRef.current += 1;
     modelControllerRef.current?.abort();
     modelControllerRef.current = null;
@@ -1411,16 +1702,33 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
       promptTemplateRunIdRef.current += 1;
       promptTemplateControllerRef.current?.abort();
       actionRef.current?.controller.abort();
+      disposeTaskObservers(false);
     };
-  }, [options.contextKey, options.serviceIdentity]);
+  }, [disposeTaskObservers, options.contextKey, options.serviceIdentity]);
+
+  const acceptedObservationKeys = state.batch?.acceptedReceipts
+    .map((item) => item.idempotencyKey)
+    .join("\u0000") ?? "";
+  useEffect(() => {
+    if (state.mode === null) return;
+    for (const accepted of batchRef.current?.acceptedReceipts ?? []) {
+      if (taskObserversRef.current.has(accepted.idempotencyKey)) continue;
+      const alreadyObserved = observedReceiptKeysRef.current.delete(accepted.idempotencyKey);
+      startTaskObservation(accepted, alreadyObserved);
+    }
+  }, [acceptedObservationKeys, startTaskObservation, state.mode]);
 
   useEffect(() => {
     const current = stateRef.current;
     if ((current.mode === "form" || current.mode === "receipt")
       && current.target !== null && current.target.targetKey !== options.selectedTargetKey) {
       close();
+      return;
     }
-  }, [close, options.selectedTargetKey]);
+    if ([...taskObserversRef.current.values()].some((observer) => observer.target.targetKey !== options.selectedTargetKey)) {
+      pauseAllTaskObservations();
+    }
+  }, [close, options.selectedTargetKey, pauseAllTaskObservations]);
 
   return {
     state,
@@ -1445,5 +1753,8 @@ export function useCanvasImageGenerationController(options: CanvasImageGeneratio
     retryOriginalIntent,
     acquireLock,
     startNewFromReceipt,
+    pauseTaskObservation,
+    continueTaskObservation,
+    refreshTaskObservation,
   };
 }

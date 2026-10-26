@@ -249,6 +249,18 @@
   margin-top: 5px;
 }
 
+.canvas-image-generation-observation {
+  display: grid;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.canvas-image-generation-observation-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .canvas-image-generation-details summary {
   cursor: pointer;
   font-weight: 600;
