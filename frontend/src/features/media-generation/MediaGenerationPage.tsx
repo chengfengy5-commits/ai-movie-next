@@ -13,6 +13,10 @@ import {
   type MediaGenerationSingleTarget,
 } from "../../shared/api/mediaGeneration";
 import {
+  type UserPreferences,
+  type UserPreferencesPort,
+} from "../../shared/api/userPreferences";
+import {
   MediaReferenceUploadError,
   type MediaReferenceKind,
 } from "../../shared/api/mediaReferenceUpload";
@@ -37,6 +41,132 @@ interface AssetChoice {
   readonly name: string;
   readonly label: string;
   readonly description: string;
+}
+
+type BatchPreferenceField = "modelId" | "promptId" | "size";
+
+interface BatchGenerationSelection {
+  readonly modelId: string;
+  readonly promptId: string;
+  readonly size: string;
+}
+
+type BatchGenerationSelections = Record<MediaGenerationAssetType, BatchGenerationSelection>;
+type BatchPreferenceEdits = Record<MediaGenerationAssetType, Set<BatchPreferenceField>>;
+type BatchPreferenceWarnings = Record<MediaGenerationAssetType, Partial<Record<BatchPreferenceField, string>>>;
+
+const BATCH_ASSET_TYPES: readonly MediaGenerationAssetType[] = ["character", "scene", "prop", "storyboard"];
+const BATCH_PROMPT_CATEGORIES: Readonly<Record<MediaGenerationAssetType, string>> = {
+  character: "character-design",
+  scene: "scene-design",
+  prop: "prop-design",
+  storyboard: "storyboard-design",
+};
+const BATCH_PREFERENCE_KEYS: Readonly<Record<BatchPreferenceField, "model" | "prompt" | "size">> = {
+  modelId: "model",
+  promptId: "prompt",
+  size: "size",
+};
+
+function emptyBatchSelections(): BatchGenerationSelections {
+  return {
+    character: { modelId: "", promptId: "", size: "" },
+    scene: { modelId: "", promptId: "", size: "" },
+    prop: { modelId: "", promptId: "", size: "" },
+    storyboard: { modelId: "", promptId: "", size: "" },
+  };
+}
+
+function emptyBatchEdits(): BatchPreferenceEdits {
+  return { character: new Set(), scene: new Set(), prop: new Set(), storyboard: new Set() };
+}
+
+function emptyBatchWarnings(): BatchPreferenceWarnings {
+  return { character: {}, scene: {}, prop: {}, storyboard: {} };
+}
+
+function defaultBatchSelections(
+  models: readonly CreatorModel[],
+  prompts: readonly CreatorPrompt[],
+): BatchGenerationSelections {
+  const defaultModel = models[0] ?? null;
+  return Object.fromEntries(BATCH_ASSET_TYPES.map((type) => [
+    type,
+    {
+      modelId: defaultModel?.id ?? "",
+      promptId: prompts.find((prompt) => prompt.category === BATCH_PROMPT_CATEGORIES[type])?.id ?? "",
+      size: batchDefaultSize(defaultModel),
+    },
+  ])) as BatchGenerationSelections;
+}
+
+function batchDefaultSize(model: CreatorModel | null): string {
+  const options = modelOptions(model);
+  return options.sizes.includes(options.defaultSize) ? options.defaultSize : options.sizes[0] ?? "";
+}
+
+function batchSelectionError(
+  type: MediaGenerationAssetType,
+  selection: BatchGenerationSelection,
+  models: readonly CreatorModel[],
+  prompts: readonly CreatorPrompt[],
+): string | null {
+  const model = models.find((candidate) => candidate.id === selection.modelId) ?? null;
+  if (model === null) return `请为${ASSET_TYPE_LABELS[type]}选择图片模型。`;
+  if (selection.promptId !== "" && !prompts.some((prompt) => (
+    prompt.id === selection.promptId && prompt.category === BATCH_PROMPT_CATEGORIES[type]
+  ))) return `请为${ASSET_TYPE_LABELS[type]}重新选择可用提示词。`;
+  const sizes = modelOptions(model).sizes;
+  if (selection.size !== "" && !sizes.includes(selection.size)) return `请为${ASSET_TYPE_LABELS[type]}重新选择当前模型支持的尺寸。`;
+  if (sizes.length > 0 && selection.size === "") return `请为${ASSET_TYPE_LABELS[type]}选择图片尺寸。`;
+  return null;
+}
+
+function batchPreferenceWarningBlocksSubmission(
+  type: MediaGenerationAssetType,
+  selection: BatchGenerationSelection,
+  warnings: BatchPreferenceWarnings,
+  models: readonly CreatorModel[],
+): boolean {
+  const warning = warnings[type];
+  if (warning.modelId !== undefined || warning.promptId !== undefined) return true;
+  if (warning.size === undefined) return false;
+  const model = models.find((candidate) => candidate.id === selection.modelId) ?? null;
+  return modelOptions(model).sizes.length > 0;
+}
+
+function mergeBatchPreferenceEdits(
+  preferences: UserPreferences,
+  selections: BatchGenerationSelections,
+  edits: BatchPreferenceEdits,
+): Record<string, unknown> {
+  const savedBatch = record(preferences.batch_gen_prefs) ?? {};
+  const nextBatch: Record<string, unknown> = { ...savedBatch };
+  for (const type of BATCH_ASSET_TYPES) {
+    if (edits[type].size === 0) continue;
+    const savedType = record(savedBatch[type]) ?? {};
+    const nextType: Record<string, unknown> = { ...savedType };
+    for (const field of edits[type]) {
+      nextType[BATCH_PREFERENCE_KEYS[field]] = selections[type][field];
+    }
+    nextBatch[type] = nextType;
+  }
+  return { batch_gen_prefs: nextBatch };
+}
+
+function batchPreferenceEditsMatch(
+  preferences: UserPreferences,
+  selections: BatchGenerationSelections,
+  edits: BatchPreferenceEdits,
+): boolean {
+  const savedBatch = record(preferences.batch_gen_prefs);
+  if (savedBatch === null) return false;
+  return BATCH_ASSET_TYPES.every((type) => {
+    const savedType = record(savedBatch[type]);
+    return [...edits[type]].every((field) => (
+      savedType?.[BATCH_PREFERENCE_KEYS[field]] === selections[type][field]
+    ));
+  });
 }
 
 const ASSET_TYPE_LABELS: Record<MediaGenerationAssetType, string> = {
@@ -216,7 +346,17 @@ export function MediaGenerationPage({
   const [selectedImageModelId, setSelectedImageModelId] = useState("");
   const [selectedImagePromptId, setSelectedImagePromptId] = useState("");
   const [selectedVideoPromptId, setSelectedVideoPromptId] = useState("");
-  const [selectedBatchPromptId, setSelectedBatchPromptId] = useState("");
+  const batchSelectionsRef = useRef<BatchGenerationSelections>(emptyBatchSelections());
+  const [batchSelections, setBatchSelections] = useState<BatchGenerationSelections>(batchSelectionsRef.current);
+  const batchPreferenceEditsRef = useRef<BatchPreferenceEdits>(emptyBatchEdits());
+  const [batchPreferenceWarnings, setBatchPreferenceWarnings] = useState<BatchPreferenceWarnings>(emptyBatchWarnings());
+  const [batchPreferenceMessage, setBatchPreferenceMessage] = useState<string | null>(null);
+  const [batchPreferenceLoading, setBatchPreferenceLoading] = useState(false);
+  const [savingBatchPreferences, setSavingBatchPreferences] = useState(false);
+  const savingBatchPreferencesRef = useRef(false);
+  const batchPreferenceControllerRef = useRef<AbortController | null>(null);
+  const batchPreferenceRestoreGenerationRef = useRef(0);
+  const catalogReadyRef = useRef(false);
   const [imagePrompt, setImagePrompt] = useState("");
   const [videoPrompt, setVideoPrompt] = useState("");
   const [videoSize, setVideoSize] = useState("");
@@ -251,6 +391,8 @@ export function MediaGenerationPage({
   const [outcome, setOutcome] = useState<SubmissionOutcome | null>(null);
   const mountedRef = useRef(false);
   const identityRef = useRef({ userId, services, sessionGeneration, signature: "" });
+  const onUnauthorizedRef = useRef(onUnauthorized);
+  onUnauthorizedRef.current = onUnauthorized;
 
   const selectedVideoModel = videoModels.find((model) => model.id === selectedVideoModelId) ?? null;
   const selectedImageModel = imageModels.find((model) => model.id === selectedImageModelId) ?? null;
@@ -271,7 +413,7 @@ export function MediaGenerationPage({
     selectedImageModelId,
     selectedImagePromptId,
     selectedVideoPromptId,
-    selectedBatchPromptId,
+    batchSelections,
     imagePrompt,
     videoPrompt,
     videoSize,
@@ -302,12 +444,60 @@ export function MediaGenerationPage({
     setRequesting(value);
   }
 
+  function updateBatchSelection(
+    type: MediaGenerationAssetType,
+    field: BatchPreferenceField,
+    value: string,
+  ) {
+    const current = batchSelectionsRef.current;
+    const nextSelection = { ...current[type], [field]: value };
+    const changedFields = new Set<BatchPreferenceField>([field]);
+    if (field === "modelId") {
+      const model = imageModels.find((candidate) => candidate.id === value) ?? null;
+      nextSelection.size = batchDefaultSize(model);
+      changedFields.add("size");
+    }
+    batchSelectionsRef.current = { ...current, [type]: nextSelection };
+    setBatchSelections(batchSelectionsRef.current);
+    for (const changedField of changedFields) batchPreferenceEditsRef.current[type].add(changedField);
+    setBatchPreferenceWarnings((warnings) => {
+      const nextWarnings = { ...warnings, [type]: { ...warnings[type] } };
+      for (const changedField of changedFields) delete nextWarnings[type][changedField];
+      return nextWarnings;
+    });
+    setBatchPreferenceMessage(null);
+  }
+
+  function preferenceScopeIsCurrent(
+    capturedServices: WorkspaceServices,
+    capturedUserId: string,
+    capturedSessionGeneration: number,
+  ): boolean {
+    return mountedRef.current
+      && identityRef.current.services === capturedServices
+      && identityRef.current.userId === capturedUserId
+      && identityRef.current.sessionGeneration === capturedSessionGeneration;
+  }
+
   useEffect(() => {
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
     };
   }, []);
+
+  useEffect(() => {
+    batchPreferenceControllerRef.current?.abort();
+    batchPreferenceControllerRef.current = null;
+    savingBatchPreferencesRef.current = false;
+    batchSelectionsRef.current = emptyBatchSelections();
+    setBatchSelections(batchSelectionsRef.current);
+    batchPreferenceEditsRef.current = emptyBatchEdits();
+    setBatchPreferenceWarnings(emptyBatchWarnings());
+    setBatchPreferenceMessage(null);
+    setBatchPreferenceLoading(false);
+    setSavingBatchPreferences(false);
+  }, [services, sessionGeneration, userId]);
 
   useEffect(() => {
     setReferenceFiles({});
@@ -320,6 +510,7 @@ export function MediaGenerationPage({
   useEffect(() => {
     const controller = new AbortController();
     let current = true;
+    catalogReadyRef.current = false;
     setLoading(true);
     setCatalogError(null);
     const catalog = services.creatorSettings;
@@ -332,25 +523,130 @@ export function MediaGenerationPage({
     void Promise.allSettled(reads).then((results) => {
       if (!current || controller.signal.aborted) return;
       const [seriesResult, videoResult, imageResult, promptResult] = results;
+      catalogReadyRef.current = imageResult.status === "fulfilled" && promptResult.status === "fulfilled";
       if (seriesResult.status === "fulfilled") setSeries(seriesResult.value);
-      else if (isUnauthorized(seriesResult.reason)) onUnauthorized();
+      else if (isUnauthorized(seriesResult.reason)) onUnauthorizedRef.current();
       else setCatalogError(describeFailure(seriesResult.reason));
       if (videoResult.status === "fulfilled") setVideoModels(videoResult.value);
-      else if (isUnauthorized(videoResult.reason)) onUnauthorized();
+      else if (isUnauthorized(videoResult.reason)) onUnauthorizedRef.current();
       else setCatalogError((message) => message ?? describeFailure(videoResult.reason));
       if (imageResult.status === "fulfilled") setImageModels(imageResult.value);
-      else if (isUnauthorized(imageResult.reason)) onUnauthorized();
+      else if (isUnauthorized(imageResult.reason)) onUnauthorizedRef.current();
       else setCatalogError((message) => message ?? describeFailure(imageResult.reason));
       if (promptResult.status === "fulfilled") setPrompts(promptResult.value);
-      else if (isUnauthorized(promptResult.reason)) onUnauthorized();
+      else if (isUnauthorized(promptResult.reason)) onUnauthorizedRef.current();
       else setCatalogError((message) => message ?? describeFailure(promptResult.reason));
+      if (imageResult.status === "fulfilled" && promptResult.status === "fulfilled") {
+        batchSelectionsRef.current = defaultBatchSelections(imageResult.value, promptResult.value);
+        setBatchSelections(batchSelectionsRef.current);
+      }
       setLoading(false);
     });
     return () => {
       current = false;
       controller.abort();
     };
-  }, [onUnauthorized, services]);
+  }, [services, sessionGeneration, userId]);
+
+  useEffect(() => {
+    const port = services.userPreferences;
+    if (mode !== "batch" || loading || !catalogReadyRef.current) return;
+    if (port === undefined) {
+      setBatchPreferenceMessage("当前服务尚未接入账户偏好读取与保存。");
+      return;
+    }
+    const controller = new AbortController();
+    let current = true;
+    const capturedServices = services;
+    const capturedUserId = userId;
+    const capturedSessionGeneration = sessionGeneration;
+    const restoreGeneration = batchPreferenceRestoreGenerationRef.current;
+    setBatchPreferenceLoading(true);
+    setBatchPreferenceMessage(null);
+    void port.get(controller.signal).then((preferences) => {
+      if (!current || controller.signal.aborted
+        || !preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)
+        || restoreGeneration !== batchPreferenceRestoreGenerationRef.current) return;
+      if (requestingRef.current || pendingRef.current !== null || savingBatchPreferencesRef.current) {
+        setBatchPreferenceMessage("账户偏好读取晚于本次操作，已保留当前选项；提交内容不会被更改。");
+        return;
+      }
+
+      const savedBatch = record(preferences.batch_gen_prefs);
+      if (savedBatch === null) {
+        setBatchPreferenceMessage("账户中还没有保存批量生成选项。修改后可点击“记住批量选项”。");
+        return;
+      }
+      const nextWarnings = emptyBatchWarnings();
+      const nextSelections = { ...batchSelectionsRef.current };
+      const edits = batchPreferenceEditsRef.current;
+      for (const type of BATCH_ASSET_TYPES) {
+        const saved = record(savedBatch[type]);
+        if (saved === null) continue;
+        const dirty = edits[type];
+        let selection = { ...nextSelections[type] };
+        if (!dirty.has("modelId") && typeof saved.model === "string" && saved.model !== "") {
+          const model = imageModels.find((candidate) => candidate.id === saved.model) ?? null;
+          if (model === null) {
+            nextWarnings[type].modelId = "已保存的模型不在当前模型目录中，请重新选择。";
+            selection.modelId = "";
+            if (!dirty.has("size")) selection.size = "";
+          } else {
+            selection.modelId = model.id;
+            if (!dirty.has("size")) selection.size = batchDefaultSize(model);
+          }
+        }
+        if (!dirty.has("promptId") && typeof saved.prompt === "string") {
+          if (saved.prompt === "") {
+            selection.promptId = "";
+          } else {
+            const validPrompt = prompts.some((prompt) => (
+              prompt.id === saved.prompt && prompt.category === BATCH_PROMPT_CATEGORIES[type]
+            ));
+            if (validPrompt) selection.promptId = saved.prompt;
+            else {
+              nextWarnings[type].promptId = "已保存的提示词不在当前类型目录中，请重新选择。";
+              selection.promptId = "";
+            }
+          }
+        }
+        if (!dirty.has("size") && typeof saved.size === "string" && saved.size !== "") {
+          const model = imageModels.find((candidate) => candidate.id === selection.modelId) ?? null;
+          const sizes = modelOptions(model).sizes;
+          if (sizes.includes(saved.size)) selection.size = saved.size;
+          else {
+            nextWarnings[type].size = sizes.length === 0
+              ? "已保存的尺寸不适用于当前模型；当前模型未配置尺寸，提交时会省略尺寸。"
+              : "已保存的尺寸不适用于当前模型，请重新选择。";
+            if (sizes.length > 0) selection.size = "";
+          }
+        }
+        nextSelections[type] = selection;
+      }
+      batchSelectionsRef.current = nextSelections;
+      setBatchSelections(nextSelections);
+      setBatchPreferenceWarnings(nextWarnings);
+      const hasWarnings = BATCH_ASSET_TYPES.some((type) => Object.keys(nextWarnings[type]).length > 0);
+      setBatchPreferenceMessage(hasWarnings
+        ? "已读取账户批量选项；部分保存值在当前目录中不可用，请重新选择后保存。"
+        : "已读取账户中保存的批量选项。修改后可点击“记住批量选项”。");
+    }).catch((error: unknown) => {
+      if (!current || controller.signal.aborted
+        || !preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)
+        || restoreGeneration !== batchPreferenceRestoreGenerationRef.current) return;
+      if (isUnauthorized(error)) onUnauthorizedRef.current();
+      else setBatchPreferenceMessage(`账户批量选项读取失败：${describeFailure(error)}`);
+    }).finally(() => {
+      if (current && !controller.signal.aborted
+        && preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)) {
+        setBatchPreferenceLoading(false);
+      }
+    });
+    return () => {
+      current = false;
+      controller.abort();
+    };
+  }, [imageModels, loading, mode, prompts, services, sessionGeneration, userId]);
 
   useEffect(() => {
     if (selectedVideoModel === null) {
@@ -390,7 +686,7 @@ export function MediaGenerationPage({
       if (current && !controller.signal.aborted) setChapters(result);
     }).catch((error: unknown) => {
       if (!current || controller.signal.aborted) return;
-      if (isUnauthorized(error)) onUnauthorized();
+      if (isUnauthorized(error)) onUnauthorizedRef.current();
       else setChapterError(describeFailure(error));
       setChapters([]);
     }).finally(() => {
@@ -400,7 +696,7 @@ export function MediaGenerationPage({
       current = false;
       controller.abort();
     };
-  }, [onUnauthorized, selectedSeriesId, services]);
+  }, [selectedSeriesId, services]);
 
   useEffect(() => {
     if (selectedSeriesId === "" || selectedChapterId === "") {
@@ -430,7 +726,7 @@ export function MediaGenerationPage({
       ]);
     }).catch((error: unknown) => {
       if (!current || controller.signal.aborted) return;
-      if (isUnauthorized(error)) onUnauthorized();
+      if (isUnauthorized(error)) onUnauthorizedRef.current();
       else setDirectoryError(describeFailure(error));
       setStoryboardAssets([]);
       setAssetChoices([]);
@@ -441,7 +737,7 @@ export function MediaGenerationPage({
       current = false;
       controller.abort();
     };
-  }, [onUnauthorized, selectedChapterId, selectedSeriesId, services]);
+  }, [selectedChapterId, selectedSeriesId, services]);
 
   useEffect(() => {
     if (selectedImagePromptId === "") return;
@@ -732,8 +1028,21 @@ export function MediaGenerationPage({
   };
 
   const submitBatch = async () => {
-    if (pendingRef.current !== null || requestingRef.current || selectedSeries === null || selectedChapterId === ""
-      || selectedImageModel === null || selectedBatchAssets.length < 1 || selectedBatchAssets.length > 64) return;
+    if (pendingRef.current !== null || requestingRef.current || savingBatchPreferencesRef.current
+      || selectedSeries === null || selectedChapterId === ""
+      || selectedBatchAssets.length < 1 || selectedBatchAssets.length > 64
+      || selectedBatchAssets.some((asset) => batchSelectionError(
+        asset.type,
+        batchSelectionsRef.current[asset.type],
+        imageModels,
+        prompts,
+      ) !== null || batchPreferenceWarningBlocksSubmission(
+        asset.type,
+        batchSelectionsRef.current[asset.type],
+        batchPreferenceWarnings,
+        imageModels,
+      ))) return;
+    batchPreferenceRestoreGenerationRef.current += 1;
     const rawKey = crypto.randomUUID();
     const signature = formSignature;
     let run: MediaGenerationRun;
@@ -744,14 +1053,17 @@ export function MediaGenerationPage({
       return;
     }
     const references = Object.freeze(splitReferences(batchReferenceImages));
+    const frozenSelections = Object.freeze(Object.fromEntries(BATCH_ASSET_TYPES.map((type) => (
+      [type, Object.freeze({ ...batchSelectionsRef.current[type] })]
+    ))) as BatchGenerationSelections);
     const assets: readonly MediaGenerationBatchAssetInput[] = Object.freeze(selectedBatchAssets.map((asset) => Object.freeze({
       type: asset.type,
       id: asset.id,
       name: asset.name,
       description: asset.description,
-      modelId: selectedImageModel.id,
-      promptId: selectedBatchPromptId,
-      ...(imageSize === "" ? {} : { size: imageSize }),
+      modelId: frozenSelections[asset.type].modelId,
+      promptId: frozenSelections[asset.type].promptId,
+      ...(frozenSelections[asset.type].size === "" ? {} : { size: frozenSelections[asset.type].size }),
       referenceImages: references,
     })));
     const input = Object.freeze({ chapterId: selectedChapterId, assets, idempotencyKey: rawKey });
@@ -792,6 +1104,112 @@ export function MediaGenerationPage({
     }
   };
 
+  const saveBatchPreferences = async () => {
+    const port: UserPreferencesPort | undefined = services.userPreferences;
+    if (port === undefined || savingBatchPreferencesRef.current || requestingRef.current || pendingRef.current !== null) return;
+    const edits = emptyBatchEdits();
+    for (const type of BATCH_ASSET_TYPES) {
+      edits[type] = new Set(batchPreferenceEditsRef.current[type]);
+    }
+    if (!BATCH_ASSET_TYPES.some((type) => edits[type].size > 0)) {
+      setBatchPreferenceMessage("没有需要保存的批量选项修改。");
+      return;
+    }
+    batchPreferenceRestoreGenerationRef.current += 1;
+    const selections = Object.freeze(Object.fromEntries(BATCH_ASSET_TYPES.map((type) => (
+      [type, Object.freeze({ ...batchSelectionsRef.current[type] })]
+    ))) as BatchGenerationSelections);
+    const capturedServices = services;
+    const capturedUserId = userId;
+    const capturedSessionGeneration = sessionGeneration;
+    const capturedSignature = identityRef.current.signature;
+    const controller = new AbortController();
+    batchPreferenceControllerRef.current = controller;
+    savingBatchPreferencesRef.current = true;
+    setSavingBatchPreferences(true);
+    setBatchPreferenceMessage("正在读取当前账户偏好并合并本次修改…");
+
+    const isCurrentSave = () => preferenceScopeIsCurrent(
+      capturedServices,
+      capturedUserId,
+      capturedSessionGeneration,
+    ) && identityRef.current.signature === capturedSignature
+      && batchPreferenceControllerRef.current === controller;
+    const clearSavedEdits = () => {
+      for (const type of BATCH_ASSET_TYPES) {
+        for (const field of edits[type]) {
+          if (batchSelectionsRef.current[type][field] === selections[type][field]) {
+            batchPreferenceEditsRef.current[type].delete(field);
+          }
+        }
+      }
+    };
+
+    try {
+      let currentPreferences: UserPreferences;
+      try {
+        currentPreferences = await port.get(controller.signal);
+      } catch (error) {
+        if (!isCurrentSave()) return;
+        if (isUnauthorized(error)) onUnauthorized();
+        else setBatchPreferenceMessage(`读取账户偏好失败，未保存任何内容：${describeFailure(error)}`);
+        return;
+      }
+      if (!isCurrentSave()) return;
+
+      const update = mergeBatchPreferenceEdits(currentPreferences, selections, edits);
+      try {
+        const receipt = await port.update(update, controller.signal);
+        if (!isCurrentSave()) return;
+        if (!receipt.updatedKeys.includes("batch_gen_prefs")) {
+          setBatchPreferenceMessage("服务器没有确认批量选项已保存；本页保留了修改，可再次明确点击保存。");
+          return;
+        }
+        clearSavedEdits();
+        setBatchPreferenceMessage("批量生成选项已保存到当前账号。");
+      } catch (error) {
+        if (!isCurrentSave()) return;
+        if (isUnauthorized(error)) {
+          onUnauthorized();
+          return;
+        }
+        const definiteClientRejection = error instanceof ApiError
+          && error.kind === "http"
+          && error.status !== null
+          && error.status >= 400
+          && error.status < 500
+          && error.status !== 408;
+        if (definiteClientRejection) {
+          setBatchPreferenceMessage(`批量选项未保存：${describeFailure(error)}`);
+          return;
+        }
+        setBatchPreferenceMessage("保存结果尚未确认，正在只读核对账户偏好；不会自动重复保存。");
+        try {
+          const latestPreferences = await port.get(controller.signal);
+          if (!isCurrentSave()) return;
+          if (batchPreferenceEditsMatch(latestPreferences, selections, edits)) {
+            clearSavedEdits();
+            setBatchPreferenceMessage("保存请求没有直接回执；只读核对发现账户偏好已包含本次修改。");
+          } else {
+            setBatchPreferenceMessage("保存结果仍未确认；已只读核对账户偏好，本页保留修改且不会自动重试。");
+          }
+        } catch (readError) {
+          if (!isCurrentSave()) return;
+          if (isUnauthorized(readError)) onUnauthorized();
+          else setBatchPreferenceMessage(`保存结果仍未确认；只读核对也失败：${describeFailure(readError)}`);
+        }
+      }
+    } finally {
+      if (batchPreferenceControllerRef.current === controller) {
+        batchPreferenceControllerRef.current = null;
+        savingBatchPreferencesRef.current = false;
+        if (preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)) {
+          setSavingBatchPreferences(false);
+        }
+      }
+    }
+  };
+
   const selectImagePrompt = (id: string) => {
     setSelectedImagePromptId(id);
     if (id === "") setImagePrompt("");
@@ -810,7 +1228,17 @@ export function MediaGenerationPage({
   };
 
   const selectedAssetForSingle = singleAssetChoices.find((asset) => asset.id === singleAssetId);
-  const currentBatchPromptOptions = prompts;
+  const batchPromptOptions = (type: MediaGenerationAssetType) => prompts.filter((prompt) => (
+    prompt.category === BATCH_PROMPT_CATEGORIES[type]
+  ));
+  const selectedBatchTypes = new Set(selectedBatchAssets.map((asset) => asset.type));
+  const batchSubmissionBlocked = [...selectedBatchTypes].some((type) => batchSelectionError(
+    type,
+    batchSelections[type],
+    imageModels,
+    prompts,
+  ) !== null || batchPreferenceWarningBlocksSubmission(type, batchSelections[type], batchPreferenceWarnings, imageModels));
+  const hasBatchPreferenceEdits = BATCH_ASSET_TYPES.some((type) => batchPreferenceEditsRef.current[type].size > 0);
   const currentImagePromptOptions = prompts.filter((prompt) => IMAGE_PROMPT_CATEGORIES.has(prompt.category));
   const currentVideoPromptOptions = prompts.filter((prompt) => prompt.category === "video-design");
   const isImageMode = mode === "image";
@@ -821,7 +1249,7 @@ export function MediaGenerationPage({
   const singlePromptOptions = isImageMode ? currentImagePromptOptions : currentVideoPromptOptions;
   const singleReferences = isImageMode ? imageReferenceImages : videoReferenceImages;
   const singleReferenceSetter = isImageMode ? setImageReferenceImages : setVideoReferenceImages;
-  const isFrozen = pending !== null || requesting || uploadingReference;
+  const isFrozen = pending !== null || requesting || uploadingReference || savingBatchPreferences;
 
   const renderReferenceUploader = (kind: MediaReferenceKind) => {
     const label = REFERENCE_KIND_LABELS[kind];
@@ -1026,19 +1454,37 @@ export function MediaGenerationPage({
               <option value="">选择章节</option>
               {sortedChapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.title}</option>)}
             </select></label>
-            <label><span>图片模型</span><select disabled={isFrozen || loading} onChange={(event) => setSelectedImageModelId(event.target.value)} value={selectedImageModelId}>
-              <option value="">选择图片模型</option>
-              {imageModels.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
-            </select></label>
-            <label><span>提示词</span><select disabled={isFrozen} onChange={(event) => setSelectedBatchPromptId(event.target.value)} value={selectedBatchPromptId}>
-              <option value="">使用各素材描述</option>
-              {currentBatchPromptOptions.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name} · {prompt.category}</option>)}
-            </select></label>
-            {imageOptions.sizes.length > 0 && (
-              <label><span>图片尺寸</span><select disabled={isFrozen} onChange={(event) => setImageSize(event.target.value)} value={imageSize}>
-                {imageOptions.sizes.map((size) => <option key={size} value={size}>{size}</option>)}
-              </select></label>
-            )}
+            {BATCH_ASSET_TYPES.map((type) => {
+              const selection = batchSelections[type];
+              const model = imageModels.find((candidate) => candidate.id === selection.modelId) ?? null;
+              const sizes = modelOptions(model).sizes;
+              const error = batchSelectionError(type, selection, imageModels, prompts);
+              return (
+                <fieldset className="media-generation-batch-type" key={type} disabled={isFrozen}>
+                  <legend>{ASSET_TYPE_LABELS[type]}选项</legend>
+                  <label><span>{ASSET_TYPE_LABELS[type]}模型</span><select disabled={loading || isFrozen}
+                    onChange={(event) => updateBatchSelection(type, "modelId", event.target.value)} value={selection.modelId}>
+                    <option value="">选择图片模型</option>
+                    {imageModels.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.name}</option>)}
+                  </select></label>
+                  <label><span>{ASSET_TYPE_LABELS[type]}提示词</span><select
+                    onChange={(event) => updateBatchSelection(type, "promptId", event.target.value)} value={selection.promptId}>
+                    <option value="">不使用提示词</option>
+                    {batchPromptOptions(type).map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name}</option>)}
+                  </select></label>
+                  <label><span>{ASSET_TYPE_LABELS[type]}图片尺寸</span><select
+                    disabled={model === null || sizes.length === 0}
+                    onChange={(event) => updateBatchSelection(type, "size", event.target.value)} value={selection.size}>
+                    <option value="">{model === null ? "请先选择模型" : sizes.length === 0 ? "该模型未配置尺寸" : "选择图片尺寸"}</option>
+                    {sizes.map((size) => <option key={size} value={size}>{size}</option>)}
+                  </select></label>
+                  {error !== null && <p className="media-generation-note media-generation-wide" role="status">{error}</p>}
+                  {Object.values(batchPreferenceWarnings[type]).map((warning) => (
+                    <p className="media-generation-alert media-generation-wide" key={warning} role="alert">{warning}</p>
+                  ))}
+                </fieldset>
+              );
+            })}
             <label className="media-generation-wide"><span>公共参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
               setBatchReferenceImages(event.target.value);
               setReferenceUploadStatus((current) => current?.kind === "image" ? null : current);
@@ -1072,10 +1518,16 @@ export function MediaGenerationPage({
             </fieldset>
           )}
           <div className="media-generation-actions">
+            <button className="secondary-button" disabled={isFrozen || batchPreferenceLoading || !hasBatchPreferenceEdits
+              || services.userPreferences === undefined} onClick={() => void saveBatchPreferences()} type="button">
+              {savingBatchPreferences ? "保存中…" : "记住批量选项"}
+            </button>
             <button className="primary-button" disabled={loading || isFrozen || selectedSeries === null || selectedChapterId === ""
-              || selectedImageModel === null || selectedBatchAssets.length === 0 || selectedBatchAssets.length > 64}
+              || selectedBatchAssets.length === 0 || selectedBatchAssets.length > 64 || batchSubmissionBlocked}
               onClick={() => void submitBatch()} type="button">{pending?.operation === "image.batch" ? "等待回执…" : `提交 ${selectedBatchAssets.length} 项批量任务`}</button>
           </div>
+          {batchPreferenceLoading && <p className="media-generation-note" role="status">正在读取当前账号的批量选项…</p>}
+          {batchPreferenceMessage !== null && <p className="media-generation-note" role="status">{batchPreferenceMessage}</p>}
           <p className="media-generation-note">服务暂不可用时会显示对应状态；提交状态待确认时，可以重新核对本次提交。已受理的任务可在“我的任务”中查看。</p>
         </div>
       )}

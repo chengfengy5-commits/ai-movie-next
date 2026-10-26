@@ -26,6 +26,11 @@ import type { ChatAssistantPort } from "./chatAssistant";
 import { createCanvasOwnedImageHttpPort } from "./canvasOwnedImageHttp";
 import type { CanvasOwnedImagePort } from "./canvasOwnedImage";
 import {
+  parseUserPreferences,
+  parseUserPreferencesUpdateReceipt,
+  type UserPreferencesPort,
+} from "./userPreferences";
+import {
   parseAccountActionReceipt,
   parseEmailCodeReceipt,
   parseRegisteredUser,
@@ -244,6 +249,7 @@ export interface WorkspaceServices {
   readonly mediaReferenceUpload?: MediaReferenceUploadPort;
   readonly chatAssistant?: ChatAssistantPort;
   readonly canvasOwnedImage?: CanvasOwnedImagePort;
+  readonly userPreferences?: UserPreferencesPort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
@@ -2057,6 +2063,8 @@ type ApiEndpoint =
   | "accountSessions"
   | "revokeAccountSession"
   | "changeAccountPassword"
+  | "userPreferences"
+  | "updateUserPreferences"
   | "series"
   | "seriesDetail"
   | "createSeries"
@@ -2192,6 +2200,12 @@ function apiRequestDefinition(
   }
   if (endpoint === "accountSessions") {
     return { path: "/auth/sessions", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "userPreferences") {
+    return { path: "/user/preferences", method: "GET" };
+  }
+  if (endpoint === "updateUserPreferences") {
+    return { path: "/user/preferences", method: "PUT" };
   }
   if (endpoint === "revokeAccountSession") {
     const sessionId = encodeApiPathId(identifiers?.sessionId, "登录设备");
@@ -2972,6 +2986,23 @@ export function createApiServices(
     },
   };
 
+  const userPreferences: UserPreferencesPort = {
+    async get(signal) {
+      const token = requireApiToken(storage);
+      return parseUserPreferences(await requestForCurrentApiSession("userPreferences", token, signal));
+    },
+    async update(preferences, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "updateUserPreferences",
+        token,
+        signal,
+        { preferences },
+      );
+      return parseUserPreferencesUpdateReceipt(payload);
+    },
+  };
+
   return {
     mode: "api",
     apiBaseUrl,
@@ -3087,6 +3118,7 @@ export function createApiServices(
     accountProfile,
     accountMembership,
     accountSecurity,
+    userPreferences,
     accountAccess: {
       async register(input, signal) {
         return parseRegisteredUser(await request("register", null, signal, input));
