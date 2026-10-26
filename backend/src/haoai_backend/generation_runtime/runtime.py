@@ -58,6 +58,18 @@ class _InertRuntime:
         del task_type
         return "pending"
 
+    def supports_recovery_scan(self, task_type: str) -> bool:
+        """An inert runtime never owns a registered recovery scanner."""
+
+        del task_type
+        return False
+
+    def run_recovery_once(self, task_type: str) -> bool:
+        """Keep recovery scanning unavailable until a family is registered."""
+
+        del task_type
+        return False
+
     async def run_web_stream(
         self,
         command: WebStreamCommand,
@@ -123,15 +135,7 @@ class _ConfiguredRuntime:
 
         if self._closed or not isinstance(task_type, str) or not task_type:
             return "pending"
-        factory = next(
-            (
-                candidate
-                for candidate in self._executor_factories
-                if isinstance(candidate, RegisteredExecutorFactory)
-                and candidate.task_type == task_type
-            ),
-            None,
-        )
+        factory = self._registered_factory(task_type)
         if factory is None:
             return "pending"
         if not self._run_recovery(factory):
@@ -150,6 +154,37 @@ class _ConfiguredRuntime:
         finally:
             if lease is not None:
                 lease.release()
+
+    def supports_recovery_scan(self, task_type: str) -> bool:
+        """Report whether this runtime has a registered recovery factory."""
+
+        if self._closed or not isinstance(task_type, str) or not task_type:
+            return False
+        factory = self._registered_factory(task_type)
+        return factory is not None and factory.recovery_factory is not None
+
+    def run_recovery_once(self, task_type: str) -> bool:
+        """Run the registered recovery path without acquiring worker capacity."""
+
+        if not self.supports_recovery_scan(task_type):
+            return False
+        factory = self._registered_factory(task_type)
+        if factory is None:
+            return False
+        return self._run_recovery(factory)
+
+    def _registered_factory(
+        self, task_type: str
+    ) -> RegisteredExecutorFactory | None:
+        return next(
+            (
+                candidate
+                for candidate in self._executor_factories
+                if isinstance(candidate, RegisteredExecutorFactory)
+                and candidate.task_type == task_type
+            ),
+            None,
+        )
 
     def _run_claimed_with_capacity(
         self,

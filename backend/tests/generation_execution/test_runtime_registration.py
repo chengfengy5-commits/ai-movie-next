@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 from datetime import datetime, timezone
-from threading import Event, Thread
+from threading import Event, Thread, current_thread
 from time import monotonic
 
 from haoai_backend.generation_contracts.ports import GenerationRuntimeConfig
@@ -10,6 +10,7 @@ from haoai_backend.generation_contracts.types import ClaimAuthority, OwnerTaskSc
 from haoai_backend.generation_runtime.configuration import RegisteredExecutorFactory
 from haoai_backend.generation_runtime.runtime import build_runtime
 from haoai_backend.generation_runtime.worker_capacity import WorkerExecutionCapacity
+from haoai_backend.generation_runtime.worker_service import GenerationWorkerService
 
 
 class _Signal:
@@ -212,6 +213,307 @@ def test_two_families_share_capacity_and_never_claim_while_full() -> None:
     assert any(event.startswith("claim:ai-review:") for event in second_events)
     assert capacity.active_count == 0
     second_runtime.shutdown("test complete")
+
+
+def test_independent_due_scanner_runs_while_executor_holds_full_capacity(
+    monkeypatch,
+) -> None:
+    executor_started = Event()
+    executor_finish = Event()
+    recovery_during_executor = Event()
+    events: list[str] = []
+    counters = {"capacity": 0, "executor": 0, "id": 0, "provider": 0}
+
+    class CountingCapacity(WorkerExecutionCapacity):
+        def try_acquire(self):
+            counters["capacity"] += 1
+            return super().try_acquire()
+
+    class ObservedRecovery:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def scan_due(self, *, stop_signal: Event) -> None:
+            assert not stop_signal.is_set()
+            self.calls += 1
+            if executor_started.is_set():
+                recovery_during_executor.set()
+
+    class BlockingExecutor:
+        def bind_execution_port(self, _port: object) -> None:
+            return None
+
+        def execute_claim(self, _claim: ClaimAuthority) -> str:
+            executor_started.set()
+            executor_finish.wait()
+            return "pending"
+
+    capacity = CountingCapacity()
+    capacity.configure(1)
+    recovery = ObservedRecovery()
+    port = _Port(events)
+
+    def new_worker_id() -> str:
+        counters["id"] += 1
+        return "instance-id"
+
+    def unused_provider_factory() -> object:
+        counters["provider"] += 1
+        return object()
+
+    def build_executor() -> BlockingExecutor:
+        counters["executor"] += 1
+        return BlockingExecutor()
+
+    runtime = build_runtime(
+        replace(
+            _config(events, shutdown_timeout=0.05),
+            worker_capacity=capacity,
+            id_factory=new_worker_id,
+            provider_factories=(("unused", unused_provider_factory),),
+        ),
+        (
+            RegisteredExecutorFactory(
+                "image-single",
+                lambda: port,
+                build_executor,
+                recovery_factory=lambda: recovery,
+            ),
+        ),
+    )
+    service = GenerationWorkerService(
+        runtime,
+        task_type="image-single",
+        poll_interval_seconds=0.01,
+        shutdown_timeout_seconds=0.05,
+    )
+    real_start = Thread.start
+
+    def start_scanner_after_executor(thread: Thread) -> None:
+        if thread.name == "generation-recovery-image-single":
+            assert executor_started.wait(timeout=1.0)
+        real_start(thread)
+
+    monkeypatch.setattr(Thread, "start", start_scanner_after_executor)
+
+    try:
+        service.start()
+        assert executor_started.wait(timeout=1.0)
+        assert recovery_during_executor.wait(timeout=0.25)
+        assert recovery.calls >= 2
+        assert capacity.active_count == 1
+        assert counters == {"capacity": 1, "executor": 1, "id": 1, "provider": 0}
+        assert sum(event.startswith("claim:") for event in events) == 1
+    finally:
+        service.shutdown("stop independent scanner regression")
+        executor_finish.set()
+        poller = getattr(service, "_thread", None)
+        scanner = getattr(service, "_recovery_thread", None)
+        if poller is not None:
+            poller.join(timeout=1.0)
+        if scanner is not None:
+            scanner.join(timeout=1.0)
+
+    assert poller is None or not poller.is_alive()
+    assert scanner is None or not scanner.is_alive()
+    assert capacity.active_count == 0
+
+
+def test_recovery_scanner_only_uses_registered_recovery_without_claim_adapters() -> None:
+    events: list[str] = []
+    counters = {"capacity": 0, "id": 0, "port": 0, "executor": 0, "provider": 0}
+
+    class CountingCapacity:
+        def try_acquire(self):
+            counters["capacity"] += 1
+            return None
+
+    recovery = _Recovery(events)
+
+    def unused_provider_factory() -> object:
+        counters["provider"] += 1
+        return object()
+
+    def unused_worker_id() -> str:
+        counters["id"] += 1
+        return "worker-id"
+
+    def port_factory() -> _Port:
+        counters["port"] += 1
+        return _Port(events)
+
+    def executor_factory() -> _Executor:
+        counters["executor"] += 1
+        return _Executor(events)
+
+    runtime = build_runtime(
+        replace(
+            _config(events),
+            worker_capacity=CountingCapacity(),
+            id_factory=unused_worker_id,
+            provider_factories=(("unused", unused_provider_factory),),
+        ),
+        (
+            RegisteredExecutorFactory(
+                "image-single",
+                port_factory,
+                executor_factory,
+                recovery_factory=lambda: recovery,
+            ),
+            RegisteredExecutorFactory(
+                "without-recovery",
+                port_factory,
+                executor_factory,
+            ),
+        ),
+    )
+
+    assert runtime.supports_recovery_scan("image-single") is True
+    assert runtime.supports_recovery_scan("without-recovery") is False
+    assert runtime.supports_recovery_scan("unknown") is False
+    assert runtime.run_recovery_once("image-single") is True
+    assert runtime.run_recovery_once("without-recovery") is False
+    assert runtime.run_recovery_once("unknown") is False
+    assert events == ["recovery"]
+    assert counters == {"capacity": 0, "id": 0, "port": 0, "executor": 0, "provider": 0}
+
+    inert = build_runtime(_config(events), ())
+    assert inert.supports_recovery_scan("image-single") is False
+    assert inert.run_recovery_once("image-single") is False
+    runtime.shutdown("test complete")
+    inert.shutdown("test complete")
+
+
+def test_inline_timer_and_explicit_recovery_share_one_tracked_guard() -> None:
+    scan_started = Event()
+    release_scan = Event()
+    active = 0
+    maximum_active = 0
+    cancel_calls = 0
+    events: list[str] = []
+
+    class BlockingRecovery:
+        def scan_due(self, *, stop_signal: Event) -> None:
+            nonlocal active, maximum_active
+            assert not stop_signal.is_set()
+            active += 1
+            maximum_active = max(maximum_active, active)
+            scan_started.set()
+            release_scan.wait()
+            active -= 1
+
+        def consume_cancel_and_due(self, scope, *, stop_signal: Event) -> str:
+            nonlocal cancel_calls
+            cancel_calls += 1
+            return "pending"
+
+    capacity = WorkerExecutionCapacity()
+    capacity.configure(1)
+    recovery = BlockingRecovery()
+    port = _Port(events)
+    outcomes: list[bool] = []
+    runtime = build_runtime(
+        replace(_config(events), worker_capacity=capacity),
+        (
+            RegisteredExecutorFactory(
+                "ai-review",
+                lambda: port,
+                lambda: _Executor(events),
+                recovery_factory=lambda: recovery,
+            ),
+        ),
+    )
+    timer = Thread(
+        target=lambda: outcomes.append(runtime.run_recovery_once("ai-review")),
+        daemon=True,
+    )
+
+    try:
+        timer.start()
+        assert scan_started.wait(timeout=1.0)
+        assert runtime.run_claimed_once("ai-review") == "pending"
+        assert (
+            runtime.consume_cancel_and_due(
+                OwnerTaskScope("owner", "task", "frame.review")
+            )
+            == "pending"
+        )
+        assert active == 1
+        assert maximum_active == 1
+        assert cancel_calls == 0
+        assert capacity.active_count == 0
+        assert not any(event.startswith("claim:") for event in events)
+    finally:
+        release_scan.set()
+        timer.join(timeout=1.0)
+
+    assert not timer.is_alive()
+    assert outcomes == [True]
+    assert active == 0
+    assert maximum_active == 1
+    assert cancel_calls == 0
+    runtime.shutdown("test complete")
+
+
+def test_scanner_shutdown_reports_tracked_recovery_and_live_scanner_until_unwind() -> None:
+    scanner_entered = Event()
+    release_scanner = Event()
+    inline_scans = 0
+    events: list[str] = []
+
+    class StopIgnoringRecovery:
+        def scan_due(self, *, stop_signal: Event) -> None:
+            nonlocal inline_scans
+            if current_thread().name == "generation-recovery-image-single":
+                scanner_entered.set()
+                release_scanner.wait()
+                return
+            inline_scans += 1
+
+    class EmptyPort:
+        def claim_next(self, _task_type: str, _instance: str):
+            return None
+
+    def unexpected_executor() -> _Executor:
+        raise AssertionError("scanner regression must not build an executor")
+
+    recovery = StopIgnoringRecovery()
+    runtime = build_runtime(
+        _config([], shutdown_timeout=0.05),
+        (
+            RegisteredExecutorFactory(
+                "image-single",
+                EmptyPort,
+                unexpected_executor,
+                recovery_factory=lambda: recovery,
+            ),
+        ),
+    )
+    service = GenerationWorkerService(
+        runtime,
+        task_type="image-single",
+        poll_interval_seconds=1.0,
+        shutdown_timeout_seconds=0.05,
+        recovery_scan_interval_seconds=0.01,
+    )
+
+    service.start()
+    assert scanner_entered.wait(timeout=1.0)
+    receipt = service.shutdown("stop blocked scanner")
+
+    assert inline_scans <= 1
+    assert receipt.timed_out is True
+    assert "recovery:image-single" in receipt.unreleased_resources
+    assert "recovery-loop:image-single" in receipt.unreleased_resources
+    assert "recovery:image-single" in receipt.recovery_plan_refs
+    assert "recovery-loop:image-single" in receipt.recovery_plan_refs
+
+    release_scanner.set()
+    scanner = service._recovery_thread
+    assert scanner is not None
+    scanner.join(timeout=1.0)
+    assert not scanner.is_alive()
+    assert service.shutdown("duplicate stop") == receipt
 
 
 
