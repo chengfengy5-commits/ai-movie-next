@@ -2872,6 +2872,10 @@ export function CanvasWorkspace({
             prompt={imageGeneration.state.prompt}
             receipt={imageGeneration.state.receipt}
             batch={imageGeneration.state.batch}
+            taskObservations={imageGeneration.state.taskObservations}
+            onPauseTaskObservation={imageGeneration.pauseTaskObservation}
+            onContinueTaskObservation={imageGeneration.continueTaskObservation}
+            onRefreshTaskObservation={imageGeneration.refreshTaskObservation}
             selectedModelId={imageGeneration.state.selectedModelId}
             targetLabel={imageGenerationDialogTargetLabel ?? "单张图片任务"}
           />

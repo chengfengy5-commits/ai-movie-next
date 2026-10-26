@@ -109,6 +109,7 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     pendingIntent: null,
     receipt: null,
     batch: overrides.batch ?? overrides.pendingIntent?.batch ?? null,
+    taskObservations: {},
     onClose: vi.fn(),
     onSelectModel: vi.fn(),
     onSelectCount: vi.fn(),
@@ -123,6 +124,9 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     onRetry: vi.fn(),
     onAcquireLock: vi.fn(),
     onStartNew: vi.fn(),
+    onPauseTaskObservation: vi.fn(),
+    onContinueTaskObservation: vi.fn(),
+    onRefreshTaskObservation: vi.fn(),
     ...overrides,
   };
   return { ...render(<CanvasImageGenerationDialog {...props} />), props };
@@ -253,6 +257,9 @@ describe("CanvasImageGenerationDialog", () => {
         stoppedOrdinal: null,
         outcome: "complete",
       },
+      taskObservations: {
+        [receipt.idempotencyKey]: { status: "stopped", error: null, inFlight: false },
+      },
     });
 
     expect(screen.getByText("任务当前状态为已完成；该回执不表示图像已经应用到画布。")).toBeTruthy();
@@ -260,8 +267,37 @@ describe("CanvasImageGenerationDialog", () => {
     expect(screen.getByText("服务器报价：12")).toBeTruthy();
     expect(screen.getByText("图片尺寸：模型默认")).toBeTruthy();
     expect(screen.getByText("计费状态：未计费")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "继续观察第 1 张" })).toBeNull();
+    expect(screen.getByRole("button", { name: "刷新第 1 张状态" })).toBeTruthy();
     expect(screen.queryByText(/图像生成已完成|图片已应用到画布/)).toBeNull();
     const taskId = screen.getByText("任务编号：task-a");
     expect(taskId.closest("details")?.open).toBe(false);
+  });
+
+  it("keeps accepted task observation controls attached to the original receipt key", () => {
+    const accepted = receiptView();
+    const rendered = renderDialog({
+      mode: "receipt",
+      receipt: accepted,
+      batch: {
+        requestedCount: 1,
+        referenceNames: [],
+        acceptedReceipts: [accepted],
+        notSentCount: 0,
+        activeOrdinal: null,
+        stoppedOrdinal: null,
+        outcome: "complete",
+      },
+      taskObservations: {
+        [accepted.idempotencyKey]: { status: "read-error", error: "安全的只读状态错误。", inFlight: false },
+      },
+    });
+
+    expect(screen.getByText("状态观察：读取失败，观察已暂停")).toBeTruthy();
+    expect(screen.getByText("安全的只读状态错误。")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "继续观察第 1 张" }));
+    fireEvent.click(screen.getByRole("button", { name: "刷新第 1 张状态" }));
+    expect(rendered.props.onContinueTaskObservation).toHaveBeenCalledWith(accepted.idempotencyKey);
+    expect(rendered.props.onRefreshTaskObservation).toHaveBeenCalledWith(accepted.idempotencyKey);
   });
 });
