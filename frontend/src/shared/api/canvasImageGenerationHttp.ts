@@ -2,6 +2,7 @@ import { ApiConfigurationError, resolveApiBaseUrl } from "./config";
 import {
   CanvasImageGenerationError,
   isValidCanvasImageGenerationSize,
+  normalizeCanvasImageReferences,
   type CanvasImageGenerationBillingStatus,
   type CanvasImageGenerationPort,
   type CanvasImageGenerationReceipt,
@@ -63,6 +64,7 @@ interface NormalizedSubmitInput {
   readonly prompt: string;
   readonly destination: CanvasOwnedResultsTarget;
   readonly size?: string;
+  readonly referenceImages?: readonly string[];
   readonly idempotencyKey: string;
 }
 
@@ -200,13 +202,23 @@ function parseDestination(value: unknown, chapterId: string): CanvasOwnedResults
 
 function normalizeSubmitInput(value: unknown, chapterId: string): NormalizedSubmitInput | null {
   const hasSize = isRecord(value) && Object.prototype.hasOwnProperty.call(value, "size");
+  const hasReferenceImages = isRecord(value) && Object.prototype.hasOwnProperty.call(value, "referenceImages");
+  let references: readonly string[] | null = Object.freeze([]);
+  if (hasReferenceImages && isRecord(value) && value.referenceImages !== undefined) {
+    references = normalizeCanvasImageReferences(value.referenceImages);
+  }
   if (!isRecord(value)
     || !hasExactKeys(value, hasSize
-      ? ["modelId", "prompt", "destination", "size", "idempotencyKey"]
-      : ["modelId", "prompt", "destination", "idempotencyKey"])
+      ? (hasReferenceImages
+        ? ["modelId", "prompt", "destination", "size", "referenceImages", "idempotencyKey"]
+        : ["modelId", "prompt", "destination", "size", "idempotencyKey"])
+      : (hasReferenceImages
+        ? ["modelId", "prompt", "destination", "referenceImages", "idempotencyKey"]
+        : ["modelId", "prompt", "destination", "idempotencyKey"]))
     || !isNonBlankText(value.modelId, 255)
     || !isNonBlankText(value.prompt)
     || (value.size !== undefined && !isValidCanvasImageGenerationSize(value.size))
+    || references === null
     || !isValidIdempotencyKey(value.idempotencyKey)) {
     return null;
   }
@@ -218,6 +230,7 @@ function normalizeSubmitInput(value: unknown, chapterId: string): NormalizedSubm
     prompt: value.prompt,
     destination,
     ...(value.size === undefined ? {} : { size: value.size }),
+    ...(references.length === 0 ? {} : { referenceImages: references }),
     idempotencyKey: value.idempotencyKey,
   });
 }
@@ -597,6 +610,9 @@ export function createCanvasImageGenerationHttpPort(
               model_id: input?.modelId,
               prompt: input?.prompt,
               ...(input?.size === undefined ? {} : { size: input.size }),
+              ...(input?.referenceImages === undefined || input.referenceImages.length === 0
+                ? {}
+                : { reference_images: input.referenceImages }),
               target: { kind: "canvas_apply", destination: input?.destination },
             })
             : undefined;

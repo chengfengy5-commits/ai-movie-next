@@ -18,6 +18,7 @@ const destination = {
 function pendingIntent(state: CanvasImageGenerationIntentView["state"]): CanvasImageGenerationIntentView {
   const batch: CanvasImageGenerationBatchView = {
     requestedCount: 3,
+    referenceNames: ["角色参考"],
     acceptedReceipts: [],
     notSentCount: 1,
     activeOrdinal: null,
@@ -31,6 +32,7 @@ function pendingIntent(state: CanvasImageGenerationIntentView["state"]): CanvasI
     modelName: "图片模型 A",
     prompt: "保留的原始提示词",
     size: "quality:high",
+    referenceNames: ["角色参考"],
     targetLabel: "分镜 1",
     ordinal: 2,
     state,
@@ -54,6 +56,7 @@ function receiptView(): CanvasImageGenerationBatchReceiptView {
     modelName: "图片模型 A",
     prompt: "保留的原始提示词",
     size: null,
+    referenceNames: [],
     receipt,
     targetLabel: "分镜 1",
     ordinal: 1,
@@ -71,6 +74,9 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
       sizeOptions: [],
       defaultSize: null,
       sizeConfigurationError: null,
+      referenceImagesEnabled: true,
+      maximumReferenceImages: 8,
+      referenceConfigurationError: null,
     }],
     selectedModelId: "image-model-a",
     selectedCount: 1,
@@ -87,6 +93,9 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     selectedPromptTemplateId: "",
     promptTemplateSelectionInvalid: false,
     prompt: "当前分镜文本",
+    referenceCandidates: [],
+    selectedReferenceIds: [],
+    referenceFiles: [],
     modelsLoading: false,
     promptTemplatesLoading: false,
     promptTemplateError: null,
@@ -106,6 +115,9 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     onSelectSize: vi.fn(),
     onSelectPromptTemplate: vi.fn(),
     onChangePrompt: vi.fn(),
+    onToggleReference: vi.fn(),
+    onSelectReferenceFiles: vi.fn(),
+    onRemoveReferenceFile: vi.fn(),
     onSubmit: vi.fn(),
     onLookup: vi.fn(),
     onRetry: vi.fn(),
@@ -147,6 +159,24 @@ describe("CanvasImageGenerationDialog", () => {
     expect(dialog.getByText("留空时使用当前内容；选用模板后可清空描述，仅使用模板。")).toBeTruthy();
   });
 
+  it("offers graph-reference checkboxes and a multiple local-image picker", () => {
+    const rendered = renderDialog({
+      referenceCandidates: [
+        { id: "frame:1", name: "目标分镜", value: "https://images.example.test/frame.png" },
+      ],
+      selectedReferenceIds: ["frame:1"],
+    });
+    const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
+    const reference = dialog.getByLabelText("目标分镜") as HTMLInputElement;
+    const localPicker = dialog.getByLabelText("选择本地参考图片");
+    expect(reference.type).toBe("checkbox");
+    expect(reference.checked).toBe(true);
+    expect(localPicker).toHaveAttribute("type", "file");
+    expect(localPicker).toHaveAttribute("multiple");
+    fireEvent.click(reference);
+    expect(rendered.props.onToggleReference).toHaveBeenCalledWith("frame:1", false);
+  });
+
   it("blocks an invalid generation count instead of keeping the previous selection", () => {
     const rendered = renderDialog({ selectedCount: 0, countSelectionInvalid: true });
     const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
@@ -164,6 +194,9 @@ describe("CanvasImageGenerationDialog", () => {
       sizeOptions: ["16:9", "quality:high"],
       defaultSize: "16:9",
       sizeConfigurationError: null,
+      referenceImagesEnabled: true,
+      maximumReferenceImages: 8,
+      referenceConfigurationError: null,
     };
     const rendered = renderDialog({ models: [model], selectedSize: "16:9" });
     const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
@@ -184,6 +217,7 @@ describe("CanvasImageGenerationDialog", () => {
     expect(screen.queryByRole("combobox", { name: "提示词模板" })).toBeNull();
     expect(screen.queryByRole("combobox", { name: "图片尺寸" })).toBeNull();
     expect(screen.getByText("图片尺寸：quality:high")).toBeTruthy();
+    expect(screen.getAllByText("参考图（1）：角色参考")).toHaveLength(2);
     expect(screen.getByText("提示词：保留的原始提示词")).toBeTruthy();
   });
 
@@ -212,6 +246,7 @@ describe("CanvasImageGenerationDialog", () => {
       receipt,
       batch: {
         requestedCount: 1,
+        referenceNames: [],
         acceptedReceipts: [receipt],
         notSentCount: 0,
         activeOrdinal: null,

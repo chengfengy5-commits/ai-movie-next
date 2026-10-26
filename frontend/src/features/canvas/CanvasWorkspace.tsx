@@ -38,6 +38,7 @@ import { AssetManagementDialog, type AssetDirectory, type GuardedAssetMutation }
 import { CanvasMediaSourceEditor } from "./CanvasMediaSourceEditor";
 import { CanvasGenerationResultsDialog, type PendingCanvasGenerationIntent } from "./generation-results/CanvasGenerationResultsDialog";
 import { CanvasImageGenerationDialog } from "./image-generation/CanvasImageGenerationDialog";
+import { collectCanvasImageReferenceCandidates } from "./image-generation/canvasImageReferences";
 import {
   useCanvasImageGenerationController,
   type CanvasImageGenerationLockResult,
@@ -638,6 +639,17 @@ export function CanvasWorkspace({
       sources.scenes,
       sources.props,
       displayDocument,
+      services.canvasSource === undefined ? undefined : sources.version,
+    ), [displayDocument, services.canvasSource, sources]);
+  const referenceGraph = useMemo(() => sources === null
+    ? { nodes: [], edges: [] }
+    : buildCanvasGraph(
+      sources.chapter,
+      sources.storyboard_assets,
+      sources.characters,
+      sources.scenes,
+      sources.props,
+      { ...displayDocument, hiddenRelations: [] },
       services.canvasSource === undefined ? undefined : sources.version,
     ), [displayDocument, services.canvasSource, sources]);
   const visibleNodes = graph.nodes.filter((node) => filter === "all" || node.kind === filter);
@@ -1580,12 +1592,16 @@ export function CanvasWorkspace({
   const selectedImageGenerationTargetKey = sources !== null && selectedSourceNode !== null && selectedGenerationTarget !== null
     ? imageGenerationTargetKey(selectedSourceNode.ref, selectedGenerationTarget.target, sources.version)
     : null;
+  const canvasDataForImageReferences = services.canvasData;
   const imageGeneration = useCanvasImageGenerationController({
     contextKey: scopeKey,
     serviceIdentity,
     selectedTargetKey: selectedImageGenerationTargetKey,
     creatorSettings: services.creatorSettings,
     port: services.canvasImageGeneration,
+    ...(canvasDataForImageReferences === undefined ? {} : {
+      readReferenceImage: (imageUrl: string, signal: AbortSignal) => canvasDataForImageReferences.readImage(imageUrl, signal),
+    }),
     validateTarget: validateImageGenerationTarget,
     checkEditLock: checkImageGenerationEditLock,
     acquireEditLock: acquireImageGenerationEditLock,
@@ -1766,6 +1782,7 @@ export function CanvasWorkspace({
       sourceVersion: snapshot.version,
       requiresLock: snapshot.requires_lock,
       promptSeed: imageGenerationPromptSeed(snapshot, selected),
+      referenceCandidates: collectCanvasImageReferenceCandidates(referenceGraph.nodes, referenceGraph.edges, selectedRef),
       context,
     };
   }
@@ -2834,6 +2851,9 @@ export function CanvasWorkspace({
             selectedPromptTemplateId={imageGeneration.state.selectedPromptTemplateId}
             selectedSize={imageGeneration.state.selectedSize}
             sizeSelectionInvalid={imageGeneration.state.sizeSelectionInvalid}
+            referenceCandidates={imageGeneration.state.target?.referenceCandidates ?? []}
+            selectedReferenceIds={imageGeneration.state.selectedReferenceIds}
+            referenceFiles={imageGeneration.state.referenceFiles}
             onAcquireLock={() => void imageGeneration.acquireLock()}
             onChangePrompt={imageGeneration.setPrompt}
             onClose={imageGeneration.close}
@@ -2843,6 +2863,9 @@ export function CanvasWorkspace({
             onSelectCount={imageGeneration.setSelectedCount}
             onSelectSize={imageGeneration.setSelectedSize}
             onSelectPromptTemplate={imageGeneration.setSelectedPromptTemplateId}
+            onToggleReference={imageGeneration.toggleReference}
+            onSelectReferenceFiles={imageGeneration.selectReferenceFiles}
+            onRemoveReferenceFile={imageGeneration.removeReferenceFile}
             onStartNew={startAnotherImageGeneration}
             onSubmit={() => void imageGeneration.submitNew()}
             pendingIntent={imageGeneration.state.intent}

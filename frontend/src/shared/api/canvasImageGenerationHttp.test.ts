@@ -1,5 +1,6 @@
 // @vitest-environment node
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { isValidCanvasImageReference } from "./canvasImageGeneration";
 import type {
   CanvasImageGenerationRunContext,
   CanvasImageGenerationSubmitInput,
@@ -81,6 +82,13 @@ function jsonResponse(
     status,
     headers: { "Content-Type": "application/json", ...headers },
   });
+}
+
+function zeroImageDataUrl(byteLength: number): string {
+  const completeGroups = Math.floor(byteLength / 3);
+  const remainder = byteLength % 3;
+  const finalGroup = remainder === 1 ? "AA==" : remainder === 2 ? "AAA=" : "";
+  return `data:image/png;base64,${"AAAA".repeat(completeGroups)}${finalGroup}`;
 }
 
 function makeInput(
@@ -219,6 +227,69 @@ describe("Canvas image generation HTTP port", () => {
     const inputWithUndefinedSize = { ...makeInput(), size: undefined };
     await harness.run.submit(inputWithUndefinedSize as unknown as CanvasImageGenerationSubmitInput, new AbortController().signal);
     expect(JSON.parse(String(requestParts(fetcher).init.body))).not.toHaveProperty("size");
+  });
+
+  it("sends an immutable ordered reference_images array and omits an empty selection", async () => {
+    const references = [
+      "https://images.example.test/reference.png?version=3",
+      "data:image/png;base64,iVBORw0KGgo=",
+    ];
+    const expectedReferences = [...references];
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(receiptWire()));
+    const harness = createHarness(fetcher);
+    const input = makeInput({ referenceImages: references });
+
+    const submitted = harness.run.submit(input, new AbortController().signal);
+    references[0] = "https://images.example.test/replacement.png";
+    await submitted;
+
+    expect(JSON.parse(String(requestParts(fetcher).init.body))).toEqual({
+      model_id: input.modelId,
+      prompt: input.prompt,
+      reference_images: expectedReferences,
+      target: { kind: "canvas_apply", destination: input.destination },
+    });
+
+    const noReferencesFetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(receiptWire()));
+    const noReferences = createHarness(noReferencesFetcher);
+    await noReferences.run.submit(makeInput({ referenceImages: [] }), new AbortController().signal);
+    expect(JSON.parse(String(requestParts(noReferencesFetcher).init.body))).not.toHaveProperty("reference_images");
+  });
+
+  it("rejects unsafe reference arrays before dispatch", async () => {
+    const invalidReferences: unknown[] = [
+      null,
+      [null],
+      [{}],
+      [""],
+      ["/uploads/relative.png"],
+      ["https://user:password@images.example.test/image.png"],
+      ["https://images.example.test/image.png#fragment"],
+      ["https://images.example.test\\\\image.png"],
+      ["http:/images.example.test/image.png"],
+      ["https:images.example.test/image.png"],
+      ["https://images.example.test/image with space.png"],
+      ["data:image/svg+xml;base64,PHN2Zz4="],
+      ["data:image/png;base64,%%%="],
+      ["data:image/png;base64,AAB="],
+      Array.from({ length: 9 }, () => "https://images.example.test/image.png"),
+    ];
+    for (const referenceImages of invalidReferences) {
+      const fetcher = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse(receiptWire()));
+      const harness = createHarness(fetcher);
+      await expect(harness.run.submit(
+        makeInput({ referenceImages } as unknown as Partial<CanvasImageGenerationSubmitInput>),
+        new AbortController().signal,
+      )).rejects.toMatchObject({ kind: "not-sent" });
+      expect(fetcher).not.toHaveBeenCalled();
+    }
+  });
+
+  it("accepts large canonical image data and rejects oversize or noncanonical tails", () => {
+    expect(isValidCanvasImageReference(zeroImageDataUrl(5 * 1024 * 1024))).toBe(true);
+    expect(isValidCanvasImageReference(zeroImageDataUrl(10 * 1024 * 1024))).toBe(true);
+    expect(isValidCanvasImageReference(zeroImageDataUrl(10 * 1024 * 1024 + 1))).toBe(false);
+    expect(isValidCanvasImageReference("data:image/png;base64,AAB=")).toBe(false);
   });
 
   it.each([
