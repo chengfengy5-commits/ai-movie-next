@@ -120,6 +120,8 @@ export interface CreatorSettingsServicePort {
   getModel(id: string, signal: AbortSignal): Promise<CreatorModel>;
   createModel(input: CreatorModelCreateInput, signal: AbortSignal): Promise<CreatorModel>;
   updateModel(id: string, update: CreatorModelUpdateInput, signal: AbortSignal): Promise<CreatorModel>;
+  promoteModelToSystem?(id: string, signal: AbortSignal): Promise<CreatorModel>;
+  demoteModelToPersonal?(id: string, signal: AbortSignal): Promise<CreatorModel>;
   testModelConnection?(
     input: CreatorModelConnectionTestInput,
     signal: AbortSignal,

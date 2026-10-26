@@ -12,11 +12,13 @@ import type {
   CreatorPromptUpdateInput,
   CreatorSettingsServicePort,
 } from "../../shared/api/creatorSettings";
+import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { ModelConnectionTest } from "./ModelConnectionTest";
 import "./creatorSettings.css";
 
 type SettingsTab = "models" | "prompts";
 type DraftMode = "create" | "edit" | "copy";
+type ModelConversionTarget = "system" | "personal";
 
 interface ModelDraft {
   kind: "model";
@@ -61,11 +63,23 @@ type Verification =
     }
   | { kind: "delete"; tab: SettingsTab; id: string; category: string; uncertain: boolean }
   | { kind: "order"; tab: SettingsTab; category: string; ids: string[]; uncertain: boolean }
+  | {
+      kind: "model-conversion";
+      tab: "models";
+      actorId: string;
+      category: string;
+      sourceId: string;
+      newId: string | null;
+      target: ModelConversionTarget;
+      service: CreatorSettingsServicePort;
+      uncertain: boolean;
+    }
   | { kind: "create-unknown"; tab: SettingsTab; category: string; name: string };
 
 interface CreatorSettingsPageProps {
   service?: CreatorSettingsServicePort;
   userId: string;
+  isSuperuser?: boolean;
   onUnauthorized(): void;
   onBack(): void;
   onDirtyChange?(dirty: boolean): void;
@@ -142,6 +156,25 @@ function isCurrentUnauthorized(error: unknown): boolean {
   return error instanceof ApiError && error.status === 401;
 }
 
+function isDefinitiveModelConversionFailure(error: unknown): boolean {
+  if (!(error instanceof ApiError)) return false;
+  if (error.kind === "network" || error.kind === "timeout" || error.kind === "invalid-response" || error.kind === "aborted") {
+    return false;
+  }
+  return error.status !== null && error.status !== 408 && error.status < 500;
+}
+
+function modelConversionFailureMessage(error: unknown, target: ModelConversionTarget): string {
+  if (error instanceof ApiError && error.status === 403) {
+    return "服务端拒绝了此转换，当前账号仍保持登录。";
+  }
+  const action = target === "system" ? "设为系统" : "转为个人";
+  if (error instanceof ApiError && error.status !== null && error.status >= 400 && error.status < 500) {
+    return `服务端未接受“${action}”操作（HTTP ${error.status}）；不会自动重试，请刷新列表后再决定。`;
+  }
+  return `“${action}”操作未完成；不会自动重试，请刷新列表核对。`;
+}
+
 function sameValue(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right);
 }
@@ -185,6 +218,7 @@ function draftHasChanges(draft: SettingsDraft | null): boolean {
 export function CreatorSettingsPage({
   service,
   userId,
+  isSuperuser = false,
   onUnauthorized,
   onBack,
   onDirtyChange,
@@ -210,10 +244,13 @@ export function CreatorSettingsPage({
   const controllers = useRef(new Set<AbortController>());
   const catalogGeneration = useRef<Record<SettingsTab, number>>({ models: 0, prompts: 0 });
   const loadingGeneration = useRef(0);
+  const conversionGeneration = useRef(0);
   const pendingLock = useRef(false);
   const tabButtons = useRef<Record<SettingsTab, HTMLButtonElement | null>>({ models: null, prompts: null });
-  const propsRef = useRef({ service, userId, onUnauthorized, onDirtyChange });
-  propsRef.current = { service, userId, onUnauthorized, onDirtyChange };
+  const propsRef = useRef({ service, userId, isSuperuser, onUnauthorized, onDirtyChange });
+  const modelCategoryRef = useRef(modelCategory);
+  propsRef.current = { service, userId, isSuperuser, onUnauthorized, onDirtyChange };
+  modelCategoryRef.current = modelCategory;
 
   useLayoutEffect(() => {
     requestGeneration.current += 1;
@@ -236,6 +273,7 @@ export function CreatorSettingsPage({
     setNotice(null);
     setDraft(null);
     setModelDraftGeneration((generation) => generation + 1);
+    conversionGeneration.current += 1;
     setOrderDraft(null);
     setOrderConflict(false);
     setDeleteTarget(null);
@@ -252,7 +290,7 @@ export function CreatorSettingsPage({
       controllers.current.clear();
       propsRef.current.onDirtyChange?.(false);
     };
-  }, [service, userId]);
+  }, [isSuperuser, service, userId]);
 
   const currentModels = useMemo(
     () => models.filter((item) => item.category === modelCategory),
@@ -737,6 +775,22 @@ export function CreatorSettingsPage({
   async function verifyState(target: Verification, request: RequestHandle): Promise<boolean> {
     const currentService = propsRef.current.service;
     if (currentService === undefined) return false;
+    if (target.kind === "model-conversion") {
+      if (target.actorId !== userId || target.service !== currentService || target.category !== modelCategory) return false;
+      const rows = await currentService.listModels(target.category, request.signal);
+      if (!request.isCurrent()) return false;
+      storeList("models", rows, target.category);
+      const sourceStillExists = rows.some((item) => item.id === target.sourceId);
+      if (target.newId === null) return false;
+      const replacement = rows.find((item) => item.id === target.newId);
+      const shouldBeSystem = target.target === "system";
+      const expectedOwner = shouldBeSystem ? "system" : target.actorId;
+      return !sourceStillExists
+        && replacement !== undefined
+        && replacement.category === target.category
+        && replacement.is_system === shouldBeSystem
+        && replacement.user_id === expectedOwner;
+    }
     if (target.kind === "create-unknown") {
       const rows = await getList(target.tab, request.signal);
       if (!request.isCurrent()) return false;
@@ -801,6 +855,10 @@ export function CreatorSettingsPage({
           ? "分类顺序已回读确认，第一项现在是此分类默认项。"
           : target.kind === "delete"
             ? "删除结果已回读确认。"
+            : target.kind === "model-conversion"
+              ? target.target === "system"
+                ? "个人模型已按新 ID 转为系统模型，原记录已移除并回读确认。"
+                : "系统模型已按新 ID 转为当前个人模型，原记录已移除并回读确认。"
             : target.kind === "entity" && target.secretChanged
               ? "模型非密钥配置已回读确认；密钥变更请求已返回成功，未读取或显示密钥值。"
               : "配置已回读确认。 ");
@@ -810,9 +868,13 @@ export function CreatorSettingsPage({
         return;
       }
       if (target.kind === "create-unknown") return;
-      setNotice(isUncertain
-        ? "只读回查尚未匹配目标状态；已保留核对信息，请刷新后人工判断。"
-        : "写入已返回成功，但回读结果不一致；请刷新核对，页面不会自动重复写入。");
+      setNotice(target.kind === "model-conversion"
+        ? target.newId === null
+          ? "已只读刷新模型目录，但无法从未知回执确认新 ID；转换仍可能已生效，不会自动重试。可继续刷新或停止本地核对。"
+          : "转换回执中的新模型或原记录状态尚未在目录中匹配；只会只读核对，不会自动重试。"
+        : isUncertain
+          ? "只读回查尚未匹配目标状态；已保留核对信息，请刷新后人工判断。"
+          : "写入已返回成功，但回读结果不一致；请刷新核对，页面不会自动重复写入。");
       setVerification({ ...target, uncertain: true });
     } catch (error) {
       if (!request.isCurrent()) return;
@@ -820,12 +882,99 @@ export function CreatorSettingsPage({
         propsRef.current.onUnauthorized();
         return;
       }
-      setNotice(target.kind === "entity" && target.mutationUnknown && target.secretChanged
-        ? "密钥变更结果无法通过只读信息确认；不会自动重试，请稍后再次只读核对或结束核对。"
-        : isUncertain
-          ? safeFailureMessage(error, "只读核对")
-          : "写入已返回成功，但刷新失败；保存结果待完成，请只读重试。 ");
+      setNotice(target.kind === "model-conversion"
+        ? "模型目录只读核对失败；转换状态仍未确认，不会自动重试。可稍后刷新或停止本地核对。"
+        : target.kind === "entity" && target.mutationUnknown && target.secretChanged
+          ? "密钥变更结果无法通过只读信息确认；不会自动重试，请稍后再次只读核对或结束核对。"
+          : isUncertain
+            ? safeFailureMessage(error, "只读核对")
+            : "写入已返回成功，但刷新失败；保存结果待完成，请只读重试。 ");
       if (target.kind !== "create-unknown") setVerification({ ...target, uncertain: true });
+    } finally {
+      request.finish();
+      if (request.isCurrent()) {
+        setPending(false);
+        pendingLock.current = false;
+      }
+    }
+  }
+
+  async function convertModel(item: CreatorModel, target: ModelConversionTarget): Promise<void> {
+    const actorId = userId;
+    const category = modelCategory;
+    const sourceId = item.id;
+    const currentService = propsRef.current.service;
+    const convert = target === "system"
+      ? currentService?.promoteModelToSystem
+      : currentService?.demoteModelToPersonal;
+    const eligibleSource = target === "system"
+      ? canManageModel(item, actorId)
+      : item.is_system === true;
+    if (!isSuperuser || currentService === undefined || convert === undefined || !eligibleSource
+      || item.category !== category || pendingLock.current || verification !== null) return;
+    if (!confirmDiscard()) return;
+
+    const modelName = item.name.trim() || "未命名模型";
+    const title = target === "system" ? `将“${modelName}”设为系统模型？` : `将“${modelName}”转为个人模型？`;
+    const description = target === "system"
+      ? "此操作会删除原个人模型，并创建一个新 ID 的系统模型；所有用户都能看到它，原排序引用会移除。"
+      : "此操作会从系统目录删除原模型，并创建一个新 ID 的当前管理员个人模型；其他用户将不再看到它，原排序引用会移除。";
+    if (!window.confirm(`${title}\n\n${description}\n\n确定继续吗？`)) return;
+
+    discardDrafts();
+    invalidateCatalog("models");
+    const request = beginRequest();
+    const attempt = ++conversionGeneration.current;
+    const isCurrent = () => request.isCurrent()
+      && conversionGeneration.current === attempt
+      && propsRef.current.userId === actorId
+      && propsRef.current.service === currentService
+      && modelCategoryRef.current === category
+      && propsRef.current.isSuperuser === true;
+    setPending(true);
+    pendingLock.current = true;
+    setNotice(null);
+
+    const check: Verification = {
+      kind: "model-conversion",
+      tab: "models",
+      actorId,
+      category,
+      sourceId,
+      newId: null,
+      target,
+      service: currentService,
+      uncertain: true,
+    };
+    try {
+      const rawReceipt = await convert.call(currentService, sourceId, request.signal);
+      if (!isCurrent()) return;
+      const receipt = parseCreatorModel(rawReceipt);
+      const expectedSystem = target === "system";
+      const expectedOwner = expectedSystem ? "system" : actorId;
+      if (receipt.id === sourceId || receipt.category !== category
+        || receipt.is_system !== expectedSystem || receipt.user_id !== expectedOwner) {
+        throw new Error("model conversion receipt did not match the requested identity");
+      }
+      const confirmedTarget: Verification = { ...check, newId: receipt.id, uncertain: false };
+      setVerification(confirmedTarget);
+      setNotice("转换请求已返回，正在只读核对原记录和新记录…");
+      request.finish();
+      await runVerification(confirmedTarget, true);
+    } catch (error) {
+      if (!isCurrent()) return;
+      if (isCurrentUnauthorized(error)) {
+        propsRef.current.onUnauthorized();
+        return;
+      }
+      if (isDefinitiveModelConversionFailure(error)) {
+        setNotice(modelConversionFailureMessage(error, target));
+        return;
+      }
+      setVerification(check);
+      setNotice("转换结果未知；不会自动重试，正在只读刷新模型目录。核对无法确认新 ID 时，可停止本地核对后再操作。");
+      request.finish();
+      await runVerification(check, true);
     } finally {
       request.finish();
       if (request.isCurrent()) {
@@ -1142,21 +1291,32 @@ export function CreatorSettingsPage({
 
       {verification !== null && (
         <div className="creator-settings-verification" role="status">
-          <span>有一项操作需要只读核对。</span>
+          <span>{verification.kind === "model-conversion"
+            ? "模型转换仍需只读核对；系统不会自动重复转换。"
+            : "有一项操作需要只读核对。"}</span>
           <button disabled={pending || !canUseService} onClick={() => void runVerification()} type="button">
             {pending ? "正在核对…" : "刷新核实"}
           </button>
           <button
             disabled={pending}
             onClick={() => {
-              if (!window.confirm("结束本次核对后不会自动重试写入；创建结果未知时会放弃当前草稿。继续吗？")) return;
+              const isModelConversion = verification.kind === "model-conversion";
+              const confirmation = isModelConversion
+                ? "这只会停止本地核对，不会撤销服务端转换；模型可能已经转换成功。请在刷新列表后再决定下一步。继续吗？"
+                : "结束本次核对后不会自动重试写入；创建结果未知时会放弃当前草稿。继续吗？";
+              if (!window.confirm(confirmation)) return;
               if (verification.kind === "create-unknown") closeDraft();
               setVerification(null);
-              setNotice("已结束本次核对；如需继续，请先检查当前列表状态。");
+              setNotice(isModelConversion
+                ? "已停止本地核对；服务端转换可能已生效，请先刷新列表并确认状态。"
+                : "已结束本次核对；如需继续，请先检查当前列表状态。");
             }}
             type="button"
-          >结束核对</button>
+          >{verification.kind === "model-conversion" ? "停止本地核对" : "结束核对"}</button>
           {verification.kind === "create-unknown" && <small>同名项目无法单独证明是哪次创建，请核对列表记录。</small>}
+          {verification.kind === "model-conversion" && (
+            <small>转换会删除原 ID 并创建新 ID；无可信回执时不会按名称或供应商猜测新记录。</small>
+          )}
         </div>
       )}
 
@@ -1196,6 +1356,20 @@ export function CreatorSettingsPage({
                 <button disabled={pending || verification !== null || !canManageModel(item, userId)} onClick={() => void startEdit(item)} type="button">编辑</button>
                 <button disabled={pending || verification !== null || !canUseService} onClick={() => startCopy(item)} type="button">复制</button>
                 <button disabled={pending || verification !== null || !canManageModel(item, userId)} onClick={() => setDeleteTarget({ tab: "models", id: item.id, name: item.name })} type="button">删除</button>
+                {isSuperuser && canManageModel(item, userId) && (
+                  <button
+                    disabled={pending || verification !== null || service?.promoteModelToSystem === undefined}
+                    onClick={() => void convertModel(item, "system")}
+                    type="button"
+                  >设为系统</button>
+                )}
+                {isSuperuser && item.is_system && (
+                  <button
+                    disabled={pending || verification !== null || service?.demoteModelToPersonal === undefined}
+                    onClick={() => void convertModel(item, "personal")}
+                    type="button"
+                  >转为个人</button>
+                )}
               </div>
               {deleteTarget?.tab === "models" && deleteTarget.id === item.id && (
                 <div className="creator-settings-inline-confirm" role="group" aria-label={`确认删除${item.name}`}>

@@ -2124,6 +2124,8 @@ type ApiEndpoint =
   | "myTeams"
   | "creatorModels"
   | "creatorModel"
+  | "promoteCreatorModelToSystem"
+  | "demoteCreatorModelToPersonal"
   | "testCreatorModelConnection"
   | "createCreatorModel"
   | "updateCreatorModel"
@@ -2309,6 +2311,11 @@ function apiRequestDefinition(
       path: "/models" + (endpoint === "reorderCreatorModels" ? "/reorder" : query),
       method: endpoint === "creatorModels" ? "GET" : "POST",
     };
+  }
+  if (endpoint === "promoteCreatorModelToSystem" || endpoint === "demoteCreatorModelToPersonal") {
+    const modelId = encodeApiPathId(identifiers?.modelId, "模型");
+    const action = endpoint === "promoteCreatorModelToSystem" ? "promote-to-system" : "demote-to-personal";
+    return { path: `/models/${modelId}/${action}`, method: "POST" };
   }
   if (endpoint === "creatorModel" || endpoint === "updateCreatorModel" || endpoint === "deleteCreatorModel") {
     const modelId = encodeApiPathId(identifiers?.modelId, "模型");
@@ -2797,6 +2804,20 @@ export function createApiServices(
       const token = requireApiToken(storage);
       const payload = await requestForCurrentApiSession(
         "updateCreatorModel", token, signal, update, { modelId: id },
+      );
+      return parseCreatorSettingsResponse(() => parseCreatorModel(payload));
+    },
+    async promoteModelToSystem(id, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "promoteCreatorModelToSystem", token, signal, undefined, { modelId: id },
+      );
+      return parseCreatorSettingsResponse(() => parseCreatorModel(payload));
+    },
+    async demoteModelToPersonal(id, signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "demoteCreatorModelToPersonal", token, signal, undefined, { modelId: id },
       );
       return parseCreatorSettingsResponse(() => parseCreatorModel(payload));
     },

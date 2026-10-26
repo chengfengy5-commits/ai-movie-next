@@ -880,8 +880,9 @@ function Dashboard() {
           )}
           {selectedView === "creator-settings" && (
             <CreatorSettingsPage
-              key={state.user.id + ":" + dashboardScopeEpoch.current}
+              key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
               {...(creatorSettingsService === undefined ? {} : { service: creatorSettingsService })}
+              isSuperuser={state.user.is_superuser}
               userId={state.user.id}
               onUnauthorized={logoutFromWorkspace}
               onBack={() => {
