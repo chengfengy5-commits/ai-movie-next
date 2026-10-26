@@ -37,6 +37,7 @@ class ServerConfiguration:
     image_single_credentials_file: Path | None = field(default=None, repr=False)
     image_batch_enabled: bool = False
     image_batch_credentials_file: Path | None = field(default=None, repr=False)
+    text_chat_enabled: bool = False
 
     def __post_init__(self) -> None:
         if type(self.user_task_max_concurrency) is not int:
@@ -45,6 +46,8 @@ class ServerConfiguration:
             raise ServerConfigurationError("IMAGE_SINGLE_ENABLED must be explicit")
         if type(self.image_batch_enabled) is not bool:
             raise ServerConfigurationError("IMAGE_BATCH_ENABLED must be explicit")
+        if type(self.text_chat_enabled) is not bool:
+            raise ServerConfigurationError("TEXT_CHAT_ENABLED must be explicit")
         if self.image_single_credentials_file is not None and (
             not isinstance(self.image_single_credentials_file, Path)
             or not self.image_single_credentials_file.is_absolute()
@@ -155,6 +158,11 @@ def load_server_configuration(
         "IMAGE_BATCH_ENABLED",
         default=False,
     )
+    text_chat_enabled = _boolean(
+        values,
+        "TEXT_CHAT_ENABLED",
+        default=False,
+    )
     image_batch_credentials_file = _optional_absolute_path(
         values,
         "IMAGE_BATCH_CREDENTIALS_FILE",
@@ -202,6 +210,7 @@ def load_server_configuration(
             image_single_credentials_file=image_single_credentials_file,
             image_batch_enabled=image_batch_enabled,
             image_batch_credentials_file=image_batch_credentials_file,
+            text_chat_enabled=text_chat_enabled,
         )
 
     missing = tuple(
@@ -256,6 +265,7 @@ def load_server_configuration(
         image_single_credentials_file=image_single_credentials_file,
         image_batch_enabled=image_batch_enabled,
         image_batch_credentials_file=image_batch_credentials_file,
+        text_chat_enabled=text_chat_enabled,
     )
 
 

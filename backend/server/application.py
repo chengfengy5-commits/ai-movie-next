@@ -16,6 +16,7 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from haoai_backend.authentication import AuthenticationRuntime
+from haoai_backend.chat_text_generation import ChatTextGenerationConfiguration
 from haoai_backend.media_storage.owned_media_runtime import OwnedMediaRuntime
 from haoai_backend.media_storage.r2_sdk_factory import Boto3S3ClientFactory
 from haoai_backend.media_storage.transfer_types import SecretValue
@@ -34,7 +35,11 @@ from haoai_backend.storyboard_asset_generation.openai_runtime import (
 from haoai_backend.generation_runtime.worker_capacity import WorkerCapacityBootstrap
 
 from .configuration import ServerConfiguration, ServerConfigurationError
-from .generation import build_frame_optimize_configuration
+from .generation import (
+    _database_clock,
+    _uuid_id,
+    build_frame_optimize_configuration,
+)
 
 
 class ServerHostAssemblyError(RuntimeError):
@@ -226,6 +231,19 @@ def create_server_host(
                 s3_client_factory=upload_factory,
             )
 
+        chat_text_generation_configuration = None
+        if configuration.text_chat_enabled:
+            from haoai_backend.chat_text_generation.openai_runtime import (
+                OpenAICompatibleChatTextRuntime,
+            )
+
+            chat_text_generation_configuration = ChatTextGenerationConfiguration(
+                runtime=OpenAICompatibleChatTextRuntime(),
+                max_user_concurrency=configuration.user_task_max_concurrency,
+                server_id_factory=_uuid_id,
+                clock=_database_clock(session_factory),
+            )
+
         worker_capacity_bootstrap = None
         worker_capacity_enabled = bool(
             (
@@ -287,6 +305,7 @@ def create_server_host(
                 if image_generation_configuration is not None
                 else None
             ),
+            chat_text_generation_configuration=chat_text_generation_configuration,
             generation_worker_configuration=(
                 image_generation_configuration.generation_worker_configuration
                 if image_generation_configuration is not None
@@ -312,6 +331,9 @@ def create_server_host(
             image_generation_configuration.image_batch_worker_configuration
             if image_generation_configuration is not None
             else None
+        )
+        app.state.server_chat_text_generation_configuration = (
+            chat_text_generation_configuration
         )
         _compose_host_lifespan(app, resources)
         return ServerHost(
