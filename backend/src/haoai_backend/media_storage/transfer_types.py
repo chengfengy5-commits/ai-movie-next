@@ -42,7 +42,7 @@ _CANONICAL_EXTENSIONS = {
 }
 _SAFE_EXTENSIONS = frozenset({
     ".aac", ".avif", ".avi", ".bmp", ".flac", ".gif", ".jpg", ".m4a",
-    ".m4v", ".mkv", ".mov", ".mp3", ".mpg", ".oga", ".ogg", ".opus",
+    ".m4v", ".mkv", ".mov", ".mp3", ".mp4", ".mpg", ".oga", ".ogg", ".opus",
     ".png", ".tif", ".wav", ".webm", ".webp",
 })
 

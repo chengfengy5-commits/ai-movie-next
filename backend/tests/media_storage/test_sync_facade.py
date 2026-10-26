@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import hashlib
 import socket
 import tempfile
 import threading
@@ -49,13 +50,15 @@ def _runtime(
     access_key=None,
     secret_key=None,
     s3_client_factory=None,
+    media_policy: SafeMediaPolicy | None = None,
 ) -> OwnedMediaRuntime:
     return OwnedMediaRuntime(
         OwnedMediaDependencies(
             transfer_tmp_dir=directory,
             getaddrinfo=getaddrinfo,
             http_library=http_library,
-            media_policy=SafeMediaPolicy((MediaTypeRule("image/png", ".png"),)),
+            media_policy=media_policy
+            or SafeMediaPolicy((MediaTypeRule("image/png", ".png"),)),
             r2_configuration=r2_configuration,
             access_key=access_key,
             secret_key=secret_key,
@@ -213,11 +216,13 @@ class SyncFacadeTests(unittest.TestCase):
                 self.worker_thread: int | None = None
                 self.body: bytes | None = None
                 self.key: str | None = None
+                self.content_type: str | None = None
 
             def put_object(self, **kwargs):
                 self.worker_thread = threading.get_ident()
                 self.body = kwargs["Body"].read()
                 self.key = kwargs["Key"]
+                self.content_type = kwargs["ContentType"]
                 return WriteReceipt(self.key, 200, "actual-dummy-request-id")
 
             def close(self) -> None:
@@ -254,6 +259,12 @@ class SyncFacadeTests(unittest.TestCase):
                 access_key=_Secret("dummy-access"),
                 secret_key=_Secret("dummy-secret"),
                 s3_client_factory=factory,
+                media_policy=SafeMediaPolicy(
+                    (
+                        MediaTypeRule("image/png", ".png"),
+                        MediaTypeRule("video/mp4", ".mp4"),
+                    )
+                ),
             )
             store = SynchronousMediaStore(
                 runtime,
@@ -281,6 +292,30 @@ class SyncFacadeTests(unittest.TestCase):
                 self.assertNotEqual(client.worker_thread, caller_thread)
                 self.assertEqual(factory.settings.region, "auto")
                 self.assertEqual(factory.settings.total_max_attempts, 3)
+
+                video_bytes = b"store-this-mp4"
+                video = store.store_bytes_or_provider_content(
+                    ReferenceInput(
+                        kind="bytes",
+                        content=video_bytes,
+                        media_type="video/mp4",
+                    ),
+                    {"max_bytes": 128},
+                )
+                self.assertIsInstance(video, StoredMedia)
+                self.assertEqual(client.body, video_bytes)
+                self.assertEqual(client.content_type, "video/mp4")
+                self.assertTrue(client.key.endswith(".mp4"))
+                self.assertEqual(
+                    video.locator,
+                    f"https://media.example.test/{client.key}",
+                )
+                self.assertEqual(video.media_type, "video/mp4")
+                self.assertEqual(video.size_bytes, len(video_bytes))
+                self.assertEqual(
+                    video.content_digest,
+                    hashlib.sha256(video_bytes).hexdigest(),
+                )
             finally:
                 runtime.close()
 
