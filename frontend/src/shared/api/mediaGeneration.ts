@@ -1,8 +1,8 @@
-export type MediaGenerationOperation = "video.single" | "image.batch";
+export type MediaGenerationOperation = "image.single" | "video.single" | "image.batch";
 
 export type MediaGenerationAssetType = "character" | "scene" | "prop" | "storyboard";
 
-export type MediaGenerationVideoTarget =
+export type MediaGenerationSingleTarget =
   | { readonly kind: "standalone" }
   | {
       readonly kind: "frame_message";
@@ -15,6 +15,17 @@ export type MediaGenerationVideoTarget =
       readonly asset_type: MediaGenerationAssetType;
       readonly asset_id: string;
     };
+
+export type MediaGenerationVideoTarget = MediaGenerationSingleTarget;
+
+export interface MediaGenerationImageInput {
+  readonly modelId: string;
+  readonly prompt: string;
+  readonly target: MediaGenerationSingleTarget;
+  readonly size?: string;
+  readonly referenceImages: readonly string[];
+  readonly idempotencyKey: string;
+}
 
 export interface MediaGenerationVideoInput {
   readonly modelId: string;
@@ -72,6 +83,16 @@ export interface VideoGenerationReceipt {
   readonly billingStatus: MediaGenerationBillingStatus;
 }
 
+export interface ImageGenerationReceipt {
+  readonly operation: "image.single";
+  readonly submissionId: string;
+  readonly taskId: string;
+  readonly messageId: string | null;
+  readonly status: MediaGenerationTaskStatus;
+  readonly quotedAmount: number;
+  readonly billingStatus: MediaGenerationBillingStatus;
+}
+
 export interface BatchImageTaskReceipt {
   readonly type: MediaGenerationAssetType;
   readonly assetId: string;
@@ -85,7 +106,7 @@ export interface BatchImageGenerationReceipt {
   readonly tasks: readonly BatchImageTaskReceipt[];
 }
 
-export type MediaGenerationReceipt = VideoGenerationReceipt | BatchImageGenerationReceipt;
+export type MediaGenerationReceipt = ImageGenerationReceipt | VideoGenerationReceipt | BatchImageGenerationReceipt;
 
 export interface MediaGenerationRunContext {
   readonly actorId: string;
@@ -100,6 +121,7 @@ export interface MediaGenerationLookupExpectation {
 
 export interface MediaGenerationRun {
   isCurrent(): boolean;
+  submitImage(input: MediaGenerationImageInput, signal: AbortSignal): Promise<ImageGenerationReceipt>;
   submitVideo(input: MediaGenerationVideoInput, signal: AbortSignal): Promise<VideoGenerationReceipt>;
   submitBatch(input: MediaGenerationBatchInput, signal: AbortSignal): Promise<BatchImageGenerationReceipt>;
   lookup(expectation: MediaGenerationLookupExpectation, signal: AbortSignal): Promise<MediaGenerationReceipt>;
