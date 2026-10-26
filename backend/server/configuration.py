@@ -38,6 +38,8 @@ class ServerConfiguration:
     image_batch_enabled: bool = False
     image_batch_credentials_file: Path | None = field(default=None, repr=False)
     text_chat_enabled: bool = False
+    video_single_enabled: bool = False
+    video_single_credentials_file: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.user_task_max_concurrency) is not int:
@@ -48,6 +50,8 @@ class ServerConfiguration:
             raise ServerConfigurationError("IMAGE_BATCH_ENABLED must be explicit")
         if type(self.text_chat_enabled) is not bool:
             raise ServerConfigurationError("TEXT_CHAT_ENABLED must be explicit")
+        if type(self.video_single_enabled) is not bool:
+            raise ServerConfigurationError("VIDEO_SINGLE_ENABLED must be explicit")
         if self.image_single_credentials_file is not None and (
             not isinstance(self.image_single_credentials_file, Path)
             or not self.image_single_credentials_file.is_absolute()
@@ -88,14 +92,42 @@ class ServerConfiguration:
                 raise ServerConfigurationError(
                     "image.batch requires complete object storage"
                 )
-        if (
-            self.image_single_enabled
-            and self.image_batch_enabled
-            and self.image_single_credentials_file
-            != self.image_batch_credentials_file
+        if self.video_single_credentials_file is not None and (
+            not isinstance(self.video_single_credentials_file, Path)
+            or not self.video_single_credentials_file.is_absolute()
         ):
             raise ServerConfigurationError(
-                "image.single and image.batch must use the same credentials file"
+                "VIDEO_SINGLE_CREDENTIALS_FILE must be an absolute path"
+            )
+        if self.video_single_enabled:
+            if self.video_single_credentials_file is None:
+                raise ServerConfigurationError(
+                    "VIDEO_SINGLE_CREDENTIALS_FILE is required when video.single is enabled"
+                )
+            if (
+                self.r2_configuration is None
+                or self.r2_access_key is None
+                or self.r2_secret_key is None
+            ):
+                raise ServerConfigurationError(
+                    "video.single requires complete object storage"
+                )
+
+        enabled_media_credentials = tuple(
+            credentials_file
+            for enabled, credentials_file in (
+                (self.image_single_enabled, self.image_single_credentials_file),
+                (self.image_batch_enabled, self.image_batch_credentials_file),
+                (self.video_single_enabled, self.video_single_credentials_file),
+            )
+            if enabled
+        )
+        if enabled_media_credentials and any(
+            credentials_file != enabled_media_credentials[0]
+            for credentials_file in enabled_media_credentials[1:]
+        ):
+            raise ServerConfigurationError(
+                "enabled media workers must use the same credentials file"
             )
 
     @property
@@ -171,13 +203,34 @@ def load_server_configuration(
         raise ServerConfigurationError(
             "IMAGE_BATCH_CREDENTIALS_FILE is required when image.batch is enabled"
         )
-    if (
-        image_single_enabled
-        and image_batch_enabled
-        and image_single_credentials_file != image_batch_credentials_file
+    video_single_enabled = _boolean(
+        values,
+        "VIDEO_SINGLE_ENABLED",
+        default=False,
+    )
+    video_single_credentials_file = _optional_absolute_path(
+        values,
+        "VIDEO_SINGLE_CREDENTIALS_FILE",
+    )
+    if video_single_enabled and video_single_credentials_file is None:
+        raise ServerConfigurationError(
+            "VIDEO_SINGLE_CREDENTIALS_FILE is required when video.single is enabled"
+        )
+    enabled_media_credentials = tuple(
+        credentials_file
+        for enabled, credentials_file in (
+            (image_single_enabled, image_single_credentials_file),
+            (image_batch_enabled, image_batch_credentials_file),
+            (video_single_enabled, video_single_credentials_file),
+        )
+        if enabled
+    )
+    if enabled_media_credentials and any(
+        credentials_file != enabled_media_credentials[0]
+        for credentials_file in enabled_media_credentials[1:]
     ):
         raise ServerConfigurationError(
-            "image.single and image.batch must use the same credentials file"
+            "enabled media workers must use the same credentials file"
         )
 
     configured = tuple(key for key in _R2_KEYS if key in values)
@@ -191,6 +244,10 @@ def load_server_configuration(
         if image_batch_enabled:
             raise ServerConfigurationError(
                 "image.batch requires complete object storage"
+            )
+        if video_single_enabled:
+            raise ServerConfigurationError(
+                "video.single requires complete object storage"
             )
         if allow_r2_dev:
             raise ServerConfigurationError(
@@ -211,6 +268,8 @@ def load_server_configuration(
             image_batch_enabled=image_batch_enabled,
             image_batch_credentials_file=image_batch_credentials_file,
             text_chat_enabled=text_chat_enabled,
+            video_single_enabled=video_single_enabled,
+            video_single_credentials_file=video_single_credentials_file,
         )
 
     missing = tuple(
@@ -266,6 +325,8 @@ def load_server_configuration(
         image_batch_enabled=image_batch_enabled,
         image_batch_credentials_file=image_batch_credentials_file,
         text_chat_enabled=text_chat_enabled,
+        video_single_enabled=video_single_enabled,
+        video_single_credentials_file=video_single_credentials_file,
     )
 
 
