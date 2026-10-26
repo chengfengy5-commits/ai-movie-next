@@ -2,8 +2,11 @@ import { act, cleanup, render, screen, waitFor, within } from "@testing-library/
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { ApiError } from "../../shared/api/errors";
+import { createApiServices } from "../../shared/api/services";
+import { API_TOKEN_KEY, type StorageLike } from "../../shared/api/storage";
 import type {
   CreatorModel,
+  CreatorModelConnectionTestResult,
   CreatorModelCreateInput,
   CreatorModelUpdateInput,
   CreatorPrompt,
@@ -15,6 +18,14 @@ import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { CreatorSettingsPage } from "./CreatorSettingsPage";
 
 afterEach(cleanup);
+
+class MemoryStorage implements StorageLike {
+  private readonly values = new Map<string, string>();
+
+  getItem(key: string): string | null { return this.values.get(key) ?? null; }
+  setItem(key: string, value: string): void { this.values.set(key, value); }
+  removeItem(key: string): void { this.values.delete(key); }
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -719,6 +730,134 @@ describe("creator settings", () => {
         Object.defineProperty(window, "innerWidth", widthDescriptor);
       }
     }
+  });
+
+  it("tests the explicitly entered model key without saving and sanitizes success and failure messages", async () => {
+    const user = userEvent.setup();
+    const { service } = makeService();
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "connection-test-session");
+    const requests: Array<{ url: string; method: string; authorization: string | null; body: unknown }> = [];
+    const connectionResults: CreatorModelConnectionTestResult[] = [
+      {
+        success: true,
+        message: "连接成功，回显 explicit-test-key",
+        status_code: 200,
+      },
+      {
+        success: false,
+        message: "连接失败，拒绝 explicit-test-key",
+        status_code: 401,
+      },
+    ];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      const rawBody = typeof init?.body === "string" ? init.body : "";
+      requests.push({
+        url: url.toString(),
+        method: init?.method ?? "",
+        authorization: new Headers(init?.headers).get("Authorization"),
+        body: rawBody === "" ? null : JSON.parse(rawBody) as unknown,
+      });
+      const result = connectionResults.shift();
+      if (result === undefined) throw new Error("unexpected connection test request");
+      return new Response(JSON.stringify(result), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }) as typeof fetch;
+    const apiServices = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const apiCreatorSettings = apiServices.creatorSettings;
+    const apiTestModelConnection = apiCreatorSettings?.testModelConnection;
+    if (apiTestModelConnection === undefined) {
+      throw new Error("API creator settings connection test port is unavailable");
+    }
+    service.testModelConnection = apiTestModelConnection;
+    const { onUnauthorized } = renderPage(service);
+
+    const modelCard = (await screen.findByText("我的文本模型")).closest("article");
+    expect(modelCard).not.toBeNull();
+    await user.click(within(modelCard!).getByRole("button", { name: "编辑" }));
+    expect(await screen.findByLabelText("API 密钥")).toHaveValue("");
+    expect(screen.getByRole("button", { name: "测试连接" })).toBeDisabled();
+    expect(screen.getByText(/编辑已保存模型时，请重新输入密钥后再测试/)).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "放弃草稿" }));
+
+    await user.click(screen.getByRole("button", { name: "新建模型" }));
+    await user.type(screen.getByLabelText("名称"), "连接测试草稿");
+    await user.type(screen.getByLabelText("供应商"), "openai");
+    await user.type(screen.getByLabelText("模型标识"), "model-a");
+    await user.type(screen.getByLabelText("服务地址"), "https://models.example.test/v1");
+    await user.type(screen.getByLabelText("API 密钥"), "explicit-test-key");
+
+    const testButton = screen.getByRole("button", { name: "测试连接" });
+    await user.click(testButton);
+    expect(await screen.findByRole("status")).toHaveTextContent("连接成功，回显 [密钥已隐藏]");
+    expect(requests).toHaveLength(1);
+    expect(requests[0]).toEqual({
+      url: "http://127.0.0.1:4175/api/models/test-connection",
+      method: "POST",
+      authorization: "Bearer connection-test-session",
+      body: {
+        provider: "openai",
+        api_key: "explicit-test-key",
+        base_url: "https://models.example.test/v1",
+        model: "model-a",
+        category: "text",
+      },
+    });
+    expect(service.createModel).not.toHaveBeenCalled();
+    expect(service.updateModel).not.toHaveBeenCalled();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(document.body).not.toHaveTextContent("explicit-test-key");
+
+    await user.click(testButton);
+    expect(await screen.findByRole("alert")).toHaveTextContent("连接失败，拒绝 [密钥已隐藏]");
+    expect(requests).toHaveLength(2);
+    expect(requests[1]?.body).toEqual(requests[0]?.body);
+    expect(service.createModel).not.toHaveBeenCalled();
+    expect(service.updateModel).not.toHaveBeenCalled();
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(document.body).not.toHaveTextContent("explicit-test-key");
+  });
+
+  it("ignores late connection-test results after draft changes and never retries automatically", async () => {
+    const user = userEvent.setup();
+    const { service } = makeService();
+    const lateResult = deferred<CreatorModelConnectionTestResult>();
+    const rejectedResult = deferred<CreatorModelConnectionTestResult>();
+    service.testModelConnection = vi.fn()
+      .mockImplementationOnce(() => lateResult.promise)
+      .mockImplementationOnce(() => rejectedResult.promise);
+    const { onUnauthorized } = renderPage(service);
+
+    await user.click(await screen.findByRole("button", { name: "新建模型" }));
+    await user.type(screen.getByLabelText("名称"), "迟到回执草稿");
+    await user.type(screen.getByLabelText("供应商"), "openai");
+    await user.type(screen.getByLabelText("模型标识"), "model-before-edit");
+    await user.type(screen.getByLabelText("API 密钥"), "late-test-key");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(service.testModelConnection).toHaveBeenCalledTimes(1);
+
+    await user.clear(screen.getByLabelText("模型标识"));
+    await user.type(screen.getByLabelText("模型标识"), "model-after-edit");
+    await act(async () => {
+      lateResult.resolve({ success: false, message: "迟到错误中包含 late-test-key" });
+    });
+    expect(screen.queryByText(/迟到错误/)).not.toBeInTheDocument();
+    expect(service.testModelConnection).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(service.testModelConnection).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      rejectedResult.reject(new Error("provider echoed late-test-key"));
+    });
+    expect(await screen.findByRole("alert")).toHaveTextContent("provider echoed [密钥已隐藏]");
+    expect(document.body).not.toHaveTextContent("late-test-key");
+    expect(service.testModelConnection).toHaveBeenCalledTimes(2);
+    expect(service.createModel).not.toHaveBeenCalled();
+    expect(service.updateModel).not.toHaveBeenCalled();
+    expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
   it("drops api_key values from model response projections", () => {

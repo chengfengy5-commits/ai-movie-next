@@ -320,6 +320,34 @@
   grid-column: 1 / -1;
 }
 
+.creator-settings-connection-test {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+}
+
+.creator-settings-connection-test p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.creator-settings-connection-success,
+.creator-settings-connection-error {
+  padding: 9px 11px;
+  border-radius: 8px;
+}
+
+.creator-settings-connection-success {
+  background: #edf8f0;
+  color: #23633a;
+}
+
+.creator-settings-connection-error {
+  background: #fff1ef;
+  color: #8a3025;
+}
+
 .creator-settings-editor-actions {
   justify-content: flex-start;
   padding-top: 4px;
