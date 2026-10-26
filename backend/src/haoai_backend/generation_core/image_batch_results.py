@@ -17,16 +17,31 @@ from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Session
 
 from haoai_backend.chat_data.tables import chat_messages
-from haoai_backend.generation_contracts.records import GenerationResultReceipt
+from haoai_backend.generation_contracts.records import ApplicationRecord, GenerationResultReceipt
 from haoai_backend.generation_contracts.types import (
+    ApplicationOutcome,
     ClaimAuthority,
     CommittedIntent,
     FrozenExecutionSnapshot,
+    GenerationActor,
     OwnerTaskScope,
     StoredMedia,
+    TargetSnapshot,
 )
 from haoai_backend.generation_credentials.batch_execution_snapshot import (
     VerifiedImageBatchExecutionInput,
+)
+from haoai_backend.generation_core.admission_receipts import (
+    AdmissionConfirmed,
+    verify_original_replay,
+)
+from haoai_backend.shared.identity import TrustedActor
+from haoai_backend.task_observation import (
+    application_ref_for,
+    find_application_record,
+    load_owned_completed_result,
+    target_matches_receipt,
+    target_scope_for_snapshot,
 )
 
 from .base_schema import (
@@ -41,7 +56,7 @@ from .base_schema import (
     UserRow,
 )
 from .persistence import GenerationRecordRepository
-from .schema import GenerationResultReceiptRow
+from .schema import ApplicationRecordRow, GenerationResultReceiptRow
 
 _TASK_TYPE = "batch-image"
 _OPERATION = "image.batch"
@@ -223,7 +238,179 @@ class SqlAlchemyImageBatchResults:
             evidence_id=evidence_id,
             now=now,
         )
-        return self._write_terminal(claim, intent, verified, expected)
+        result = self._write_terminal(claim, intent, verified, expected)
+        if isinstance(result, GenerationResultReceipt):
+            try:
+                self.apply_completed(
+                    claim.scope,
+                    result.result_ref,
+                    stop_signal=claim.local_lost_signal,
+                )
+            except Exception:
+                # The generated result is already durable and remains successful.
+                pass
+        return result
+
+    def apply_completed(
+        self,
+        scope: OwnerTaskScope,
+        result_ref: str,
+        *,
+        stop_signal: Event | None = None,
+    ) -> ApplicationOutcome:
+        """Apply an original completed result locally without changing T1."""
+        if (
+            type(scope) is not OwnerTaskScope
+            or scope.operation != _OPERATION
+            or not _nonempty_string(result_ref)
+            or _is_stopping(stop_signal)
+        ):
+            return ApplicationOutcome("write_failed", result_ref, None, None, "batch result application is unavailable")
+
+        target_scope: str | None = None
+        try:
+            with self._session_factory() as session:
+                with session.begin():
+                    if _is_stopping(stop_signal):
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "batch result application was stopped")
+                    graph = _lock_batch_graph(session, scope)
+                    if (
+                        graph is None
+                        or not _batch_identity_matches(graph, scope)
+                        or graph.task.get("status") != "completed"
+                        or graph.task.get("user_cancelled_at") is not None
+                        or graph.unit.get("user_cancelled_at") is not None
+                        or graph.unit.get("billing_status") not in {"charged", "no_charge"}
+                        or graph.unit.get("refunded_amount") != 0
+                        or not _has_timely_linked_success(session, graph, scope)
+                    ):
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "original successful batch result is not eligible for application")
+
+                    target = _batch_target_snapshot(graph.request_data.get("target_snapshot"))
+                    if target is None:
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "original batch target is unavailable")
+                    target_scope = target_scope_for_snapshot(target)
+                    receipt = GenerationRecordRepository(session).find_result_receipt(
+                        scope.user_id, scope.task_id, result_ref
+                    )
+                    if (
+                        receipt is None
+                        or receipt.operation != _OPERATION
+                        or receipt.unit_id != graph.unit.get("id")
+                        or receipt.step_id != graph.step.get("id")
+                        or receipt.submission_id != graph.submission.get("id")
+                    ):
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "original result receipt binding is invalid")
+
+                    actor = GenerationActor(scope.user_id, TrustedActor(scope.user_id))
+                    loaded = load_owned_completed_result(session, actor, scope.task_id, result_ref)
+                    if (
+                        isinstance(loaded, str)
+                        or loaded != receipt
+                        or not target_matches_receipt(session, receipt, target)
+                    ):
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "original result target could not be verified")
+
+                    original = verify_original_replay(
+                        session,
+                        owner_id=scope.user_id,
+                        operation=_OPERATION,
+                        raw_key=str(graph.parent.get("idempotency_key") or ""),
+                        request_digest=str(graph.parent.get("request_digest") or ""),
+                    )
+                    if (
+                        not isinstance(original, AdmissionConfirmed)
+                        or original.operation != _OPERATION
+                        or original.submission_id != graph.parent.get("id")
+                        or tuple(task.task_id for task in original.receipt.tasks)
+                        != graph.ordered_task_ids
+                    ):
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "original batch admission or billing proof could not be verified")
+
+                    existing = _read_batch_application(
+                        session, receipt, target_scope
+                    )
+                    if existing is not None:
+                        return existing
+                    evidence = session.execute(
+                        select(ResultEvidenceRow.__table__)
+                        .where(
+                            ResultEvidenceRow.__table__.c.id == receipt.evidence_id,
+                            ResultEvidenceRow.__table__.c.step_id == receipt.step_id,
+                            ResultEvidenceRow.__table__.c.submission_id == receipt.submission_id,
+                        )
+                        .with_for_update()
+                    ).mappings().one_or_none()
+                    if (
+                        evidence is None
+                        or evidence.get("validity") != "valid"
+                        or evidence.get("application_status") != "pending"
+                        or evidence.get("result_digest") != receipt.content_digest
+                        or evidence.get("result_location") != receipt.recoverable_locator
+                    ):
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "original result evidence is not pending application")
+                    if _is_stopping(stop_signal):
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "batch result application was stopped")
+                    application_time = self._read_clock()
+                    if application_time is None:
+                        return ApplicationOutcome("write_failed", result_ref, None, None, "batch result application clock is unavailable")
+
+                    from haoai_backend.asset_data import stage_batch_asset_image_if_empty
+
+                    outcome = stage_batch_asset_image_if_empty(
+                        session, actor, receipt, target
+                    )
+                    if outcome.kind not in {"applied", "target_conflict", "target_deleted"}:
+                        return outcome
+                    application_status = (
+                        "applied" if outcome.kind == "applied" else "rejected"
+                    )
+                    applied_at = (
+                        _database_datetime(application_time)
+                        if application_status == "applied"
+                        else None
+                    )
+                    changed = session.execute(
+                        update(ResultEvidenceRow.__table__)
+                        .where(
+                            ResultEvidenceRow.__table__.c.id == receipt.evidence_id,
+                            ResultEvidenceRow.__table__.c.step_id == receipt.step_id,
+                            ResultEvidenceRow.__table__.c.submission_id == receipt.submission_id,
+                            ResultEvidenceRow.__table__.c.validity == "valid",
+                            ResultEvidenceRow.__table__.c.application_status == "pending",
+                            ResultEvidenceRow.__table__.c.result_digest == receipt.content_digest,
+                            ResultEvidenceRow.__table__.c.result_location == receipt.recoverable_locator,
+                        )
+                        .values(
+                            application_status=application_status,
+                            applied_at=applied_at,
+                        )
+                    )
+                    if changed.rowcount != 1:
+                        raise RuntimeError("batch result evidence application compare-and-set lost")
+            return outcome
+        except Exception:
+            if target_scope is not None:
+                confirmed = self._confirm_batch_application(
+                    scope, result_ref, target_scope
+                )
+                if confirmed is not None:
+                    return confirmed
+            return ApplicationOutcome("write_failed", result_ref, None, None, "batch result application remains pending")
+
+    def _confirm_batch_application(
+        self, scope: OwnerTaskScope, result_ref: str, target_scope: str
+    ) -> ApplicationOutcome | None:
+        try:
+            with self._session_factory() as session:
+                receipt = GenerationRecordRepository(session).find_result_receipt(
+                    scope.user_id, scope.task_id, result_ref
+                )
+                if receipt is None or receipt.operation != _OPERATION:
+                    return None
+                return _read_batch_application(session, receipt, target_scope)
+        except Exception:
+            return None
 
     def fail(
         self,
@@ -2050,6 +2237,152 @@ def _has_timely_linked_success(
         )
     ).scalar_one_or_none()
     return message == locator
+
+
+def _batch_target_snapshot(value: object) -> TargetSnapshot | None:
+    fields = {
+        "kind",
+        "chapter_id",
+        "series_id",
+        "stable_storyboard_asset_id",
+        "asset_type",
+        "asset_id",
+        "compat_frame_index",
+        "expected_text_digest",
+        "media_identity",
+        "content_digest",
+        "notes_revision",
+        "full_frame_digest",
+        "full_chapter_digest",
+        "expected_asset_image_url",
+        "same_series_target_digest",
+    }
+    if not isinstance(value, Mapping) or set(value) != fields:
+        return None
+    if (
+        value.get("kind") != "asset_message"
+        or any(
+            not _nonempty_string(value.get(name))
+            for name in ("chapter_id", "series_id", "asset_type", "asset_id")
+        )
+        or value.get("asset_type") not in {"character", "scene", "prop", "storyboard"}
+    ):
+        return None
+    optional_strings = fields - {
+        "kind",
+        "chapter_id",
+        "series_id",
+        "asset_type",
+        "asset_id",
+        "compat_frame_index",
+        "notes_revision",
+    }
+    if any(
+        item is not None and not isinstance(item, str)
+        for key in optional_strings
+        if (item := value.get(key)) is not None
+    ):
+        return None
+    if value.get("compat_frame_index") is not None or value.get("notes_revision") is not None:
+        return None
+    try:
+        return TargetSnapshot(**dict(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _read_batch_application(
+    session: Session,
+    receipt: GenerationResultReceipt,
+    target_scope: str,
+) -> ApplicationOutcome | None:
+    probe = session.execute(
+        select(ApplicationRecordRow)
+        .where(
+            ApplicationRecordRow.result_ref == receipt.result_ref,
+            ApplicationRecordRow.target_scope == target_scope,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+    if probe is None:
+        return None
+    record = find_application_record(
+        session,
+        receipt.owner_id,
+        receipt.task_id,
+        receipt.result_ref,
+        target_scope,
+    )
+    if record is None or not _batch_application_record_matches(
+        record, receipt, target_scope
+    ):
+        return ApplicationOutcome(
+            "write_failed", receipt.result_ref, None, None,
+            "existing batch application receipt could not be verified",
+        )
+    evidence = session.execute(
+        select(
+            ResultEvidenceRow.__table__.c.application_status,
+            ResultEvidenceRow.__table__.c.applied_at,
+        ).where(
+            ResultEvidenceRow.__table__.c.id == receipt.evidence_id,
+            ResultEvidenceRow.__table__.c.step_id == receipt.step_id,
+            ResultEvidenceRow.__table__.c.submission_id == receipt.submission_id,
+            ResultEvidenceRow.__table__.c.validity == "valid",
+        )
+    ).mappings().one_or_none()
+    expected_status = "applied" if record.delivery_status == "applied" else "rejected"
+    if (
+        evidence is None
+        or evidence.get("application_status") != expected_status
+        or (expected_status == "applied") != (evidence.get("applied_at") is not None)
+    ):
+        return ApplicationOutcome(
+            "write_failed", receipt.result_ref, None, None,
+            "existing batch application evidence could not be verified",
+        )
+    if record.delivery_status == "applied":
+        return ApplicationOutcome(
+            "already_applied", receipt.result_ref, record.application_ref,
+            record.after_target_digest,
+        )
+    return ApplicationOutcome(
+        record.delivery_status, receipt.result_ref, record.application_ref,
+        record.after_target_digest,
+    )
+
+
+def _batch_application_record_matches(
+    record: ApplicationRecord,
+    receipt: GenerationResultReceipt,
+    target_scope: str,
+) -> bool:
+    if not all(
+        (
+            record.application_ref == application_ref_for(receipt.result_ref, target_scope),
+            record.result_ref == receipt.result_ref,
+            record.owner_id == receipt.owner_id,
+            record.task_id == receipt.task_id,
+            record.unit_id == receipt.unit_id,
+            record.target_scope == target_scope,
+            record.result_digest == receipt.content_digest,
+            record.committed_at is not None,
+        )
+    ):
+        return False
+    if record.delivery_status == "applied":
+        return _is_digest(record.before_target_digest) and _is_digest(
+            record.after_target_digest
+        )
+    if record.delivery_status in {"target_conflict", "target_deleted"}:
+        return (
+            record.before_target_digest == record.after_target_digest
+            and (
+                record.before_target_digest is None
+                or _is_digest(record.before_target_digest)
+            )
+        )
+    return False
 
 
 def _confirm_due_finances(
