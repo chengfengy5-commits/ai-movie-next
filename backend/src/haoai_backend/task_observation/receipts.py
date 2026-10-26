@@ -6,12 +6,25 @@ from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
+from haoai_backend.generation_contracts.types import (
+    BatchImageReceipt,
+    BatchImageTaskReceipt,
+)
+
 from .errors import (
     TaskObservationBadRequest,
     TaskObservationIntegrityError,
     TaskObservationNotFound,
+    TaskObservationUnavailable,
 )
 from .ports import TaskObservationReader, TaskReceiptReader, TaskRow
+
+_BATCH_WIRE_TYPE_BY_ASSET_TYPE = {
+    "character": "character",
+    "scene": "scene",
+    "prop": "prop",
+    "storyboard": "storyboard",
+}
 
 
 def _value(row: Mapping[str, Any] | object, key: str, default: Any = None) -> Any:
@@ -56,7 +69,12 @@ def build_task_receipt(
 
 
 def _validate_submission_key(operation: str, raw_key: str | None) -> str:
-    if operation not in {"image.single", "video.single", "storyboard.two_pass"}:
+    if operation not in {
+        "image.single",
+        "image.batch",
+        "video.single",
+        "storyboard.two_pass",
+    }:
         raise TaskObservationBadRequest("不支持的任务操作")
     if raw_key is None or not raw_key.strip() or len(raw_key) > 255:
         raise TaskObservationBadRequest("Idempotency-Key 必须为 1 到 255 个非空白字符")
@@ -70,8 +88,17 @@ def build_submission_receipt(
     observation_reader: TaskObservationReader,
     receipt_reader: TaskReceiptReader,
 ) -> dict[str, Any]:
-    """Read one accepted submission, requiring exactly one owned task and unit."""
+    """Read an accepted submission from its original persisted task graph."""
     idempotency_key = _validate_submission_key(operation, raw_key)
+    if operation == "image.batch":
+        batch_reader = getattr(receipt_reader, "load_original_batch_receipt", None)
+        if not callable(batch_reader):
+            raise TaskObservationUnavailable("批量提交回执服务尚未接线")
+        batch_receipt = batch_reader(actor_id, idempotency_key)
+        if batch_receipt is None:
+            raise TaskObservationNotFound("未找到该幂等键对应的任务提交")
+        return _batch_submission_receipt_to_wire(batch_receipt)
+
     submission = receipt_reader.find_submission(actor_id, operation, idempotency_key)
     if submission is None:
         raise TaskObservationNotFound("未找到该幂等键对应的任务提交")
@@ -100,3 +127,38 @@ def build_submission_receipt(
         "quoted_amount": _value(unit, "quoted_amount"),
         "billing_status": _value(unit, "billing_status"),
     }
+
+
+def _batch_submission_receipt_to_wire(receipt: BatchImageReceipt) -> dict[str, Any]:
+    if type(receipt) is not BatchImageReceipt or type(receipt.tasks) is not tuple:
+        raise TaskObservationIntegrityError("批量提交回执结构无法核实")
+    if not 1 <= len(receipt.tasks) <= 64:
+        raise TaskObservationIntegrityError("批量提交任务集合无效")
+
+    tasks: list[dict[str, str]] = []
+    for task in receipt.tasks:
+        if type(task) is not BatchImageTaskReceipt:
+            raise TaskObservationIntegrityError("批量提交任务记录无效")
+        wire_type = _BATCH_WIRE_TYPE_BY_ASSET_TYPE.get(task.task_type)
+        if wire_type is None or any(
+            not isinstance(value, str) or not value
+            for value in (
+                task.asset_id,
+                task.asset_name,
+                task.message_id,
+                task.task_id,
+            )
+        ):
+            raise TaskObservationIntegrityError("批量提交任务字段无法核实")
+        tasks.append(
+            {
+                "type": wire_type,
+                "asset_id": task.asset_id,
+                "asset_name": task.asset_name,
+                "message_id": task.message_id,
+                "task_id": task.task_id,
+            }
+        )
+    if len({task["task_id"] for task in tasks}) != len(tasks):
+        raise TaskObservationIntegrityError("批量提交任务顺序无效")
+    return {"tasks": tasks}

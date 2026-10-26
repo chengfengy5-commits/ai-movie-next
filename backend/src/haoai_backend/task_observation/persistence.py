@@ -9,7 +9,15 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.engine import RowMapping
 from sqlalchemy.orm import Session
 
+from haoai_backend.generation_contracts.types import BatchImageReceipt
+from haoai_backend.generation_core.admission_receipts import (
+    AdmissionConfirmed,
+    verify_original_replay,
+)
+from haoai_backend.generation_core.base_schema import TaskSubmissionRow
+
 from .domain import TeamMembershipRecord
+from .errors import TaskObservationIntegrityError
 from .payload import has_frame_optimize_registration_hint
 from .ports import TaskObservationUnitOfWork, UnitOfWorkFactory
 from .tables import (
@@ -222,6 +230,62 @@ class SqlAlchemyTaskObservationUnitOfWork(TaskObservationUnitOfWork):
             select(billing_units).where(billing_units.c.task_id == task_id)
         )
         return _row_mapping(result.mappings().one_or_none())
+
+    def load_original_batch_receipt(
+        self, actor_id: str, raw_key: str
+    ) -> BatchImageReceipt | None:
+        table = TaskSubmissionRow.__table__
+        with self._session.no_autoflush:
+            submission = self._session.execute(
+                select(
+                    table.c.id,
+                    table.c.user_id,
+                    table.c.operation,
+                    table.c.idempotency_key,
+                    table.c.request_digest,
+                    table.c.task_ids,
+                    table.c.status,
+                ).where(
+                    table.c.user_id == actor_id,
+                    table.c.operation == "image.batch",
+                    table.c.idempotency_key == raw_key,
+                )
+            ).mappings().one_or_none()
+            if submission is None:
+                return None
+            if (
+                submission["user_id"] != actor_id
+                or submission["operation"] != "image.batch"
+                or submission["idempotency_key"] != raw_key
+                or submission["status"] != "accepted"
+            ):
+                raise TaskObservationIntegrityError("原始批量提交记录无法核实")
+
+            result = verify_original_replay(
+                self._session,
+                owner_id=actor_id,
+                operation="image.batch",
+                raw_key=raw_key,
+                request_digest=submission["request_digest"],
+            )
+
+        if (
+            not isinstance(result, AdmissionConfirmed)
+            or result.source != "original_replay"
+            or result.operation != "image.batch"
+            or type(result.receipt) is not BatchImageReceipt
+        ):
+            raise TaskObservationIntegrityError("批量提交任务图无法完整核实")
+        task_ids = submission["task_ids"]
+        if (
+            not isinstance(task_ids, list)
+            or not 1 <= len(task_ids) <= 64
+            or any(not isinstance(task_id, str) or not task_id for task_id in task_ids)
+            or len(set(task_ids)) != len(task_ids)
+            or tuple(task.task_id for task in result.receipt.tasks) != tuple(task_ids)
+        ):
+            raise TaskObservationIntegrityError("原始批量提交任务顺序无法核实")
+        return result.receipt
 
     def load_sql_superuser(self, actor_id: str) -> bool:
         result = self._session.execute(
