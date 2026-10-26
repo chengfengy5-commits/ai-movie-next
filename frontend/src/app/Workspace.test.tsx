@@ -15,6 +15,7 @@ import {
 } from "../shared/api/storage";
 import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, User } from "../shared/api/contracts";
 import { ApiError } from "../shared/api/errors";
+import { MediaGenerationError, type MediaGenerationPort, type MediaGenerationRun } from "../shared/api/mediaGeneration";
 import { parsePersonalProductionSnapshot } from "../shared/api/personalProductionNotes";
 import { digestPersonalProductionMediaIdentity } from "../features/chapters/personal-production/mediaIdentity";
 import type { PersonalRoughCutSnapshot } from "../shared/api/personalRoughCut";
@@ -797,6 +798,95 @@ describe("read-only workspace", () => {
     assetNavigationProbe.consumedEpochs.length = 0;
     assetNavigationProbe.abandonedEpochs.length = 0;
     assetNavigationProbe.sourcePanelCloseCallback = null;
+  });
+
+  it("opens the user-facing AI generation page from the main workspace navigation", async () => {
+    const user = userEvent.setup();
+    const services = createDemoServices(window.localStorage);
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    renderWorkspace(services);
+
+    await screen.findByRole("region", { name: "我的剧集" });
+    await user.click(within(screen.getByRole("navigation", { name: "主要导航" }))
+      .getByRole("button", { name: "AI 生成" }));
+
+    expect(await screen.findByRole("heading", { name: "AI 生成" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "普通视频" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "批量素材生图" })).toBeInTheDocument();
+    expect(screen.getByText("当前服务没有接入媒体生成提交接口，页面不会模拟生成结果。")).toBeInTheDocument();
+  });
+
+  it("retains an unknown media generation submission across navigation and rechecks with the same key", async () => {
+    const user = userEvent.setup();
+    const videoModel: CreatorModel = {
+      id: "media-nav-video-model",
+      category: "video",
+      name: "导航测试视频模型",
+      provider: "fixture",
+      model: "video-fixture",
+      base_url: null,
+      params: null,
+      sort_order: 0,
+      is_system: false,
+      user_id: "media-nav-user",
+    };
+    const creatorSettings = {
+      ...emptyCreatorSettingsService(),
+      listModels: vi.fn(async (category: string) => category === "video" ? [videoModel] : []),
+    };
+    let rejectSubmission: ((reason: unknown) => void) | null = null;
+    let isContextCurrent = () => false;
+    const submitVideo = vi.fn<MediaGenerationRun["submitVideo"]>(() => new Promise((_resolve, reject) => {
+      rejectSubmission = reject;
+    }));
+    const lookup = vi.fn<MediaGenerationRun["lookup"]>(() => new Promise(() => {}));
+    const run: MediaGenerationRun = {
+      isCurrent: () => isContextCurrent(),
+      submitVideo,
+      submitBatch: vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
+      lookup,
+    };
+    const mediaGeneration: MediaGenerationPort = {
+      beginRun: vi.fn((context) => {
+        isContextCurrent = context.isContextCurrent;
+        return run;
+      }),
+    };
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings,
+      mediaGeneration,
+    };
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    renderWorkspace(services);
+
+    await screen.findByRole("heading", { name: "我的剧集" });
+    await user.click(within(screen.getByRole("navigation", { name: "主要导航" }))
+      .getByRole("button", { name: "AI 生成" }));
+    await user.selectOptions(await screen.findByLabelText("视频模型"), videoModel.id);
+    await user.type(screen.getByLabelText("视频提示词"), "雨巷跟拍镜头");
+    await user.click(screen.getByRole("button", { name: "提交视频任务" }));
+    expect(submitVideo).toHaveBeenCalledTimes(1);
+    const originalInput = submitVideo.mock.calls[0]![0];
+
+    await user.click(within(screen.getByRole("navigation", { name: "主要导航" }))
+      .getByRole("button", { name: "我的任务" }));
+    await screen.findByRole("heading", { name: "我的任务" });
+    if (rejectSubmission === null) throw new Error("The video POST has not started.");
+    await act(async () => {
+      rejectSubmission?.(new MediaGenerationError("unknown-outcome", "连接中断，提交结果待确认。"));
+      await Promise.resolve();
+    });
+
+    await user.click(within(screen.getByRole("navigation", { name: "主要导航" }))
+      .getByRole("button", { name: "AI 生成" }));
+    expect(await screen.findByText(/提交状态尚未确认/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "重新核对提交" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "重新核对提交" }));
+    expect(lookup).toHaveBeenCalledTimes(2);
+    expect(lookup.mock.calls.map(([expectation]) => expectation.idempotencyKey))
+      .toEqual([originalInput.idempotencyKey, originalInput.idempotencyKey]);
+    expect(submitVideo).toHaveBeenCalledTimes(1);
   });
 
   it("routes from the mobile topbar and guards navigation and logout while a draft is dirty", async () => {
