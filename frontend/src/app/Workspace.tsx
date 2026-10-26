@@ -14,6 +14,7 @@ import { SeriesPage } from "../features/series/SeriesPage";
 import { MyTasksPage } from "../features/tasks/MyTasksPage";
 import { CreatorSettingsPage } from "../features/creator-settings/CreatorSettingsPage";
 import { MediaGenerationPage } from "../features/media-generation/MediaGenerationPage";
+import { ChatAssistantPage, type ChatAssistantSourceIntent } from "../features/chat/ChatAssistantPage";
 import { AccountPage } from "../features/account/AccountPage";
 import { TeamsPage } from "../features/teams/TeamsPage";
 import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
@@ -36,6 +37,9 @@ function restoreErrorMessage(error: ApiError): string {
   return error.detail ?? "暂时无法验证当前登录状态。";
 }
 
+type WorkspaceView = "series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings"
+  | "media-generation" | "chat-assistant" | "account";
+
 function Dashboard() {
   const { services, state, logout, refreshCurrentUser, sessionGeneration } = useAuth();
   const collaborationActorId = state.status === "authenticated" ? state.user.id : null;
@@ -56,8 +60,10 @@ function Dashboard() {
     seriesShareGuardScopeRevisionRef.current += 1;
   }
   const [selectedSeries, setSelectedSeries] = useState<Series | null>(null);
-  const [selectedView, setSelectedView] = useState<"series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "media-generation" | "account">("series");
+  const [selectedView, setSelectedView] = useState<WorkspaceView>("series");
   const [mediaGenerationVisited, setMediaGenerationVisited] = useState(false);
+  const [chatAssistantVisited, setChatAssistantVisited] = useState(false);
+  const [chatAssistantSeries, setChatAssistantSeries] = useState<Series | null>(null);
   const [teamDirectoryRevision, setTeamDirectoryRevision] = useState(0);
   const [seriesRevision, setSeriesRevision] = useState(0);
   const [teamGuardVersion, setTeamGuardVersion] = useState(0);
@@ -82,7 +88,7 @@ function Dashboard() {
     userId: string;
     services: typeof services;
     selectedSeries: Series | null;
-    selectedView: "series" | "chapters" | "assets" | "tasks" | "teams" | "creator-settings" | "media-generation" | "account";
+    selectedView: WorkspaceView;
     scopeEpoch: number;
   } | null>(null);
 
@@ -149,6 +155,8 @@ function Dashboard() {
     setSelectedSeries(null);
     setSelectedView("series");
     setMediaGenerationVisited(false);
+    setChatAssistantVisited(false);
+    setChatAssistantSeries(null);
   }
 
   const renderNavigationContext = {
@@ -279,6 +287,16 @@ function Dashboard() {
     setSelectedSeries(null);
     setMediaGenerationVisited(true);
     setSelectedView("media-generation");
+  }
+
+  function navigateToChatAssistant() {
+    if (selectedView === "chat-assistant" || selectedSeries === null || selectedSeries.can_enter !== true
+      || !confirmLeaveCurrentView()) return;
+    clearChapterNavigationIntent();
+    clearAssetNavigationIntent();
+    setChatAssistantSeries(selectedSeries);
+    setChatAssistantVisited(true);
+    setSelectedView("chat-assistant");
   }
 
   function navigateToAccount() {
@@ -422,6 +440,56 @@ function Dashboard() {
     setSelectedView("chapters");
   }
 
+  function acceptChatAssistantSource(target: ChatAssistantSourceIntent) {
+    const current = currentNavigationContext.current;
+    if (
+      !dashboardMounted.current
+      || current === null
+      || current !== renderNavigationContext
+      || current.userId !== renderNavigationContext.userId
+      || current.services !== renderNavigationContext.services
+      || current.selectedSeries !== renderNavigationContext.selectedSeries
+      || current.selectedView !== "chat-assistant"
+      || current.selectedView !== renderNavigationContext.selectedView
+      || current.scopeEpoch !== renderNavigationContext.scopeEpoch
+      || dashboardScope.current.userId !== current.userId
+      || dashboardScope.current.services !== current.services
+      || dashboardScopeEpoch.current !== current.scopeEpoch
+      || current.selectedSeries === null
+      || current.selectedSeries.can_enter !== true
+      || target.seriesId !== current.selectedSeries.id
+      || !target.isCurrent()
+    ) return;
+
+    clearChapterNavigationIntent();
+    clearAssetNavigationIntent();
+    if (target.kind === "chapter") {
+      const intent: ChapterNavigationIntent = {
+        userId: current.userId,
+        services: current.services,
+        seriesId: current.selectedSeries.id,
+        chapterId: target.chapterId,
+        navigationEpoch: ++navigationEpoch.current,
+      };
+      navigationIntentRef.current = intent;
+      setChapterNavigationIntent(intent);
+      setSelectedView("chapters");
+      return;
+    }
+
+    const intent: AssetNavigationIntent = {
+      userId: current.userId,
+      services: current.services,
+      seriesId: current.selectedSeries.id,
+      category: target.category,
+      assetId: target.assetId,
+      navigationEpoch: ++navigationEpoch.current,
+    };
+    assetNavigationIntentRef.current = intent;
+    setAssetNavigationIntent(intent);
+    setSelectedView("assets");
+  }
+
   const creatorSettingsService = (services as typeof services & {
     creatorSettings?: CreatorSettingsServicePort;
   }).creatorSettings;
@@ -479,6 +547,18 @@ function Dashboard() {
             <span className="nav-icon" aria-hidden="true">✦</span>
             <span>AI 生成</span>
           </button>
+          {selectedSeries !== null && (
+            <button
+              aria-current={selectedView === "chat-assistant" ? "page" : undefined}
+              className={selectedView === "chat-assistant" ? "nav-item active" : "nav-item"}
+              disabled={selectedSeries.can_enter !== true}
+              onClick={navigateToChatAssistant}
+              type="button"
+            >
+              <span className="nav-icon" aria-hidden="true">✎</span>
+              <span>AI 助手</span>
+            </button>
+          )}
           <button
             aria-current={selectedView === "creator-settings" ? "page" : undefined}
             className={selectedView === "creator-settings" ? "nav-item active" : "nav-item"}
@@ -538,6 +618,8 @@ function Dashboard() {
               ? "创作者设置"
               : selectedView === "media-generation"
                 ? "AI 生成"
+              : selectedView === "chat-assistant"
+                ? "AI 助手"
               : selectedView === "account"
                 ? "我的账户"
                 : selectedView === "tasks"
@@ -568,6 +650,10 @@ function Dashboard() {
               <button className="mobile-task-entry" onClick={navigateToMediaGeneration} type="button">
                 AI 生成
               </button>
+            )}
+            {selectedSeries !== null && selectedView !== "chat-assistant" && (
+              <button className="mobile-task-entry" disabled={selectedSeries.can_enter !== true}
+                onClick={navigateToChatAssistant} type="button">AI 助手</button>
             )}
             {selectedView !== "teams" && (
               <button className="mobile-task-entry teams-mobile-entry" onClick={navigateToTeams} type="button">
@@ -701,6 +787,24 @@ function Dashboard() {
               />
             </div>
           )}
+          {chatAssistantVisited && chatAssistantSeries !== null && (
+            <div
+              hidden={selectedView !== "chat-assistant"}
+              inert={selectedView !== "chat-assistant"}
+              aria-hidden={selectedView !== "chat-assistant"}
+            >
+              <ChatAssistantPage
+                key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}:${chatAssistantSeries.id}`}
+                services={services}
+                series={chatAssistantSeries}
+                userId={state.user.id}
+                sessionGeneration={sessionGeneration}
+                onUnauthorized={logoutFromWorkspace}
+                onBack={() => setSelectedView("chapters")}
+                onNavigateSource={acceptChatAssistantSource}
+              />
+            </div>
+          )}
           {selectedView === "teams" && (
             <TeamsPage
               key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
@@ -764,6 +868,8 @@ function Dashboard() {
               ? "个人模型与提示词"
               : selectedView === "media-generation"
                 ? "视频与批量图片任务"
+              : selectedView === "chat-assistant"
+                ? "剧集文字会话"
               : selectedView === "account"
                 ? "本人资料、登录设备与密码"
               : selectedView === "tasks"
