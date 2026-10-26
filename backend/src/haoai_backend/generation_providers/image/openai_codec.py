@@ -7,6 +7,7 @@ network, media validation, persistence, or execution-policy decisions.
 from __future__ import annotations
 
 import json
+import secrets
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Literal
@@ -16,6 +17,19 @@ _DEFAULT_BASE_URL = "https://api.openai.com/v1"
 _DEFAULT_MODEL = "dall-e-3"
 _DEFAULT_SIZE = "1024x1024"
 _GENERATION_PATH = "/images/generations"
+_EDIT_PATH = "/images/edits"
+_MAX_REFERENCE_IMAGES = 8
+_MAX_REFERENCE_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_MULTIPART_REQUEST_BYTES = (
+    _MAX_REFERENCE_IMAGES * _MAX_REFERENCE_IMAGE_BYTES + 256 * 1024
+)
+_IMAGE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+    "image/bmp": ".bmp",
+}
 _OPENAI_SIZE_MAP = {
     "1:1": "1024x1024",
     "16:9": "1792x1024",
@@ -35,6 +49,23 @@ class OpenAIImageGenerationRequest:
     url: str
     body_json: bytes
     content_type: Literal["application/json"] = "application/json"
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIImageEditReference:
+    """One validated image part ready for the multipart edit request."""
+
+    content: bytes
+    media_type: str
+
+
+@dataclass(frozen=True, slots=True)
+class OpenAIImageEditRequest:
+    """Immutable raw HTTP request components for reference image editing."""
+
+    url: str
+    body: bytes
+    content_type: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -101,6 +132,95 @@ def build_openai_text_to_image_request(
         url=base + _GENERATION_PATH,
         body_json=json.dumps(payload).encode("utf-8"),
     )
+
+
+def build_openai_image_edit_request(
+    *,
+    base_url: str | None,
+    model: str | None,
+    prompt: str,
+    size: str | None,
+    references: tuple[OpenAIImageEditReference, ...],
+) -> OpenAIImageEditRequest:
+    """Build one bounded legacy multipart image-edit request."""
+
+    if not 1 <= len(references) <= _MAX_REFERENCE_IMAGES:
+        raise ValueError("reference image count is outside the supported limit")
+    if not isinstance(prompt, str):
+        raise ValueError("prompt must be text")
+
+    total_reference_bytes = 0
+    for reference in references:
+        if (
+            type(reference) is not OpenAIImageEditReference
+            or type(reference.content) is not bytes
+            or not 1 <= len(reference.content) <= _MAX_REFERENCE_IMAGE_BYTES
+            or reference.media_type not in _IMAGE_EXTENSIONS
+        ):
+            raise ValueError("reference image is not prepared for multipart encoding")
+        total_reference_bytes += len(reference.content)
+    if total_reference_bytes > _MAX_REFERENCE_IMAGES * _MAX_REFERENCE_IMAGE_BYTES:
+        raise ValueError("reference image bytes exceed the supported limit")
+
+    base = base_url or _DEFAULT_BASE_URL
+    fields: list[tuple[str, str]] = [
+        ("model", model or _DEFAULT_MODEL),
+        ("prompt", prompt),
+        ("n", "1"),
+    ]
+    if size:
+        fields.append(("size", _OPENAI_SIZE_MAP.get(size, size)))
+
+    boundary = _new_boundary(fields, references)
+    segments: list[bytes] = []
+    for name, value in fields:
+        segments.extend(
+            (
+                f"--{boundary}\r\n".encode("ascii"),
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'.encode(
+                    "ascii"
+                ),
+                value.encode("utf-8"),
+                b"\r\n",
+            )
+        )
+    for index, reference in enumerate(references):
+        # The field name and filename are fixed server values, never request text.
+        segments.extend(
+            (
+                f"--{boundary}\r\n".encode("ascii"),
+                (
+                    'Content-Disposition: form-data; name="image"; '
+                    f'filename="ref_{index}.png"\r\n'
+                ).encode("ascii"),
+                f"Content-Type: {reference.media_type}\r\n\r\n".encode("ascii"),
+                reference.content,
+                b"\r\n",
+            )
+        )
+    segments.append(f"--{boundary}--\r\n".encode("ascii"))
+    if sum(map(len, segments)) > _MAX_MULTIPART_REQUEST_BYTES:
+        raise ValueError("multipart request exceeds the local transport limit")
+
+    return OpenAIImageEditRequest(
+        url=base + _EDIT_PATH,
+        body=b"".join(segments),
+        content_type=f"multipart/form-data; boundary={boundary}",
+    )
+
+
+def _new_boundary(
+    fields: list[tuple[str, str]],
+    references: tuple[OpenAIImageEditReference, ...],
+) -> str:
+    values = tuple(value.encode("utf-8") for _, value in fields) + tuple(
+        reference.content for reference in references
+    )
+    while True:
+        boundary = f"haoai-{secrets.token_hex(24)}"
+        marker = boundary.encode("ascii")
+        if all(marker not in value for value in values):
+            return boundary
 
 
 def parse_openai_image_response(

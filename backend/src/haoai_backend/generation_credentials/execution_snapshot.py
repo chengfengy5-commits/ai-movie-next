@@ -26,6 +26,7 @@ from haoai_backend.generation_contracts.types import (
     FrozenExecutionSnapshot,
     FrozenGrantSnapshot,
     ModelReference,
+    ReferenceInput,
     TargetSnapshot,
 )
 from haoai_backend.generation_core.graph_planning import (
@@ -175,6 +176,9 @@ _REQUEST_PROJECTION_KEYS = frozenset(
         "target_snapshot",
     }
 )
+_REFERENCE_KEYS = frozenset(
+    {"reference_images", "reference_audios", "reference_videos"}
+)
 _PAYLOAD_KEYS = frozenset(
     {
         "parent_attempt_id",
@@ -233,7 +237,7 @@ class VerifiedImageExecutionInput:
     snapshot: FrozenExecutionSnapshot = field(repr=False)
     credential_binding: CredentialBinding = field(repr=False)
     provider_credential: BoundCredential = field(repr=False)
-    references: tuple[object, ...] = field(default=(), repr=False)
+    references: tuple[ReferenceInput, ...] = field(default=(), repr=False)
 
 
 def read_original_image_single_execution_input(
@@ -301,7 +305,12 @@ def read_original_image_single_execution_input(
 
         item = payload["item"]
         snapshot = _decode_execution_snapshot(item.get("execution_snapshot"))
-        if snapshot is None or not _snapshot_matches_binding(snapshot, item, binding, row):
+        references = _reference_inputs_from_item(item)
+        if (
+            snapshot is None
+            or references is None
+            or not _snapshot_matches_binding(snapshot, item, binding, row)
+        ):
             return None
         plan = build_operation_graph_plan(
             binding.operation,
@@ -361,7 +370,7 @@ def read_original_image_single_execution_input(
             snapshot=snapshot,
             credential_binding=credential_binding,
             provider_credential=provider_credential,
-            references=(),
+            references=references,
         )
     except (GenerationError, KeyError, TypeError, ValueError, UnicodeError):
         return None
@@ -778,8 +787,7 @@ def _snapshot_matches_binding(
         or set(prompt) != _PROMPT_KEYS
         or set(credential) != _CREDENTIAL_KEYS
         or set(projection) != _REQUEST_PROJECTION_KEYS
-        or any(value not in ([], ()) for value in references.values())
-        or raw_item.get("reference_images") not in ([], None)
+        or _reference_inputs_from_item(item) is None
     ):
         return False
     scope = {
@@ -808,9 +816,6 @@ def _snapshot_matches_binding(
             projection.get("target_ref") == f"{binding.protected_ref}#target",
             projection.get("model_ref") == f"{binding.protected_ref}#model",
             projection.get("grant_ref") == f"{binding.protected_ref}#grant",
-            projection.get("reference_images_version") == 1,
-            projection.get("reference_images_count") == 0,
-            _is_digest(projection.get("reference_images_digest")),
             canonical_payload_json(projection.get("target_snapshot"))
             == canonical_payload_json(_target_snapshot_value(snapshot.target_snapshot)),
             model.get("source") == row["source"],
@@ -844,6 +849,63 @@ def _snapshot_matches_binding(
             version_provenance.get("rotation_proof_ref") is None
             or isinstance(version_provenance.get("rotation_proof_ref"), str),
         )
+    )
+
+
+def _reference_inputs_from_item(
+    item: Mapping[str, object],
+) -> tuple[ReferenceInput, ...] | None:
+    references = item.get("references")
+    raw_item = item.get("raw_item")
+    projection = item.get("request_data_projection")
+    if (
+        not isinstance(references, Mapping)
+        or set(references) != _REFERENCE_KEYS
+        or not isinstance(raw_item, Mapping)
+        or not isinstance(projection, Mapping)
+    ):
+        return None
+
+    images = references.get("reference_images")
+    audios = references.get("reference_audios")
+    videos = references.get("reference_videos")
+    raw_images = raw_item.get("reference_images")
+    if (
+        not isinstance(images, list)
+        or any(not isinstance(value, str) for value in images)
+        or not isinstance(audios, list)
+        or not isinstance(videos, list)
+        or audios
+        or videos
+        or not isinstance(raw_images, list)
+        or any(not isinstance(value, str) for value in raw_images)
+        or raw_images != images
+        or raw_item.get("reference_audios") not in (None, [])
+        or raw_item.get("reference_videos") not in (None, [])
+        or type(projection.get("reference_images_version")) is not int
+        or projection.get("reference_images_version") != 1
+        or type(projection.get("reference_images_count")) is not int
+        or projection.get("reference_images_count") != len(images)
+    ):
+        return None
+
+    try:
+        encoded_images = json.dumps(
+            images,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError):
+        return None
+    if projection.get("reference_images_digest") != hashlib.sha256(encoded_images).hexdigest():
+        return None
+
+    return tuple(
+        ReferenceInput(
+            kind="data_uri" if value.startswith("data:") else "public_http",
+            locator=value,
+        )
+        for value in images
     )
 
 

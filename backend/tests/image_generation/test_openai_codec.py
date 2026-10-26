@@ -7,13 +7,71 @@ import unittest
 
 from haoai_backend.generation_providers.image import (
     OpenAIImageCodecError,
+    OpenAIImageEditReference,
     OpenAIImageOutput,
+    build_openai_image_edit_request,
     build_openai_text_to_image_request,
     parse_openai_image_response,
 )
 
 
 class OpenAIImageRequestCodecTests(unittest.TestCase):
+    def test_reference_edit_is_bounded_ordered_multipart_without_quality(self) -> None:
+        first = b"\x89PNG\r\n\x1a\nfirst-image"
+        second = b"\xff\xd8\xffsecond-image"
+        request = build_openai_image_edit_request(
+            base_url="https://images.example/v1",
+            model="image-edit-model",
+            prompt="replace the sky",
+            size="16:9",
+            references=(
+                OpenAIImageEditReference(first, "image/png"),
+                OpenAIImageEditReference(second, "image/jpeg"),
+            ),
+        )
+
+        self.assertEqual(request.url, "https://images.example/v1/images/edits")
+        self.assertTrue(request.content_type.startswith("multipart/form-data; boundary="))
+        boundary = request.content_type.split("boundary=", 1)[1]
+        self.assertTrue(request.body.startswith(f"--{boundary}\r\n".encode("ascii")))
+        self.assertTrue(request.body.endswith(f"--{boundary}--\r\n".encode("ascii")))
+        self.assertEqual(request.body.count(b'name="image"; filename="ref_0.png"'), 1)
+        self.assertEqual(request.body.count(b'name="image"; filename="ref_1.png"'), 1)
+        self.assertEqual(request.body.count(b"Content-Type: image/png"), 1)
+        self.assertEqual(request.body.count(b"Content-Type: image/jpeg"), 1)
+        self.assertLess(request.body.index(first), request.body.index(second))
+        self.assertIn(b"1792x1024", request.body)
+        self.assertNotIn(b'name="quality"', request.body)
+
+    def test_reference_edit_omits_empty_size_and_rejects_unsafe_parts(self) -> None:
+        no_size = build_openai_image_edit_request(
+            base_url=None,
+            model="dall-e-3",
+            prompt="edit this",
+            size=None,
+            references=(
+                OpenAIImageEditReference(b"\x89PNG\r\n\x1a\nimage", "image/png"),
+            ),
+        )
+        self.assertNotIn(b'name="size"', no_size.body)
+
+        for references in (
+            (),
+            tuple(
+                OpenAIImageEditReference(b"x", "image/png") for _ in range(9)
+            ),
+            (OpenAIImageEditReference(b"x", "image/svg+xml"),),
+        ):
+            with self.subTest(references=len(references)):
+                with self.assertRaises(ValueError):
+                    build_openai_image_edit_request(
+                        base_url=None,
+                        model="dall-e-3",
+                        prompt="edit this",
+                        size=None,
+                        references=references,
+                    )
+
     def test_defaults_match_legacy_json_generation_shape(self) -> None:
         request = build_openai_text_to_image_request(
             base_url=None,

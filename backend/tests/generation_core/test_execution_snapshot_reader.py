@@ -9,10 +9,11 @@ from pathlib import Path
 
 import pytest
 import test_admission_staging as joint_fixtures
-from sqlalchemy import insert, select, update
+from sqlalchemy import event, insert, select, update
 from sqlalchemy.orm import Session
 
 from haoai_backend.generation_catalog.domain import ModelSource
+from haoai_backend.generation_contracts.types import ReferenceInput
 from haoai_backend.generation_credentials.domain import (
     CredentialCrypto,
     HmacProofAuthority,
@@ -26,6 +27,7 @@ from haoai_backend.generation_credentials.execution_snapshot import (
 )
 from haoai_backend.generation_credentials.persistence import prepared_payloads
 from haoai_backend.generation_credentials.snapshot_producer import (
+    canonical_payload_json,
     stored_payload_associated_data,
 )
 from haoai_backend.generation_core.admission_receipts import AdmissionStaged
@@ -420,6 +422,186 @@ def test_reader_reopens_only_the_original_durable_image_snapshot_and_binding(
         assert "joint-fixture-provider-secret" not in caplog.text
         assert "A quiet room" not in caplog.text
     finally:
+        caller.close()
+        engine.dispose()
+
+
+def test_reader_restores_only_exact_authenticated_ordered_reference_images(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = _authenticated_environment(monkeypatch, tmp_path)
+    engine = environment.engine
+    registry = environment.binding._producer._registry
+    crypto = environment.capabilities.crypto
+    proof_authority = environment.capabilities.proof_authority
+    assert crypto is not None and proof_authority is not None
+    caller = _joint_caller(engine)
+    raw_key = "authenticated-reference-images"
+    source_references = (
+        "data:image/png;base64,AA==",
+        "https://ref.example.test/first.png",
+        "data:image/jpeg;base64,AQ==",
+    )
+    dml_statements: list[str] = []
+
+    def record_dml(connection, cursor, statement, parameters, context, executemany):
+        verb = statement.lstrip().split(maxsplit=1)[0].upper()
+        if verb in {"DELETE", "INSERT", "REPLACE", "UPDATE"}:
+            dml_statements.append(verb)
+
+    try:
+        staged = _joint_prepare_and_stage(
+            environment.binding,
+            caller,
+            operation="image.single",
+            raw_key=raw_key,
+            request={
+                "model_id": "model-1",
+                "prompt": "A quiet room",
+                "target": {"kind": "standalone"},
+                "size": None,
+                "reference_images": list(source_references),
+            },
+        )
+        assert isinstance(staged, AdmissionStaged)
+        task_id = staged.ordered_tasks[0].task_id
+        caller.commit()
+
+        event.listen(engine, "before_cursor_execute", record_dml)
+        with Session(engine) as reader:
+            binding = _binding_from_committed_rows(
+                reader,
+                task_id=task_id,
+                raw_key=raw_key,
+            )
+            payload_row = dict(
+                reader.execute(
+                    select(prepared_payloads).where(
+                        prepared_payloads.c.prepared_payload_id
+                        == binding.prepared_payload_id
+                    )
+                ).mappings().one()
+            )
+            result = read_original_image_single_execution_input(
+                reader,
+                binding,
+                registry=registry,
+                crypto=crypto,
+                proof_authority=proof_authority,
+            )
+            assert type(result) is VerifiedImageExecutionInput
+            assert result.references == (
+                ReferenceInput(kind="data_uri", locator=source_references[0]),
+                ReferenceInput(kind="public_http", locator=source_references[1]),
+                ReferenceInput(kind="data_uri", locator=source_references[2]),
+            )
+
+            payload_row_material = SealedMaterial(
+                ciphertext=payload_row["ciphertext"],
+                nonce=payload_row["nonce"],
+                key_id=payload_row["encryption_key_id"],
+                algorithm_version=crypto.algorithm_version,
+            )
+            aad = stored_payload_associated_data(
+                payload_row,
+                parent_attempt_id=binding.submission_id,
+                protected_ref=binding.protected_ref,
+                item_index=0,
+                ordered_count=1,
+                ordered_manifest_digest=binding.ordered_manifest_digest,
+            )
+            plaintext = crypto.open_secret(payload_row_material, aad)
+            assert plaintext is not None
+            payload = json.loads(plaintext)
+            item = payload["item"]
+            projection = item["request_data_projection"]
+
+            for change in (
+                {"reference_images_version": 2},
+                {"reference_images_count": len(source_references) + 1},
+                {"reference_images_digest": "0" * 64},
+            ):
+                assert not _snapshot_matches_binding(
+                    result.snapshot,
+                    {
+                        **item,
+                        "request_data_projection": {**projection, **change},
+                    },
+                    binding,
+                    payload_row,
+                )
+
+            reordered = {
+                **item,
+                "references": {
+                    **item["references"],
+                    "reference_images": list(reversed(source_references)),
+                },
+            }
+            assert not _snapshot_matches_binding(
+                result.snapshot, reordered, binding, payload_row
+            )
+            assert not _snapshot_matches_binding(
+                result.snapshot,
+                {
+                    **item,
+                    "references": {
+                        **item["references"],
+                        "reference_videos": ["https://ref.example.test/video.mp4"],
+                    },
+                },
+                binding,
+                payload_row,
+            )
+            assert not _snapshot_matches_binding(
+                result.snapshot,
+                {
+                    **item,
+                    "references": {
+                        **item["references"],
+                        "unrecognized": [],
+                    },
+                },
+                binding,
+                payload_row,
+            )
+
+            # Recomputing the ordinary image digest does not create the producer's
+            # command HMAC for a reordered payload.
+            changed_payload = json.loads(plaintext)
+            changed_item = changed_payload["item"]
+            changed_images = list(reversed(source_references))
+            changed_item["references"]["reference_images"] = changed_images
+            changed_item["raw_item"]["reference_images"] = changed_images
+            changed_projection = changed_item["request_data_projection"]
+            changed_projection["reference_images_count"] = len(changed_images)
+            changed_projection["reference_images_digest"] = hashlib.sha256(
+                json.dumps(
+                    changed_images,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            changed_plaintext = canonical_payload_json(changed_payload).decode("utf-8")
+            original_unseal = crypto.unseal
+
+            def unseal_with_unsigned_reorder(material, associated_data):
+                assert original_unseal(material, associated_data) is not None
+                return changed_plaintext
+
+            assert read_original_image_single_execution_input(
+                reader,
+                binding,
+                registry=registry,
+                crypto=replace(crypto, unseal=unseal_with_unsigned_reorder),
+                proof_authority=proof_authority,
+            ) is None
+        event.remove(engine, "before_cursor_execute", record_dml)
+        assert dml_statements == []
+    finally:
+        if event.contains(engine, "before_cursor_execute", record_dml):
+            event.remove(engine, "before_cursor_execute", record_dml)
         caller.close()
         engine.dispose()
 

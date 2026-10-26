@@ -51,6 +51,8 @@ from haoai_backend.media_uploads.domain import (
 
 
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
+_MAX_REFERENCE_IMAGES = 8
+_MAX_REFERENCE_TOTAL_BYTES = _MAX_REFERENCE_IMAGES * _MAX_IMAGE_BYTES
 _IMAGE_EXTENSIONS = {
     "image/jpeg": ".jpg",
     "image/png": ".png",
@@ -186,6 +188,7 @@ class _GatedHttpContext:
     async def __aenter__(self):
         self._guard.require_live()
         context = self._factory()
+        self._guard.require_live()
         client = await context.__aenter__()
         try:
             self._guard.require_live()
@@ -208,7 +211,9 @@ class _GatedPublicFetcher:
 
     async def fetch_public(self, *args: object, **kwargs: object):
         self._guard.require_live()
-        return await self._fetcher.fetch_public(*args, **kwargs)
+        result = await self._fetcher.fetch_public(*args, **kwargs)
+        self._guard.require_live()
+        return result
 
 
 class ImageSingleExecutor:
@@ -271,12 +276,38 @@ class ImageSingleExecutor:
         verified = prepared.verified_input
         intent = prepared.intent
         guard = _AuthorityGuard(self._configuration, claim, intent.deadline_at)
+        provider_references: tuple[ReferenceInput, ...] = ()
         if verified.references:
-            return (
-                results.mark_unknown(claim, intent, verified)
-                if guard.is_live()
-                else "ownership_lost"
-            )
+            try:
+                prepared_references = self._prepare_reference_images(
+                    verified.references,
+                    guard,
+                )
+            except _ExecutionAuthorityLost:
+                return "ownership_lost"
+            except Exception:
+                if not guard.is_live():
+                    return "ownership_lost"
+                return results.fail(
+                    claim,
+                    intent,
+                    verified,
+                    code="provider_transport_unavailable",
+                    safe_detail="参考图未能安全读取",
+                    provider_request_started=False,
+                )
+            if isinstance(prepared_references, Failure):
+                if not guard.is_live():
+                    return "ownership_lost"
+                return results.fail(
+                    claim,
+                    intent,
+                    verified,
+                    code=prepared_references.code,
+                    safe_detail=prepared_references.safe_detail,
+                    provider_request_started=False,
+                )
+            provider_references = prepared_references
         try:
             guard.require_live()
             provider = build_original_openai_image_provider(
@@ -292,6 +323,7 @@ class ImageSingleExecutor:
                     binding, purpose, guard
                 ),
             )
+            guard.require_live()
         except Exception:
             if not guard.is_live():
                 return "ownership_lost"
@@ -301,7 +333,7 @@ class ImageSingleExecutor:
         try:
             provider_result = provider.generate_sync_image(
                 verified.snapshot,
-                verified.references,
+                provider_references,
                 intent,
             )
         except Exception:
@@ -377,6 +409,110 @@ class ImageSingleExecutor:
                     evidence_kind=stored_observation.evidence_kind,
                 )
         return outcome
+
+    def _prepare_reference_images(
+        self,
+        references: tuple[ReferenceInput, ...],
+        guard: _AuthorityGuard,
+    ) -> tuple[ReferenceInput, ...] | Failure:
+        if len(references) > _MAX_REFERENCE_IMAGES:
+            return Failure(
+                "request_body_too_large",
+                "参考图数量超过图片编辑请求上限",
+            )
+
+        prepared: list[ReferenceInput] = []
+        total_bytes = 0
+        for reference in references:
+            guard.require_live()
+            if type(reference) is not ReferenceInput or not isinstance(
+                reference.locator, str
+            ):
+                return Failure(
+                    "invalid_frozen_snapshot",
+                    "冻结参考图输入格式无效",
+                )
+
+            if reference.kind == "data_uri":
+                parsed = _decode_image_data_uri(reference.locator)
+                guard.require_live()
+                if parsed is None:
+                    return Failure(
+                        "invalid_frozen_snapshot",
+                        "参考图无法通过图片校验",
+                    )
+                content_and_type = self._validate_image(*parsed)
+            elif reference.kind in {"public_http", "managed_url"}:
+                if not _valid_public_reference_locator(reference.locator):
+                    return Failure(
+                        "invalid_frozen_snapshot",
+                        "参考图地址无法通过安全校验",
+                    )
+                guard.require_live()
+                try:
+                    fetcher = self._configuration.public_media_fetcher_factory()
+                finally:
+                    guard.require_live()
+                try:
+                    fetched = asyncio.run(
+                        _GatedPublicFetcher(fetcher, guard).fetch_public(
+                            reference,
+                            max_bytes=_MAX_IMAGE_BYTES,
+                            timeout_seconds=(
+                                self._configuration.timeout_settings.public_media_fetch_seconds
+                            ),
+                        )
+                    )
+                except _ExecutionAuthorityLost:
+                    raise
+                except Exception:
+                    return Failure(
+                        "provider_transport_unavailable",
+                        "参考图未能安全读取",
+                    )
+                guard.require_live()
+                if (
+                    not isinstance(fetched, PreparedReference)
+                    or fetched.kind != "bytes"
+                    or fetched.locator is not None
+                    or type(fetched.content) is not bytes
+                    or not isinstance(fetched.media_type, str)
+                ):
+                    return Failure(
+                        "provider_transport_unavailable",
+                        "参考图未能安全读取",
+                    )
+                content_and_type = self._validate_image(
+                    fetched.content,
+                    fetched.media_type,
+                )
+            else:
+                return Failure(
+                    "invalid_frozen_snapshot",
+                    "冻结参考图类型不受支持",
+                )
+
+            guard.require_live()
+            if content_and_type is None:
+                return Failure(
+                    "invalid_frozen_snapshot",
+                    "参考图无法通过图片校验",
+                )
+            content, media_type = content_and_type
+            total_bytes += len(content)
+            if total_bytes > _MAX_REFERENCE_TOTAL_BYTES:
+                return Failure(
+                    "request_body_too_large",
+                    "参考图数据超过图片编辑请求上限",
+                )
+            prepared.append(
+                ReferenceInput(
+                    kind="bytes",
+                    content=content,
+                    media_type=media_type,
+                )
+            )
+        return tuple(prepared)
 
     def _resolve_credential(self, binding, purpose, guard: _AuthorityGuard):
         guard.require_live()
@@ -536,6 +672,23 @@ def _decode_image_data_uri(value: str) -> tuple[bytes, str] | None:
     if not content or len(content) > _MAX_IMAGE_BYTES:
         return None
     return content, media_type
+
+
+def _valid_public_reference_locator(value: str) -> bool:
+    if any(ord(character) <= 0x20 or ord(character) == 0x7F for character in value):
+        return False
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in {"http", "https"}
+        and bool(parsed.hostname)
+        and parsed.username is None
+        and parsed.password is None
+        and not parsed.fragment
+    )
 
 
 def _observation_from_provider_result(
