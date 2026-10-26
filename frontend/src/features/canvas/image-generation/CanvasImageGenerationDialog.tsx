@@ -6,6 +6,9 @@ import "./CanvasImageGenerationDialog.css";
 export interface CanvasImageGenerationModelOption {
   readonly id: string;
   readonly name: string;
+  readonly sizeOptions: readonly string[];
+  readonly defaultSize: string | null;
+  readonly sizeConfigurationError: string | null;
 }
 
 export interface CanvasImageGenerationPromptTemplateOption {
@@ -22,6 +25,7 @@ export interface CanvasImageGenerationIntentView {
   readonly modelId: string;
   readonly modelName: string;
   readonly prompt: string;
+  readonly size: string | null;
   readonly targetLabel: string;
   readonly state: "unknown" | "not-found";
 }
@@ -31,6 +35,7 @@ export interface CanvasImageGenerationReceiptView {
   readonly modelId: string;
   readonly modelName: string;
   readonly prompt: string;
+  readonly size: string | null;
   readonly receipt: CanvasImageGenerationReceipt;
   readonly targetLabel: string;
 }
@@ -40,6 +45,8 @@ export interface CanvasImageGenerationDialogProps {
   readonly targetLabel: string;
   readonly models: readonly CanvasImageGenerationModelOption[];
   readonly selectedModelId: string;
+  readonly selectedSize: string;
+  readonly sizeSelectionInvalid: boolean;
   readonly promptTemplates: readonly CanvasImageGenerationPromptTemplateOption[];
   readonly selectedPromptTemplateId: string;
   readonly promptTemplateSelectionInvalid: boolean;
@@ -58,6 +65,7 @@ export interface CanvasImageGenerationDialogProps {
   readonly receipt: CanvasImageGenerationReceiptView | null;
   onClose(): void;
   onSelectModel(modelId: string): void;
+  onSelectSize(size: string): void;
   onSelectPromptTemplate(promptTemplateId: string): void;
   onChangePrompt(prompt: string): void;
   onSubmit(): void;
@@ -124,6 +132,8 @@ export function CanvasImageGenerationDialog({
   targetLabel,
   models,
   selectedModelId,
+  selectedSize,
+  sizeSelectionInvalid,
   promptTemplates,
   selectedPromptTemplateId,
   promptTemplateSelectionInvalid,
@@ -142,6 +152,7 @@ export function CanvasImageGenerationDialog({
   receipt,
   onClose,
   onSelectModel,
+  onSelectSize,
   onSelectPromptTemplate,
   onChangePrompt,
   onSubmit,
@@ -151,6 +162,10 @@ export function CanvasImageGenerationDialog({
   onStartNew,
 }: CanvasImageGenerationDialogProps) {
   const focus = useSeriesDialogFocus({ active: true, canDismiss: true, onDismiss: onClose });
+  const selectedModel = models.find((model) => model.id === selectedModelId);
+  const sizeConfigurationInvalid = selectedModel !== undefined && selectedModel.sizeConfigurationError !== null;
+  const sizeSelectionBlocked = selectedModel !== undefined && selectedModel.sizeOptions.length > 0
+    && (sizeSelectionInvalid || !selectedModel.sizeOptions.includes(selectedSize));
   const title = mode === "form" ? "生成图片"
     : mode === "intent" ? "核对原生成任务" : "生成任务状态";
 
@@ -192,6 +207,30 @@ export function CanvasImageGenerationDialog({
                 {models.map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
               </select>
             </label>
+            {selectedModel !== undefined && selectedModel.sizeConfigurationError !== null && (
+              <p className="canvas-image-generation-error" role="alert">{selectedModel.sizeConfigurationError}</p>
+            )}
+            {selectedModel !== undefined && selectedModel.sizeOptions.length > 0 && (
+              <label>
+                图片尺寸
+                <select
+                  aria-label="图片尺寸"
+                  disabled={busy}
+                  onChange={(event) => onSelectSize(event.currentTarget.value)}
+                  value={selectedSize}
+                >
+                  {sizeSelectionBlocked && (
+                    <option disabled value={selectedSize}>请选择有效尺寸</option>
+                  )}
+                  {selectedModel.sizeOptions.map((size) => <option key={size} value={size}>{size}</option>)}
+                </select>
+              </label>
+            )}
+            {sizeSelectionInvalid && (
+              <p className="canvas-image-generation-error" role="alert">
+                请选择当前模型提供的有效尺寸，未发送图片任务。
+              </p>
+            )}
             <label>
               提示词模板
               <select
@@ -246,7 +285,8 @@ export function CanvasImageGenerationDialog({
             {error !== null && <p className="canvas-image-generation-error" role="alert">{error}</p>}
             {message !== null && <p className="canvas-image-generation-message" role="status">{message}</p>}
             <footer className="canvas-image-generation-footer">
-              <button disabled={busy || modelsLoading || models.length === 0 || selectedModelId === ""} type="submit">
+              <button disabled={busy || modelsLoading || models.length === 0 || selectedModelId === ""
+                || sizeConfigurationInvalid || sizeSelectionBlocked} type="submit">
                 {busy ? "正在提交…" : "提交单张图片任务"}
               </button>
               <button disabled={busy} onClick={onClose} type="button">取消</button>
@@ -267,6 +307,7 @@ export function CanvasImageGenerationDialog({
               <summary>查看原提交详情</summary>
               <p>目标：{targetIdentity(pendingIntent.destination)}</p>
               <p>模型：{pendingIntent.modelName}</p>
+              <p>图片尺寸：{pendingIntent.size ?? "模型默认"}</p>
               <p>提示词：{pendingIntent.prompt}</p>
               <p>模型编号：{pendingIntent.modelId}</p>
               <p>请求编号：{pendingIntent.idempotencyKey}</p>
@@ -296,6 +337,7 @@ export function CanvasImageGenerationDialog({
           <div className="canvas-image-generation-receipt" role="status">
             <p>{receiptOutcome(receipt.receipt)}</p>
             <p>任务状态：{taskStatus(receipt.receipt.status)}</p>
+            <p>图片尺寸：{receipt.size ?? "模型默认"}</p>
             <p>服务器报价：{receipt.receipt.quotedAmount}</p>
             <p>计费状态：{billingStatus(receipt.receipt.billingStatus)}</p>
             {receiptDetails(receipt)}

@@ -21,6 +21,7 @@ function pendingIntent(state: CanvasImageGenerationIntentView["state"]): CanvasI
     modelId: "image-model-a",
     modelName: "图片模型 A",
     prompt: "保留的原始提示词",
+    size: "quality:high",
     targetLabel: "分镜 1",
     state,
   };
@@ -41,6 +42,7 @@ function receiptView(): CanvasImageGenerationReceiptView {
     modelId: "image-model-a",
     modelName: "图片模型 A",
     prompt: "保留的原始提示词",
+    size: null,
     receipt,
     targetLabel: "分镜 1",
   };
@@ -50,8 +52,16 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
   const props: CanvasImageGenerationDialogProps = {
     mode: "form",
     targetLabel: "分镜 1",
-    models: [{ id: "image-model-a", name: "图片模型 A" }],
+    models: [{
+      id: "image-model-a",
+      name: "图片模型 A",
+      sizeOptions: [],
+      defaultSize: null,
+      sizeConfigurationError: null,
+    }],
     selectedModelId: "image-model-a",
+    selectedSize: "",
+    sizeSelectionInvalid: false,
     promptTemplates: [{
       id: "template-a",
       name: "角色设计",
@@ -76,6 +86,7 @@ function renderDialog(overrides: Partial<CanvasImageGenerationDialogProps> = {})
     receipt: null,
     onClose: vi.fn(),
     onSelectModel: vi.fn(),
+    onSelectSize: vi.fn(),
     onSelectPromptTemplate: vi.fn(),
     onChangePrompt: vi.fn(),
     onSubmit: vi.fn(),
@@ -116,10 +127,33 @@ describe("CanvasImageGenerationDialog", () => {
     expect(dialog.getByText("留空时使用当前内容；选用模板后可清空描述，仅使用模板。")).toBeTruthy();
   });
 
+  it("offers configured sizes in the form and reports an invalid selection", () => {
+    const model = {
+      id: "image-model-a",
+      name: "图片模型 A",
+      sizeOptions: ["16:9", "quality:high"],
+      defaultSize: "16:9",
+      sizeConfigurationError: null,
+    };
+    const rendered = renderDialog({ models: [model], selectedSize: "16:9" });
+    const dialog = within(screen.getByRole("dialog", { name: "生成图片" }));
+    const select = dialog.getByRole("combobox", { name: "图片尺寸" }) as HTMLSelectElement;
+    expect(select.value).toBe("16:9");
+    expect(Array.from(select.options).map((option) => option.value)).toEqual(["16:9", "quality:high"]);
+    fireEvent.change(select, { target: { value: "quality:high" } });
+    expect(rendered.props.onSelectSize).toHaveBeenCalledWith("quality:high");
+
+    rendered.rerender(<CanvasImageGenerationDialog {...rendered.props} sizeSelectionInvalid />);
+    expect(screen.getByText("请选择当前模型提供的有效尺寸，未发送图片任务。")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "提交单张图片任务" })).toBeDisabled();
+  });
+
   it("does not expose template controls while inspecting a frozen operation", () => {
     renderDialog({ mode: "intent", pendingIntent: pendingIntent("unknown") });
 
     expect(screen.queryByRole("combobox", { name: "提示词模板" })).toBeNull();
+    expect(screen.queryByRole("combobox", { name: "图片尺寸" })).toBeNull();
+    expect(screen.getByText("图片尺寸：quality:high")).toBeTruthy();
     expect(screen.getByText("提示词：保留的原始提示词")).toBeTruthy();
   });
 
@@ -147,6 +181,7 @@ describe("CanvasImageGenerationDialog", () => {
     expect(screen.getByText("任务当前状态为已完成；该回执不表示图像已经应用到画布。")).toBeTruthy();
     expect(screen.getByText("任务状态：已完成")).toBeTruthy();
     expect(screen.getByText("服务器报价：12")).toBeTruthy();
+    expect(screen.getByText("图片尺寸：模型默认")).toBeTruthy();
     expect(screen.getByText("计费状态：未计费")).toBeTruthy();
     expect(screen.queryByText(/图像生成已完成|图片已应用到画布/)).toBeNull();
     const taskId = screen.getByText("任务编号：task-a");
