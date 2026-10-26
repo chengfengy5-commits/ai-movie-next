@@ -35,7 +35,6 @@ class CanvasDataUnitOfWork(Protocol):
         self,
         document_id: str,
         *,
-        version: int,
         user_id: str,
         document_json: str,
         update_document_json: bool,

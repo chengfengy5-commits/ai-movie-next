@@ -5,7 +5,6 @@ import json
 from haoai_backend.canvas_data.domain import (
     empty_canvas_document,
     exceeds_document_limit,
-    next_document_version,
     parse_stored_document,
     serialize_document,
 )
@@ -56,9 +55,3 @@ def test_size_limit_counts_characters_and_uses_strictly_greater_than() -> None:
     assert not exceeds_document_limit("界" * 1_000_000)
     assert exceeds_document_limit("界" * 1_000_001)
     assert len(("界" * 1_000_000).encode("utf-8")) > 1_000_000
-
-
-def test_version_increment_preserves_zero_fallback() -> None:
-    assert next_document_version(None) == 2
-    assert next_document_version(0) == 2
-    assert next_document_version(7) == 8

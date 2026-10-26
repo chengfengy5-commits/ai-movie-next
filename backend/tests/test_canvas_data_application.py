@@ -46,7 +46,6 @@ class FakeUnitOfWork:
         self,
         document_id,
         *,
-        version,
         user_id,
         document_json,
         update_document_json,
@@ -55,7 +54,6 @@ class FakeUnitOfWork:
         self.events.append((
             "update",
             document_id,
-            version,
             user_id,
             document_json,
             update_document_json,
@@ -152,8 +150,7 @@ def test_same_document_existing_save_still_increments_version_once() -> None:
     result = application.save_chapter_canvas(lambda: uow, TrustedActor("user-a"), "chapter-a", payload, version=4)
 
     update_event = next(event for event in uow.events if event[0] == "update")
-    assert update_event[2] == 5
-    assert update_event[5:] == (False, False)
+    assert update_event[2:] == ("user-a", '{"nodes": []}', False, False)
     assert result["version"] == 5
     assert result["document_json"] is payload
     assert uow.commits == 1

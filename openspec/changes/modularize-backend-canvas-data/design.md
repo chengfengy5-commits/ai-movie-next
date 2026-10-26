@@ -36,7 +36,7 @@ PUT 顺序：读章节并保留缺章 404 优先；同一 Session 执行 series 
 
 画布是共享章节资源。写请求 document_json 为 dict，version 是可省略/显式 null 的普通 Optional[int]，保留 Pydantic 常规转换及 extra-ignore。用 json.dumps(document_json, ensure_ascii=False) 且保持默认 separators，字符数大于 1,000,000 才拒绝。domain 只负责纯转换，不就地修改调用方 payload。
 
-没有当前文档时创建 version 1，忽略输入 expected version。已有行只比较已读版本快照；请求版本非 null 且不匹配则 409，否则写为 (current_version or 1)+1。即使 payload 相同也执行一次成功写入与版本递增。数据库更新仍以画布 id 为主键，不添加 WHERE version CAS；两个并发写入的覆盖语义不在本迁移中强化。
+没有当前文档时创建 version 1，忽略输入 expected version。已有行只将非 null 请求 version 与已读快照比较；不匹配则 409。通过比较后仍按画布 id 盲写，不增加内容 CAS，允许晚到内容覆盖。legacy 更新的 revision 由数据库在 UPDATE 时基于当前列原子应用旧公式：当前值为 0 或 NULL 时写 2，否则当前整数加 1；因此竞争中的晚到 legacy 不会复用已被 guarded-v1 消费的 revision。该变化有意修订并发 revision 语义：例如 guarded 已提交 v2 后，晚到 legacy 仍可覆盖内容，但写入 v3。正常相同内容保存仍推进版本；负整数仍按旧规则加 1。数据库更新仍仅以画布 id 为 WHERE 条件，不增加 revision CAS、显式行锁或自动重试。
 
 ### 持久化与提交后刷新
 

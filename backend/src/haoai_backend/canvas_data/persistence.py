@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import case, insert, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import Session
@@ -119,14 +119,17 @@ class SqlAlchemyCanvasDataUnitOfWork:
         self,
         document_id: str,
         *,
-        version: int,
         user_id: str,
         document_json: str,
         update_document_json: bool,
         update_updated_by: bool,
     ) -> None:
         values: dict[str, Any] = {
-            "version": version,
+            "version": case(
+                (canvas_documents.c.version == 0, 2),
+                (canvas_documents.c.version.is_(None), 2),
+                else_=canvas_documents.c.version + 1,
+            ),
             "updated_at": self._now(),
         }
         if update_document_json:
