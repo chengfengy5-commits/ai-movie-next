@@ -52,14 +52,23 @@ class _Response:
 
 
 class _HttpClient:
-    def __init__(self, provider: str, *, query_timeout: bool = False) -> None:
+    def __init__(
+        self,
+        provider: str,
+        *,
+        query_timeout: bool = False,
+        create_without_id: bool = False,
+    ) -> None:
         self.provider = provider
         self.query_timeout = query_timeout
+        self.create_without_id = create_without_id
         self.calls: list[tuple[str, str, bytes | None]] = []
 
     async def request(self, method, url, *, content=None, **_kwargs):
         self.calls.append((method, url, content))
         if method == "POST":
+            if self.create_without_id:
+                return _Response(b"{}")
             external_id = f"{self.provider}-original-task-id"
             body = (
                 {"request_id": external_id}
@@ -355,7 +364,7 @@ def test_video_worker_creates_queries_original_id_and_stores_video(
         runtime.shutdown("test_complete")
 
 
-def test_video_worker_query_timeout_keeps_original_id_and_never_reposts(
+def test_video_worker_rebuilds_runtime_and_queries_original_id_after_timeout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     request: pytest.FixtureRequest,
@@ -364,23 +373,142 @@ def test_video_worker_query_timeout_keeps_original_id_and_never_reposts(
     request.addfinalizer(environment.engine.dispose)
     task_id, _submission_id = _admit_video_task(environment, key="worker-query-timeout")
     before_financial = video_fixtures._financial_snapshot(environment.engine)
-    client = _HttpClient("xai", query_timeout=True)
-    media_store = _MediaStore()
-    runtime = _build_runtime(environment, client, media_store, _PublicFetcher())
+    first_client = _HttpClient("xai", query_timeout=True)
+    first_store = _MediaStore()
+    first_runtime = _build_runtime(
+        environment, first_client, first_store, _PublicFetcher()
+    )
+    second_client = _HttpClient("xai")
+    second_store = _MediaStore()
+    second_fetcher = _PublicFetcher()
+    second_runtime = None
     try:
-        first = runtime.run_claimed_once("video-single")
-        second = runtime.run_claimed_once("video-single")
+        first = first_runtime.run_claimed_once("video-single")
+        first_runtime.shutdown("test_restart")
+        with Session(environment.engine) as reader:
+            task_before = reader.execute(
+                select(AITaskRow.__table__).where(
+                    AITaskRow.__table__.c.id == task_id
+                )
+            ).mappings().one()
+            unit_before = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.__table__.c.task_id == task_id
+                )
+            ).mappings().one()
+            submission_before = reader.execute(
+                select(ExternalSubmissionRow.__table__)
+                .join(
+                    ExecutionStepRow.__table__,
+                    ExecutionStepRow.__table__.c.id
+                    == ExternalSubmissionRow.__table__.c.step_id,
+                )
+                .join(
+                    BillingUnitRow.__table__,
+                    BillingUnitRow.__table__.c.id
+                    == ExecutionStepRow.__table__.c.billing_unit_id,
+                )
+                .where(BillingUnitRow.__table__.c.task_id == task_id)
+            ).mappings().one()
+        original = {
+            "generation": task_before["execution_generation"],
+            "first_intent_at": unit_before["first_intent_at"],
+            "deadline_at": unit_before["deadline_at"],
+            "submission_id": submission_before["id"],
+            "external_task_id": submission_before["external_task_id"],
+            "submitted_at": submission_before["submitted_at"],
+            "request_snapshot": submission_before["request_snapshot"],
+        }
+        second_runtime = _build_runtime(
+            environment, second_client, second_store, second_fetcher
+        )
+        second = second_runtime.run_claimed_once("video-single")
 
         assert first == "pending"
-        assert len(client.calls) == 2
-        assert [call[0] for call in client.calls] == ["POST", "GET"]
-        assert "xai-original-task-id" in client.calls[1][1]
-        assert second in {None, "pending"}
-        assert len([call for call in client.calls if call[0] == "POST"]) == 1
-        assert media_store.stored == []
+        assert [call[0] for call in first_client.calls] == ["POST", "GET"]
+        assert "xai-original-task-id" in first_client.calls[1][1]
+        assert isinstance(second, GenerationResultReceipt)
+        assert [call[0] for call in second_client.calls] == ["GET"]
+        assert second_client.calls[0][1].endswith(
+            "/v1/videos/xai-original-task-id"
+        )
+        assert second_store.prepared_locators == []
+        assert second_fetcher.locators == [_VIDEO_URL]
+        assert len(second_store.stored) == 1
+        assert second.task_id == task_id
         with Session(environment.engine) as reader:
             task = reader.execute(
                 select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+            ).mappings().one()
+            unit = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.__table__.c.task_id == task_id
+                )
+            ).mappings().one()
+            submission = reader.execute(
+                select(ExternalSubmissionRow.__table__)
+                .join(
+                    ExecutionStepRow.__table__,
+                    ExecutionStepRow.__table__.c.id
+                    == ExternalSubmissionRow.__table__.c.step_id,
+                )
+                .join(
+                    BillingUnitRow.__table__,
+                    BillingUnitRow.__table__.c.id
+                    == ExecutionStepRow.__table__.c.billing_unit_id,
+                )
+                .where(BillingUnitRow.__table__.c.task_id == task_id)
+            ).mappings().one()
+        assert task["status"] == "completed"
+        assert task["execution_generation"] == original["generation"] + 1
+        assert unit["result_status"] == "succeeded"
+        assert unit["first_intent_at"] == original["first_intent_at"]
+        assert unit["deadline_at"] == original["deadline_at"]
+        assert submission["id"] == original["submission_id"]
+        assert submission["submission_status"] == "completed"
+        assert submission["external_task_id"] == original["external_task_id"]
+        assert submission["submitted_at"] == original["submitted_at"]
+        assert submission["request_snapshot"] == original["request_snapshot"]
+        assert video_fixtures._financial_snapshot(environment.engine) == before_financial
+    finally:
+        first_runtime.shutdown("test_complete")
+        if second_runtime is not None:
+            second_runtime.shutdown("test_complete")
+
+
+def test_video_worker_does_not_repost_unknown_create_without_provider_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    environment = _worker_environment(monkeypatch, tmp_path, provider="xai")
+    request.addfinalizer(environment.engine.dispose)
+    task_id, _submission_id = _admit_video_task(
+        environment, key="worker-unknown-create-no-id"
+    )
+    before_financial = video_fixtures._financial_snapshot(environment.engine)
+    first_client = _HttpClient("xai", create_without_id=True)
+    first_runtime = _build_runtime(
+        environment, first_client, _MediaStore(), _PublicFetcher()
+    )
+    second_client = _HttpClient("xai")
+    second_runtime = _build_runtime(
+        environment, second_client, _MediaStore(), _PublicFetcher()
+    )
+    try:
+        assert first_runtime.run_claimed_once("video-single") == "pending"
+        first_runtime.shutdown("test_restart")
+        assert [call[0] for call in first_client.calls] == ["POST"]
+        assert second_runtime.run_claimed_once("video-single") == "pending"
+        assert second_client.calls == []
+        with Session(environment.engine) as reader:
+            task = reader.execute(
+                select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+            ).mappings().one()
+            unit = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.__table__.c.task_id == task_id
+                )
             ).mappings().one()
             submission = reader.execute(
                 select(ExternalSubmissionRow.__table__)
@@ -397,8 +525,57 @@ def test_video_worker_query_timeout_keeps_original_id_and_never_reposts(
                 .where(BillingUnitRow.__table__.c.task_id == task_id)
             ).mappings().one()
         assert task["status"] == "reconciling"
+        assert unit["result_status"] == "unknown"
         assert submission["submission_status"] == "unknown"
-        assert submission["external_task_id"] == "xai-original-task-id"
+        assert submission["external_task_id"] is None
+        assert submission["submitted_at"] is None
         assert video_fixtures._financial_snapshot(environment.engine) == before_financial
     finally:
-        runtime.shutdown("test_complete")
+        first_runtime.shutdown("test_complete")
+        second_runtime.shutdown("test_complete")
+
+
+def test_video_worker_does_not_query_cancelled_known_provider_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+) -> None:
+    environment = _worker_environment(monkeypatch, tmp_path, provider="xai")
+    request.addfinalizer(environment.engine.dispose)
+    task_id, _submission_id = _admit_video_task(
+        environment, key="worker-query-timeout-cancelled"
+    )
+    before_financial = video_fixtures._financial_snapshot(environment.engine)
+    first_client = _HttpClient("xai", query_timeout=True)
+    first_runtime = _build_runtime(
+        environment, first_client, _MediaStore(), _PublicFetcher()
+    )
+    second_client = _HttpClient("xai")
+    second_runtime = _build_runtime(
+        environment, second_client, _MediaStore(), _PublicFetcher()
+    )
+    cancelled_at = joint_fixtures._G2_JOINT_NOW.replace(tzinfo=timezone.utc)
+    try:
+        assert first_runtime.run_claimed_once("video-single") == "pending"
+        first_runtime.shutdown("test_cancel")
+        with Session(environment.engine) as session, session.begin():
+            session.execute(
+                update(AITaskRow.__table__)
+                .where(AITaskRow.__table__.c.id == task_id)
+                .values(user_cancelled_at=cancelled_at)
+            )
+            session.execute(
+                update(BillingUnitRow.__table__)
+                .where(BillingUnitRow.__table__.c.task_id == task_id)
+                .values(
+                    user_cancelled_at=cancelled_at,
+                    cancellation_reason="user_cancelled",
+                )
+            )
+        assert second_runtime.run_claimed_once("video-single") == "pending"
+        assert [call[0] for call in first_client.calls] == ["POST", "GET"]
+        assert second_client.calls == []
+        assert video_fixtures._financial_snapshot(environment.engine) == before_financial
+    finally:
+        first_runtime.shutdown("test_complete")
+        second_runtime.shutdown("test_complete")

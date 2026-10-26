@@ -11,7 +11,7 @@ import json
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field, fields
-from typing import Any
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -307,6 +307,7 @@ def read_original_video_single_execution_input(
     registry: CredentialRegistry,
     crypto: CredentialCrypto,
     proof_authority: HmacProofAuthority,
+    credential_purpose: Literal["create", "query"] = "create",
 ) -> VerifiedVideoExecutionInput | None:
     """Reopen the payload bound to one ordinary ``video.single`` graph.
 
@@ -320,6 +321,7 @@ def read_original_video_single_execution_input(
         or type(registry) is not CredentialRegistry
         or type(crypto) is not CredentialCrypto
         or type(proof_authority) is not HmacProofAuthority
+        or credential_purpose not in ("create", "query")
         or not _valid_binding(binding)
     ):
         return None
@@ -421,7 +423,7 @@ def read_original_video_single_execution_input(
         )
         provider_credential = registry.resolve_original_credential(
             credential_binding,
-            "create",
+            credential_purpose,
         )
         if (
             type(provider_credential) is not BoundCredential

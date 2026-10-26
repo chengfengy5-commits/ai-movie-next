@@ -349,6 +349,37 @@ class VideoSingleExecutor:
         prepared = intents.prepare(claim)
         if prepared.disposition == "ownership_lost":
             return "ownership_lost"
+        if prepared.disposition == "resume_query":
+            intent = prepared.intent
+            verified = prepared.verified_input
+            external_ref = prepared.external_ref
+            if (
+                intent is None
+                or verified is None
+                or external_ref is None
+                or not _external_ref_matches(external_ref, intent)
+                or external_ref.create_outcome != "submitted"
+                or not _safe_provider_id(external_ref.external_id)
+            ):
+                return "pending"
+            guard = _AuthorityGuard(self._configuration, claim, intent, verified)
+            try:
+                guard.require_live()
+                provider = self._build_provider(verified, intent, guard)
+                guard.require_live()
+            except _ExecutionAuthorityLost:
+                return "ownership_lost"
+            except Exception:
+                return "pending" if guard.is_live() else "ownership_lost"
+            return self._poll_and_store(
+                claim,
+                intent,
+                verified,
+                external_ref,
+                provider,
+                results,
+                guard,
+            )
         if (
             prepared.disposition != "committed"
             or prepared.intent is None

@@ -18,6 +18,7 @@ from haoai_backend.generation_core.base_schema import (
     AITaskRow,
     BillingUnitRow,
     ExecutionStepRow,
+    ExternalSubmissionRow,
     TaskSubmissionRow,
     UserRow,
 )
@@ -38,6 +39,12 @@ _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _CLAIMABLE_STATUSES = ("queued", "processing", "reconciling")
 _DEFAULT_LEASE_SECONDS = 60
 _CANDIDATE_PAGE_SIZE = 128
+_RECONCILING_RESULT = json.dumps(
+    {"message": "视频生成结果需要恢复确认", "status": "reconciling"},
+    ensure_ascii=False,
+    sort_keys=True,
+    separators=(",", ":"),
+)
 
 SessionFactory = Callable[[], Session]
 DbClock = Callable[[], datetime]
@@ -60,6 +67,7 @@ class _LockedGraph:
     unit: dict[str, object]
     step: dict[str, object]
     submission: dict[str, object]
+    external_submissions: tuple[dict[str, object], ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -253,8 +261,7 @@ class SqlAlchemyVideoSingleClaims:
                 if (
                     graph is None
                     or not _registered_graph_matches(graph)
-                    or not _lease_is_available(graph.task, now)
-                    or not _item_is_unstarted(graph.unit, graph.step)
+                    or not _claim_is_available(graph, now)
                 ):
                     return None
                 task_table = AITaskRow.__table__
@@ -400,7 +407,7 @@ class SqlAlchemyVideoSingleClaims:
                         or graph.task.get("request_data") != expected.request_data
                         or not _registered_graph_matches(graph)
                         or not _claim_available_for_renewal(
-                            graph.task, graph.unit, graph.step, now
+                            graph, now
                         )
                     ):
                         return None
@@ -534,6 +541,12 @@ def _lock_registered_graph(
     ).mappings().one_or_none()
     if submission_row is None:
         return None
+    external_submissions = session.execute(
+        select(ExternalSubmissionRow.__table__)
+        .where(ExternalSubmissionRow.__table__.c.step_id == step["id"])
+        .order_by(ExternalSubmissionRow.__table__.c.id)
+        .with_for_update()
+    ).mappings().all()
     return _LockedGraph(
         owner_id=owner_id,
         task_id=task_id,
@@ -542,6 +555,7 @@ def _lock_registered_graph(
         unit=unit,
         step=step,
         submission=dict(submission_row),
+        external_submissions=tuple(dict(row) for row in external_submissions),
     )
 
 
@@ -654,16 +668,159 @@ def _item_is_unstarted(unit: dict[str, object], step: dict[str, object]) -> bool
 
 
 def _claim_available_for_renewal(
-    task: dict[str, object],
-    unit: dict[str, object],
-    step: dict[str, object],
+    graph: _LockedGraph,
     now: datetime,
 ) -> bool:
+    task = graph.task
     return bool(
         task.get("status") == "processing"
         and task.get("user_cancelled_at") is None
         and _lease_is_active(task, now)
-        and _item_is_unstarted(unit, step)
+        and (
+            (not graph.external_submissions and _item_is_unstarted(graph.unit, graph.step))
+            or _query_resume_item_is_valid(graph, now)
+        )
+    )
+
+
+def _claim_is_available(graph: _LockedGraph, now: datetime) -> bool:
+    return bool(
+        not graph.external_submissions
+        and _lease_is_available(graph.task, now)
+        and _item_is_unstarted(graph.unit, graph.step)
+    ) or bool(
+        _query_resume_lease_is_available(graph.task, now)
+        and _query_resume_item_is_valid(graph, now)
+    )
+
+
+def _query_resume_lease_is_available(
+    task: dict[str, object], now: datetime
+) -> bool:
+    if task.get("user_cancelled_at") is not None:
+        return False
+    status = task.get("status")
+    lease = task.get("lease_until")
+    if lease is None:
+        return (
+            status in {"queued", "reconciling"}
+            and task.get("claimed_by") is None
+            and task.get("claim_token") is None
+        )
+    return bool(
+        status in {"processing", "reconciling"}
+        and isinstance(lease, datetime)
+        and _aware_utc(lease) <= now
+        and _nonempty_string(task.get("claimed_by"))
+        and _nonempty_string(task.get("claim_token"))
+    )
+
+
+def _query_resume_item_is_valid(graph: _LockedGraph, now: datetime) -> bool:
+    task = graph.task
+    unit = graph.unit
+    step = graph.step
+    if len(graph.external_submissions) != 1:
+        return False
+    external = graph.external_submissions[0]
+    external_id = external.get("external_task_id")
+    submitted_at = external.get("submitted_at")
+    intent_at = external.get("intent_at")
+    deadline_at = external.get("deadline_at")
+    first_intent_at = unit.get("first_intent_at")
+    unit_deadline_at = unit.get("deadline_at")
+    request_data = _json_object(task.get("request_data"))
+    snapshot = step.get("input_snapshot")
+    request_snapshot = external.get("request_snapshot")
+    if (
+        not _safe_provider_id(external_id)
+        or not all(
+            isinstance(value, datetime)
+            for value in (submitted_at, intent_at, deadline_at, first_intent_at, unit_deadline_at)
+        )
+        or not isinstance(request_data, dict)
+        or not isinstance(snapshot, dict)
+        or not isinstance(request_snapshot, dict)
+        or set(request_snapshot)
+        != {
+            "owner_id", "task_id", "unit_id", "step_id", "operation",
+            "graph_version", "attempt_id", "prepared_payload_id", "protected_ref",
+            "snapshot_digest", "snapshot_ref", "credential_binding_ref",
+            "target_snapshot", "provider", "model_id",
+        }
+    ):
+        return False
+
+    status = external.get("submission_status")
+    if status == "submitted":
+        state_matches = (
+            task.get("result") is None
+            and unit.get("result_status") == "pending"
+            and step.get("execution_status") == "submitting"
+        )
+    elif status == "unknown":
+        state_matches = (
+            task.get("result") == _RECONCILING_RESULT
+            and unit.get("result_status") == "unknown"
+            and step.get("execution_status") == "reconciling"
+        )
+    else:
+        return False
+
+    try:
+        first_intent = _aware_utc(first_intent_at)
+        intent = _aware_utc(intent_at)
+        submitted = _aware_utc(submitted_at)
+        deadline = _aware_utc(deadline_at)
+        unit_deadline = _aware_utc(unit_deadline_at)
+    except (TypeError, ValueError):
+        return False
+    expected_snapshot_ref = (
+        f"{_GRAPH_VERSION}:{snapshot.get('prepared_payload_id')}:"
+        f"{snapshot.get('snapshot_digest')}:{snapshot.get('ordered_manifest_digest')}"
+    )
+    return all(
+        (
+            task.get("status") in {"queued", "processing", "reconciling"},
+            task.get("user_cancelled_at") is None,
+            unit.get("user_cancelled_at") is None,
+            unit.get("success_confirmed_at") is None,
+            unit.get("billing_status") in {"charged", "no_charge"},
+            task.get("billing_status") == unit.get("billing_status"),
+            unit.get("refunded_amount") == 0,
+            unit.get("result_status") in {"pending", "unknown"},
+            step.get("execution_status") in {"submitting", "reconciling"},
+            state_matches,
+            _nonempty_string(external.get("id")),
+            external.get("step_id") == step.get("id"),
+            external.get("submission_key")
+            == f"video-single-create-v1:{unit.get('id')}:{step.get('id')}",
+            external.get("provider") in {"xai", "manxiaobai"},
+            _nonempty_string(external.get("model_ref")),
+            external.get("request_digest") == unit.get("input_digest"),
+            external.get("submission_status") in {"submitted", "unknown"},
+            _same_time(intent, first_intent),
+            _same_time(deadline, unit_deadline),
+            deadline == first_intent + timedelta(hours=2),
+            first_intent <= submitted < deadline,
+            now < deadline,
+            request_snapshot.get("owner_id") == graph.owner_id,
+            request_snapshot.get("task_id") == graph.task_id,
+            request_snapshot.get("unit_id") == unit.get("id"),
+            request_snapshot.get("step_id") == step.get("id"),
+            request_snapshot.get("operation") == _OPERATION,
+            request_snapshot.get("graph_version") == _GRAPH_VERSION,
+            request_snapshot.get("attempt_id") == snapshot.get("server_attempt_id"),
+            request_snapshot.get("prepared_payload_id")
+            == snapshot.get("prepared_payload_id"),
+            request_snapshot.get("protected_ref") == snapshot.get("protected_ref"),
+            request_snapshot.get("snapshot_digest") == snapshot.get("snapshot_digest"),
+            request_snapshot.get("snapshot_ref") == expected_snapshot_ref,
+            request_snapshot.get("target_snapshot") == request_data.get("target_snapshot"),
+            request_snapshot.get("provider") == external.get("provider"),
+            request_snapshot.get("model_id") == external.get("model_ref"),
+            _nonempty_string(request_snapshot.get("credential_binding_ref")),
+        )
     )
 
 
@@ -765,6 +922,16 @@ def _json_object(value: object) -> dict[str, object] | None:
 
 def _nonempty_string(value: object) -> bool:
     return isinstance(value, str) and bool(value)
+
+
+def _safe_provider_id(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value.strip())
+        and value == value.strip()
+        and len(value.encode("utf-8")) <= 255
+        and not any(ord(character) < 0x20 for character in value)
+    )
 
 
 def _is_digest(value: object) -> bool:
