@@ -72,6 +72,11 @@ def validate_runtime_configuration(
     for field_name in factory_fields:
         if not callable(getattr(explicit_config, field_name)):
             raise TypeError(f"{field_name} must be an explicit callable factory")
+    worker_capacity = explicit_config.worker_capacity
+    if worker_capacity is not None and not callable(
+        getattr(worker_capacity, "try_acquire", None)
+    ):
+        raise TypeError("worker_capacity must be an explicit capacity gate")
 
     provider_names: set[str] = set()
     for provider_name, provider_factory in explicit_config.provider_factories:

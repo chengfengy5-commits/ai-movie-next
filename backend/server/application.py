@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import math
+import os
 import threading
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from sqlalchemy import create_engine
+from sqlalchemy import Column, MetaData, String, Table, create_engine, select
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
@@ -28,6 +31,7 @@ from haoai_backend.runtime_status import (
 from haoai_backend.storyboard_asset_generation.openai_runtime import (
     OpenAICompatibleStoryboardAssetRuntime,
 )
+from haoai_backend.generation_runtime.worker_capacity import WorkerCapacityBootstrap
 
 from .configuration import ServerConfiguration, ServerConfigurationError
 from .generation import build_frame_optimize_configuration
@@ -35,6 +39,14 @@ from .generation import build_frame_optimize_configuration
 
 class ServerHostAssemblyError(RuntimeError):
     """A host setup failure with no configuration values in its message."""
+
+
+_WORKER_CONFIGURATION_METADATA = MetaData()
+_WORKER_CONFIGURATION = Table(
+    "system_configs",
+    _WORKER_CONFIGURATION_METADATA,
+    Column("worker_max_concurrency", String(10)),
+)
 
 
 class _ServerAuthenticationRuntime(AuthenticationRuntime):
@@ -126,10 +138,12 @@ def create_server_host(
     configuration: ServerConfiguration,
     *,
     sdk_factories: tuple[Callable[..., object], Callable[..., object]] | None = None,
+    worker_environment: Mapping[str, str] | None = None,
 ) -> ServerHost:
     """Build the existing ASGI application without connecting to external systems."""
     if not isinstance(configuration, ServerConfiguration):
         raise ServerConfigurationError("an explicit server configuration is required")
+    environment = os.environ if worker_environment is None else worker_environment
 
     engine: Engine | None = None
     resources: _OwnedResources | None = None
@@ -212,6 +226,27 @@ def create_server_host(
                 s3_client_factory=upload_factory,
             )
 
+        worker_capacity_bootstrap = None
+        worker_capacity_enabled = bool(
+            (
+                image_generation_configuration is not None
+                and image_generation_configuration.generation_worker_configuration
+                is not None
+            )
+            or (
+                frame_optimize_configuration is not None
+                and frame_optimize_configuration.enabled
+            )
+        )
+        if worker_capacity_enabled:
+            worker_capacity_bootstrap = WorkerCapacityBootstrap(
+                read_database_value=lambda: _read_worker_max_concurrency(
+                    session_factory
+                ),
+                environment_value=environment.get("WORKER_CONCURRENCY"),
+                timeout_seconds=_worker_db_call_timeout_seconds(environment),
+            )
+
         resources = _OwnedResources(
             engine,
             storage,
@@ -253,6 +288,7 @@ def create_server_host(
                 if image_generation_configuration is not None
                 else None
             ),
+            worker_capacity_bootstrap=worker_capacity_bootstrap,
         )
         app.state.server_session_factory = session_factory
         app.state.server_resources = resources
@@ -290,6 +326,37 @@ def create_server_host(
         if isinstance(error, ServerHostAssemblyError):
             raise
         raise ServerHostAssemblyError("server host assembly failed") from None
+
+
+def _read_worker_max_concurrency(session_factory: Callable[[], Any]) -> object:
+    """Read only the worker capacity field using the host's existing Session factory."""
+
+    session = session_factory()
+    try:
+        return session.execute(
+            select(_WORKER_CONFIGURATION.c.worker_max_concurrency).limit(1)
+        ).scalar_one_or_none()
+    finally:
+        try:
+            session.rollback()
+        finally:
+            session.close()
+
+
+def _worker_db_call_timeout_seconds(environment: Mapping[str, str]) -> float:
+    """Preserve the bounded DB bridge's default and lower bound safely."""
+
+    try:
+        value = float(environment.get("WORKER_DB_CALL_TIMEOUT", "10"))
+    except (TypeError, ValueError):
+        raise ServerConfigurationError(
+            "WORKER_DB_CALL_TIMEOUT must be a finite number"
+        ) from None
+    if not math.isfinite(value):
+        raise ServerConfigurationError(
+            "WORKER_DB_CALL_TIMEOUT must be a finite number"
+        )
+    return max(0.1, value)
 
 
 def _create_engine(database_url: str) -> Engine:

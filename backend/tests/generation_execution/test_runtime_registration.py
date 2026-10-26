@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timezone
 from threading import Event, Thread
 from time import monotonic
@@ -8,6 +9,7 @@ from haoai_backend.generation_contracts.ports import GenerationRuntimeConfig
 from haoai_backend.generation_contracts.types import ClaimAuthority, OwnerTaskScope
 from haoai_backend.generation_runtime.configuration import RegisteredExecutorFactory
 from haoai_backend.generation_runtime.runtime import build_runtime
+from haoai_backend.generation_runtime.worker_capacity import WorkerExecutionCapacity
 
 
 class _Signal:
@@ -124,6 +126,92 @@ def test_build_is_inert_and_only_registered_task_type_can_claim() -> None:
 
     receipt = runtime.shutdown("test complete")
     assert receipt.released_resources == ()
+
+
+class _Recovery:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+
+    def scan_due(self, *, stop_signal: Event) -> None:
+        assert not stop_signal.is_set()
+        self.events.append("recovery")
+
+
+def test_two_families_share_capacity_and_never_claim_while_full() -> None:
+    capacity = WorkerExecutionCapacity()
+    capacity.configure(1)
+    first_events: list[str] = []
+    second_events: list[str] = []
+    first_port = _Port(first_events)
+    second_port = _Port(second_events)
+    first_started = Event()
+    first_finish = Event()
+    first_outcomes: list[str] = []
+
+    first_runtime = build_runtime(
+        replace(
+            _config(first_events, shutdown_timeout=0.05),
+            worker_capacity=capacity,
+        ),
+        (
+            RegisteredExecutorFactory(
+                "image-single",
+                lambda: first_port,
+                lambda: _BlockingExecutor(first_started, first_finish),
+                recovery_factory=lambda: _Recovery(first_events),
+            ),
+        ),
+    )
+    second_runtime = build_runtime(
+        replace(_config(second_events), worker_capacity=capacity),
+        (
+            RegisteredExecutorFactory(
+                "ai-review",
+                lambda: second_port,
+                lambda: _Executor(second_events),
+                recovery_factory=lambda: _Recovery(second_events),
+            ),
+        ),
+    )
+    first = Thread(
+        target=lambda: first_outcomes.append(
+            first_runtime.run_claimed_once("image-single")
+        ),
+        daemon=True,
+    )
+
+    try:
+        first.start()
+        assert first_started.wait(timeout=1.0)
+        first_active_count = capacity.active_count
+        second_outcome = second_runtime.run_claimed_once("ai-review")
+        second_claims = [event for event in second_events if event.startswith("claim:")]
+        assert (first_active_count, second_outcome, second_claims) == (1, "pending", [])
+        assert second_events == ["recovery"]
+
+        shutdown_started = monotonic()
+        first_shutdown = first_runtime.shutdown("shutdown while executor is blocked")
+        shutdown_elapsed = monotonic() - shutdown_started
+
+        assert shutdown_elapsed < 0.5
+        assert first.is_alive()
+        assert capacity.active_count == 1
+        assert first_shutdown.revoked_claim_refs == ("task:1",)
+        assert second_runtime.run_claimed_once("ai-review") == "pending"
+        assert not any(event.startswith("claim:") for event in second_events)
+        assert capacity.active_count == 1
+    finally:
+        first_finish.set()
+        first.join(timeout=1.0)
+
+    assert not first.is_alive()
+    assert first_outcomes == ["pending"]
+    assert capacity.active_count == 0
+    assert first_events.count("release") == 1
+    assert second_runtime.run_claimed_once("ai-review") == "pending"
+    assert any(event.startswith("claim:ai-review:") for event in second_events)
+    assert capacity.active_count == 0
+    second_runtime.shutdown("test complete")
 
 
 
