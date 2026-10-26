@@ -67,8 +67,15 @@ def target_scope_for_snapshot(target: TargetSnapshot) -> str:
         if identity.endswith("|None"):
             raise ValueError("frame application target requires a stable id or index")
         scope = f"{target.kind}|{target.series_id}|chapter|{target.chapter_id}|{identity}"
-    elif target.kind == "canvas_asset_image" and target.asset_type and target.asset_id:
-        scope = f"{target.kind}|{target.series_id}|asset|{target.asset_type}|{target.asset_id}"
+    elif target.kind in {"asset_message", "canvas_asset_image"} and target.asset_type and target.asset_id:
+        if target.kind == "asset_message" and not target.chapter_id:
+            raise ValueError("asset-message application target requires a chapter id")
+        scope = (
+            f"asset_message|{target.series_id}|chapter|{target.chapter_id}"
+            f"|asset|{target.asset_type}|{target.asset_id}"
+            if target.kind == "asset_message"
+            else f"{target.kind}|{target.series_id}|asset|{target.asset_type}|{target.asset_id}"
+        )
     else:
         raise ValueError("unsupported generation application target")
     if len(scope) > 255:

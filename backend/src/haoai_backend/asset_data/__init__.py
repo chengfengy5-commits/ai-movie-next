@@ -5,9 +5,16 @@ from typing import Any
 
 from .ports import AssetGenerationWriter
 
-__all__ = ("AssetGenerationWriter", "digest_asset_target", "stage_asset_image")
+__all__ = (
+    "AssetGenerationWriter",
+    "digest_asset_target",
+    "stage_asset_image",
+    "stage_batch_asset_image_if_empty",
+)
 
-_GENERATION_EXPORTS = frozenset({"digest_asset_target", "stage_asset_image"})
+_GENERATION_EXPORTS = frozenset(
+    {"digest_asset_target", "stage_asset_image", "stage_batch_asset_image_if_empty"}
+)
 
 
 def __getattr__(name: str) -> Any:
