@@ -57,6 +57,8 @@ interface GenerationWorkspaceHarnessOptions {
   readonly deferredImageLookup?: boolean;
   readonly imageLookupTaskIds?: readonly string[];
   readonly deferredLockCheckAfterImageSubmission?: number;
+  readonly ownedResultTaskIds?: readonly string[];
+  readonly withoutOwnedResults?: boolean;
   readonly ownedImageReplies?: readonly {
     readonly status: number;
     readonly contentType?: string;
@@ -228,7 +230,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
   };
   const eligibility = options.eligibility ?? "ready";
   const ownedResult: CanvasOwnedResultItem = {
-    task_id: "generation-task",
+    task_id: options.ownedResultTaskIds?.[0] ?? "generation-task",
     result_ref: "generation-result",
     operation: "image.single",
     completed_at: timestamp,
@@ -465,7 +467,11 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
         ? { ...ownedResult, expected_target: characterTargetSnapshot }
         : ownedResult;
       const item = url.searchParams.has("cursor")
-        ? { ...pageItem, result_ref: "generation-page-two" }
+        ? {
+          ...pageItem,
+          ...(options.ownedResultTaskIds?.[1] === undefined ? {} : { task_id: options.ownedResultTaskIds[1] }),
+          result_ref: "generation-page-two",
+        }
         : pageItem;
       return Response.json({
         chapter_id: activeChapter.id,
@@ -529,6 +535,8 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     throw new Error(`Unexpected API request: ${method} ${url.pathname}`);
   });
   const services = createApiServices("http://127.0.0.1:8000/api", { storage, fetcher });
+  const workspaceServices = { ...services };
+  if (options.withoutOwnedResults) Reflect.deleteProperty(workspaceServices, "canvasOwnedResults");
   const onSourceChanged = vi.fn();
   const onUnauthorized = vi.fn();
   const canvasPort = services.canvasData;
@@ -537,7 +545,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     sessionGeneration = 2,
     actorId = "demo-user",
     chapter = activeChapter,
-    workspaceServices: WorkspaceServices = services,
+      selectedServices: WorkspaceServices = workspaceServices,
   ) => (
     <CanvasWorkspace
       chapter={chapter}
@@ -546,7 +554,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
       onSourceChanged={onSourceChanged}
       port={canvasPort}
       series={currentSeries}
-      services={workspaceServices}
+      services={selectedServices}
       sessionGeneration={sessionGeneration}
       userId={actorId}
     />
@@ -571,7 +579,7 @@ function mountGenerationWorkspace(options: GenerationWorkspaceHarnessOptions) {
     setFreshSourceVersion(value: string | undefined) { freshSourceVersion = value; },
     setLockMode(value: "unlocked" | "foreign" | "expired" | undefined) { activeLockMode = value; },
     setOwnedResultVisible(value: boolean) { ownedResultVisible = value; },
-    rerender(sessionGeneration: number, actorId = "demo-user", chapter = activeChapter, servicesOverride: WorkspaceServices = services) {
+    rerender(sessionGeneration: number, actorId = "demo-user", chapter = activeChapter, servicesOverride: WorkspaceServices = workspaceServices) {
       activeChapter = chapter;
       view.rerender(workspace(sessionGeneration, actorId, chapter, servicesOverride));
     },
@@ -2898,6 +2906,89 @@ describe("selected chapter to canvas integration", () => {
     await waitFor(() => expect(dialog.getByText("当前目标没有可显示的图片生成记录。")).toBeTruthy());
     await waitFor(() => expect(revokeObjectURL).toHaveBeenCalledWith("blob:removed-candidate-image"));
     expect(screen.queryByRole("img", { name: "生成结果图片预览" })).toBeNull();
+  });
+
+  it("opens task-filtered owned candidates from a completed image receipt", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageSubmitReplies: [{ status: 200, receiptStatus: "completed" }],
+      ownedResultTaskIds: ["unrelated-task", "image-task-1"],
+      initialNextCursor: "YWJj",
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText("任务状态：已完成")).toBeTruthy();
+    fireEvent.click(await receiptDialog.findByRole("button", { name: "查看本张结果" }));
+
+    const resultDialog = generationResultsDialog();
+    expect(await resultDialog.findByText(/当前已加载范围内暂无该任务的图片结果/)).toBeTruthy();
+    expect(resultDialog.getByText("任务编号：image-task-1").closest("details")?.open).toBe(false);
+    const pageRequests = () => harness.requests.filter((request) => request.url.pathname.endsWith("/canvas-owned-results"));
+    expect(pageRequests()).toHaveLength(1);
+    expect(pageRequests()[0]?.url.searchParams.get("target_kind")).toBe("frame_preview");
+    expect(resultDialog.queryByText("任务编号：unrelated-task")).toBeNull();
+    expect(resultDialog.queryByRole("button", { name: "应用到当前目标" })).toBeNull();
+
+    fireEvent.click(resultDialog.getByRole("button", { name: "加载下一页" }));
+    expect(await resultDialog.findByText("任务编号：image-task-1")).toBeTruthy();
+    expect(resultDialog.queryByText("任务编号：unrelated-task")).toBeNull();
+    fireEvent.click(resultDialog.getByRole("button", { name: "应用到当前目标" }));
+    expect(await resultDialog.findByText(/应用成功。正在刷新章节内容/)).toBeTruthy();
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(1);
+    expect(harness.requests.filter((request) => request.method === "PUT")[0]?.body).toMatchObject({
+      generation_application: {
+        task_id: "image-task-1",
+        result_ref: "generation-page-two",
+      },
+    });
+  });
+
+  it("shows why a completed task result cannot open when owned-result service is unavailable", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      withoutOwnedResults: true,
+      imageSubmitReplies: [{ status: 200, receiptStatus: "completed" }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.click(form.getByRole("button", { name: "提交单张图片任务" }));
+
+    const receiptDialog = within(await screen.findByRole("dialog", { name: "生成任务状态" }));
+    expect(await receiptDialog.findByText("任务状态：已完成")).toBeTruthy();
+    fireEvent.click(receiptDialog.getByRole("button", { name: "查看本张结果" }));
+
+    expect(await receiptDialog.findByRole("alert")).toBeTruthy();
+    expect(receiptDialog.getByText("当前未接入图片结果服务，无法查看本张图片结果。")).toBeTruthy();
+    expect(screen.queryByRole("dialog", { name: "生成图片记录" })).toBeNull();
+    expect(harness.requests.filter((request) => request.url.pathname.endsWith("/canvas-owned-results"))).toHaveLength(0);
+  });
+
+  it("keeps a completed sibling out of result review while another submission is unknown", async () => {
+    const harness = mountGenerationWorkspace({
+      targetKind: "stable-frame",
+      imageSubmitReplies: [{ status: 200, receiptStatus: "completed" }, { status: 503 }],
+    });
+    fireEvent.click(await screen.findByRole("article", { name: "分镜 1" }));
+    fireEvent.click(screen.getByRole("button", { name: "生成图片" }));
+    const form = await waitForImageModelOption(await screen.findByRole("dialog", { name: "生成图片" }));
+    fireEvent.change(form.getByLabelText("生成数量"), { target: { value: "2" } });
+    fireEvent.click(form.getByRole("button", { name: "提交2张图片任务" }));
+
+    const intentDialog = within(await screen.findByRole("dialog", { name: "核对原生成任务" }));
+    expect(await intentDialog.findByText(/本轮停在第 2 张，结果待确认/)).toBeTruthy();
+    expect(intentDialog.getByText(/请先核对本轮未确认的图片提交/)).toBeTruthy();
+    expect(intentDialog.queryByRole("button", { name: "查看本张结果" })).toBeNull();
+    expect(harness.requests.filter((request) => request.method === "POST"
+      && request.url.pathname === "/api/chat/image")).toHaveLength(2);
+    expect(harness.requests.filter((request) => request.url.pathname.endsWith("/canvas-owned-results"))).toHaveLength(0);
+    expect(harness.requests.filter((request) => request.method === "PUT")).toHaveLength(0);
   });
 
   it("reads an application proof without lock traffic even when the chapter requires a lock for writes", async () => {

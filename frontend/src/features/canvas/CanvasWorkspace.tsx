@@ -121,6 +121,7 @@ interface OwnedAssetPlacement {
 interface CanvasGenerationDialogModel {
   id: number;
   selectedRef: string | null;
+  taskIdFilter: string | null;
   target: CanvasOwnedResultsTarget;
   targetLabel: string;
   sourceVersion: string | null;
@@ -1962,6 +1963,7 @@ export function CanvasWorkspace({
     const dialog: CanvasGenerationDialogModel = {
       id: ++generationDialogSequenceRef.current,
       selectedRef: selected.ref,
+      taskIdFilter: null,
       target: resolved.target,
       targetLabel: resolved.label,
       sourceVersion: snapshot.version,
@@ -1990,6 +1992,7 @@ export function CanvasWorkspace({
     const dialog: CanvasGenerationDialogModel = {
       id: ++generationDialogSequenceRef.current,
       selectedRef: null,
+      taskIdFilter: intent.candidate.task_id,
       target: intent.destination,
       targetLabel: generationTargetLabel(intent.destination),
       sourceVersion: null,
@@ -2008,6 +2011,93 @@ export function CanvasWorkspace({
     setGenerationLockUnavailable(false);
     setGenerationLockPending(false);
     setGenerationLockMessage(null);
+  }
+
+  function completedImageResultTargetIsCurrent(target: CanvasImageGenerationTarget, imageGuardBlocked: boolean): boolean {
+    const snapshot = sourcesRef.current;
+    const selected = graph.nodes.find((node) => node.ref === target.selectedRef) ?? null;
+    const resolved = snapshot === null || selected === null ? null : generationTargetForNode(snapshot, selected);
+    return services.canvasSource !== undefined
+      && services.canvasOwnedResults !== undefined
+      && services.canvasGenerationApplications !== undefined
+      && services.canvasResultApplications !== undefined
+      && target.context.actorId === userId
+      && target.context.seriesId === series.id
+      && target.context.chapterId === selectedChapter.id
+      && target.context.isCurrent()
+      && snapshot !== null
+      && snapshot.version === target.sourceVersion
+      && snapshot.requires_lock === target.requiresLock
+      && selectedNodeRef.current === target.selectedRef
+      && resolved !== null
+      && sameGenerationTarget(resolved.target, target.destination)
+      && target.targetKey === imageGenerationTargetKey(target.selectedRef, target.destination, snapshot.version)
+      && !sourceMutationPending && !sourceMutationPendingRef.current && !sourceReadbackPending
+      && pendingSourceAcknowledgementRef.current === null && unknownSourceIntentRef.current === null
+      && sourceError === null && documentState.writable && !documentState.dirty
+      && documentState.status !== "saving" && documentState.status !== "unknown" && documentState.status !== "conflict"
+      && generationIntentRef.current === null && !generationBusyRef.current && !generationMutationPendingRef.current
+      && generationDialogRef.current === null
+      && imageGenerationBlockedRef.current === imageGuardBlocked
+      && !imageGenerationUnresolvedRef.current && !imageGenerationBusyRef.current;
+  }
+
+  function openCompletedImageTaskResults(idempotencyKey: string): string | null {
+    const state = imageGeneration.state;
+    const batch = state.batch;
+    const target = state.target;
+    const accepted = batch?.acceptedReceipts.find((item) => item.idempotencyKey === idempotencyKey);
+    if (state.mode !== "receipt" || state.intent !== null || state.busy || batch === null || target === null
+      || (batch.outcome !== "complete" && batch.outcome !== "stopped")
+      || accepted === undefined || accepted.receipt.operation !== "image.single"
+      || accepted.receipt.status !== "completed" || !sameGenerationTarget(accepted.destination, target.destination)) {
+      const message = "请先确认本轮图片提交已结束，再查看这张已完成任务的图片结果。";
+      setSourceMessage(message);
+      return message;
+    }
+    if (!generationPortsAvailable) {
+      const message = "当前未接入图片结果服务，无法查看本张图片结果。";
+      setSourceMessage(message);
+      return message;
+    }
+    if (!completedImageResultTargetIsCurrent(target, true)) {
+      const message = "原图片任务的画布身份、目标或服务上下文已变化；没有打开或改绑结果记录。";
+      setSourceMessage(message);
+      return message;
+    }
+
+    imageGeneration.close();
+    if (imageGenerationBlockedRef.current
+      || !completedImageResultTargetIsCurrent(target, false)) {
+      setSourceMessage("关闭任务回执后上下文复核未通过；没有打开或改绑结果记录。");
+      return null;
+    }
+
+    const dialog: CanvasGenerationDialogModel = {
+      id: ++generationDialogSequenceRef.current,
+      selectedRef: target.selectedRef,
+      taskIdFilter: accepted.receipt.taskId,
+      target: target.destination,
+      targetLabel: target.targetLabel,
+      sourceVersion: target.sourceVersion,
+      requiresLock: target.requiresLock,
+      items: [],
+      cursor: undefined,
+      nextCursor: null,
+      loading: false,
+      error: null,
+      message: null,
+    };
+    generationDialogRef.current = dialog;
+    setGenerationDialog(dialog);
+    setGenerationHistoryLookups(new Map());
+    setGenerationConfirmedProof(null);
+    setGenerationLockRequired(false);
+    setGenerationLockUnavailable(false);
+    setGenerationLockPending(false);
+    setGenerationLockMessage(null);
+    void loadGenerationPage(undefined, false);
+    return null;
   }
 
   async function confirmGenerationEditLock(
@@ -2808,6 +2898,7 @@ export function CanvasWorkspace({
             lockUnavailable={generationLockUnavailable}
             message={generationDialog.message}
             nextCursor={generationDialog.nextCursor}
+            taskIdFilter={generationDialog.taskIdFilter}
             onAcquireLock={() => void acquireGenerationEditLock()}
             onApply={applyGenerationItem}
             onBeginImagePreview={beginGenerationImagePreview}
@@ -2876,6 +2967,7 @@ export function CanvasWorkspace({
             onPauseTaskObservation={imageGeneration.pauseTaskObservation}
             onContinueTaskObservation={imageGeneration.continueTaskObservation}
             onRefreshTaskObservation={imageGeneration.refreshTaskObservation}
+            onViewTaskResult={openCompletedImageTaskResults}
             selectedModelId={imageGeneration.state.selectedModelId}
             targetLabel={imageGenerationDialogTargetLabel ?? "单张图片任务"}
           />

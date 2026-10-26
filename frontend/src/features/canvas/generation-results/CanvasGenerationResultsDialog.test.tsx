@@ -96,6 +96,7 @@ function pendingIntent(
 
 function renderDialog(overrides: Partial<CanvasGenerationResultsDialogProps> = {}) {
   const props: CanvasGenerationResultsDialogProps = {
+    taskIdFilter: null,
     targetLabel: "第 1 帧",
     items: [result("ready", "ready-result")],
     nextCursor: null,
@@ -137,6 +138,17 @@ afterEach(() => {
 });
 
 describe("CanvasGenerationResultsDialog", () => {
+  it("limits a task-scoped entry to candidates from that exact task", () => {
+    renderDialog({
+      taskIdFilter: "task-b",
+      items: [result("ready", "task-a-result"), { ...result("ready", "task-b-result"), task_id: "task-b" }],
+    });
+
+    expect(screen.getByText("任务编号：task-b")).toBeTruthy();
+    expect(screen.queryByText("任务编号：task-a")).toBeNull();
+    expect(screen.getByRole("button", { name: "应用到当前目标" })).toBeTruthy();
+  });
+
   it("shows apply only for ready results and history verification for already-applied results", () => {
     const items = [
       result("ready", "ready-result"),

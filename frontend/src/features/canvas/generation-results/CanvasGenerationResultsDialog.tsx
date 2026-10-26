@@ -19,6 +19,7 @@ export interface PendingCanvasGenerationIntent {
 
 export interface CanvasGenerationResultsDialogProps {
   readonly intentOnly?: boolean;
+  readonly taskIdFilter: string | null;
   readonly targetLabel: string;
   readonly items: readonly CanvasOwnedResultItem[];
   readonly nextCursor: string | null;
@@ -137,6 +138,7 @@ function lookupMessage(lookup: CanvasResultApplicationLookup): string {
 
 export function CanvasGenerationResultsDialog({
   intentOnly = false,
+  taskIdFilter,
   targetLabel,
   items,
   nextCursor,
@@ -168,8 +170,9 @@ export function CanvasGenerationResultsDialog({
   const [imagePreview, setImagePreview] = useState<ImagePreviewState | null>(null);
   const activeImagePreviewRef = useRef<ImagePreviewRequest | null>(null);
   const imagePreviewSequenceRef = useRef(0);
-  const itemsRef = useRef(items);
-  itemsRef.current = items;
+  const visibleItems = taskIdFilter === null ? items : items.filter((item) => item.task_id === taskIdFilter);
+  const itemsRef = useRef(visibleItems);
+  itemsRef.current = visibleItems;
   const imagePreviewScopeKeyRef = useRef(imagePreviewScopeKey);
   imagePreviewScopeKeyRef.current = imagePreviewScopeKey;
   const imagePreviewServiceIdentityRef = useRef(imagePreviewServiceIdentity);
@@ -406,10 +409,20 @@ export function CanvasGenerationResultsDialog({
 
         <div aria-label="生成记录列表" aria-busy={loading} className="canvas-generation-list">
           {loading && <p role="status">正在读取生成记录…</p>}
-          {!loading && error === null && items.length === 0 && (
-            <p>{intentOnly ? "此处只保留了原操作；请先核对应用记录。" : "当前目标没有可显示的图片生成记录。"}</p>
+          {!loading && error === null && visibleItems.length === 0 && (
+            <p>{intentOnly
+              ? "此处只保留了原操作；请先核对应用记录。"
+              : taskIdFilter !== null
+                ? "当前已加载范围内暂无该任务的图片结果。任务显示已完成不代表结果已就绪；可重新读取当前页或按需加载下一页。"
+                : "当前目标没有可显示的图片生成记录。"}</p>
           )}
-          {items.map((item) => {
+          {!loading && error === null && visibleItems.length === 0 && taskIdFilter !== null && !intentOnly && (
+            <details className="canvas-generation-details">
+              <summary>查看对应任务编号</summary>
+              <p>任务编号：{taskIdFilter}</p>
+            </details>
+          )}
+          {visibleItems.map((item) => {
             const lookup = historyLookups.get(item.result_ref);
             const applyDisabled = busy || loading || pendingIntent !== null
               || lockPending || lockRequired || lockUnavailable;

@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
 import type { CanvasImageGenerationReceipt } from "../../../shared/api/canvasImageGeneration";
 import type { CanvasOwnedResultsTarget } from "../../../shared/api/canvasOwnedResults";
@@ -119,6 +120,7 @@ export interface CanvasImageGenerationDialogProps {
   onPauseTaskObservation(idempotencyKey: string): void;
   onContinueTaskObservation(idempotencyKey: string): void;
   onRefreshTaskObservation(idempotencyKey: string): void;
+  onViewTaskResult(idempotencyKey: string): string | null;
 }
 
 function taskStatus(status: CanvasImageGenerationReceipt["status"]): string {
@@ -176,10 +178,13 @@ function receiptDetails(view: CanvasImageGenerationReceiptView) {
 
 function batchProgress(
   batch: CanvasImageGenerationBatchView,
+  mode: CanvasImageGenerationDialogProps["mode"],
+  pendingIntent: CanvasImageGenerationIntentView | null,
   taskObservations: Readonly<Record<string, CanvasImageTaskObservationView>>,
   onPauseTaskObservation: (idempotencyKey: string) => void,
   onContinueTaskObservation: (idempotencyKey: string) => void,
   onRefreshTaskObservation: (idempotencyKey: string) => void,
+  onViewTaskResult: (idempotencyKey: string) => void,
 ) {
   return (
     <div className="canvas-image-generation-batch" aria-label="本轮图片任务进度" role="status">
@@ -203,6 +208,10 @@ function batchProgress(
                 <p>第 {item.ordinal} 张 · 请求编号：{item.idempotencyKey}</p>
                 <p>任务编号：{item.receipt.taskId} · 状态：{taskStatus(item.receipt.status)}</p>
                 <p>服务器报价：{item.receipt.quotedAmount} · 计费状态：{billingStatus(item.receipt.billingStatus)}</p>
+                {item.receipt.status === "completed"
+                  && (batch.outcome === "unknown" || pendingIntent !== null) && (
+                  <p>这张任务已经完成，但本轮还有提交结果未确认。请先核对本轮未确认的图片提交，再查看本张结果。</p>
+                )}
                 <div className="canvas-image-generation-observation" aria-label={`第 ${item.ordinal} 张任务状态观察`}>
                   <p>状态观察：{observation === undefined ? "等待开始" : observationStatusLabel(observation.status)}</p>
                   {observation?.error !== null && observation?.error !== undefined && (
@@ -226,6 +235,11 @@ function batchProgress(
                   </div>
                 </div>
                 {receiptDetails(item)}
+                {mode === "receipt" && pendingIntent === null
+                  && (batch.outcome === "complete" || batch.outcome === "stopped")
+                  && item.receipt.operation === "image.single" && item.receipt.status === "completed" && (
+                  <button onClick={() => onViewTaskResult(item.idempotencyKey)} type="button">查看本张结果</button>
+                )}
               </li>
             );
           })}
@@ -292,8 +306,15 @@ export function CanvasImageGenerationDialog({
   onPauseTaskObservation,
   onContinueTaskObservation,
   onRefreshTaskObservation,
+  onViewTaskResult,
 }: CanvasImageGenerationDialogProps) {
   const focus = useSeriesDialogFocus({ active: true, canDismiss: true, onDismiss: onClose });
+  const [resultHandoffError, setResultHandoffError] = useState<string | null>(null);
+  const receiptKey = receipt === null ? null
+    : batch?.acceptedReceipts.find((item) => item.receipt.submissionId === receipt.receipt.submissionId)?.idempotencyKey ?? null;
+  useEffect(() => {
+    setResultHandoffError(null);
+  }, [mode, receiptKey]);
   const selectedModel = models.find((model) => model.id === selectedModelId);
   const sizeConfigurationInvalid = selectedModel !== undefined && selectedModel.sizeConfigurationError !== null;
   const countSelectionBlocked = countSelectionInvalid || ![1, 2, 3, 4].includes(selectedCount);
@@ -306,6 +327,9 @@ export function CanvasImageGenerationDialog({
     && referenceSelectionCount > selectedModel.maximumReferenceImages;
   const title = mode === "form" ? "生成图片"
     : mode === "intent" ? "核对原生成任务" : "生成任务状态";
+  const handleViewTaskResult = (idempotencyKey: string) => {
+    setResultHandoffError(onViewTaskResult(idempotencyKey));
+  };
 
   return (
     <div className="canvas-image-generation-backdrop" role="presentation">
@@ -492,8 +516,8 @@ export function CanvasImageGenerationDialog({
             )}
             {error !== null && <p className="canvas-image-generation-error" role="alert">{error}</p>}
             {message !== null && <p className="canvas-image-generation-message" role="status">{message}</p>}
-            {batch !== null && batchProgress(batch, taskObservations, onPauseTaskObservation,
-              onContinueTaskObservation, onRefreshTaskObservation)}
+            {batch !== null && batchProgress(batch, mode, pendingIntent, taskObservations, onPauseTaskObservation,
+              onContinueTaskObservation, onRefreshTaskObservation, onViewTaskResult)}
             <footer className="canvas-image-generation-footer">
               <button disabled={busy || modelsLoading || models.length === 0 || selectedModelId === ""
                 || countSelectionBlocked
@@ -515,8 +539,8 @@ export function CanvasImageGenerationDialog({
             </p>
             {error !== null && <p>{error}</p>}
             {message !== null && <p>{message}</p>}
-            {batch !== null && batchProgress(batch, taskObservations, onPauseTaskObservation,
-              onContinueTaskObservation, onRefreshTaskObservation)}
+            {batch !== null && batchProgress(batch, mode, pendingIntent, taskObservations, onPauseTaskObservation,
+              onContinueTaskObservation, onRefreshTaskObservation, onViewTaskResult)}
             <details className="canvas-image-generation-details">
               <summary>查看原提交详情</summary>
               <p>目标：{targetIdentity(pendingIntent.destination)}</p>
@@ -567,8 +591,9 @@ export function CanvasImageGenerationDialog({
                 <p>计费状态：{billingStatus(receipt.receipt.billingStatus)}</p>
               </>
             )}
-            {batchProgress(batch, taskObservations, onPauseTaskObservation,
-              onContinueTaskObservation, onRefreshTaskObservation)}
+            {batchProgress(batch, mode, pendingIntent, taskObservations, onPauseTaskObservation,
+              onContinueTaskObservation, onRefreshTaskObservation, handleViewTaskResult)}
+            {resultHandoffError !== null && <p className="canvas-image-generation-error" role="alert">{resultHandoffError}</p>}
             {message !== null && <p>{message}</p>}
             {error !== null && <p className="canvas-image-generation-error" role="alert">{error}</p>}
             <footer className="canvas-image-generation-footer">
