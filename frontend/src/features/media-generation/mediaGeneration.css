@@ -81,6 +81,24 @@
   gap: 1rem;
 }
 
+.media-generation-batch-type {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+  min-width: 0;
+  margin: 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+}
+
+.media-generation-batch-type legend {
+  padding: 0 0.35rem;
+  color: var(--ink);
+  font-weight: 700;
+}
+
 .media-generation-fields label {
   display: grid;
   min-width: 0;
@@ -255,6 +273,10 @@
   }
 
   .media-generation-fields {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .media-generation-batch-type {
     grid-template-columns: minmax(0, 1fr);
   }
 

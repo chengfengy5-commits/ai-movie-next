@@ -5,6 +5,7 @@ import type { Chapter, Character, Series, StoryboardAsset } from "../../shared/a
 import type { MediaGenerationPort, MediaGenerationRun } from "../../shared/api/mediaGeneration";
 import type { MediaReferenceUploadPort, MediaReferenceUploadRun } from "../../shared/api/mediaReferenceUpload";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
+import type { UserPreferences, UserPreferencesPort } from "../../shared/api/userPreferences";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { MediaGenerationPage } from "./MediaGenerationPage";
 
@@ -22,6 +23,12 @@ function creatorSettings(): CreatorSettingsServicePort {
     sort_order: 0,
     is_system: false,
     user_id: "actor-926",
+  };
+  const sceneImageModel: CreatorModel = {
+    ...imageModel,
+    id: "image-model-scene-926",
+    name: "场景图片模型",
+    params: JSON.stringify({ image_size: { enabled: true, default: "2:3", options: ["2:3", "4:3"] } }),
   };
   const videoModel: CreatorModel = {
     id: "video-model-926",
@@ -49,10 +56,16 @@ function creatorSettings(): CreatorSettingsServicePort {
     is_system: false,
     user_id: "actor-926",
   };
+  const prompts: CreatorPrompt[] = [
+    prompt,
+    { ...prompt, id: "image-prompt-scene-926", category: "scene-design", name: "场景提示词" },
+    { ...prompt, id: "image-prompt-prop-926", category: "prop-design", name: "道具提示词" },
+    { ...prompt, id: "image-prompt-storyboard-926", category: "storyboard-design", name: "分镜提示词" },
+  ];
   const unexpected = async (): Promise<never> => { throw new Error("Unexpected creator-setting mutation."); };
   return {
-    listModels: vi.fn(async (category) => category === "video" ? [videoModel] : category === "image" ? [imageModel] : []),
-    listPrompts: vi.fn(async () => [prompt]),
+    listModels: vi.fn(async (category) => category === "video" ? [videoModel] : category === "image" ? [imageModel, sceneImageModel] : []),
+    listPrompts: vi.fn(async () => prompts),
     getModel: unexpected,
     createModel: unexpected,
     updateModel: unexpected,
@@ -101,6 +114,20 @@ function generationPort(
     })),
   };
   return { beginRun: vi.fn(() => run) };
+}
+
+function userPreferencesPort(initial: UserPreferences) {
+  let preferences: UserPreferences = JSON.parse(JSON.stringify(initial)) as UserPreferences;
+  const get = vi.fn(async () => JSON.parse(JSON.stringify(preferences)) as UserPreferences);
+  const update = vi.fn(async (value: UserPreferences) => {
+    preferences = { ...preferences, ...JSON.parse(JSON.stringify(value)) as UserPreferences };
+    return { updatedKeys: Object.keys(value) };
+  });
+  const port: UserPreferencesPort = {
+    get,
+    update,
+  };
+  return { port, current: () => preferences, get, update };
 }
 
 function referenceUploadPort(
@@ -362,12 +389,24 @@ describe("MediaGenerationPage", () => {
     const series = seriesFixture();
     const chapter = chapterFixture();
     const scene = { id: "scene-926", series_id: series.id, title: "雨巷", description: "青石路面", image_url: null, aliases: null, canonical_key: null, created_at: "2026-10-20T00:00:00Z", updated_at: "2026-10-20T00:00:00Z" };
+    const preferences = userPreferencesPort({
+      another_preference: { keep: true },
+      batch_gen_prefs: {
+        character: { model: "image-model-scene-926", prompt: "image-prompt-926", size: "4:3", custom_character_field: "keep-character" },
+        scene: { model: "image-model-926", prompt: "image-prompt-scene-926", size: "16:9", custom_scene_field: "keep-scene" },
+        prop: { model: "removed-model", prompt: "removed-prompt", size: "64:64", custom_prop_field: "keep-prop" },
+        storyboard: { model: "image-model-scene-926", prompt: "image-prompt-storyboard-926", size: "2:3" },
+        checks: { character: false, scene: true, prop: false, keep_unknown: "keep-check" },
+        extension: { keep: "unknown-batch-field" },
+      },
+    });
     const services: WorkspaceServices = {
       ...createDemoServices(window.localStorage),
       mode: "api",
       apiBaseUrl: "http://127.0.0.1:4175/api",
       creatorSettings: creatorSettings(),
       mediaGeneration: generationPort(submitBatch),
+      userPreferences: preferences.port,
       listSeries: vi.fn(async () => [series]),
       listChapters: vi.fn(async () => [chapter]),
       listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
@@ -376,20 +415,64 @@ describe("MediaGenerationPage", () => {
       listProps: vi.fn(async () => []),
     };
 
-    render(
-      <MediaGenerationPage
-        services={services}
-        userId="actor-926"
-        sessionGeneration={4}
-        onUnauthorized={vi.fn()}
-        onOpenTasks={onOpenTasks}
-      />,
-    );
+    const props = {
+      services,
+      userId: "actor-926",
+      sessionGeneration: 4,
+      onUnauthorized: vi.fn(),
+      onOpenTasks,
+    };
+    const { rerender } = render(<MediaGenerationPage {...props} />);
 
     await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await screen.findByText("已读取账户批量选项；部分保存值在当前目录中不可用，请重新选择后保存。");
     await user.selectOptions(screen.getByLabelText("剧集"), series.id);
     await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
-    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-scene-926");
+    expect(screen.getByLabelText("角色图片尺寸")).toHaveValue("4:3");
+    expect(screen.getByLabelText("场景模型")).toHaveValue("image-model-926");
+    expect(screen.getByLabelText("场景图片尺寸")).toHaveValue("16:9");
+    expect(screen.getByLabelText("场景提示词")).toHaveValue("image-prompt-scene-926");
+    expect(screen.getByLabelText("道具模型")).toHaveValue("");
+    expect(screen.getByText("已保存的模型不在当前模型目录中，请重新选择。")).toBeInTheDocument();
+    await user.selectOptions(screen.getByLabelText("角色模型"), "image-model-926");
+    await user.selectOptions(screen.getByLabelText("角色图片尺寸"), "16:9");
+    await user.selectOptions(screen.getByLabelText("角色提示词"), "");
+    await user.selectOptions(screen.getByLabelText("场景模型"), "image-model-scene-926");
+    await user.selectOptions(screen.getByLabelText("场景图片尺寸"), "4:3");
+    await user.selectOptions(screen.getByLabelText("场景提示词"), "");
+    await user.selectOptions(screen.getByLabelText("场景提示词"), "image-prompt-scene-926");
+    await user.selectOptions(screen.getByLabelText("分镜模型"), "image-model-926");
+    await user.selectOptions(screen.getByLabelText("分镜图片尺寸"), "1:1");
+    await user.selectOptions(screen.getByLabelText("分镜提示词"), "");
+    await user.selectOptions(screen.getByLabelText("分镜提示词"), "image-prompt-storyboard-926");
+
+    const listModels = vi.mocked(services.creatorSettings!.listModels);
+    const listPrompts = vi.mocked(services.creatorSettings!.listPrompts);
+    const modelReadCount = listModels.mock.calls.length;
+    const promptReadCount = listPrompts.mock.calls.length;
+    rerender(<MediaGenerationPage {...props} onUnauthorized={vi.fn()} />);
+    expect(listModels).toHaveBeenCalledTimes(modelReadCount);
+    expect(listPrompts).toHaveBeenCalledTimes(promptReadCount);
+    expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-926");
+    expect(screen.getByLabelText("角色图片尺寸")).toHaveValue("16:9");
+    expect(screen.getByLabelText("角色提示词")).toHaveValue("");
+    expect(screen.getByLabelText("场景模型")).toHaveValue("image-model-scene-926");
+    expect(screen.getByLabelText("场景图片尺寸")).toHaveValue("4:3");
+    expect(screen.getByLabelText("分镜图片尺寸")).toHaveValue("1:1");
+
+    await user.click(screen.getByRole("button", { name: "记住批量选项" }));
+    await screen.findByText("批量生成选项已保存到当前账号。");
+    expect(preferences.update).toHaveBeenCalledOnce();
+    expect(preferences.current().another_preference).toEqual({ keep: true });
+    expect(preferences.current().batch_gen_prefs).toEqual({
+      character: { model: "image-model-926", prompt: "", size: "16:9", custom_character_field: "keep-character" },
+      scene: { model: "image-model-scene-926", prompt: "image-prompt-scene-926", size: "4:3", custom_scene_field: "keep-scene" },
+      prop: { model: "removed-model", prompt: "removed-prompt", size: "64:64", custom_prop_field: "keep-prop" },
+      storyboard: { model: "image-model-926", prompt: "image-prompt-storyboard-926", size: "1:1" },
+      checks: { character: false, scene: true, prop: false, keep_unknown: "keep-check" },
+      extension: { keep: "unknown-batch-field" },
+    });
     const assetChoices = await screen.findByRole("group", { name: /选择生成素材/ });
     await user.click(within(assetChoices).getByRole("checkbox", { name: /第 2 镜 · 雨巷转场镜头/ }));
     await user.click(within(assetChoices).getByRole("checkbox", { name: /^雨巷场景 · 青石路面$/ }));
@@ -400,13 +483,97 @@ describe("MediaGenerationPage", () => {
     expect(submitBatch).toHaveBeenCalledTimes(1);
     const submitted = submitBatch.mock.calls[0]![0];
     expect(submitted).toMatchObject({ chapterId: chapter.id, assets: [
-      { type: "storyboard", id: "storyboard-926", name: "雨巷转场镜头", description: "石板路上的中景转场", modelId: "image-model-926" },
-      { type: "scene", id: "scene-926", modelId: "image-model-926" },
-      { type: "character", id: "character-926", modelId: "image-model-926" },
+      { type: "storyboard", id: "storyboard-926", name: "雨巷转场镜头", description: "石板路上的中景转场", modelId: "image-model-926", promptId: "image-prompt-storyboard-926", size: "1:1" },
+      { type: "scene", id: "scene-926", modelId: "image-model-scene-926", promptId: "image-prompt-scene-926", size: "4:3" },
+      { type: "character", id: "character-926", modelId: "image-model-926", promptId: "", size: "16:9" },
     ] });
     expect(submitted.idempotencyKey).toEqual(expect.any(String));
 
     await user.click(screen.getByRole("button", { name: "查看我的任务" }));
     expect(onOpenTasks).toHaveBeenCalledTimes(1);
+
+    cleanup();
+    render(<MediaGenerationPage {...props} />);
+    await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await screen.findByText("已读取账户批量选项；部分保存值在当前目录中不可用，请重新选择后保存。");
+    expect(screen.getByLabelText("角色提示词")).toHaveValue("");
+  });
+
+  it("keeps a frozen batch unchanged when account preferences arrive late and isolates a later account", async () => {
+    const user = userEvent.setup();
+    let finishPreferences: ((value: UserPreferences) => void) | undefined;
+    const latePreferences = new Promise<UserPreferences>((resolve) => { finishPreferences = resolve; });
+    let finishStalePreferences: ((value: UserPreferences) => void) | undefined;
+    const stalePreferences = new Promise<UserPreferences>((resolve) => { finishStalePreferences = resolve; });
+    let preferenceRead = 0;
+    let finishSubmission: ((value: Awaited<ReturnType<MediaGenerationRun["submitBatch"]>>) => void) | undefined;
+    const submitBatch = vi.fn<MediaGenerationRun["submitBatch"]>(() => new Promise((resolve) => { finishSubmission = resolve; }));
+    const preferencesA: UserPreferencesPort = {
+      get: vi.fn(() => ++preferenceRead === 1 ? latePreferences : stalePreferences),
+      update: vi.fn(async () => ({ updatedKeys: ["batch_gen_prefs"] })),
+    };
+    const preferencesB = userPreferencesPort({
+      batch_gen_prefs: {
+        character: { model: "image-model-926", prompt: "image-prompt-926", size: "1:1" },
+      },
+    });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(submitBatch),
+      userPreferences: preferencesA,
+      listSeries: vi.fn(async () => [seriesFixture()]),
+      listChapters: vi.fn(async () => [chapterFixture()]),
+      listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
+      listCharacters: vi.fn(async () => [characterFixture()]),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const props = { services, userId: "actor-926", sessionGeneration: 4, onUnauthorized: vi.fn(), onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage {...props} />);
+
+    await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await user.selectOptions(await screen.findByLabelText("角色模型"), "image-model-scene-926");
+    await user.selectOptions(screen.getByLabelText("剧集"), "series-926");
+    await user.selectOptions(await screen.findByLabelText("章节"), "chapter-926");
+    const assetChoices = await screen.findByRole("group", { name: /选择生成素材/ });
+    await user.click(within(assetChoices).getByRole("checkbox", { name: /林舟/ }));
+    await user.click(screen.getByRole("button", { name: "提交 1 项批量任务" }));
+
+    await waitFor(() => expect(submitBatch).toHaveBeenCalledOnce());
+    const frozenInput = submitBatch.mock.calls[0]![0];
+    expect(frozenInput.assets[0]).toMatchObject({
+      type: "character",
+      modelId: "image-model-scene-926",
+      size: "2:3",
+      promptId: "image-prompt-926",
+    });
+    finishSubmission?.({ operation: "image.batch", tasks: [] });
+    const acceptedMessage = "批量请求已回读，共 0 项；每项仍可在“我的任务”中查看。";
+    await screen.findByText(acceptedMessage);
+
+    finishPreferences?.({ batch_gen_prefs: {
+      character: { model: "image-model-926", prompt: "image-prompt-926", size: "16:9" },
+      scene: { model: "image-model-scene-926", prompt: "image-prompt-scene-926", size: "4:3" },
+    } });
+    await waitFor(() => expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-scene-926"));
+    expect(screen.getByLabelText("场景模型")).toHaveValue("image-model-926");
+    expect(screen.getByText(acceptedMessage)).toBeInTheDocument();
+    expect(frozenInput.assets[0]).toMatchObject({ modelId: "image-model-scene-926", size: "2:3" });
+    expect(submitBatch).toHaveBeenCalledOnce();
+    expect(preferencesA.update).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "普通视频" }));
+    await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await waitFor(() => expect(preferencesA.get).toHaveBeenCalledTimes(2));
+    rerender(<MediaGenerationPage {...props} userId="actor-927" services={{ ...services, userPreferences: preferencesB.port }} />);
+    await screen.findByText("已读取账户中保存的批量选项。修改后可点击“记住批量选项”。");
+    expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-926");
+    expect(screen.getByLabelText("角色图片尺寸")).toHaveValue("1:1");
+    finishStalePreferences?.({ batch_gen_prefs: {
+      character: { model: "image-model-scene-926", prompt: "image-prompt-character-926", size: "4:3" },
+    } });
+    await waitFor(() => expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-926"));
+    expect(screen.getByLabelText("角色图片尺寸")).toHaveValue("1:1");
   });
 });
