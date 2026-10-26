@@ -28,6 +28,7 @@ from sqlalchemy import event, insert
 from sqlalchemy.engine import Engine
 
 from backend.server import __main__ as server_cli
+from backend.server import application as server_application
 from backend.server.application import _OwnedResources, create_server_host
 from backend.server.application import ServerHostAssemblyError
 from backend.server.configuration import load_server_configuration
@@ -283,7 +284,7 @@ class _FakePublicResponse:
     def __init__(self, library: _ControlledPublicHttpLibrary) -> None:
         self.status = 200
         self.headers = {
-            "content-type": "image/png",
+            "content-type": library.content_type,
             "content-length": str(len(library.content)),
         }
         self._library = library
@@ -344,11 +345,12 @@ class _FakePublicSession:
 
 
 class _ControlledPublicHttpLibrary:
-    def __init__(self, content: bytes) -> None:
+    def __init__(self, content: bytes, *, content_type: str = "image/png") -> None:
         from haoai_backend.media_storage.pinned_http import EncodedRequestTarget
 
         self._target_type = EncodedRequestTarget
         self.content = content
+        self.content_type = content_type
         self.blocked = True
         self.release = threading.Event()
         self.first_started = threading.Event()
@@ -448,6 +450,136 @@ def _request_upload(app: Any, token: str) -> httpx.Response:
             )
 
     return asyncio.run(send())
+
+
+@pytest.mark.parametrize(
+    ("extension", "response_type", "stored_type"),
+    [
+        (".png", "application/octet-stream", "image/png"),
+        (".mp3", "audio/mpeg", "audio/mpeg"),
+        (".mp4", "application/octet-stream", "video/mp4"),
+    ],
+)
+def test_retry_oss_upload_host_pins_external_fetch_and_short_circuits_managed_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    extension: str,
+    response_type: str,
+    stored_type: str,
+) -> None:
+    public_content = b"synthetic retry media bytes"
+    library = _ControlledPublicHttpLibrary(
+        public_content,
+        content_type=response_type,
+    )
+    library.blocked = False
+    dns_calls: list[tuple[str, int, int]] = []
+
+    async def fake_getaddrinfo(
+        host: str,
+        port: int,
+        *,
+        family: int,
+        type: int,
+    ):
+        assert family == socket.AF_UNSPEC
+        assert type == socket.SOCK_STREAM
+        dns_calls.append((host, port, threading.get_ident()))
+        return (
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", port),
+            ),
+        )
+
+    monkeypatch.setattr(
+        server_application,
+        "_build_retry_public_media_http_library",
+        lambda: library,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        server_application,
+        "_resolve_public_media_address",
+        fake_getaddrinfo,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        socket,
+        "getaddrinfo",
+        lambda *_args, **_kwargs: pytest.fail(
+            "retry must use the injected DNS resolver"
+        ),
+    )
+
+    configuration = load_server_configuration(_environment(tmp_path, storage=True))
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    token = _seed_authenticated_user(host.app.state.server_engine)
+    external_url = f"https://media.example.test/output{extension}"
+
+    async def exercise_route() -> tuple[httpx.Response, httpx.Response, httpx.Response]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host.app, raise_app_exceptions=False),
+            base_url="http://server-host.test",
+        ) as client:
+            headers = {"Authorization": f"Bearer {token}"}
+            external = await client.post(
+                "/api/upload/retry-oss",
+                headers=headers,
+                json={"url": external_url},
+            )
+            assert external.status_code == 200
+            managed_url = external.json()["url"]
+            managed_replay = await client.post(
+                "/api/upload/retry-oss",
+                headers=headers,
+                json={"url": managed_url},
+            )
+            unsafe = await client.post(
+                "/api/upload/retry-oss",
+                headers=headers,
+                json={"url": "http://127.0.0.1/private.mp4"},
+            )
+            return external, managed_replay, unsafe
+
+    try:
+        external, managed_replay, unsafe = asyncio.run(exercise_route())
+
+        assert external.status_code == 200
+        managed_url = external.json()["url"]
+        assert managed_url.startswith("https://cdn.example.test/media/")
+        assert managed_replay.status_code == 200
+        assert managed_replay.json() == {"url": managed_url}
+        assert unsafe.status_code == 400
+        assert unsafe.json() == {"detail": "公网媒体地址未通过安全检查"}
+
+        assert [(host, port) for host, port, _thread_id in dns_calls] == [
+            ("media.example.test", 443)
+        ]
+        assert [url for url, _timeout, _thread_id in library.get_calls] == [
+            external_url
+        ]
+        assert [timeout for _url, timeout, _thread_id in library.get_calls] == [600]
+        assert library.responses[0].close_calls == 1
+        assert library.sessions[0].close_calls == 1
+        assert library.connectors[0].close_calls == 1
+        assert len(sdk_state["clients"]) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+        stored_call = sdk_state["clients"][0].calls[0]
+        assert stored_call["Key"].endswith(extension)
+        assert stored_call["ContentType"] == stored_type
+        assert stored_call["body_bytes"] == public_content
+    finally:
+        host.close()
+
+    assert sdk_state["clients"][0].close_calls == 1
 
 
 def test_host_wires_authenticated_upload_and_business_routes_to_one_factory(
@@ -553,8 +685,8 @@ def test_host_wires_authenticated_upload_and_business_routes_to_one_factory(
     config_response, retry_response = asyncio.run(read_public_routes())
     assert config_response.status_code == 200
     assert config_response.json()["site_title"] == "Synthetic site"
-    assert retry_response.status_code == 502
-    assert retry_response.json()["detail"] == "下载失败"
+    assert retry_response.status_code == 200
+    assert retry_response.json() == {"url": payload["url"]}
     assert len(sdk_state["clients"][0].calls) == 1
 
     async def shutdown() -> None:

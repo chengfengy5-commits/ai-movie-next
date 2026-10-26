@@ -9,7 +9,9 @@ import threading
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 from typing import Any, Callable
+from urllib.parse import urlsplit
 
 from sqlalchemy import Column, MetaData, String, Table, create_engine, select
 from sqlalchemy.engine import Engine
@@ -17,11 +19,28 @@ from sqlalchemy.orm import sessionmaker
 
 from haoai_backend.authentication import AuthenticationRuntime
 from haoai_backend.chat_text_generation import ChatTextGenerationConfiguration
+from haoai_backend.generation_contracts import TransferFailure
+from haoai_backend.media_storage.aiohttp_library import AiohttpMatureHttpLibrary
 from haoai_backend.media_storage.owned_media_runtime import OwnedMediaRuntime
+from haoai_backend.media_storage.pinned_http import (
+    MatureHttpLibrary,
+    PinnedPublicMediaFetcher,
+)
+from haoai_backend.media_storage.public_fetch_policy import PublicFetchPolicy
 from haoai_backend.media_storage.r2_sdk_factory import Boto3S3ClientFactory
-from haoai_backend.media_storage.transfer_types import SecretValue
+from haoai_backend.media_storage.transfer_types import (
+    MediaTypeRule,
+    SafeMediaPolicy,
+    SecretValue,
+)
 from haoai_backend.media_uploads import MediaUploadApplication
-from haoai_backend.media_uploads.adapters import R2MediaUploadStorage
+from haoai_backend.media_uploads.adapters import (
+    PinnedPublicMediaFetchAdapter,
+    R2MediaUploadStorage,
+    managed_origin_map_from_configuration,
+)
+from haoai_backend.media_uploads.domain import retry_media_spec
+from haoai_backend.media_uploads.ports import FetchedPublicMedia
 from haoai_backend.runtime_status import (
     Boto3R2HeadBucketClientFactory,
     R2HeadBucketProbe,
@@ -51,6 +70,29 @@ _WORKER_CONFIGURATION = Table(
     "system_configs",
     _WORKER_CONFIGURATION_METADATA,
     Column("worker_max_concurrency", String(10)),
+)
+_RETRY_MEDIA_POLICY_RULES = (
+    MediaTypeRule("audio/aac", ".aac"),
+    MediaTypeRule("audio/flac", ".flac"),
+    MediaTypeRule("audio/mp4", ".m4a"),
+    MediaTypeRule("audio/mpeg", ".mp3"),
+    MediaTypeRule("audio/ogg", ".ogg"),
+    MediaTypeRule("audio/opus", ".opus"),
+    MediaTypeRule("audio/wav", ".wav"),
+    MediaTypeRule("image/avif", ".avif"),
+    MediaTypeRule("image/bmp", ".bmp"),
+    MediaTypeRule("image/gif", ".gif"),
+    MediaTypeRule("image/jpeg", ".jpg"),
+    MediaTypeRule("image/png", ".png"),
+    MediaTypeRule("image/tiff", ".tif"),
+    MediaTypeRule("image/webp", ".webp"),
+    MediaTypeRule("video/mp4", ".mp4"),
+    MediaTypeRule("video/mpeg", ".mpg"),
+    MediaTypeRule("video/quicktime", ".mov"),
+    MediaTypeRule("video/webm", ".webm"),
+    MediaTypeRule("video/x-m4v", ".m4v"),
+    MediaTypeRule("video/x-matroska", ".mkv"),
+    MediaTypeRule("video/x-msvideo", ".avi"),
 )
 
 
@@ -204,8 +246,10 @@ def create_server_host(
             )
             media_application = MediaUploadApplication(
                 storage=storage,
-                public_media_fetcher=None,
-                managed_origin_map={},
+                public_media_fetcher=_RetryPublicMediaFetcher(),
+                managed_origin_map=managed_origin_map_from_configuration(
+                    configuration.r2_configuration
+                ),
             )
             head_bucket_factory = Boto3R2HeadBucketClientFactory(
                 session_factory=session_constructor,
@@ -393,6 +437,91 @@ def _read_worker_max_concurrency(session_factory: Callable[[], Any]) -> object:
             session.rollback()
         finally:
             session.close()
+
+
+class _RetryPublicMediaFetcher:
+    """Build the legacy retry fetch with the existing pinned public-media transport."""
+
+    def __init__(self) -> None:
+        self._http_library: MatureHttpLibrary | None = None
+
+    async def fetch(
+        self,
+        url: str,
+        *,
+        max_bytes: int,
+        timeout_seconds: float,
+    ) -> FetchedPublicMedia | TransferFailure:
+        fallback = _retry_media_fallback(url)
+        if fallback is None:
+            return TransferFailure(
+                "unsupported_media_type",
+                "公网媒体类型不受支持",
+            )
+
+        http_library = self._http_library
+        if http_library is None:
+            http_library = _build_retry_public_media_http_library()
+            self._http_library = http_library
+
+        pinned_fetcher = PinnedPublicMediaFetcher(
+            PublicFetchPolicy(_resolve_public_media_address),
+            SafeMediaPolicy(
+                _RETRY_MEDIA_POLICY_RULES,
+                generic_fallback=fallback,
+            ),
+            http_library=http_library,
+        )
+        return await PinnedPublicMediaFetchAdapter(pinned_fetcher).fetch(
+            url,
+            max_bytes=max_bytes,
+            timeout_seconds=timeout_seconds,
+        )
+
+
+def _retry_media_fallback(url: str) -> MediaTypeRule | None:
+    try:
+        path = urlsplit(url).path
+    except (TypeError, ValueError):
+        path = ""
+    extension = PurePosixPath(path).suffix.lower() or ".mp4"
+    spec = retry_media_spec(extension)
+    if spec is None:
+        return None
+    return next(
+        (
+            rule
+            for rule in _RETRY_MEDIA_POLICY_RULES
+            if rule.media_type == spec.content_type
+        ),
+        None,
+    )
+
+
+def _build_retry_public_media_http_library() -> MatureHttpLibrary:
+    try:
+        import aiohttp
+        from yarl import URL
+    except ImportError:
+        raise RuntimeError("public media transport is unavailable") from None
+    return AiohttpMatureHttpLibrary(
+        url_factory=URL,
+        connector_factory=aiohttp.TCPConnector,
+        session_factory=aiohttp.ClientSession,
+        timeout_factory=aiohttp.ClientTimeout,
+        cookie_jar_factory=aiohttp.DummyCookieJar,
+    )
+
+
+async def _resolve_public_media_address(
+    host: str,
+    port: int,
+    *,
+    family: int,
+    type: int,
+) -> list[tuple[object, ...]]:
+    loop = asyncio.get_running_loop()
+    return await loop.getaddrinfo(host, port, family=family, type=type)
 
 
 def _worker_db_call_timeout_seconds(environment: Mapping[str, str]) -> float:
