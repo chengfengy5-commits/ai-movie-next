@@ -91,6 +91,20 @@ export interface CreatorModelReorderInput {
   model_ids: string[];
 }
 
+export interface CreatorModelConnectionTestInput {
+  provider: string;
+  api_key: string;
+  base_url: string;
+  model: string;
+  category: CreatorModelCategory;
+}
+
+export interface CreatorModelConnectionTestResult {
+  success: boolean;
+  message: string;
+  status_code?: number;
+}
+
 export interface CreatorPromptReorderInput {
   category: CreatorPromptCategory;
   prompt_ids: string[];
@@ -106,6 +120,10 @@ export interface CreatorSettingsServicePort {
   getModel(id: string, signal: AbortSignal): Promise<CreatorModel>;
   createModel(input: CreatorModelCreateInput, signal: AbortSignal): Promise<CreatorModel>;
   updateModel(id: string, update: CreatorModelUpdateInput, signal: AbortSignal): Promise<CreatorModel>;
+  testModelConnection?(
+    input: CreatorModelConnectionTestInput,
+    signal: AbortSignal,
+  ): Promise<CreatorModelConnectionTestResult>;
   deleteModel(id: string, signal: AbortSignal): Promise<CreatorSettingsMessage>;
   reorderModels(input: CreatorModelReorderInput, signal: AbortSignal): Promise<CreatorSettingsMessage>;
   listPrompts(category: CreatorPromptCategory | undefined, signal: AbortSignal): Promise<CreatorPrompt[]>;
@@ -225,4 +243,23 @@ export function parseCreatorPromptList(value: unknown): CreatorPrompt[] {
 export function parseCreatorSettingsMessage(value: unknown): CreatorSettingsMessage {
   const response = record(value, "保存结果");
   return { message: requiredString(response, "message", "保存结果") };
+}
+
+export function parseCreatorModelConnectionTestResult(value: unknown): CreatorModelConnectionTestResult {
+  const response = record(value, "连接测试结果");
+  if (typeof response.success !== "boolean") {
+    throw new InvalidCreatorSettingsResponseError("连接测试结果.success无效。");
+  }
+  if (typeof response.message !== "string") {
+    throw new InvalidCreatorSettingsResponseError("连接测试结果.message无效。");
+  }
+  if (response.status_code !== undefined
+    && (typeof response.status_code !== "number" || !Number.isInteger(response.status_code))) {
+    throw new InvalidCreatorSettingsResponseError("连接测试结果.status_code无效。");
+  }
+  return {
+    success: response.success,
+    message: response.message,
+    ...(response.status_code === undefined ? {} : { status_code: response.status_code }),
+  };
 }

@@ -124,10 +124,13 @@ import {
   InvalidCreatorSettingsResponseError,
   parseCreatorModel,
   parseCreatorModelList,
+  parseCreatorModelConnectionTestResult,
   parseCreatorPrompt,
   parseCreatorPromptList,
   parseCreatorSettingsMessage,
   type CreatorModel,
+  type CreatorModelConnectionTestInput,
+  type CreatorModelConnectionTestResult,
   type CreatorModelCreateInput,
   type CreatorModelReorderInput,
   type CreatorModelUpdateInput,
@@ -2113,6 +2116,7 @@ type ApiEndpoint =
   | "myTeams"
   | "creatorModels"
   | "creatorModel"
+  | "testCreatorModelConnection"
   | "createCreatorModel"
   | "updateCreatorModel"
   | "deleteCreatorModel"
@@ -2279,6 +2283,9 @@ function apiRequestDefinition(
   }
   if (endpoint === "myTeams") {
     return { path: "/teams/my", method: "GET" };
+  }
+  if (endpoint === "testCreatorModelConnection") {
+    return { path: "/models/test-connection", method: "POST" };
   }
   if (endpoint === "creatorModels" || endpoint === "createCreatorModel" || endpoint === "reorderCreatorModels") {
     const query = endpoint === "creatorModels" && identifiers?.category !== undefined
@@ -2778,6 +2785,13 @@ export function createApiServices(
         "updateCreatorModel", token, signal, update, { modelId: id },
       );
       return parseCreatorSettingsResponse(() => parseCreatorModel(payload));
+    },
+    async testModelConnection(input: CreatorModelConnectionTestInput, signal): Promise<CreatorModelConnectionTestResult> {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "testCreatorModelConnection", token, signal, input,
+      );
+      return parseCreatorSettingsResponse(() => parseCreatorModelConnectionTestResult(payload));
     },
     async deleteModel(id, signal) {
       const token = requireApiToken(storage);

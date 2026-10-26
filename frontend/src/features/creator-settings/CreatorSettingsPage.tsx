@@ -3,6 +3,7 @@ import { ApiError } from "../../shared/api/errors";
 import type {
   CreatorModel,
   CreatorModelCategory,
+  CreatorModelConnectionTestInput,
   CreatorModelCreateInput,
   CreatorModelUpdateInput,
   CreatorPrompt,
@@ -11,6 +12,7 @@ import type {
   CreatorPromptUpdateInput,
   CreatorSettingsServicePort,
 } from "../../shared/api/creatorSettings";
+import { ModelConnectionTest } from "./ModelConnectionTest";
 import "./creatorSettings.css";
 
 type SettingsTab = "models" | "prompts";
@@ -197,6 +199,7 @@ export function CreatorSettingsPage({
   const [listError, setListError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [draft, setDraft] = useState<SettingsDraft | null>(null);
+  const [modelDraftGeneration, setModelDraftGeneration] = useState(0);
   const [orderDraft, setOrderDraft] = useState<{ tab: SettingsTab; category: string; baseline: string[]; ids: string[] } | null>(null);
   const [orderConflict, setOrderConflict] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<{ tab: SettingsTab; id: string; name: string } | null>(null);
@@ -232,6 +235,7 @@ export function CreatorSettingsPage({
     setListError(null);
     setNotice(null);
     setDraft(null);
+    setModelDraftGeneration((generation) => generation + 1);
     setOrderDraft(null);
     setOrderConflict(false);
     setDeleteTarget(null);
@@ -327,7 +331,13 @@ export function CreatorSettingsPage({
 
   function closeDraft(): void {
     editorGeneration.current += 1;
+    setModelDraftGeneration((generation) => generation + 1);
     setDraft(null);
+  }
+
+  function updateModelDraft(update: (current: ModelDraft) => ModelDraft): void {
+    setModelDraftGeneration((generation) => generation + 1);
+    setDraft((current) => current?.kind === "model" ? update(current) : current);
   }
 
   function handleError(error: unknown, request: RequestHandle, action: string): void {
@@ -407,6 +417,7 @@ export function CreatorSettingsPage({
 
   function discardDrafts(): void {
     editorGeneration.current += 1;
+    setModelDraftGeneration((generation) => generation + 1);
     setDraft(null);
     setOrderDraft(null);
     setOrderConflict(false);
@@ -481,6 +492,7 @@ export function CreatorSettingsPage({
   function startCreate(): void {
     if (pendingLock.current || verification !== null || !confirmDiscard()) return;
     editorGeneration.current += 1;
+    setModelDraftGeneration((generation) => generation + 1);
     setDeleteTarget(null);
     setVerification(null);
     setNotice(null);
@@ -494,6 +506,7 @@ export function CreatorSettingsPage({
   function startCopy(item: CreatorModel | CreatorPrompt): void {
     if (pendingLock.current || verification !== null || !confirmDiscard()) return;
     editorGeneration.current += 1;
+    setModelDraftGeneration((generation) => generation + 1);
     setDeleteTarget(null);
     setVerification(null);
     setNotice(null);
@@ -517,6 +530,7 @@ export function CreatorSettingsPage({
       return;
     }
     editorGeneration.current += 1;
+    setModelDraftGeneration((generation) => generation + 1);
     invalidateCatalog("provider" in item ? "models" : "prompts");
     const request = beginRequest(true);
     setPending(true);
@@ -1241,23 +1255,36 @@ export function CreatorSettingsPage({
             <div className="creator-settings-fields">
               <label>
                 <span>分类</span>
-                <select disabled={pending || draft.mode === "edit"} onChange={(event) => setDraft((current) => current?.kind === "model" ? { ...current, category: event.target.value } : current)} value={draft.category}>
+                <select disabled={pending || draft.mode === "edit"} onChange={(event) => updateModelDraft((current) => ({ ...current, category: event.target.value }))} value={draft.category}>
                   {modelCategories.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                 </select>
               </label>
-              <label><span>名称</span><input autoComplete="off" disabled={pending} onChange={(event) => setDraft((current) => current?.kind === "model" ? { ...current, name: event.target.value } : current)} value={draft.name} /></label>
-              <label><span>供应商</span><input autoComplete="off" disabled={pending} onChange={(event) => setDraft((current) => current?.kind === "model" ? { ...current, provider: event.target.value } : current)} value={draft.provider} /></label>
-              <label><span>模型标识</span><input autoComplete="off" disabled={pending} onChange={(event) => setDraft((current) => current?.kind === "model" ? { ...current, model: event.target.value } : current)} value={draft.model} /></label>
-              <label><span>服务地址</span><input autoComplete="off" disabled={pending} onChange={(event) => setDraft((current) => current?.kind === "model" ? { ...current, baseUrl: event.target.value } : current)} value={draft.baseUrl} /></label>
+              <label><span>名称</span><input autoComplete="off" disabled={pending} onChange={(event) => updateModelDraft((current) => ({ ...current, name: event.target.value }))} value={draft.name} /></label>
+              <label><span>供应商</span><input autoComplete="off" disabled={pending} onChange={(event) => updateModelDraft((current) => ({ ...current, provider: event.target.value }))} value={draft.provider} /></label>
+              <label><span>模型标识</span><input autoComplete="off" disabled={pending} onChange={(event) => updateModelDraft((current) => ({ ...current, model: event.target.value }))} value={draft.model} /></label>
+              <label><span>服务地址</span><input autoComplete="off" disabled={pending} onChange={(event) => updateModelDraft((current) => ({ ...current, baseUrl: event.target.value }))} value={draft.baseUrl} /></label>
               <label className="creator-settings-field-wide">
                 <span>模型参数（JSON 对象）</span>
-                <textarea autoComplete="off" disabled={pending} onChange={(event) => setDraft((current) => current?.kind === "model" ? { ...current, params: event.target.value } : current)} rows={5} value={draft.params} />
+                <textarea autoComplete="off" disabled={pending} onChange={(event) => updateModelDraft((current) => ({ ...current, params: event.target.value }))} rows={5} value={draft.params} />
               </label>
               <label className="creator-settings-field-wide">
                 <span id="creator-settings-api-key-label">API 密钥</span>
-                <input aria-describedby={draft.mode === "edit" ? "creator-settings-api-key-help" : undefined} aria-labelledby="creator-settings-api-key-label" autoComplete="new-password" disabled={pending} onChange={(event) => setDraft((current) => current?.kind === "model" ? { ...current, apiKey: event.target.value } : current)} placeholder={draft.mode === "edit" ? "留空保留已保存的密钥" : "输入你自己的 API 密钥"} type="password" value={draft.apiKey} />
+                <input aria-describedby={draft.mode === "edit" ? "creator-settings-api-key-help" : undefined} aria-labelledby="creator-settings-api-key-label" autoComplete="new-password" disabled={pending} onChange={(event) => updateModelDraft((current) => ({ ...current, apiKey: event.target.value }))} placeholder={draft.mode === "edit" ? "留空保留已保存的密钥" : "输入你自己的 API 密钥"} type="password" value={draft.apiKey} />
                 {draft.mode === "edit" && <small id="creator-settings-api-key-help">留空保留已保存的密钥；如需更换，请输入新密钥。</small>}
               </label>
+              <ModelConnectionTest
+                draftGeneration={modelDraftGeneration}
+                input={{
+                  provider: draft.provider,
+                  api_key: draft.apiKey,
+                  base_url: draft.baseUrl,
+                  model: draft.model,
+                  category: draft.category,
+                } satisfies CreatorModelConnectionTestInput}
+                onUnauthorized={onUnauthorized}
+                ownerId={userId}
+                service={service}
+              />
               <p className="creator-settings-hint creator-settings-field-wide">平台积分显示为 0 仅表示平台积分；供应商是否收费取决于你与供应商的配置。</p>
             </div>
           ) : (
