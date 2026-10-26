@@ -7,6 +7,8 @@ new generation records after the existing tables pass structural preflight.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from sqlalchemy import (
     Boolean,
     CheckConstraint,
@@ -23,10 +25,28 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
+from sqlalchemy.engine import Dialect
 from sqlalchemy.orm import declarative_base
+from sqlalchemy.types import TypeDecorator
 
 
 Base = declarative_base(metadata=MetaData())
+
+
+class UTCDateTime(TypeDecorator[datetime]):
+    """Interpret UTC-naive parameters as UTC and bind all values as aware UTC."""
+
+    impl = DateTime(timezone=True)
+    cache_ok = True
+
+    def process_bind_param(
+        self, value: datetime | None, dialect: Dialect
+    ) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
 
 
 class UserRow(Base):
@@ -55,7 +75,7 @@ class AITaskRow(Base):
     claim_token = Column(String(64), nullable=True)
     recovery_status = Column(String(32), nullable=False, default="ready", server_default="ready")
     billing_status = Column(String(32), nullable=False, default="unbilled", server_default="unbilled")
-    user_cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    user_cancelled_at = Column(UTCDateTime(), nullable=True)
     cancellation_reason = Column(String(64), nullable=True)
     message_id = Column(String(36), nullable=False, default="")
     credit_cost = Column(Integer, nullable=False, default=0, server_default="0")
@@ -105,10 +125,10 @@ class TaskQuoteRow(Base):
     unit_manifest = Column(JSON, nullable=False, default=list)
     status = Column(String(24), nullable=False, default="quoted", server_default="quoted")
     confirmation_key = Column(String(255), nullable=True)
-    expires_at = Column(DateTime(timezone=True), nullable=False)
-    confirmed_at = Column(DateTime(timezone=True), nullable=True)
-    consumed_at = Column(DateTime(timezone=True), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    expires_at = Column(UTCDateTime(), nullable=False)
+    confirmed_at = Column(UTCDateTime(), nullable=True)
+    consumed_at = Column(UTCDateTime(), nullable=True)
+    created_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class TaskSubmissionRow(Base):
@@ -130,7 +150,7 @@ class TaskSubmissionRow(Base):
     task_ids = Column(JSON, nullable=False, default=list)
     task_quote_id = Column(String(36), ForeignKey("task_quotes.id"), nullable=True)
     status = Column(String(24), nullable=False, default="accepted", server_default="accepted")
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class BillingUnitRow(Base):
@@ -166,16 +186,16 @@ class BillingUnitRow(Base):
     refunded_amount = Column(Integer, nullable=False, default=0, server_default="0")
     billing_status = Column(String(32), nullable=False, default="unbilled", server_default="unbilled")
     result_status = Column(String(32), nullable=False, default="pending", server_default="pending")
-    first_intent_at = Column(DateTime(timezone=True), nullable=True)
-    deadline_at = Column(DateTime(timezone=True), nullable=True)
-    success_confirmed_at = Column(DateTime(timezone=True), nullable=True)
-    user_cancelled_at = Column(DateTime(timezone=True), nullable=True)
+    first_intent_at = Column(UTCDateTime(), nullable=True)
+    deadline_at = Column(UTCDateTime(), nullable=True)
+    success_confirmed_at = Column(UTCDateTime(), nullable=True)
+    user_cancelled_at = Column(UTCDateTime(), nullable=True)
     cancellation_reason = Column(String(64), nullable=True)
     quote_id = Column(String(36), ForeignKey("task_quotes.id"), nullable=True)
     quote_unit_key = Column(String(255), nullable=True)
     candidate_digest = Column(String(128), nullable=True)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class ExecutionStepRow(Base):
@@ -199,8 +219,8 @@ class ExecutionStepRow(Base):
     required = Column(Boolean, nullable=False, default=True, server_default="true")
     step_order = Column(Integer, nullable=False, default=0, server_default="0")
     execution_status = Column(String(32), nullable=False, default="prepared", server_default="prepared")
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    created_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class ExternalSubmissionRow(Base):
@@ -217,13 +237,13 @@ class ExternalSubmissionRow(Base):
     model_ref = Column(String(255), nullable=True)
     request_digest = Column(String(128), nullable=False)
     request_snapshot = Column(JSON, nullable=False, default=dict)
-    intent_at = Column(DateTime(timezone=True), nullable=False)
-    submitted_at = Column(DateTime(timezone=True), nullable=True)
+    intent_at = Column(UTCDateTime(), nullable=False)
+    submitted_at = Column(UTCDateTime(), nullable=True)
     external_task_id = Column(String(255), nullable=True)
     submission_status = Column(String(32), nullable=False, default="submitting", server_default="submitting")
-    deadline_at = Column(DateTime(timezone=True), nullable=False)
-    created_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
-    updated_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    deadline_at = Column(UTCDateTime(), nullable=False)
+    created_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    updated_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
 
 
 class ResultEvidenceRow(Base):
@@ -253,10 +273,10 @@ class ResultEvidenceRow(Base):
     payload_digest = Column(String(128), nullable=False)
     result_location = Column(Text, nullable=True)
     result_digest = Column(String(128), nullable=True)
-    received_at = Column(DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
+    received_at = Column(UTCDateTime(), nullable=False, server_default=text("CURRENT_TIMESTAMP"))
     validity = Column(String(24), nullable=False, default="unknown", server_default="unknown")
     application_status = Column(String(24), nullable=False, default="pending", server_default="pending")
-    applied_at = Column(DateTime(timezone=True), nullable=True)
+    applied_at = Column(UTCDateTime(), nullable=True)
 
 
 class UserCreditRow(Base):
