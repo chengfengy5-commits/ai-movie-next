@@ -23,6 +23,14 @@
       "tables": [
         "generation_result_targets"
       ]
+    },
+    {
+      "version": "0003_fused_generation_submissions",
+      "file": "0003_fused_generation_submissions.sql",
+      "sha256": "4cefd8e428911da76e89297517ed3e6cb2dc7222d873f21b4c510d3a4e7c0680",
+      "tables": [
+        "fused_generation_submissions"
+      ]
     }
   ]
 }

@@ -9,6 +9,8 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from starlette.concurrency import run_in_threadpool
 from sqlalchemy.orm import Session
+from haoai_backend.generation_credentials.application import CredentialRegistry
+from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 
 from .admin_purchase_packages.http import build_admin_purchase_packages_router
 from .admin_purchase_packages.persistence import purchase_packages_uow_factory
@@ -103,6 +105,8 @@ from .fused_generation import (
 )
 from .fused_generation.http import build_fused_generation_router
 from .fused_generation.persistence import fused_generation_uow_factory
+from .fused_generation.execution import FusedGenerationExecution
+from .fused_generation.recovery_worker import FusedGenerationRecoveryWorker
 from .storyboard_generation import StoryboardGenerationRuntime
 from .storyboard_generation.http import build_storyboard_generation_router
 from .storyboard_generation.persistence import storyboard_generation_uow_factory
@@ -282,6 +286,9 @@ def create_app(
     fused_generation_runtime: FusedGenerationRuntime | None = None,
     fused_generation_storage: FusedGenerationStorage | None = None,
     fused_generation_inline_image_storage: FusedGenerationImageStorage | None = None,
+    fused_generation_credential_registry: CredentialRegistry | None = None,
+    fused_generation_credential_crypto: CredentialCrypto | None = None,
+    fused_generation_proof_authority: HmacProofAuthority | None = None,
     storyboard_generation_runtime: StoryboardGenerationRuntime | None = None,
     storyboard_asset_generation_runtime: StoryboardAssetRuntime | None = None,
     chat_media_admission_configuration: ChatMediaAdmissionConfiguration | None = None,
@@ -476,10 +483,17 @@ def create_app(
         video_single_service: GenerationWorkerService | None = None
         frame_review_service: GenerationWorkerService | None = None
         frame_optimize_service: GenerationWorkerService | None = None
+        active_fused_recovery_worker: FusedGenerationRecoveryWorker | None = None
         try:
             if worker_capacity is not None:
                 bootstrap = worker_capacity_bootstrap or WorkerCapacityBootstrap()
                 worker_capacity.configure(await bootstrap.resolve())
+            if fused_recovery_worker is not None:
+                fused_recovery_worker.start()
+                active_fused_recovery_worker = fused_recovery_worker
+                application.state.fused_generation_recovery_worker = (
+                    fused_recovery_worker
+                )
             if (
                 generation_worker_runtime is not None
                 and generation_worker_configuration is not None
@@ -555,6 +569,9 @@ def create_app(
         finally:
             if worker_capacity is not None:
                 worker_capacity.close_claims()
+            if active_fused_recovery_worker is not None:
+                await active_fused_recovery_worker.shutdown()
+                application.state.fused_generation_recovery_worker = None
             if frame_optimize_service is not None:
                 receipt = await run_in_threadpool(
                     frame_optimize_service.shutdown,
@@ -599,6 +616,7 @@ def create_app(
     )
     app.state.generation_worker_runtime = generation_worker_runtime
     app.state.generation_worker_service = None
+    app.state.fused_generation_recovery_worker = None
     app.state.image_batch_worker_runtime = image_batch_worker_runtime
     app.state.image_batch_worker_service = None
     app.state.image_batch_worker_shutdown = None
@@ -1349,13 +1367,43 @@ def create_app(
         if effective_session_factory is not None
         else None
     )
+    fused_generation_execution = FusedGenerationExecution(
+        runtime=fused_generation_runtime,
+        uow_factory=fused_uow_factory,
+        storage=fused_generation_storage,
+        inline_image_storage=fused_generation_inline_image_storage,
+        credential_registry=fused_generation_credential_registry,
+        credential_crypto=fused_generation_credential_crypto,
+        proof_authority=fused_generation_proof_authority,
+    )
+    fused_recovery_worker = (
+        FusedGenerationRecoveryWorker(
+            fused_generation_execution,
+            fused_uow_factory,
+        )
+        if fused_uow_factory is not None
+        and fused_generation_runtime is not None
+        and fused_generation_credential_registry is not None
+        and fused_generation_credential_crypto is not None
+        and fused_generation_proof_authority is not None
+        else None
+    )
     app.include_router(
         build_fused_generation_router(
             uow_factory=fused_uow_factory,
             resolve_actor=effective_resolver,
             runtime=fused_generation_runtime,
+            resolve_receipt_actor=(
+                account_actor_resolver
+                if resolve_task_account is not None or authentication_runtime is not None
+                else None
+            ),
             storage=fused_generation_storage,
             inline_image_storage=fused_generation_inline_image_storage,
+            credential_registry=fused_generation_credential_registry,
+            credential_crypto=fused_generation_credential_crypto,
+            proof_authority=fused_generation_proof_authority,
+            execution=fused_generation_execution,
         )
     )
     storyboard_uow_factory = (

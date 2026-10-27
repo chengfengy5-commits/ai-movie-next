@@ -48,6 +48,7 @@ from haoai_backend.generation_catalog.tables import (
     system_prompts,
 )
 from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
+from haoai_backend.generation_core.schema import FusedGenerationSubmissionRow
 from haoai_backend.generation_contracts import StoredMedia
 from haoai_backend.series_data.tables import (
     chapters,
@@ -75,6 +76,7 @@ def fused_database(tmp_path: Path):
 
     authentication_metadata.create_all(engine)
     Base.metadata.create_all(engine)
+    FusedGenerationSubmissionRow.__table__.create(engine)
     series_metadata.create_all(engine, tables=[series, chapters, characters, props])
     catalog_metadata.create_all(
         engine,
@@ -259,6 +261,33 @@ def _stage_task(factory, prepared):
         uow.commit()
     finally:
         uow.close()
+
+
+def test_recovery_scan_and_receipt_read_project_only_small_safe_fields(fused_database):
+    engine, factory = fused_database
+    statements: list[str] = []
+
+    def capture_statement(_connection, _cursor, statement, _parameters, _context, _many):
+        if "fused_generation_submissions" in statement.lower():
+            statements.append(statement.lower())
+
+    event.listen(engine, "before_cursor_execute", capture_statement)
+    uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    try:
+        assert uow.recoverable_durable_submissions(limit=32) == ()
+        assert uow.find_durable_submission_receipt("owner", "missing-key") is None
+    finally:
+        uow.rollback()
+        uow.close()
+        event.remove(engine, "before_cursor_execute", capture_statement)
+
+    assert len(statements) == 2
+    assert "encrypted_" not in statements[0]
+    assert "request_nonce" not in statements[0]
+    assert "result_digest" not in statements[0]
+    assert "encrypted_" not in statements[1]
+    assert "request_nonce" not in statements[1]
+    assert "result_digest" not in statements[1]
 
 
 def test_system_model_charge_is_atomic_and_owned_model_is_free(fused_database):

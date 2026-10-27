@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable
 from typing import Any, Literal, Mapping, TypeAlias
+
+from haoai_backend.generation_contracts.types import CredentialBinding
 
 FUSED_UNKNOWN_REASON = "图片生成结果待核对，请勿重新提交"
 FUSED_UNKNOWN_PROGRESS_MESSAGE = "图片生成结果待核对"
@@ -69,6 +72,10 @@ class PreparedFusedGeneration:
     credit_cost: int
     server_model: FusedServerImageModel = field(repr=False)
     target_frame: FusedFrameTarget | None
+    submission_id: str | None = None
+    idempotency_key: str | None = field(default=None, repr=False)
+    request_digest: str | None = None
+    credential_binding: CredentialBinding | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +89,8 @@ class FusedGenerationInput:
     prompt: str
     reference_images: tuple[str, ...]
     server_model: FusedServerImageModel = field(repr=False)
+    provider_secret: str | None = field(default=None, repr=False)
+    dispatch_gate: Callable[[str], Awaitable[bool]] | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -131,3 +140,6 @@ class FusedCompletion:
 @dataclass(frozen=True, slots=True)
 class FusedTaskClaim:
     cancelled: bool
+    submission_id: str | None = None
+    generation: int | None = None
+    stage: str = "accepted"

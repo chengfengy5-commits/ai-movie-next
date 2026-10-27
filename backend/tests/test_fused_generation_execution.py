@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import threading
+from dataclasses import replace
 from datetime import datetime
 
 import pytest
@@ -22,6 +23,7 @@ from haoai_backend.fused_generation.errors import (
 )
 from haoai_backend.fused_generation.execution import FusedGenerationExecution
 from haoai_backend.generation_contracts import StoredMedia
+from haoai_backend.generation_contracts.types import CredentialBinding
 
 
 SERVER_SECRET = "provider-secret-do-not-persist"
@@ -335,6 +337,17 @@ class Runtime:
         return self.output
 
 
+class CredentialRegistrySpy:
+    def __init__(self) -> None:
+        self.resolve_calls = 0
+
+    def resolve_original_credential(self, binding, purpose):
+        self.resolve_calls += 1
+        raise AssertionError(
+            "mismatched frozen endpoint must fail before secret lookup"
+        )
+
+
 class FakeInlineImageStorage:
     def __init__(self, *, wrong_digest: bool = False, block: bool = False) -> None:
         self.calls = 0
@@ -388,6 +401,45 @@ def test_storage_failure_keeps_provider_url_and_duplicate_execution_is_terminal_
     assert storage.calls == ["https://provider.test/result.png"]
     assert state.status == "completed"
     assert state.finish_args == [("https://provider.test/result.png", None)]
+
+
+def test_durable_execution_rejects_mismatched_binding_before_secret_lookup() -> None:
+    state = ExecutionState()
+    state.claim_token = "claim-a"
+    factory = Factory(state)
+    runtime = Runtime(state)
+    registry = CredentialRegistrySpy()
+    binding = CredentialBinding(
+        source="system",
+        row_id="system-model",
+        owner_or_system="system",
+        provider="provider-a",
+        original_principal_id="principal-a",
+        endpoint_origin="https://registered.example.test",
+        allowed_content_paths=(),
+        binding_version="1",
+    )
+    prepared = replace(
+        _prepared(),
+        submission_id="submission-a",
+        credential_binding=binding,
+        server_model=replace(
+            _prepared().server_model,
+            base_url="https://different.example.test/v1",
+        ),
+    )
+    execution = FusedGenerationExecution(
+        runtime=runtime,
+        uow_factory=factory,
+        credential_registry=registry,
+        credential_crypto=object(),
+    )
+
+    asyncio.run(execution._create_durable_result(prepared, "claim-a", 1))
+
+    assert registry.resolve_calls == 0
+    assert runtime.calls == 0
+    assert state.finish_args == [(None, "模型 endpoint 与原始凭据登记不一致")]
     assert state.open_count == state.close_count
     assert state.active_sessions == 0
 

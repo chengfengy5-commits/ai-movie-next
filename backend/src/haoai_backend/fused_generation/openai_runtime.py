@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hashlib
 import inspect
 import json
 from collections.abc import Callable, Mapping
@@ -128,16 +129,29 @@ class FusedOpenAIImageRuntime:
         ):
             raise ProviderGenerationFailure("图片 provider 地址未获授权")
 
+        provider_secret = request.provider_secret or request.server_model.api_key
+        if type(provider_secret) is not str or not provider_secret.strip():
+            raise ProviderGenerationFailure("图片 provider 凭据不可用")
+
         dispatched = False
         try:
             async with asyncio.timeout(self._provider_timeout_seconds):
                 async with self._http_client_factory() as client:
+                    if request.dispatch_gate is not None:
+                        try:
+                            allowed = await request.dispatch_gate(
+                                hashlib.sha256(edit.body).hexdigest()
+                            )
+                        except Exception:
+                            allowed = False
+                        if allowed is not True:
+                            return _UNKNOWN
                     dispatched = True
                     response = await client.request(
                         "POST",
                         edit.url,
                         headers={
-                            "Authorization": f"Bearer {request.server_model.api_key}",
+                            "Authorization": f"Bearer {provider_secret}",
                             "Content-Type": edit.content_type,
                         },
                         content=edit.body,
@@ -192,8 +206,10 @@ class FusedOpenAIImageRuntime:
         if (
             type(model.provider) is not str
             or model.provider.lower() not in {"openai", "haoai"}
-            or type(model.api_key) is not str
-            or not model.api_key.strip()
+            or not (
+                (type(request.provider_secret) is str and request.provider_secret.strip())
+                or (type(model.api_key) is str and model.api_key.strip())
+            )
             or type(model.wire_model) is not str
             or not model.wire_model.strip()
             or type(request.prompt) is not str

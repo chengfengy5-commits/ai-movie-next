@@ -12,6 +12,10 @@ import { ApiError } from "../../shared/api/errors";
 import { demoSeries } from "../series/demoSeries";
 import { FusedAssetsPage } from "./FusedAssetsPage";
 import { fusedGenerationPreferenceKey } from "./fusedGenerationPreferences";
+import {
+  readFusedGenerationSubmissionLocator,
+  writeFusedGenerationSubmissionLocator,
+} from "./fusedGenerationSubmissions";
 
 const apiBaseUrl = "http://127.0.0.1:4175/api";
 
@@ -401,7 +405,9 @@ describe("FusedAssetsPage", () => {
       chapter_id: null,
       frame_index: null,
       name: null,
-    }, expect.any(AbortSignal));
+    }, expect.any(AbortSignal), {
+      idempotencyKey: expect.any(String),
+    });
     expect(getTaskReceipt).toHaveBeenCalledWith("task-fused-1", expect.any(AbortSignal));
     expect(listFusedAssets).toHaveBeenCalledTimes(2);
 
@@ -447,7 +453,7 @@ describe("FusedAssetsPage", () => {
       prompt_system: null,
       prompt_user: null,
       size: "1536x1024",
-    }), expect.any(AbortSignal));
+    }), expect.any(AbortSignal), { idempotencyKey: expect.any(String) });
 
     await user.selectOptions(screen.getByRole("combobox", { name: "融合类型" }), "prop");
     await waitFor(() => expect(screen.getByRole("checkbox", { name: "旧车票" })).toBeEnabled());
@@ -463,7 +469,7 @@ describe("FusedAssetsPage", () => {
       prompt_system: "保持原作画风",
       prompt_user: "道具合成正文",
       size: "1024x1024",
-    }), expect.any(AbortSignal));
+    }), expect.any(AbortSignal), { idempotencyKey: expect.any(String) });
   });
 
   it("keeps an unverified submit frozen and never repeats it after a 503", async () => {
@@ -477,7 +483,14 @@ describe("FusedAssetsPage", () => {
       throw new ApiError("http", "融合生成服务尚未接线", 503);
     });
     const getTaskReceipt = vi.fn(async () => taskReceipt());
-    const services = generationServices({ fusedGeneration: { submit }, getTaskReceipt });
+    const lookupSubmission = vi.fn(async () => ({
+      status: "provider_result_unknown" as const,
+      feeDisposition: "debit" as const,
+      feeAmount: 4,
+      taskId: "task-fused-unknown",
+      messageId: null,
+    }));
+    const services = generationServices({ fusedGeneration: { submit, lookupSubmission }, getTaskReceipt });
     renderPage(services);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "提交融合生成" })).toBeEnabled());
@@ -486,16 +499,119 @@ describe("FusedAssetsPage", () => {
     await user.click(screen.getByRole("checkbox", { name: "林原" }));
     await user.click(screen.getByRole("button", { name: "提交融合生成" }));
 
-    expect(await screen.findByText(/融合生成服务暂不可用（HTTP 503）/u)).toBeInTheDocument();
+    expect(await screen.findByText(/Provider 已派发，结果待核对（记录费用 4 积分）/u)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "提交融合生成" })).toBeDisabled();
     expect(submit).toHaveBeenCalledOnce();
-    expect(submit).toHaveBeenCalledWith(expect.objectContaining({ size: "1536x1024" }), expect.any(AbortSignal));
+    expect(submit).toHaveBeenCalledWith(expect.objectContaining({ size: "1536x1024" }), expect.any(AbortSignal), {
+      idempotencyKey: expect.any(String),
+    });
+    expect(lookupSubmission).toHaveBeenCalledWith(expect.any(String), expect.any(AbortSignal));
     expect(getTaskReceipt).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "停止本地跟踪" }));
-    expect(await screen.findByText(/服务器上的融合任务仍可能运行并产生费用/u)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "提交融合生成" })).toBeEnabled();
+    expect(await screen.findByText(/服务器上的任务仍可能运行并产生费用/u)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "提交融合生成" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "提交融合生成" }));
+    expect(screen.getByRole("button", { name: "核对原提交回执" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "核对原提交回执" }));
+    await waitFor(() => expect(lookupSubmission).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "提交融合生成" })).toBeDisabled();
     expect(submit).toHaveBeenCalledOnce();
+    expect(readFusedGenerationSubmissionLocator(window.localStorage, {
+      userId: "fixture-user",
+      apiBaseUrl,
+      seriesId: "series-1",
+      memberType: "character",
+    })).toMatchObject({ status: "found" });
+  });
+
+  it("restores a saved submission by GET only and preserves its locator when tracking stops", async () => {
+    const key = "saved-fused-key-1110";
+    writeFusedGenerationSubmissionLocator(window.localStorage, {
+      version: 1,
+      userId: "fixture-user",
+      apiBaseUrl,
+      seriesId: "series-1",
+      memberType: "character",
+      operation: "fused.image",
+      idempotencyKey: key,
+    });
+    const submit = vi.fn(async (_input: FusedGenerationInput) => ({ taskId: "unexpected", messageId: null }));
+    const lookupSubmission = vi.fn(async () => ({
+      status: "provider_result_unknown" as const,
+      feeDisposition: "debit" as const,
+      feeAmount: 4,
+      taskId: "task-fused-unknown",
+      messageId: null,
+    }));
+    renderPage(generationServices({ fusedGeneration: { submit, lookupSubmission } }));
+
+    expect(await screen.findByText(/正在只读查询融合提交回执/u)).toBeInTheDocument();
+    expect(await screen.findByText(/Provider 已派发，结果待核对（记录费用 4 积分）/u)).toBeInTheDocument();
+    expect(lookupSubmission).toHaveBeenCalledWith(key, expect.any(AbortSignal));
+    expect(submit).not.toHaveBeenCalled();
+    const restored = readFusedGenerationSubmissionLocator(window.localStorage, {
+      userId: "fixture-user",
+      apiBaseUrl,
+      seriesId: "series-1",
+      memberType: "character",
+    });
+    expect(restored).toMatchObject({ status: "found", locator: { idempotencyKey: key } });
+    expect(JSON.stringify(restored)).not.toContain("prompt");
+
+    await userEvent.setup().click(screen.getByRole("button", { name: "停止本地跟踪" }));
+    expect(readFusedGenerationSubmissionLocator(window.localStorage, {
+      userId: "fixture-user",
+      apiBaseUrl,
+      seriesId: "series-1",
+      memberType: "character",
+    })).toMatchObject({ status: "found", locator: { idempotencyKey: key } });
+  });
+
+  it("does not send a generation request unless its original key was saved first", async () => {
+    const user = userEvent.setup();
+    const originalSetItem = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key, value) {
+      if (key.startsWith("haoai:fused-submission:")) throw new Error("locator storage denied");
+      originalSetItem.call(this, key, value);
+    });
+    const submit = vi.fn(async (_input: FusedGenerationInput) => ({ taskId: "must-not-send", messageId: null }));
+    const lookupSubmission = vi.fn(async () => ({
+      status: "charged_incomplete" as const,
+      feeDisposition: "zero" as const,
+      feeAmount: 0,
+      taskId: null,
+      messageId: null,
+    }));
+    renderPage(generationServices({ fusedGeneration: { submit, lookupSubmission } }));
+
+    await waitFor(() => expect(screen.getByRole("button", { name: "提交融合生成" })).toBeEnabled());
+    await user.click(screen.getByRole("checkbox", { name: "林原" }));
+    await user.click(screen.getByRole("button", { name: "提交融合生成" }));
+
+    expect(await screen.findByText("浏览器无法保存本次融合提交核对键，未发送请求。")).toBeInTheDocument();
+    expect(submit).not.toHaveBeenCalled();
+    expect(lookupSubmission).not.toHaveBeenCalled();
+  });
+
+  it("blocks generation and preserves an unreadable original locator", async () => {
+    const storageKey = "haoai:fused-submission:v1:fixture-user:http%3A%2F%2F127.0.0.1%3A4175%2Fapi:series-1:character";
+    window.localStorage.setItem(storageKey, "not-json");
+    const submit = vi.fn(async (_input: FusedGenerationInput) => ({ taskId: "must-not-send", messageId: null }));
+    const lookupSubmission = vi.fn(async () => ({
+      status: "charged_incomplete" as const,
+      feeDisposition: "debit" as const,
+      feeAmount: 4,
+      taskId: null,
+      messageId: null,
+    }));
+    renderPage(generationServices({ fusedGeneration: { submit, lookupSubmission } }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("浏览器保存的原融合提交定位信息已损坏。为避免丢失未知任务，当前范围暂停新提交；请先恢复这条定位信息。");
+    expect(screen.getByRole("button", { name: "提交融合生成" })).toBeDisabled();
+    expect(window.localStorage.getItem(storageKey)).toBe("not-json");
+    expect(submit).not.toHaveBeenCalled();
+    expect(lookupSubmission).not.toHaveBeenCalled();
   });
 
   it("does not send a selected fuse template whose JSON has no usable current-type content", async () => {
@@ -523,16 +639,26 @@ describe("FusedAssetsPage", () => {
     expect(submit).not.toHaveBeenCalled();
   });
 
-  it("does not let a stopped task read release the lock owned by a newer task read", async () => {
+  it("keeps the original locator after stop and guards a newer read from a stale task response", async () => {
     const user = userEvent.setup();
     const firstRead = deferred<TaskReceipt>();
     const secondRead = deferred<TaskReceipt>();
     const submit = vi.fn(async (_input: FusedGenerationInput, _signal: AbortSignal) => {
-      const taskId = submit.mock.calls.length === 1 ? "task-first" : "task-second";
-      return { taskId, messageId: null };
+      return { taskId: "task-first", messageId: null };
     });
-    const getTaskReceipt = vi.fn((taskId: string) => taskId === "task-first" ? firstRead.promise : secondRead.promise);
-    const services = generationServices({ fusedGeneration: { submit }, getTaskReceipt });
+    let taskReadCount = 0;
+    const getTaskReceipt = vi.fn(() => {
+      taskReadCount += 1;
+      return taskReadCount === 1 ? firstRead.promise : secondRead.promise;
+    });
+    const lookupSubmission = vi.fn(async () => ({
+      status: "accepted" as const,
+      feeDisposition: "debit" as const,
+      feeAmount: 4,
+      taskId: "task-first",
+      messageId: null,
+    }));
+    const services = generationServices({ fusedGeneration: { submit, lookupSubmission }, getTaskReceipt });
     renderPage(services);
 
     await waitFor(() => expect(screen.getByRole("button", { name: "提交融合生成" })).toBeEnabled());
@@ -540,21 +666,32 @@ describe("FusedAssetsPage", () => {
     await user.click(screen.getByRole("button", { name: "提交融合生成" }));
     await waitFor(() => expect(getTaskReceipt).toHaveBeenCalledWith("task-first", expect.any(AbortSignal)));
     await user.click(screen.getByRole("button", { name: "停止本地跟踪" }));
-    await user.click(screen.getByRole("button", { name: "提交融合生成" }));
-    await waitFor(() => expect(getTaskReceipt).toHaveBeenCalledWith("task-second", expect.any(AbortSignal)));
+    expect(screen.getByRole("button", { name: "提交融合生成" })).toBeDisabled();
+    await user.click(screen.getByRole("button", { name: "核对原提交回执" }));
+    await waitFor(() => expect(getTaskReceipt).toHaveBeenCalledTimes(2));
+    expect(submit).toHaveBeenCalledOnce();
+    expect(readFusedGenerationSubmissionLocator(window.localStorage, {
+      userId: "fixture-user",
+      apiBaseUrl,
+      seriesId: "series-1",
+      memberType: "character",
+    })).toMatchObject({ status: "found", locator: { taskId: "task-first" } });
 
     await act(async () => {
       firstRead.resolve(taskReceipt({ id: "task-first", status: "processing", progress: 12 }));
       await firstRead.promise;
     });
-    expect(screen.getByRole("button", { name: "正在核对…" })).toBeDisabled();
+    const activeReadButtons = screen.getAllByRole("button", { name: "正在核对…" });
+    expect(activeReadButtons).toHaveLength(2);
+    activeReadButtons.forEach((button) => expect(button).toBeDisabled());
 
     await act(async () => {
-      secondRead.resolve(taskReceipt({ id: "task-second", status: "completed" }));
+      secondRead.resolve(taskReceipt({ id: "task-first", status: "processing", progress: 25 }));
       await secondRead.promise;
     });
-    expect(await screen.findByText("最近任务状态：已完成")).toBeInTheDocument();
-    expect(submit).toHaveBeenCalledTimes(2);
+    expect(await screen.findByText("最近任务状态：生成中")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "提交融合生成" })).toBeDisabled();
+    expect(submit).toHaveBeenCalledOnce();
   });
 
   it("ignores a late submit receipt after the actor scope changes", async () => {

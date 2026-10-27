@@ -13,6 +13,11 @@ from haoai_backend.fused_generation.media_storage import (
 )
 from haoai_backend.fused_generation.openai_runtime import FusedOpenAIImageRuntime
 from haoai_backend.generation_contracts import ReferenceInput, StoredMedia, TransferFailure
+from haoai_backend.generation_credentials.application import (
+    CredentialRegistry,
+    build_credential_registry,
+)
+from haoai_backend.generation_credentials.domain import CredentialCrypto, HmacProofAuthority
 from haoai_backend.media_uploads.domain import MAX_IMAGE_BYTES
 from haoai_backend.media_storage.sync_facade import SynchronousMediaStore
 from haoai_backend.media_storage.transfer_types import MAX_TRANSFER_SECONDS
@@ -20,6 +25,8 @@ from haoai_backend.media_storage.transfer_types import MAX_TRANSFER_SECONDS
 from .configuration import ServerConfiguration, ServerConfigurationError
 from .http import AiohttpAsyncHttpClientFactory
 from .media_runtime import ServerMediaRuntimeResources
+from .credentials import load_registry_capabilities
+from .generation import _database_clock, _uuid_id
 
 _UNKNOWN_TRANSFER_FAILURES = frozenset(
     {"cleanup_failure", "storage_outcome_unverified", "timeout", "transfer_failure"}
@@ -31,6 +38,9 @@ class FusedGenerationHostConfiguration:
     runtime: FusedOpenAIImageRuntime = field(repr=False)
     storage: FusedGenerationURLStorage = field(repr=False)
     inline_image_storage: SynchronousFusedGenerationImageStorage = field(repr=False)
+    credential_registry: CredentialRegistry = field(repr=False)
+    credential_crypto: CredentialCrypto = field(repr=False)
+    proof_authority: HmacProofAuthority = field(repr=False)
 
 
 class FusedGenerationURLStorage:
@@ -80,6 +90,7 @@ class FusedGenerationURLStorage:
 def build_fused_generation_host_configuration(
     configuration: ServerConfiguration,
     *,
+    session_factory,
     media_resources: ServerMediaRuntimeResources | None,
 ) -> FusedGenerationHostConfiguration:
     if (
@@ -89,12 +100,23 @@ def build_fused_generation_host_configuration(
         or configuration.r2_configuration is None
         or configuration.r2_access_key is None
         or configuration.r2_secret_key is None
+        or configuration.fused_generation_credentials_file is None
         or media_resources is None
     ):
         raise ServerConfigurationError(
             "fused generation runtime dependencies are incomplete"
         )
 
+    capabilities = load_registry_capabilities(
+        configuration.fused_generation_credentials_file,
+        legacy_secret_key=configuration.secret_key.value,
+        session_factory=session_factory,
+        db_clock=_database_clock(session_factory),
+        id_factory=_uuid_id,
+    )
+    if capabilities.crypto is None or capabilities.proof_authority is None:
+        raise ServerConfigurationError("fused credential capabilities are incomplete")
+    registry = build_credential_registry(capabilities)
     media_store = media_resources.media_store_factory()
     runtime = FusedOpenAIImageRuntime(
         http_client_factory=AiohttpAsyncHttpClientFactory(),
@@ -105,6 +127,9 @@ def build_fused_generation_host_configuration(
         runtime=runtime,
         storage=FusedGenerationURLStorage(media_store),
         inline_image_storage=SynchronousFusedGenerationImageStorage(media_store),
+        credential_registry=registry,
+        credential_crypto=capabilities.crypto,
+        proof_authority=capabilities.proof_authority,
     )
 
 

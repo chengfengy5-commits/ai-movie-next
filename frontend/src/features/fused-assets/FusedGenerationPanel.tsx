@@ -14,6 +14,13 @@ import {
   safeFusedImageUrl,
   writeFusedGenerationPreference,
 } from "./fusedGenerationPreferences";
+import {
+  newFusedSubmissionKey,
+  removeFusedGenerationSubmissionLocator,
+  readFusedGenerationSubmissionLocator,
+  writeFusedGenerationSubmissionLocator,
+  type FusedGenerationSubmissionLocator,
+} from "./fusedGenerationSubmissions";
 
 type FusedMemberAsset = Character | Prop;
 type FeedbackKind = "success" | "failure" | "unknown" | "info";
@@ -41,6 +48,8 @@ interface ActiveOperation {
   readonly controller: AbortController;
   readonly kind: "upload" | "generate";
   phase: "uploading" | "submitting" | "tracking" | "unknown";
+  memberType?: FusedGenerationMemberType;
+  submissionKey?: string;
   taskId?: string;
   messageId?: string | null;
 }
@@ -55,6 +64,12 @@ interface Props {
   onActivityChange(active: boolean): void;
   onRefreshAssets(): Promise<void>;
 }
+
+type SubmissionGuard =
+  | { readonly context: string; readonly status: "clear" }
+  | { readonly context: string; readonly status: "pending"; readonly locator: FusedGenerationSubmissionLocator }
+  | { readonly context: string; readonly status: "blocked"; readonly message: string }
+  | { readonly context: null; readonly status: "checking" };
 
 function sameScope(left: PanelScope, right: PanelScope): boolean {
   return left.services === right.services && left.apiBaseUrl === right.apiBaseUrl
@@ -107,6 +122,10 @@ function safeFailureMessage(error: unknown): string {
     return `融合生成请求被服务拒绝（HTTP ${error.status}）。请核对成员图片、模型和提示词后再决定是否重新提交。`;
   }
   return "融合生成请求结果未知，服务器可能已受理且费用状态尚未确认。系统不会自动重发；请只读核对任务或明确停止本地跟踪。";
+}
+
+function feeSummary(amount: number | null): string {
+  return amount === null ? "" : `（记录费用 ${amount} 积分）`;
 }
 
 function preferenceFromStorage(
@@ -180,6 +199,10 @@ export function FusedGenerationPanel({
   const [taskStatus, setTaskStatus] = useState<string | null>(null);
   const [taskReadBusy, setTaskReadBusy] = useState(false);
   const [feedback, setFeedback] = useState<Feedback | null>(null);
+  const [submissionGuard, setSubmissionGuard] = useState<SubmissionGuard>({
+    context: null,
+    status: "checking",
+  });
 
   const isCurrent = useCallback((scope: PanelScope, signal?: AbortSignal): boolean => (
     mountedRef.current && signal?.aborted !== true && sameScope(scopeRef.current, scope)
@@ -300,6 +323,7 @@ export function FusedGenerationPanel({
   }, [memberType, services, seriesId, userId, sessionGeneration, isCurrent]);
 
   const preferenceContext = `${userId}\u0000${services.apiBaseUrl ?? ""}\u0000${memberType}`;
+  const submissionContext = `${userId}\u0000${services.apiBaseUrl ?? ""}\u0000${seriesId}\u0000${memberType}`;
   useEffect(() => {
     if (catalogLoading || catalogError !== null || restoredPreferenceContextRef.current === preferenceContext) return;
     const storageRead = preferenceFromStorage(scopeRef.current, memberType);
@@ -316,6 +340,57 @@ export function FusedGenerationPanel({
       setFeedback({ kind: "info", message: "浏览器本地偏好不可读，当前使用本页默认选项；你仍可手动选择并生成。" });
     }
   }, [catalogLoading, catalogError, models, prompts, preferenceContext, memberType]);
+
+  useEffect(() => {
+    const scope = scopeRef.current;
+    const context = `${scope.userId}\u0000${scope.apiBaseUrl ?? ""}\u0000${scope.seriesId}\u0000${memberType}`;
+    if (typeof window === "undefined" || operationRef.current !== null) {
+      setSubmissionGuard({ context, status: "clear" });
+      return;
+    }
+    let locatorRead: ReturnType<typeof readFusedGenerationSubmissionLocator>;
+    try {
+      locatorRead = readFusedGenerationSubmissionLocator(window.localStorage, {
+        userId: scope.userId,
+        apiBaseUrl: scope.apiBaseUrl ?? "",
+        seriesId: scope.seriesId,
+        memberType,
+      });
+    } catch {
+      const message = "浏览器本地提交定位信息不可读取。为避免覆盖可能仍未知的任务，当前范围暂停新融合提交。";
+      setSubmissionGuard({ context, status: "blocked", message });
+      setFeedback({ kind: "unknown", message });
+      return;
+    }
+    if (locatorRead.status === "missing") {
+      setSubmissionGuard({ context, status: "clear" });
+      return;
+    }
+    if (locatorRead.status === "invalid" || locatorRead.status === "unavailable") {
+      const message = locatorRead.status === "invalid"
+        ? "浏览器保存的原融合提交定位信息已损坏。为避免丢失未知任务，当前范围暂停新提交；请先恢复这条定位信息。"
+        : "浏览器本地提交定位信息不可读取。为避免覆盖可能仍未知的任务，当前范围暂停新融合提交。";
+      setSubmissionGuard({ context, status: "blocked", message });
+      setFeedback({ kind: "unknown", message });
+      return;
+    }
+    const locator = locatorRead.locator;
+    setSubmissionGuard({ context, status: "pending", locator });
+    const controller = new AbortController();
+    const active: ActiveOperation = {
+      scope,
+      controller,
+      kind: "generate",
+      phase: "unknown",
+      memberType,
+      submissionKey: locator.idempotencyKey,
+      ...(locator.taskId === undefined ? {} : { taskId: locator.taskId }),
+    };
+    updateOperation(active);
+    setFeedback({ kind: "info", message: "已恢复本地提交定位信息，正在只读查询原幂等键；不会重发生成请求。" });
+    void reconcileSubmission(active);
+    return () => controller.abort();
+  }, [services, seriesId, userId, sessionGeneration, memberType, updateOperation]);
 
   function savePreference(nextModelId: string, nextPromptId: string, nextSize: string): void {
     const key = fusedGenerationPreferenceKey(userId, services.apiBaseUrl ?? "", memberType);
@@ -450,6 +525,7 @@ export function FusedGenerationPanel({
       }
       setTaskStatus(receipt.status);
       if (isTerminalTaskStatus(receipt.status)) {
+        clearResolvedSubmissionLocator(active);
         updateOperation(null);
         setFeedback({
           kind: receipt.status.toLowerCase() === "completed" || receipt.status.toLowerCase() === "success"
@@ -477,14 +553,185 @@ export function FusedGenerationPanel({
     }
   }
 
+  function clearResolvedSubmissionLocator(active: ActiveOperation): boolean {
+    if (active.submissionKey === undefined || active.memberType === undefined) return false;
+    const context = `${active.scope.userId}\u0000${active.scope.apiBaseUrl ?? ""}\u0000${active.scope.seriesId}\u0000${active.memberType}`;
+    try {
+      const current = readFusedGenerationSubmissionLocator(window.localStorage, {
+        userId: active.scope.userId,
+        apiBaseUrl: active.scope.apiBaseUrl ?? "",
+        seriesId: active.scope.seriesId,
+        memberType: active.memberType,
+      });
+      if (current.status === "found" && current.locator.idempotencyKey !== active.submissionKey) {
+        setSubmissionGuard({ context, status: "pending", locator: current.locator });
+        return false;
+      }
+      if (current.status === "invalid" || current.status === "unavailable") {
+        const message = "浏览器无法核对并清除已完成任务的本地定位信息；为避免覆盖其他提交，当前范围暂停新提交。";
+        setSubmissionGuard({ context, status: "blocked", message });
+        return false;
+      }
+      if (current.status === "found" && !removeFusedGenerationSubmissionLocator(window.localStorage, {
+        userId: active.scope.userId,
+        apiBaseUrl: active.scope.apiBaseUrl ?? "",
+        seriesId: active.scope.seriesId,
+        memberType: active.memberType,
+      })) {
+        const message = "浏览器无法清除已核实任务的本地定位信息；为避免覆盖原提交，当前范围暂停新提交。";
+        setSubmissionGuard({ context, status: "blocked", message });
+        return false;
+      }
+      setSubmissionGuard({ context, status: "clear" });
+      return true;
+    } catch {
+      const message = "浏览器无法核对本地提交定位信息；为避免覆盖原提交，当前范围暂停新提交。";
+      setSubmissionGuard({ context, status: "blocked", message });
+      return false;
+    }
+  }
+
+  async function reconcileSubmission(active: ActiveOperation): Promise<void> {
+    const lookup = active.scope.services.fusedGeneration?.lookupSubmission;
+    if (lookup === undefined || active.submissionKey === undefined
+      || operationRef.current !== active || taskReadOwnerRef.current !== null
+      || !isCurrent(active.scope, active.controller.signal)) {
+      if (operationRef.current === active && lookup === undefined) {
+        active.phase = "unknown";
+        setFeedback({ kind: "unknown", message: "当前服务没有原幂等键查询能力；定位信息已保留，不会重发任务。" });
+      }
+      return;
+    }
+    const readOwner = {};
+    taskReadOwnerRef.current = readOwner;
+    setTaskReadBusy(true);
+    setFeedback({ kind: "info", message: "正在只读查询融合提交回执…" });
+    let continueToTaskReceipt = false;
+    try {
+      const receipt = await lookup(active.submissionKey, active.controller.signal);
+      if (operationRef.current !== active || !isCurrent(active.scope, active.controller.signal)) return;
+      if (receipt.taskId !== null) active.taskId = receipt.taskId;
+      if (receipt.messageId !== null) active.messageId = receipt.messageId;
+      if (receipt.taskId !== null && typeof window !== "undefined") {
+        const locator: FusedGenerationSubmissionLocator = {
+          version: 1,
+          userId: active.scope.userId,
+          apiBaseUrl: active.scope.apiBaseUrl ?? "",
+          seriesId: active.scope.seriesId,
+          memberType: active.memberType ?? selectedTypeRef.current,
+          operation: "fused.image",
+          idempotencyKey: active.submissionKey,
+          taskId: receipt.taskId,
+        };
+        if (writeFusedGenerationSubmissionLocator(window.localStorage, locator)) {
+          setSubmissionGuard({
+            context: `${locator.userId}\u0000${locator.apiBaseUrl}\u0000${locator.seriesId}\u0000${locator.memberType}`,
+            status: "pending",
+            locator,
+          });
+        }
+      }
+      switch (receipt.status) {
+        case "accepted":
+        case "result_known":
+          active.phase = "tracking";
+          setFeedback({ kind: "info", message: "原融合任务已受理，正在只读核对任务状态。" });
+          continueToTaskReceipt = receipt.taskId !== null;
+          break;
+        case "completed":
+        case "failed":
+          active.phase = "tracking";
+          setFeedback({
+            kind: receipt.status === "completed" ? "success" : "failure",
+            message: `原融合任务${receipt.status === "completed" ? "已完成" : "已失败"}；正在核对任务详情。`,
+          });
+          continueToTaskReceipt = receipt.taskId !== null;
+          if (receipt.taskId === null) {
+            active.phase = "unknown";
+            setFeedback({ kind: "unknown", message: "原提交回执没有任务ID，无法核实终态；原定位键仍保留，不会创建新提交。" });
+          }
+          break;
+        case "provider_result_unknown":
+          active.phase = "unknown";
+          setFeedback({ kind: "unknown", message: `Provider 已派发，结果待核对${feeSummary(receipt.feeAmount)}。不会重发生成请求。` });
+          break;
+        case "media_result_unknown":
+          active.phase = "unknown";
+          setFeedback({ kind: "unknown", message: `图片已返回，媒体保存或交付待核对${feeSummary(receipt.feeAmount)}。不会重新生成或重复上传。` });
+          break;
+        case "charged_incomplete":
+          active.phase = "unknown";
+          setFeedback({ kind: "unknown", message: `提交记录尚未完成，原费用状态待核对${feeSummary(receipt.feeAmount)}。不会重新提交。` });
+          break;
+        case "rejected_after_charge":
+          active.phase = "unknown";
+          setFeedback({ kind: "failure", message: `服务已保存原拒绝回执${feeSummary(receipt.feeAmount)}。请核对费用后再显式创建新任务。` });
+          clearResolvedSubmissionLocator(active);
+          updateOperation(null);
+          break;
+      }
+    } catch (error) {
+      if (operationRef.current !== active || !isCurrent(active.scope, active.controller.signal)) return;
+      if (error instanceof ApiError && error.status === 401) {
+        unauthorizedRef.current();
+        updateOperation(null);
+      } else {
+        active.phase = "unknown";
+        setFeedback({ kind: "unknown", message: "原幂等键暂时无法只读核对。定位信息已保留；不会使用新键重发。" });
+      }
+    } finally {
+      if (taskReadOwnerRef.current === readOwner) {
+        taskReadOwnerRef.current = null;
+        setTaskReadBusy(false);
+      }
+    }
+    if (continueToTaskReceipt && operationRef.current === active) {
+      await reconcileTask(active);
+    }
+  }
+
   async function submitGeneration(): Promise<void> {
     if (operationRef.current !== null || blocked) return;
+    if (submissionGuard.context !== submissionContext || submissionGuard.status !== "clear") {
+      const message = submissionGuard.status === "blocked"
+        ? submissionGuard.message
+        : "存在尚未核实的融合提交。请只读核对原提交回执；当前不会创建新幂等键。";
+      setFeedback({ kind: "unknown", message });
+      return;
+    }
     const submit = services.fusedGeneration;
     if (submit === undefined) {
       setFeedback({ kind: "failure", message: "当前服务未接入融合生成。" });
       return;
     }
     const scope = scopeRef.current;
+    let currentLocator: ReturnType<typeof readFusedGenerationSubmissionLocator>;
+    try {
+      currentLocator = readFusedGenerationSubmissionLocator(window.localStorage, {
+        userId: scope.userId,
+        apiBaseUrl: scope.apiBaseUrl ?? "",
+        seriesId: scope.seriesId,
+        memberType,
+      });
+    } catch {
+      const message = "浏览器本地提交定位信息不可读取，为避免覆盖原提交，本次没有发送请求。";
+      setSubmissionGuard({ context: submissionContext, status: "blocked", message });
+      setFeedback({ kind: "unknown", message });
+      return;
+    }
+    if (currentLocator.status === "found") {
+      setSubmissionGuard({ context: submissionContext, status: "pending", locator: currentLocator.locator });
+      setFeedback({ kind: "unknown", message: "已存在原融合提交定位信息。请只读核对原提交回执；不会使用新键重发。" });
+      return;
+    }
+    if (currentLocator.status === "invalid" || currentLocator.status === "unavailable") {
+      const message = currentLocator.status === "invalid"
+        ? "浏览器保存的原融合提交定位信息已损坏，为避免丢失未知任务，本次没有发送请求。"
+        : "浏览器本地提交定位信息不可读取，为避免覆盖可能仍未知的任务，本次没有发送请求。";
+      setSubmissionGuard({ context: submissionContext, status: "blocked", message });
+      setFeedback({ kind: "unknown", message });
+      return;
+    }
     if (catalogLoading || catalogError !== null || assetsLoading || assetsError !== null
       || readyPreferenceContext !== preferenceContext) {
       setFeedback({ kind: "failure", message: "模型、提示词或当前剧集成员目录尚未完成核对。" });
@@ -541,16 +788,54 @@ export function FusedGenerationPanel({
       name: null,
     });
     const controller = new AbortController();
-    const active: ActiveOperation = { scope, controller, kind: "generate", phase: "submitting" };
+    let idempotencyKey: string;
+    try {
+      idempotencyKey = newFusedSubmissionKey();
+    } catch {
+      setFeedback({ kind: "failure", message: "无法生成安全的融合提交核对键，未发送请求。" });
+      return;
+    }
+    const locator: FusedGenerationSubmissionLocator = {
+      version: 1,
+      userId: scope.userId,
+      apiBaseUrl: scope.apiBaseUrl ?? "",
+      seriesId: scope.seriesId,
+      memberType,
+      operation: "fused.image",
+      idempotencyKey,
+    };
+    try {
+      if (typeof window === "undefined"
+        || !writeFusedGenerationSubmissionLocator(window.localStorage, locator)) {
+        setFeedback({ kind: "failure", message: "浏览器无法保存本次融合提交核对键，未发送请求。" });
+        return;
+      }
+      setSubmissionGuard({ context: submissionContext, status: "pending", locator });
+    } catch {
+      setFeedback({ kind: "failure", message: "浏览器无法保存本次融合提交核对键，未发送请求。" });
+      return;
+    }
+    const active: ActiveOperation = {
+      scope,
+      controller,
+      kind: "generate",
+      phase: "submitting",
+      memberType,
+      submissionKey: idempotencyKey,
+    };
     updateOperation(active);
     setTaskStatus(null);
     setFeedback({ kind: "info", message: "正在提交融合生成任务…" });
     try {
-      const receipt = await submit.submit(input, controller.signal);
+      const receipt = await submit.submit(input, controller.signal, { idempotencyKey });
       if (!isCurrent(scope, controller.signal) || !ownsOperation(active)) return;
       active.phase = "tracking";
       active.taskId = receipt.taskId;
       active.messageId = receipt.messageId;
+      const acceptedLocator = { ...locator, taskId: receipt.taskId };
+      if (writeFusedGenerationSubmissionLocator(window.localStorage, acceptedLocator)) {
+        setSubmissionGuard({ context: submissionContext, status: "pending", locator: acceptedLocator });
+      }
       setFeedback({ kind: "info", message: "任务已受理，正在只读核对任务状态。" });
       if (scope.services.getTaskReceipt === undefined) {
         setFeedback({ kind: "unknown", message: "任务已受理，但当前服务没有任务详情读取能力。不会重复提交；可停止本地跟踪。" });
@@ -562,6 +847,11 @@ export function FusedGenerationPanel({
       if (error instanceof ApiError && error.status === 401) {
         unauthorizedRef.current();
         updateOperation(null);
+        return;
+      }
+      if (submit.lookupSubmission !== undefined) {
+        active.phase = "unknown";
+        await reconcileSubmission(active);
         return;
       }
       if (error instanceof ApiError && error.kind === "http" && error.status !== null
@@ -586,16 +876,38 @@ export function FusedGenerationPanel({
     setFeedback({
       kind: "unknown",
       message: kind === "generate"
-        ? "已停止本地跟踪；服务器上的融合任务仍可能运行并产生费用，未收到取消确认。请到任务页或刷新融合列表只读核对。"
+        ? "已停止本地跟踪；原提交核对键已保留。服务器上的任务仍可能运行并产生费用，未收到取消确认。刷新后只读查询原键即可。"
         : "已停止本地跟踪；上传请求仍可能在服务器完成。未知图片不会加入本次成员列表。",
     });
+  }
+
+  function resumePendingSubmission(): void {
+    if (operationRef.current !== null || submissionGuard.context !== submissionContext
+      || submissionGuard.status !== "pending") return;
+    const scope = scopeRef.current;
+    const controller = new AbortController();
+    const active: ActiveOperation = {
+      scope,
+      controller,
+      kind: "generate",
+      phase: "unknown",
+      memberType,
+      submissionKey: submissionGuard.locator.idempotencyKey,
+      ...(submissionGuard.locator.taskId === undefined ? {} : { taskId: submissionGuard.locator.taskId }),
+    };
+    updateOperation(active);
+    setFeedback({ kind: "info", message: "正在只读核对原融合提交回执；不会发送新的生成请求。" });
+    void reconcileSubmission(active);
   }
 
   const currentModel = models.find((model) => model.id === modelId && model.category === "image") ?? null;
   const sizes = fusedImageSizeOptions(currentModel);
   const preferenceContextReady = readyPreferenceContext === preferenceContext;
   const locked = operation !== null;
-  const disabled = locked || blocked || catalogLoading || assetsLoading || !preferenceContextReady;
+  const submissionGuardReady = submissionGuard.context === submissionContext
+    && submissionGuard.status === "clear";
+  const disabled = locked || blocked || catalogLoading || assetsLoading || !preferenceContextReady
+    || !submissionGuardReady;
   const validAssets = assets.filter((asset) => asset.series_id === seriesId);
 
   return (
@@ -607,6 +919,14 @@ export function FusedGenerationPanel({
         </div>
         {locked && (
           <button className="text-button" onClick={stopLocalTracking} type="button">停止本地跟踪</button>
+        )}
+        {!locked && submissionGuard.context === submissionContext && submissionGuard.status === "pending" && (
+          <button className="text-button" disabled={taskReadBusy} onClick={resumePendingSubmission} type="button">
+            {taskReadBusy ? "正在核对…" : "核对原提交回执"}
+          </button>
+        )}
+        {!locked && submissionGuard.context === submissionContext && submissionGuard.status === "blocked" && (
+          <p className="fused-generation-alert" role="alert">{submissionGuard.message}</p>
         )}
       </div>
 
@@ -720,6 +1040,11 @@ export function FusedGenerationPanel({
       {taskStatus !== null && <p className="fused-generation-state" role="status">最近任务状态：{readableStatus(taskStatus)}</p>}
 
       <div className="fused-generation-actions">
+        {operation?.kind === "generate" && operation.submissionKey !== undefined && (
+          <button className="secondary-button" disabled={taskReadBusy} onClick={() => void reconcileSubmission(operation)} type="button">
+            {taskReadBusy ? "正在核对…" : "核对原提交回执"}
+          </button>
+        )}
         {operation?.kind === "generate" && operation.taskId !== undefined && (
           <button className="secondary-button" disabled={taskReadBusy} onClick={() => void reconcileTask(operation)} type="button">
             {taskReadBusy ? "正在核对…" : "核对任务状态"}
