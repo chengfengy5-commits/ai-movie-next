@@ -27,6 +27,7 @@ import {
   type ChatContextPreference,
   type ChatContextPreferenceFailure,
 } from "./chatContextPreferences";
+import { ChatAssistantSplitPane } from "./ChatAssistantSplitPane";
 import "./chatAssistant.css";
 
 const PENDING_LOCATOR_PREFIX = "haoai.chat-assistant.pending.v1";
@@ -1359,108 +1360,118 @@ export function ChatAssistantPage({
         </label>
       </div>
 
-      <div className="chat-assistant-history" aria-label="聊天记录" aria-live="polite">
-        <div className="chat-assistant-history-heading">
-          <h2>当前会话</h2>
-          <button className="text-button" disabled={!contextPreferenceReady || historyLoading || target === null} onClick={() => target !== null && void refreshHistory(target)} type="button">
-            刷新会话
-          </button>
-        </div>
-        {historyLoading && <p role="status">正在读取当前会话…</p>}
-        {historyError !== null && <p className="chat-assistant-alert" role="alert">{historyError}</p>}
-        {!historyLoading && visibleMessages.length === 0 && <p className="chat-assistant-empty">选择章节和会话目标后开始聊天。</p>}
-        <ol className="chat-assistant-message-list">
-          {visibleMessages.map((message) => {
-            const parsed = message.role === "user"
-              ? parseChatContent(message.content)
-              : { metadata: null, text: message.content };
-            const displayText = message.id === pending?.assistantMessageId && streamPreview !== "" ? streamPreview : parsed.text;
-            const state = taskStates.get(message.id) ?? (message.id === pending?.assistantMessageId ? "processing" : "unknown");
-            const canDelete = state === "completed" || state === "failed";
-            const promptName = parsed.metadata?.promptId === null || parsed.metadata?.promptId === undefined
-              ? null
-              : prompts.find((prompt) => prompt.id === parsed.metadata!.promptId)?.name ?? null;
-            return (
-              <li className={`chat-assistant-message ${message.role}`} key={message.id}>
-                <div className="chat-assistant-message-meta">
-                  <strong>{message.role === "user" ? "我" : message.modelName ?? parsed.metadata?.modelName ?? "AI 助手"}</strong>
-                  <time dateTime={message.createdAt}>{formatMessageTime(message.createdAt)}</time>
-                </div>
-                {(parsed.metadata !== null || promptName !== null) && (
-                  <p className="chat-assistant-context-chip">
-                    {parsed.metadata?.modelName ?? message.modelName ?? "模型"}
-                    {promptName !== null && ` · ${promptName}`}
-                  </p>
+      <ChatAssistantSplitPane
+        apiBaseUrl={services.apiBaseUrl}
+        sessionGeneration={sessionGeneration}
+        userId={userId}
+        messages={
+          <div className="chat-assistant-history" aria-label="聊天记录" aria-live="polite">
+            <div className="chat-assistant-history-heading">
+              <h2>当前会话</h2>
+              <button className="text-button" disabled={!contextPreferenceReady || historyLoading || target === null} onClick={() => target !== null && void refreshHistory(target)} type="button">
+                刷新会话
+              </button>
+            </div>
+            {historyLoading && <p role="status">正在读取当前会话…</p>}
+            {historyError !== null && <p className="chat-assistant-alert" role="alert">{historyError}</p>}
+            {!historyLoading && visibleMessages.length === 0 && <p className="chat-assistant-empty">选择章节和会话目标后开始聊天。</p>}
+            <ol className="chat-assistant-message-list">
+              {visibleMessages.map((message) => {
+                const parsed = message.role === "user"
+                  ? parseChatContent(message.content)
+                  : { metadata: null, text: message.content };
+                const displayText = message.id === pending?.assistantMessageId && streamPreview !== "" ? streamPreview : parsed.text;
+                const state = taskStates.get(message.id) ?? (message.id === pending?.assistantMessageId ? "processing" : "unknown");
+                const canDelete = state === "completed" || state === "failed";
+                const promptName = parsed.metadata?.promptId === null || parsed.metadata?.promptId === undefined
+                  ? null
+                  : prompts.find((prompt) => prompt.id === parsed.metadata!.promptId)?.name ?? null;
+                return (
+                  <li className={`chat-assistant-message ${message.role}`} key={message.id}>
+                    <div className="chat-assistant-message-meta">
+                      <strong>{message.role === "user" ? "我" : message.modelName ?? parsed.metadata?.modelName ?? "AI 助手"}</strong>
+                      <time dateTime={message.createdAt}>{formatMessageTime(message.createdAt)}</time>
+                    </div>
+                    {(parsed.metadata !== null || promptName !== null) && (
+                      <p className="chat-assistant-context-chip">
+                        {parsed.metadata?.modelName ?? message.modelName ?? "模型"}
+                        {promptName !== null && ` · ${promptName}`}
+                      </p>
+                    )}
+                    <p className="chat-assistant-message-body">{displayText}</p>
+                    {state === "processing" && message.id !== pending?.assistantMessageId && <p className="chat-assistant-inline-state">任务仍在运行或等待确认</p>}
+                    {message.id === pending?.assistantMessageId && <p className="chat-assistant-inline-state">{pending.phase === "receiving" ? "正在接收" : "结果未确认"}</p>}
+                    <div className="chat-assistant-message-actions">
+                      <button className="text-button" onClick={() => navigateToMessageSource(message)} type="button">{sourceText(message, assets)}</button>
+                      <button className="text-button" onClick={() => void copyMessage(displayText)} type="button">复制消息</button>
+                      {message.role === "user" && (
+                        <button className="text-button" onClick={() => {
+                          const context = parseChatContent(message.content);
+                          recordContextInteraction();
+                          setDraft(context.text);
+                          if (context.metadata !== null) {
+                            editedSelectionContextRef.current = selectionPreferenceContextKey;
+                            if (models.some((model) => model.id === context.metadata!.modelId)) setModelId(context.metadata.modelId);
+                            setPromptId(context.metadata.promptId !== null && prompts.some((prompt) => prompt.id === context.metadata!.promptId)
+                              ? context.metadata.promptId
+                              : "");
+                            setSelectionPreferenceNotice(null);
+                          }
+                          setMessageNotice("已将原消息载入输入框；不会自动发送。");
+                        }} type="button">重新编辑</button>
+                      )}
+                      {canDelete && pending === null && (
+                        <button className="text-button danger-text" disabled={deletingMessageId === message.id}
+                          onClick={() => void deleteTerminalMessage(message)} type="button">删除此消息</button>
+                      )}
+                    </div>
+                  </li>
+                );
+              })}
+            </ol>
+          </div>
+        }
+        input={(
+          <>
+            {pending !== null && (
+              <section className="chat-assistant-pending" aria-label="待核对的聊天任务">
+                <p role="status">{pending.detail}</p>
+                {pending.phase === "receiving" && (
+                  <button className="secondary-button" onClick={() => streamControllerRef.current?.abort()} type="button">停止接收</button>
                 )}
-                <p className="chat-assistant-message-body">{displayText}</p>
-                {state === "processing" && message.id !== pending?.assistantMessageId && <p className="chat-assistant-inline-state">任务仍在运行或等待确认</p>}
-                {message.id === pending?.assistantMessageId && <p className="chat-assistant-inline-state">{pending.phase === "receiving" ? "正在接收" : "结果未确认"}</p>}
-                <div className="chat-assistant-message-actions">
-                  <button className="text-button" onClick={() => navigateToMessageSource(message)} type="button">{sourceText(message, assets)}</button>
-                  <button className="text-button" onClick={() => void copyMessage(displayText)} type="button">复制消息</button>
-                  {message.role === "user" && (
-                    <button className="text-button" onClick={() => {
-                      const context = parseChatContent(message.content);
-                      recordContextInteraction();
-                      setDraft(context.text);
-                      if (context.metadata !== null) {
-                        editedSelectionContextRef.current = selectionPreferenceContextKey;
-                        if (models.some((model) => model.id === context.metadata!.modelId)) setModelId(context.metadata.modelId);
-                        setPromptId(context.metadata.promptId !== null && prompts.some((prompt) => prompt.id === context.metadata!.promptId)
-                          ? context.metadata.promptId
-                          : "");
-                        setSelectionPreferenceNotice(null);
-                      }
-                      setMessageNotice("已将原消息载入输入框；不会自动发送。");
-                    }} type="button">重新编辑</button>
-                  )}
-                  {canDelete && pending === null && (
-                    <button className="text-button danger-text" disabled={deletingMessageId === message.id}
-                      onClick={() => void deleteTerminalMessage(message)} type="button">删除此消息</button>
-                  )}
-                </div>
-              </li>
-            );
-          })}
-        </ol>
-      </div>
+                {pending.phase !== "receiving" && (
+                  <button className="secondary-button" disabled={operationBusyRef.current} onClick={() => void manualRefreshPending()} type="button">刷新原任务状态</button>
+                )}
+                {pending.phase === "unknown" && (
+                  <button className="secondary-button" disabled={operationBusyRef.current} onClick={stopTrackingPending} type="button">停止跟踪本次任务</button>
+                )}
+                {pending.phase === "receiving" && <span>停止接收只停止本页读取，不会取消服务器任务。</span>}
+                {pending.phase === "recovering" && <span>正在只读核对原任务；本页不会重新发送。</span>}
+                {pending.phase === "unknown" && (
+                  <span>原任务仍可能在服务器运行，费用状态未确认。停止跟踪只清除本页等待，不会取消任务或自动重发。</span>
+                )}
+              </section>
+            )}
 
-      {pending !== null && (
-        <section className="chat-assistant-pending" aria-label="待核对的聊天任务">
-          <p role="status">{pending.detail}</p>
-          {pending.phase === "receiving" && (
-            <button className="secondary-button" onClick={() => streamControllerRef.current?.abort()} type="button">停止接收</button>
-          )}
-          {pending.phase !== "receiving" && (
-            <button className="secondary-button" disabled={operationBusyRef.current} onClick={() => void manualRefreshPending()} type="button">刷新原任务状态</button>
-          )}
-          {pending.phase === "unknown" && (
-            <button className="secondary-button" disabled={operationBusyRef.current} onClick={stopTrackingPending} type="button">停止跟踪本次任务</button>
-          )}
-          {pending.phase === "receiving" && <span>停止接收只停止本页读取，不会取消服务器任务。</span>}
-          {pending.phase === "recovering" && <span>正在只读核对原任务；本页不会重新发送。</span>}
-          {pending.phase === "unknown" && (
-            <span>原任务仍可能在服务器运行，费用状态未确认。停止跟踪只清除本页等待，不会取消任务或自动重发。</span>
-          )}
-        </section>
-      )}
+            {streamNotice !== null && <p className="chat-assistant-note" role="status">{streamNotice}</p>}
+            {messageNotice !== null && <p className="chat-assistant-note" role="status">{messageNotice}</p>}
 
-      {streamNotice !== null && <p className="chat-assistant-note" role="status">{streamNotice}</p>}
-      {messageNotice !== null && <p className="chat-assistant-note" role="status">{messageNotice}</p>}
-
-      <form className="chat-assistant-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage(); }}>
-        <label>
-          <span>发送给 AI 助手</span>
-          <textarea disabled={catalogError !== null || series.can_enter !== true} onChange={(event) => {
-            recordContextInteraction();
-            setDraft(event.target.value);
-          }} rows={5} value={draft} />
-        </label>
-        <div className="chat-assistant-composer-actions">
-          <span>{selectedModel === null ? "请先选择实际可用的文本模型。" : `当前模型：${selectedModel.name}`}</span>
-          <button className="primary-button" disabled={!canSend} type="submit">发送消息</button>
-        </div>
-      </form>
+            <form className="chat-assistant-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage(); }}>
+              <label>
+                <span>发送给 AI 助手</span>
+                <textarea disabled={catalogError !== null || series.can_enter !== true} onChange={(event) => {
+                  recordContextInteraction();
+                  setDraft(event.target.value);
+                }} rows={5} value={draft} />
+              </label>
+              <div className="chat-assistant-composer-actions">
+                <span>{selectedModel === null ? "请先选择实际可用的文本模型。" : `当前模型：${selectedModel.name}`}</span>
+                <button className="primary-button" disabled={!canSend} type="submit">发送消息</button>
+              </div>
+            </form>
+          </>
+        )}
+      />
     </section>
   );
 }

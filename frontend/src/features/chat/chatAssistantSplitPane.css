@@ -1,0 +1,108 @@
+.chat-assistant-split-layout {
+  display: grid;
+  gap: 0.35rem;
+  min-width: 0;
+}
+
+.chat-assistant-split-toolbar {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem 1rem;
+  justify-content: flex-end;
+  min-width: 0;
+}
+
+.chat-assistant-split-toolbar p {
+  color: var(--text-muted, #777);
+  flex: 1 1 20rem;
+  margin: 0;
+}
+
+.chat-assistant-split-pane {
+  display: flex;
+  flex-direction: column;
+  height: clamp(22rem, 65vh, 56rem);
+  max-height: calc(100vh - 18rem);
+  max-height: calc(100dvh - 18rem);
+  min-height: 22rem;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.chat-assistant-split-messages,
+.chat-assistant-split-input {
+  min-height: 0;
+  min-width: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+}
+
+.chat-assistant-split-messages {
+  flex: var(--chat-assistant-message-share, 62) 1 0;
+}
+
+.chat-assistant-split-input {
+  display: grid;
+  flex: var(--chat-assistant-input-share, 38) 1 0;
+  gap: 0.9rem;
+  align-content: start;
+}
+
+.chat-assistant-split-divider {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  border-radius: 999px;
+  cursor: row-resize;
+  display: flex;
+  flex: 0 0 0.9rem;
+  justify-content: center;
+  padding: 0;
+  position: relative;
+  touch-action: none;
+  user-select: none;
+}
+
+.chat-assistant-split-divider::after {
+  background: var(--border, #c8cbd0);
+  border-radius: inherit;
+  content: "";
+  height: 3px;
+  transition: background-color 120ms ease, width 120ms ease;
+  width: 3rem;
+}
+
+.chat-assistant-split-divider:hover::after,
+.chat-assistant-split-divider:focus-visible::after,
+.chat-assistant-split-pane[data-dragging="true"] .chat-assistant-split-divider::after {
+  background: var(--accent, #536dfe);
+  width: 4rem;
+}
+
+.chat-assistant-split-divider:focus-visible {
+  outline: 2px solid var(--accent, #536dfe);
+  outline-offset: 2px;
+}
+
+@media (max-width: 700px), (max-height: 600px) {
+  .chat-assistant-split-pane {
+    display: grid;
+    gap: 1rem;
+    height: auto;
+    max-height: none;
+    min-height: 0;
+    overflow: visible;
+  }
+
+  .chat-assistant-split-messages,
+  .chat-assistant-split-input {
+    flex: none;
+    min-height: auto;
+    overflow: visible;
+  }
+
+  .chat-assistant-split-divider {
+    display: none;
+  }
+}
