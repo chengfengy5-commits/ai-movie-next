@@ -6,6 +6,9 @@ import json
 from typing import Any
 
 
+DEFAULT_BASE_URL = "https://api.video.aistarslab.com/openapi"
+
+
 def duration_options(duration: dict[str, Any] | None) -> list[int]:
     """Convert a duration range to the options shown by the legacy UI."""
     values = duration or {}

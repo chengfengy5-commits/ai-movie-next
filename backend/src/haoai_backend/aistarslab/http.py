@@ -18,12 +18,14 @@ from haoai_backend.shared.errors import BusinessError
 from .application import AistarslabApplication
 from .authentication import AistarslabActor, authenticate_aistarslab_actor
 from .ports import (
+    AistarslabConfigCache,
     AistarslabLegacyReaderFactory,
     AistarslabTransport,
     Clock,
     IdFactory,
 )
-from .provider import ConfigCache, system_clock
+from .persistence import AistarslabSystemModelWriterAdapter
+from .provider import AistarslabClient, ConfigCache, system_clock
 from .schemas import (
     AddDefaultRequest,
     BuildImageParamsRequest,
@@ -51,7 +53,7 @@ def build_aistarslab_router(
     transport: AistarslabTransport,
     clock: Clock = system_clock,
     id_factory: IdFactory = lambda: str(uuid4()),
-    cache: ConfigCache | None = None,
+    cache: AistarslabConfigCache | None = None,
 ) -> APIRouter:
     """Build the route set from explicit authentication, storage, and HTTP ports."""
     router = APIRouter(prefix="/api/aistarslab", tags=["aistarslab"])
@@ -59,12 +61,16 @@ def build_aistarslab_router(
         model_configs_uow_factory=model_configs_uow_factory,
         legacy_reader_factory=legacy_reader_factory,
         system_config_uow_factory=system_config_uow_factory,
-        system_model_uow_factory=system_model_uow_factory,
+        system_model_writer=AistarslabSystemModelWriterAdapter(
+            system_model_uow_factory,
+            legacy_reader_factory,
+            cipher,
+        ),
         cipher=cipher,
-        transport=transport,
+        provider=AistarslabClient(transport),
         clock=clock,
         id_factory=id_factory,
-        cache=cache,
+        cache=cache if cache is not None else ConfigCache(),
     )
 
     def active_member(request: Request) -> AistarslabActor:
