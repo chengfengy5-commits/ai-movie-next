@@ -62,9 +62,10 @@ import {
   type VideoSelectionPreference,
 } from "./mediaSelectionPreferences";
 import { QuickReferenceSettingsPanel } from "./QuickReferenceSettingsPanel";
+import { BatchVideoGenerationPanel } from "./BatchVideoGenerationPanel";
 import "./mediaGeneration.css";
 
-type MediaMode = "image" | "video" | "batch";
+type MediaMode = "image" | "video" | "batch" | "batch-video";
 type SingleTargetMode = "standalone" | "frame_message" | "asset_message";
 type ReferenceUploadStatusKind = "uploading" | "uploaded" | "failed" | "unknown";
 type LibraryAsset = Character | Scene | Prop | StoryboardAsset;
@@ -549,6 +550,7 @@ export function MediaGenerationPage({
   onOpenTasks,
 }: MediaGenerationPageProps) {
   const [mode, setMode] = useState<MediaMode>("video");
+  const [batchVideoActive, setBatchVideoActive] = useState(false);
   const [series, setSeries] = useState<Series[]>([]);
   const [selectedSeriesId, setSelectedSeriesId] = useState("");
   const [chapters, setChapters] = useState<Chapter[]>([]);
@@ -1515,7 +1517,7 @@ export function MediaGenerationPage({
   const setModeSafely = (value: MediaMode) => {
     if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
       || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
-      || savingBatchPreferencesRef.current) return;
+      || savingBatchPreferencesRef.current || batchVideoActive) return;
     acceptedReceiptContextRef.current = null;
     setMode(value);
     setOutcome(null);
@@ -2402,7 +2404,7 @@ export function MediaGenerationPage({
       : !isImageMode && singleVideoReferences.length > REFERENCE_COUNT_LIMIT.video
         ? "参考视频超过5项上限，请先减少引用。"
         : null;
-  const isFrozen = pending !== null || requesting || uploadingReference || savingBatchPreferences
+  const isFrozen = pending !== null || requesting || uploadingReference || savingBatchPreferences || batchVideoActive
     || savingQuickReferencePreferences || preparingQuickReference;
 
   const renderReferenceUploader = (kind: MediaReferenceKind) => {
@@ -2461,6 +2463,7 @@ export function MediaGenerationPage({
         <button aria-pressed={mode === "image"} disabled={isFrozen} onClick={() => setModeSafely("image")} type="button">普通图片</button>
         <button aria-pressed={mode === "video"} disabled={isFrozen} onClick={() => setModeSafely("video")} type="button">普通视频</button>
         <button aria-pressed={mode === "batch"} disabled={isFrozen} onClick={() => setModeSafely("batch")} type="button">批量素材生图</button>
+        <button aria-pressed={mode === "batch-video"} disabled={isFrozen} onClick={() => setModeSafely("batch-video")} type="button">批量分镜视频</button>
       </nav>
 
       <QuickReferenceSettingsPanel
@@ -2486,7 +2489,7 @@ export function MediaGenerationPage({
         <p className="media-generation-note" role="status">当前服务没有接入媒体生成提交接口，页面不会模拟生成结果。</p>
       )}
 
-      {mode !== "batch" ? (
+      {mode === "image" || mode === "video" ? (
         <div className="media-generation-card">
           <div className="media-generation-section-heading">
             <div><p className="eyebrow">{isImageMode ? "图片生成" : "视频生成"}</p><h2>{isImageMode ? "普通图片" : "普通视频"}</h2></div>
@@ -2650,7 +2653,7 @@ export function MediaGenerationPage({
             </button>
           </div>
         </div>
-      ) : (
+      ) : mode === "batch" ? (
         <div className="media-generation-card">
           <div className="media-generation-section-heading">
             <div><p className="eyebrow">批量生成</p><h2>批量素材生图</h2></div>
@@ -2752,6 +2755,35 @@ export function MediaGenerationPage({
           {batchPreferenceMessage !== null && <p className="media-generation-note" role="status">{batchPreferenceMessage}</p>}
           <p className="media-generation-note">服务暂不可用时会显示对应状态；提交状态待确认时，可以重新核对本次提交。已受理的任务可在“我的任务”中查看。</p>
         </div>
+      ) : (
+        <BatchVideoGenerationPanel
+          services={services}
+          userId={userId}
+          sessionGeneration={sessionGeneration}
+          series={series}
+          selectedSeriesId={selectedSeriesId}
+          onSeriesChange={setSelectedSeriesId}
+          chapters={chapters}
+          selectedChapterId={selectedChapterId}
+          onChapterChange={setSelectedChapterId}
+          selectedSeries={selectedSeries}
+          selectedChapter={selectedChapter}
+          storyboards={storyboardAssets}
+          characters={characterAssets}
+          scenes={sceneAssets}
+          props={propAssets}
+          models={videoModels}
+          prompts={prompts}
+          quickReferenceSettings={quickReferenceSettings}
+          loading={loading}
+          chapterLoading={chapterLoading}
+          directoryLoading={directoryLoading}
+          chapterError={chapterError}
+          directoryError={directoryError}
+          onUnauthorized={onUnauthorized}
+          onOpenTasks={onOpenTasks}
+          onActivityChange={setBatchVideoActive}
+        />
       )}
 
       {pending !== null && (

@@ -34,6 +34,8 @@ export interface CreatorModel {
   model?: string | null;
   base_url?: string | null;
   params: string | null;
+  /** Public, read-only estimate used by generation previews; never sent in writes. */
+  cost_per_call?: number | null;
   sort_order: number;
   is_system: boolean;
   user_id: string;
@@ -194,6 +196,11 @@ export function parseCreatorModel(value: unknown): CreatorModel {
   const params = optionalNullableString(model, "params", "模型");
   const modelName = optionalNullableString(model, "model", "模型");
   const baseUrl = optionalNullableString(model, "base_url", "模型");
+  const costPerCall = model.cost_per_call === undefined
+    ? undefined
+    : typeof model.cost_per_call === "number" && Number.isSafeInteger(model.cost_per_call) && model.cost_per_call >= 0
+      ? model.cost_per_call
+      : null;
   return {
     id: requiredString(model, "id", "模型"),
     category: requiredString(model, "category", "模型"),
@@ -202,6 +209,7 @@ export function parseCreatorModel(value: unknown): CreatorModel {
     ...(modelName === undefined ? {} : { model: modelName }),
     ...(baseUrl === undefined ? {} : { base_url: baseUrl }),
     params: params ?? null,
+    ...(costPerCall === undefined ? {} : { cost_per_call: costPerCall }),
     sort_order: requiredNumber(model, "sort_order", "模型"),
     is_system: requiredBoolean(model, "is_system", "模型"),
     user_id: requiredString(model, "user_id", "模型"),
