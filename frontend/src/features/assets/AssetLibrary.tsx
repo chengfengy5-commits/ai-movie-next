@@ -7,6 +7,7 @@ import type {
   Series,
 } from "../../shared/api/contracts";
 import type { AssetGenerationHistoryPort } from "../../shared/api/assetGenerationHistory";
+import type { FusedGenerationMemberType } from "../../shared/api/fusedGeneration";
 import { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import { AssetMaintenanceDialog } from "./maintenance/AssetMaintenanceDialog";
@@ -44,6 +45,7 @@ import type {
   CharacterAudioDirectory,
   CharacterAudioRun,
 } from "../../shared/api/characterAudio";
+import type { FusedSourceEntrySelection } from "../series-workbench/fusedSourceEntry";
 
 type AssetRecord = Character | Scene | Prop;
 
@@ -370,6 +372,8 @@ function AssetCard({
   generationHistoryUnavailable,
   onCharacterAudio,
   characterAudioUnavailable,
+  onFuse,
+  fusedSourceUnavailable,
   onEdit,
   onDelete,
   usageUnavailable,
@@ -392,6 +396,8 @@ function AssetCard({
   generationHistoryUnavailable?: string | undefined;
   onCharacterAudio?: (() => void) | undefined;
   characterAudioUnavailable?: string | undefined;
+  onFuse?: (() => void) | undefined;
+  fusedSourceUnavailable?: string | undefined;
   onEdit?: (() => void) | undefined;
   onDelete?: (() => void) | undefined;
   usageUnavailable: boolean;
@@ -483,6 +489,14 @@ function AssetCard({
             {characterAudioUnavailable !== undefined && <small role="note">{characterAudioUnavailable}</small>}
           </div>
         )}
+        {(type === "characters" || type === "props") && (
+          <div className="asset-card-fused-source-action">
+            <button className="secondary-button" disabled={onFuse === undefined} onClick={onFuse} type="button">
+              {type === "characters" ? "用作融合角色" : "用作融合道具"}
+            </button>
+            {fusedSourceUnavailable !== undefined && <small role="note">{fusedSourceUnavailable}</small>}
+          </div>
+        )}
         {(onEdit !== undefined || onDelete !== undefined) && (
           <div className="asset-card-management-actions" aria-label={name + "素材操作"}>
             {onEdit !== undefined && <button onClick={onEdit} type="button">编辑</button>}
@@ -503,6 +517,9 @@ export interface AssetLibraryProps {
   onViewChapter?(target: AssetFrameUsageChapterTarget): void;
   onViewFrame?(target: AssetFrameUsageFrameTarget): void;
   onUseAsWorkbenchTarget?(target: AssetFrameUsageWorkbenchTarget): void;
+  onFusedSource?(selection: FusedSourceEntrySelection): void;
+  sessionGeneration?: number;
+  active?: boolean;
   navigationIntent?: AssetNavigationIntent | null;
   generationHistoryPort?: AssetGenerationHistoryPort | undefined;
   onNavigationConsumed?(navigationEpoch: number): void;
@@ -518,6 +535,9 @@ export function AssetLibrary({
   onViewChapter,
   onViewFrame,
   onUseAsWorkbenchTarget,
+  onFusedSource,
+  sessionGeneration = 0,
+  active = true,
   navigationIntent = null,
   generationHistoryPort,
   onNavigationConsumed,
@@ -598,8 +618,20 @@ export function AssetLibrary({
   const navigationConsumedHandlerRef = useRef(onNavigationConsumed);
   const navigationAbandonedHandlerRef = useRef(onNavigationAbandoned);
   const selectedTypeRef = useRef(selectedType);
+  const sessionGenerationRef = useRef(sessionGeneration);
+  const activeRef = useRef(active);
+  const fusedSourceGenerationRef = useRef(0);
+  const fusedSourceContextRef = useRef({ active, selectedType, sessionGeneration });
   const unauthorizedHandlerRef = useRef(onUnauthorized);
   selectedTypeRef.current = selectedType;
+  sessionGenerationRef.current = sessionGeneration;
+  activeRef.current = active;
+  if (fusedSourceContextRef.current.active !== active
+    || fusedSourceContextRef.current.selectedType !== selectedType
+    || fusedSourceContextRef.current.sessionGeneration !== sessionGeneration) {
+    fusedSourceContextRef.current = { active, selectedType, sessionGeneration };
+    fusedSourceGenerationRef.current += 1;
+  }
   navigationConsumedHandlerRef.current = onNavigationConsumed;
   navigationAbandonedHandlerRef.current = onNavigationAbandoned;
   unauthorizedHandlerRef.current = onUnauthorized;
@@ -2111,6 +2143,69 @@ export function AssetLibrary({
         : generationHistoryPort === undefined
           ? services.mode === "demo" ? "演示模式暂未接入生成历史服务。" : "当前服务暂未接入生成历史接口。"
           : undefined;
+    const fusedMemberType: FusedGenerationMemberType | null = category === "characters"
+      ? "character"
+      : category === "props" ? "prop" : null;
+    const fusedSourceUnavailable = fusedMemberType === null
+      ? undefined
+      : !identityIsUnique || item.id !== item.id.trim()
+        ? "素材身份暂无法核对，不能作为融合来源。"
+        : typeof item.image_url !== "string" || item.image_url.trim() === ""
+          ? "素材没有可用图片，不能作为融合成员。"
+          : series.can_enter !== true
+            ? "当前账号不能进入此剧集，不能选择融合来源。"
+            : onFusedSource === undefined
+              ? "当前页面没有可用的融合入口。"
+              : undefined;
+    const directorySnapshot = result;
+    const fuseMember = fusedMemberType !== null && fusedSourceUnavailable === undefined
+      ? () => {
+        if (directorySnapshot === null || directorySnapshot.scope !== libraryScope
+          || directorySnapshot.result.status !== "ready"
+          || directorySnapshot.result.type !== category
+          || directorySnapshot.result.items !== items
+          || directorySnapshot.result.items.filter((candidate) => candidate.id === item.id).length !== 1) {
+          return;
+        }
+        const requestGeneration = directorySnapshot.requestGeneration;
+        const sourceGeneration = fusedSourceGenerationRef.current;
+        const apiBaseUrl = services.apiBaseUrl;
+        const ids = Object.freeze([item.id]);
+        const selection: FusedSourceEntrySelection = {
+          actorId: userId,
+          apiBaseUrl,
+          services,
+          sessionGeneration,
+          sourceEpoch: sourceGeneration,
+          seriesId: series.id,
+          memberType: fusedMemberType,
+          memberAssetIds: ids,
+          target: null,
+          isCurrent: () => {
+            const activeDirectory = resultRef.current;
+            return sessionGenerationRef.current === sessionGeneration
+              && activeRef.current
+              && fusedSourceGenerationRef.current === sourceGeneration
+              && libraryScopeRef.current === libraryScope
+              && userId === libraryScope.userId
+              && services === libraryScope.services
+              && series.id === libraryScope.seriesId
+              && services.apiBaseUrl === apiBaseUrl
+              && selectedTypeRef.current === category
+              && activeDirectory === directorySnapshot
+              && activeDirectory?.requestGeneration === requestGeneration
+              && activeDirectory.result.status === "ready"
+              && activeDirectory.result.type === category
+              && activeDirectory.result.items === items
+              && items.includes(item)
+              && items.filter((candidate) => candidate.id === item.id && candidate.series_id === series.id).length === 1
+              && item.id.trim() !== ""
+              && item.id === item.id.trim();
+          },
+        };
+        if (selection.isCurrent()) onFusedSource?.(selection);
+      }
+      : undefined;
     return (
       <AssetCard
         apiBaseUrl={services.apiBaseUrl}
@@ -2151,6 +2246,8 @@ export function AssetLibrary({
           ? () => openCharacterAudio(item as Character, items as Character[])
           : undefined}
         characterAudioUnavailable={characterAudioUnavailable}
+        onFuse={fuseMember}
+        fusedSourceUnavailable={fusedSourceUnavailable}
         onEdit={identityIsUnique ? () => openManagement("edit", category, item, items) : undefined}
         onDelete={identityIsUnique ? () => openManagement("delete", category, item, items) : undefined}
         usageUnavailable={!identityIsUnique}

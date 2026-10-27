@@ -11,6 +11,7 @@ import type {
   StoryboardAsset,
   StoryboardFrame,
 } from "../../shared/api/contracts";
+import type { FusedGenerationMemberType } from "../../shared/api/fusedGeneration";
 import type { PersonalProductionSnapshot } from "../../shared/api/personalProductionNotes";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
@@ -112,6 +113,7 @@ import {
   type StoryboardAssetGenerationSnapshot,
 } from "./storyboard-assets/StoryboardAssetExtractionDialog";
 import { FrameResourceColumn } from "../series-workbench/FrameResourceColumn";
+import { createFusedFrameSource, type FusedSourceEntrySelection } from "../series-workbench/fusedSourceEntry";
 import type { FrameResourceDirectories, FrameResourceDirectoryState } from "../series-workbench/frameResourceProjection";
 import type { WorkbenchSourceSelection, WorkbenchSourceTarget } from "../series-workbench/sourceIntent";
 import {
@@ -138,6 +140,7 @@ interface ChapterBrowserProps {
   onNavigateToAsset?(target: FrameAssetReferenceAssetTarget): void;
   workbenchActive?: boolean;
   onWorkbenchSource?(selection: WorkbenchSourceSelection): void;
+  onFusedSource?(selection: FusedSourceEntrySelection): void;
 }
 
 export interface ChapterNavigationIntent {
@@ -847,6 +850,7 @@ export function ChapterBrowser({
   onNavigateToAsset,
   workbenchActive = false,
   onWorkbenchSource,
+  onFusedSource,
 }: ChapterBrowserProps) {
   const [chapters, setChapters] = useState<Chapter[] | null>(null);
   const [chaptersLoading, setChaptersLoading] = useState(true);
@@ -6063,6 +6067,84 @@ export function ChapterBrowser({
                                 }}
                                 frame={sourceFrame}
                                 frameIndex={frame.position - 1}
+                                {...(onFusedSource === undefined ? {} : {
+                                  onFuseMemberType: (memberType: FusedGenerationMemberType) => {
+                                    const chapter = selectedChapter;
+                                    const chapterContent = chapter?.content;
+                                    const frameIndex = frame.position - 1;
+                                    const memberCategory = memberType === "character" ? "characters" : "props";
+                                    const memberDirectory = frameResourceCatalogs[memberCategory];
+                                    const assetSnapshot = currentAssetResult;
+                                    if (!workbenchActive || chapter === null || chapterContent === null
+                                      || sourceFrame === undefined || memberDirectory.status !== "ready"
+                                      || assetSnapshot?.status !== "ready") {
+                                      setChapterMutationNotice("镜头、角色/道具目录或故事板目录尚未完成核对，不能打开融合入口。");
+                                      return;
+                                    }
+                                    const proof = createFusedFrameSource({
+                                      seriesId: series.id,
+                                      chapterId: chapter.id,
+                                      frameIndex,
+                                      chapterContent,
+                                      storyboardAssets: assetSnapshot.assets,
+                                      memberType,
+                                      memberDirectory: memberDirectory.items,
+                                    });
+                                    if (proof.status !== "ready") {
+                                      setChapterMutationNotice(proof.reason);
+                                      return;
+                                    }
+                                    const scope = { userId, services, seriesId: series.id };
+                                    const chaptersSnapshot = chapters;
+                                    const catalogSnapshot = frameResourceCatalogs;
+                                    const chapterGeneration = chapterRequestGeneration.current;
+                                    const assetGeneration = assetRequestGeneration.current;
+                                    const resourceGeneration = frameResourceCatalogGeneration.current;
+                                    const memberDirectorySnapshot = memberDirectory.items;
+                                    const selection: FusedSourceEntrySelection = {
+                                      actorId: userId,
+                                      apiBaseUrl: services.apiBaseUrl,
+                                      services,
+                                      sessionGeneration,
+                                      sourceEpoch: resourceGeneration,
+                                      seriesId: series.id,
+                                      memberType: proof.memberType,
+                                      memberAssetIds: proof.memberAssetIds,
+                                      target: proof.target,
+                                      isCurrent: () => {
+                                        const directory = chapterDirectoryRef.current;
+                                        const currentChapter = directory.chapters?.find((item) => item.id === chapter.id);
+                                        const currentFrame = currentChapter?.content?.[frameIndex];
+                                        const currentMemberDirectory = frameResourceCatalogs[memberCategory];
+                                        return workbenchActive
+                                          && sessionGenerationRef.current === sessionGeneration
+                                          && sameChapterBrowserScope(activeScopeRef.current, scope)
+                                          && sameChapterBrowserScope(directory.scope, scope)
+                                          && directory.requestGeneration === chapterGeneration
+                                          && directory.chapters === chaptersSnapshot
+                                          && chaptersSnapshot?.filter((item) => item.id === chapter.id).length === 1
+                                          && currentChapter === chapter
+                                          && selectedChapterIdRef.current === chapter.id
+                                          && chapterRequestGeneration.current === chapterGeneration
+                                          && assetRequestGeneration.current === assetGeneration
+                                          && frameResourceCatalogGeneration.current === resourceGeneration
+                                          && selectedChapter === chapter
+                                          && chapter.content === chapterContent
+                                          && currentFrame === sourceFrame
+                                          && currentMemberDirectory.status === "ready"
+                                          && currentMemberDirectory.items === memberDirectorySnapshot
+                                          && assetResultRef.current === assetSnapshot
+                                          && frameResourceCatalogs === catalogSnapshot;
+                                      },
+                                    };
+                                    if (!selection.isCurrent()) {
+                                      setChapterMutationNotice("来源目录或镜头已变化，请刷新后重新选择。");
+                                      return;
+                                    }
+                                    setChapterMutationNotice(null);
+                                    onFusedSource(selection);
+                                  },
+                                })}
                                 onSelect={(target: WorkbenchSourceTarget) => {
                                   const chapter = selectedChapter;
                                   if (!workbenchActive || onWorkbenchSource === undefined || chapter === null) return;

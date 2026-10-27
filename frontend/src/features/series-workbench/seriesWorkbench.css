@@ -182,6 +182,32 @@
   background: #fafcfb;
 }
 
+.frame-resource-fused-actions {
+  display: flex;
+  grid-column: 1 / -1;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 2px 4px 4px;
+}
+
+.frame-resource-fused-action {
+  display: grid;
+  gap: 3px;
+}
+
+.frame-resource-fused-action .secondary-button {
+  min-height: 28px;
+  padding: 0 9px;
+  font-size: 10px;
+}
+
+.frame-resource-fused-action small {
+  max-width: 180px;
+  color: #778889;
+  font-size: 9px;
+}
+
 .frame-resource-group h4 {
   margin: 0 0 6px;
   color: #49615f;

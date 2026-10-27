@@ -1,5 +1,6 @@
 import { isSafeCoverUrl } from "../../shared/api/config";
 import type { StoryboardFrame } from "../../shared/api/contracts";
+import type { FusedGenerationMemberType } from "../../shared/api/fusedGeneration";
 import { projectFrameResources, type FrameResourceDirectories } from "./frameResourceProjection";
 import type { WorkbenchSourceTarget } from "./sourceIntent";
 
@@ -12,6 +13,7 @@ interface FrameResourceColumnProps {
   readonly apiBaseUrl: string | null;
   readonly directories: FrameResourceDirectories;
   readonly onSelect?: (target: WorkbenchSourceTarget) => void;
+  readonly onFuseMemberType?: (memberType: FusedGenerationMemberType) => void;
 }
 
 export function FrameResourceColumn({
@@ -23,8 +25,25 @@ export function FrameResourceColumn({
   apiBaseUrl,
   directories,
   onSelect,
+  onFuseMemberType,
 }: FrameResourceColumnProps) {
   const groups = projectFrameResources(frame, frameIndex, chapterId, seriesId, chapterFrames, directories);
+  const fusionAvailability = (memberType: FusedGenerationMemberType): { disabled: boolean; reason: string | null } => {
+    if (directories.storyboard.status === "loading") return { disabled: true, reason: "正在读取分镜目录。" };
+    if (directories.storyboard.status === "error") return { disabled: true, reason: "分镜目录读取失败。" };
+    const category = memberType === "character" ? "characters" : "props";
+    const group = groups.find((candidate) => candidate.category === category);
+    if (group === undefined || group.status === "loading") return { disabled: true, reason: "正在读取素材目录。" };
+    if (group.status === "error") return { disabled: true, reason: "素材目录读取失败。" };
+    if (group.rows.length === 0) return { disabled: false, reason: "当前镜头未关联素材，可进入后手动选择。" };
+    if (group.rows.some((row) => row.state !== "ready" || row.target?.kind !== "asset")) {
+      return { disabled: true, reason: "当前镜头的关联素材无法唯一核对。" };
+    }
+    if (group.rows.some((row) => typeof row.imageUrl !== "string" || row.imageUrl.trim() === "")) {
+      return { disabled: true, reason: "当前镜头的关联素材缺少可用图片。" };
+    }
+    return { disabled: false, reason: null };
+  };
   return (
     <section className="frame-resource-column" aria-label={`镜头 ${frameIndex + 1} 的五类关联素材`}>
       {groups.map((group) => (
@@ -52,6 +71,27 @@ export function FrameResourceColumn({
           })}
         </div>
       ))}
+      {onFuseMemberType !== undefined && (
+        <div className="frame-resource-fused-actions" aria-label={`镜头 ${frameIndex + 1} 的融合入口`}>
+          {(["character", "prop"] as const).map((memberType) => {
+            const availability = fusionAvailability(memberType);
+            const label = memberType === "character" ? "融合镜头角色" : "融合镜头道具";
+            return (
+              <div className="frame-resource-fused-action" key={memberType}>
+                <button
+                  className="secondary-button"
+                  disabled={availability.disabled}
+                  onClick={() => onFuseMemberType(memberType)}
+                  type="button"
+                >
+                  {label}
+                </button>
+                {availability.reason !== null && <small role="note">{availability.reason}</small>}
+              </div>
+            );
+          })}
+        </div>
+      )}
     </section>
   );
 }
