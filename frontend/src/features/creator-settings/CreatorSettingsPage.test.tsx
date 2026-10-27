@@ -17,6 +17,7 @@ import type {
 import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { CreatorSettingsPage } from "./CreatorSettingsPage";
 import type { ProviderQuotaAccount, ProviderQuotaAccountEditor, ProviderQuotaBalance, ProviderQuotaServicePort } from "../../shared/api/providerQuota";
+import type { ZhangyugePatServicePort } from "../../shared/api/zhangyugePat";
 
 afterEach(() => {
   cleanup();
@@ -261,6 +262,7 @@ function renderPage(
   userId = ownerId,
   isSuperuser = false,
   providerQuotaService?: ProviderQuotaServicePort,
+  zhangyugePatService?: ZhangyugePatServicePort,
 ) {
   const onUnauthorized = vi.fn();
   const onBack = vi.fn();
@@ -269,6 +271,7 @@ function renderPage(
     onBack={onBack}
     onUnauthorized={onUnauthorized}
     providerQuotaService={providerQuotaService}
+    zhangyugePatService={zhangyugePatService}
     service={service}
     userId={userId}
   />);
@@ -1307,6 +1310,148 @@ describe("creator settings", () => {
     expect(screen.getByRole("button", { name: "添加账号" })).toBeEnabled();
     expect(quotaService.createAccount).toHaveBeenCalledOnce();
     expect(quotaService.getBalance).not.toHaveBeenCalled();
+  });
+
+  it("lets admins save PAT separately from clear and guards dirty navigation", async () => {
+    const user = userEvent.setup();
+    const { service: settingsService } = makeService();
+    let configured = false;
+    const patService: ZhangyugePatServicePort = {
+      getStatus: vi.fn(async () => ({ configured })),
+      save: vi.fn(async (pat) => { configured = pat.trim() !== ""; }),
+    };
+    const { onBack } = renderPage(settingsService, ownerId, true, undefined, patService);
+    await screen.findByText("我的文本模型");
+    await user.click(screen.getByRole("button", { name: "章鱼哥 PAT 设置" }));
+    expect(await screen.findByText("未检测到可用 PAT。")).toBeInTheDocument();
+    expect(patService.getStatus).toHaveBeenCalledOnce();
+
+    await user.click(screen.getByRole("button", { name: "保存 PAT" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/请输入新的 PAT/);
+    expect(patService.save).not.toHaveBeenCalled();
+
+    const patInput = screen.getByLabelText("输入新的 PAT");
+    await user.type(patInput, "fresh-pat-value");
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(screen.getByRole("button", { name: "收起 PAT 设置" }));
+    expect(screen.getByRole("region", { name: "章鱼哥 PAT 配置" })).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "提示词" }));
+    expect(screen.getByRole("tab", { name: "模型" })).toHaveAttribute("aria-selected", "true");
+    await user.click(screen.getByRole("button", { name: "返回工作空间" }));
+    expect(confirmSpy).toHaveBeenCalledTimes(3);
+    expect(onBack).not.toHaveBeenCalled();
+    expect(patInput).toHaveValue("fresh-pat-value");
+
+    await user.click(screen.getByRole("button", { name: "保存 PAT" }));
+    expect(await screen.findByText("PAT 已保存。")).toBeInTheDocument();
+    expect(patService.save).toHaveBeenCalledOnce();
+    expect(patService.save).toHaveBeenCalledWith("fresh-pat-value", expect.any(AbortSignal));
+    expect(patInput).toHaveValue("");
+    expect(document.body.textContent).not.toContain("fresh-pat-value");
+
+    await user.click(screen.getByRole("button", { name: "清空已保存 PAT" }));
+    expect(confirmSpy).toHaveBeenCalledTimes(4);
+    expect(patService.save).toHaveBeenCalledOnce();
+    confirmSpy.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "清空已保存 PAT" }));
+    expect(await screen.findByText("PAT 已清空。")).toBeInTheDocument();
+    expect(vi.mocked(patService.save).mock.calls.map(([value]) => value)).toEqual(["fresh-pat-value", ""]);
+  });
+
+  it("keeps unknown PAT writes read-only until the user stops local tracking", async () => {
+    const user = userEvent.setup();
+    const { service: settingsService } = makeService();
+    const patService: ZhangyugePatServicePort = {
+      getStatus: vi.fn()
+        .mockResolvedValueOnce({ configured: false })
+        .mockResolvedValueOnce({ configured: true }),
+      save: vi.fn(async () => { throw new ApiError("timeout", "timeout detail must not render"); }),
+    };
+    const { onBack } = renderPage(settingsService, ownerId, true, undefined, patService);
+    await screen.findByText("我的文本模型");
+    await user.click(screen.getByRole("button", { name: "章鱼哥 PAT 设置" }));
+    await screen.findByText("未检测到可用 PAT。");
+    await user.type(screen.getByLabelText("输入新的 PAT"), "unknown-pat-value");
+    await user.click(screen.getByRole("button", { name: "保存 PAT" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/结果未确认，不会自动重试/);
+    expect(document.body.textContent).not.toContain("timeout detail");
+    expect(patService.save).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "保存 PAT" })).toBeDisabled();
+
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(screen.getByRole("button", { name: "返回工作空间" }));
+    expect(confirmSpy).toHaveBeenCalledOnce();
+    expect(onBack).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "刷新配置状态" }));
+    expect(patService.getStatus).toHaveBeenCalledTimes(2);
+    expect(patService.save).toHaveBeenCalledOnce();
+    expect(await screen.findByText("已检测到可用 PAT。")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(/不能证明本次 PAT 内容/);
+    expect(screen.getByRole("button", { name: "保存 PAT" })).toBeDisabled();
+    expect(patService.save).toHaveBeenCalledOnce();
+
+    await user.click(screen.getByRole("button", { name: "停止本地跟踪" }));
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("输入新的 PAT")).toHaveValue("");
+    expect(patService.save).toHaveBeenCalledOnce();
+  });
+
+  it("hides PAT controls from regular users and discards stale scope status", async () => {
+    const user = userEvent.setup();
+    const { service: settingsService } = makeService();
+    const oldStatus = deferred<{ configured: boolean }>();
+    const regularUserService: ZhangyugePatServicePort = {
+      getStatus: vi.fn(async () => ({ configured: true })),
+      save: vi.fn(async () => undefined),
+    };
+    const oldScopeService: ZhangyugePatServicePort = {
+      getStatus: vi.fn()
+        .mockResolvedValueOnce({ configured: false })
+        .mockReturnValueOnce(oldStatus.promise),
+      save: vi.fn(async () => undefined),
+    };
+    const newScopeService: ZhangyugePatServicePort = {
+      getStatus: vi.fn(async () => ({ configured: true })),
+      save: vi.fn(async () => undefined),
+    };
+    const { onUnauthorized, view } = renderPage(settingsService, ownerId, false, undefined, regularUserService);
+    await screen.findByText("我的文本模型");
+    expect(screen.queryByRole("button", { name: "章鱼哥 PAT 设置" })).not.toBeInTheDocument();
+    expect(regularUserService.getStatus).not.toHaveBeenCalled();
+    expect(regularUserService.save).not.toHaveBeenCalled();
+
+    view.rerender(<CreatorSettingsPage
+      isSuperuser
+      onBack={vi.fn()}
+      onUnauthorized={onUnauthorized}
+      service={settingsService}
+      userId={ownerId}
+      zhangyugePatService={oldScopeService}
+    />);
+    await user.click(screen.getByRole("button", { name: "章鱼哥 PAT 设置" }));
+    expect(oldScopeService.getStatus).toHaveBeenCalledOnce();
+    await screen.findByText("未检测到可用 PAT。");
+    await user.type(screen.getByLabelText("输入新的 PAT"), "old-scope-draft");
+    await user.click(screen.getByRole("button", { name: "刷新配置状态" }));
+    expect(oldScopeService.getStatus).toHaveBeenCalledTimes(2);
+
+    view.rerender(<CreatorSettingsPage
+      isSuperuser
+      onBack={vi.fn()}
+      onUnauthorized={onUnauthorized}
+      service={settingsService}
+      userId={otherOwnerId}
+      zhangyugePatService={newScopeService}
+    />);
+    expect(await screen.findByText("已检测到可用 PAT。")).toBeInTheDocument();
+    expect(screen.getByLabelText("输入新的 PAT")).toHaveValue("");
+    await act(async () => {
+      oldStatus.resolve({ configured: false });
+      await oldStatus.promise;
+    });
+    expect(screen.queryByText("未检测到可用 PAT。")).not.toBeInTheDocument();
+    expect(newScopeService.getStatus).toHaveBeenCalledOnce();
+    expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
   it("drops api_key values from model response projections", () => {

@@ -15,7 +15,9 @@ import type {
 import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { ModelConnectionTest } from "./ModelConnectionTest";
 import { ProviderQuotaPanel } from "./ProviderQuotaPanel";
+import { ZhangyugePatPanel } from "./ZhangyugePatPanel";
 import type { ProviderQuotaServicePort } from "../../shared/api/providerQuota";
+import type { ZhangyugePatServicePort } from "../../shared/api/zhangyugePat";
 import "./creatorSettings.css";
 
 type SettingsTab = "models" | "prompts";
@@ -81,6 +83,7 @@ type Verification =
 interface CreatorSettingsPageProps {
   service?: CreatorSettingsServicePort;
   providerQuotaService?: ProviderQuotaServicePort | undefined;
+  zhangyugePatService?: ZhangyugePatServicePort | undefined;
   userId: string;
   isSuperuser?: boolean;
   onUnauthorized(): void;
@@ -221,6 +224,7 @@ function draftHasChanges(draft: SettingsDraft | null): boolean {
 export function CreatorSettingsPage({
   service,
   providerQuotaService,
+  zhangyugePatService,
   userId,
   isSuperuser = false,
   onUnauthorized,
@@ -238,6 +242,8 @@ export function CreatorSettingsPage({
   const [notice, setNotice] = useState<string | null>(null);
   const [providerQuotaOpen, setProviderQuotaOpen] = useState(false);
   const providerQuotaCloseGuard = useRef<() => boolean>(() => true);
+  const [zhangyugePatOpen, setZhangyugePatOpen] = useState(false);
+  const zhangyugePatCloseGuard = useRef<() => boolean>(() => true);
   const [draft, setDraft] = useState<SettingsDraft | null>(null);
   const [modelDraftGeneration, setModelDraftGeneration] = useState(0);
   const [orderDraft, setOrderDraft] = useState<{ tab: SettingsTab; category: string; baseline: string[]; ids: string[] } | null>(null);
@@ -345,6 +351,10 @@ export function CreatorSettingsPage({
   useEffect(() => {
     propsRef.current.onDirtyChange?.(hasUnsavedChanges || pending || verification !== null);
   }, [hasUnsavedChanges, onDirtyChange, pending, verification]);
+
+  useEffect(() => {
+    if (!isSuperuser) setZhangyugePatOpen(false);
+  }, [isSuperuser]);
 
   function beginRequest(editorBound = false): RequestHandle {
     const sessionGeneration = requestGeneration.current;
@@ -470,13 +480,20 @@ export function CreatorSettingsPage({
     setNotice(null);
   }
 
+  function allowAdminPanelsClose(): boolean {
+    if (providerQuotaOpen && !providerQuotaCloseGuard.current()) return false;
+    if (zhangyugePatOpen && !zhangyugePatCloseGuard.current()) return false;
+    return true;
+  }
+
   function changeTab(nextTab: SettingsTab): boolean {
     if (nextTab === tab) return true;
-    if (providerQuotaOpen && !providerQuotaCloseGuard.current()) return false;
+    if (!allowAdminPanelsClose()) return false;
     if (pendingLock.current || verification !== null || !confirmDiscard()) return false;
     invalidateCurrentView();
     discardDrafts();
     setProviderQuotaOpen(false);
+    setZhangyugePatOpen(false);
     setTab(nextTab);
     setNotice(null);
     return true;
@@ -488,6 +505,14 @@ export function CreatorSettingsPage({
       return;
     }
     if (providerQuotaCloseGuard.current()) setProviderQuotaOpen(false);
+  }
+
+  function toggleZhangyugePat(): void {
+    if (!zhangyugePatOpen) {
+      setZhangyugePatOpen(true);
+      return;
+    }
+    if (zhangyugePatCloseGuard.current()) setZhangyugePatOpen(false);
   }
 
   function handleTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, currentTabValue: SettingsTab): void {
@@ -1274,7 +1299,7 @@ export function CreatorSettingsPage({
   }
 
   function requestBack(): void {
-    if (providerQuotaOpen && !providerQuotaCloseGuard.current()) return;
+    if (!allowAdminPanelsClose()) return;
     if (pending || verification !== null) {
       if (!window.confirm("当前有操作正在保存或只读核对，离开后将中断页面核对。继续吗？")) return;
     } else if (!confirmDiscard()) {
@@ -1358,6 +1383,16 @@ export function CreatorSettingsPage({
               {providerQuotaOpen ? "收起额度监控" : "供应商额度监控"}
             </button>
           )}
+          {isSuperuser && tab === "models" && (
+            <button
+              aria-controls="creator-zhangyuge-pat-panel"
+              aria-expanded={zhangyugePatOpen}
+              onClick={toggleZhangyugePat}
+              type="button"
+            >
+              {zhangyugePatOpen ? "收起 PAT 设置" : "章鱼哥 PAT 设置"}
+            </button>
+          )}
           <button className="creator-settings-primary" disabled={!canUseService || pending || verification !== null} onClick={startCreate} type="button">
             新建{tab === "models" ? "模型" : "提示词"}
           </button>
@@ -1373,6 +1408,16 @@ export function CreatorSettingsPage({
           onCloseGuardChange={(guard) => { providerQuotaCloseGuard.current = guard; }}
           onUnauthorized={onUnauthorized}
           service={providerQuotaService}
+        />
+      )}
+      {zhangyugePatOpen && isSuperuser && tab === "models" && (
+        <ZhangyugePatPanel
+          actorId={userId}
+          isSuperuser={isSuperuser}
+          onClose={() => setZhangyugePatOpen(false)}
+          onCloseGuardChange={(guard) => { zhangyugePatCloseGuard.current = guard; }}
+          onUnauthorized={onUnauthorized}
+          service={zhangyugePatService}
         />
       )}
 
