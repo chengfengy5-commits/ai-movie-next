@@ -96,7 +96,11 @@ from .series_exchange.persistence import series_exchange_uow_factory
 from .storyboard_save.http import mount_storyboard_save_routes
 from .media_uploads import MediaUploadApplication, build_media_uploads_router
 from .media_uploads.authentication import create_media_upload_identity_resolver
-from .fused_generation import FusedGenerationRuntime, FusedGenerationStorage
+from .fused_generation import (
+    FusedGenerationImageStorage,
+    FusedGenerationRuntime,
+    FusedGenerationStorage,
+)
 from .fused_generation.http import build_fused_generation_router
 from .fused_generation.persistence import fused_generation_uow_factory
 from .storyboard_generation import StoryboardGenerationRuntime
@@ -277,6 +281,7 @@ def create_app(
     media_upload_application: MediaUploadApplication | None = None,
     fused_generation_runtime: FusedGenerationRuntime | None = None,
     fused_generation_storage: FusedGenerationStorage | None = None,
+    fused_generation_inline_image_storage: FusedGenerationImageStorage | None = None,
     storyboard_generation_runtime: StoryboardGenerationRuntime | None = None,
     storyboard_asset_generation_runtime: StoryboardAssetRuntime | None = None,
     chat_media_admission_configuration: ChatMediaAdmissionConfiguration | None = None,
@@ -1350,6 +1355,7 @@ def create_app(
             resolve_actor=effective_resolver,
             runtime=fused_generation_runtime,
             storage=fused_generation_storage,
+            inline_image_storage=fused_generation_inline_image_storage,
         )
     )
     storyboard_uow_factory = (

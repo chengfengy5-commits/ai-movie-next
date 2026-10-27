@@ -14,7 +14,12 @@ from haoai_backend.shared.errors import BusinessError
 from haoai_backend.shared.identity import TrustedActor
 
 from .application import prepare_fused_generation
-from .ports import FusedGenerationRuntime, FusedGenerationStorage, FusedGenerationUnitOfWorkFactory
+from .ports import (
+    FusedGenerationImageStorage,
+    FusedGenerationRuntime,
+    FusedGenerationStorage,
+    FusedGenerationUnitOfWorkFactory,
+)
 from .execution import FusedGenerationExecution
 from .schemas import FusedAssetGenerateRequest
 
@@ -35,12 +40,14 @@ def build_fused_generation_router(
     resolve_actor: ActorResolver | None,
     runtime: FusedGenerationRuntime | None,
     storage: FusedGenerationStorage | None = None,
+    inline_image_storage: FusedGenerationImageStorage | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api", tags=["fused-generation"])
     execution = FusedGenerationExecution(
         runtime=runtime,
         uow_factory=uow_factory,
         storage=storage,
+        inline_image_storage=inline_image_storage,
     )
     runtime_ready = runtime is not None and callable(getattr(runtime, "generate", None))
 

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import socket
+import struct
+import zlib
 from contextlib import AbstractAsyncContextManager
 from dataclasses import replace
 from typing import Any
@@ -12,6 +15,7 @@ import pytest
 
 from haoai_backend.fused_generation.domain import (
     FusedGenerationInput,
+    FusedGenerationInlineImage,
     FusedGenerationOutput,
     FusedGenerationUnknown,
     FusedServerImageModel,
@@ -28,6 +32,7 @@ from haoai_backend.media_storage.pinned_http import (
 )
 from haoai_backend.media_storage.public_fetch_policy import PublicFetchPolicy
 from haoai_backend.media_storage.transfer_types import MediaTypeRule, SafeMediaPolicy
+from haoai_backend.media_uploads.domain import MAX_IMAGE_BYTES
 
 
 class FakeResponse:
@@ -228,6 +233,23 @@ def _success_body(url: str = "https://cdn.openai.example/generated.png") -> byte
     return json.dumps({"data": [{"url": url}]}).encode("utf-8")
 
 
+def _synthetic_png() -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00\xff"))
+        + chunk(b"IEND", b"")
+    )
+
+
 def test_runtime_sends_one_ordered_multipart_request_with_selected_model_and_size():
     first = PreparedReference(
         kind="bytes", locator=None, content=b"first-reference", media_type="image/png"
@@ -321,6 +343,42 @@ def test_custom_provider_origin_requires_explicit_allowlist_entry():
     assert result == FusedGenerationOutput("https://cdn.openai.example/generated.png")
     assert len(client.calls) == 1
     assert client.calls[0]["url"] == "https://image-gateway.example/openai/v1/images/edits"
+
+
+def test_valid_base64_image_is_decoded_and_payload_is_hidden_from_repr():
+    image_bytes = _synthetic_png()
+    body = json.dumps(
+        {"data": [{"b64_json": base64.b64encode(image_bytes).decode("ascii")}]}
+    ).encode("utf-8")
+    client = FakeHttpClient(FakeResponse(200, body))
+    runtime, _, _ = _runtime(client)
+
+    result = asyncio.run(runtime.generate(_request()))
+
+    assert isinstance(result, FusedGenerationInlineImage)
+    assert result.content == image_bytes
+    assert result.media_type == "image/png"
+    assert repr(image_bytes) not in repr(result)
+    assert len(client.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        "not base64!",
+        "A" * (4 * ((MAX_IMAGE_BYTES + 2) // 3) + 4),
+    ],
+    ids=["malformed", "encoded-size-limit"],
+)
+def test_invalid_or_oversized_base64_is_unknown_without_post_retry(encoded: str):
+    body = json.dumps({"data": [{"b64_json": encoded}]}).encode("utf-8")
+    client = FakeHttpClient(FakeResponse(200, body))
+    runtime, _, _ = _runtime(client)
+
+    result = asyncio.run(runtime.generate(_request()))
+
+    assert isinstance(result, FusedGenerationUnknown)
+    assert len(client.calls) == 1
 
 
 @pytest.mark.parametrize(

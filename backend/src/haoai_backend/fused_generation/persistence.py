@@ -29,8 +29,12 @@ from haoai_backend.series_exchange.tables import fused_assets
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import (
+    FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE,
+    FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
     FUSED_UNKNOWN_PROGRESS_MESSAGE,
     FUSED_UNKNOWN_REASON,
+    FusedGenerationUnknownReason,
+    FUSED_UNKNOWN_REASONS,
     FusedPromptText,
     FusedServerImageModel,
     FusedTaskClaim,
@@ -343,12 +347,43 @@ class SqlAlchemyFusedGenerationUnitOfWork:
         ).scalar_one_or_none()
         return FusedTaskClaim(cancelled=cancelled is not None)
 
+    def authorize_inline_image_storage(
+        self,
+        task_id: str,
+        user_id: str,
+        claim_token: str,
+    ) -> bool:
+        task_table = AITaskRow.__table__
+        task = self._session.execute(
+            select(
+                task_table.c.type,
+                task_table.c.user_id,
+                task_table.c.status,
+                task_table.c.claim_token,
+                task_table.c.request_data,
+                task_table.c.recovery_status,
+                task_table.c.user_cancelled_at,
+            )
+            .where(task_table.c.id == task_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        return bool(
+            task is not None
+            and task["type"] == "fused"
+            and task["user_id"] == user_id
+            and task["status"] == "processing"
+            and task["claim_token"] == claim_token
+            and task["user_cancelled_at"] is None
+            and task["recovery_status"] != "provider_result_unknown"
+            and is_server_controlled_fused_task(task["type"], task["request_data"])
+        )
+
     def retain_unknown(
         self,
         task_id: str,
         user_id: str,
         claim_token: str,
-        safe_reason: str,
+        safe_reason: FusedGenerationUnknownReason,
     ) -> bool:
         task_table = AITaskRow.__table__
         task = self._session.execute(
@@ -373,8 +408,13 @@ class SqlAlchemyFusedGenerationUnitOfWork:
 
         reason = (
             safe_reason
-            if safe_reason == FUSED_UNKNOWN_REASON
+            if type(safe_reason) is str and safe_reason in FUSED_UNKNOWN_REASONS
             else FUSED_UNKNOWN_REASON
+        )
+        progress_message = (
+            FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE
+            if reason == FUSED_MEDIA_STORAGE_UNKNOWN_REASON
+            else FUSED_UNKNOWN_PROGRESS_MESSAGE
         )
         result = self._session.execute(
             update(task_table)
@@ -390,7 +430,7 @@ class SqlAlchemyFusedGenerationUnitOfWork:
             .values(
                 recovery_status="provider_result_unknown",
                 result=reason,
-                progress_message=FUSED_UNKNOWN_PROGRESS_MESSAGE,
+                progress_message=progress_message,
                 updated_at=self.current_time(),
             )
         )
@@ -403,7 +443,8 @@ class SqlAlchemyFusedGenerationUnitOfWork:
         *,
         image_url: str | None,
         error_message: str | None,
-    ) -> None:
+        preserve_if_cancelled: bool = False,
+    ) -> bool:
         task_table = AITaskRow.__table__
         task = self._session.execute(
             select(
@@ -420,9 +461,11 @@ class SqlAlchemyFusedGenerationUnitOfWork:
             or task["claim_token"] != claim_token
             or task["recovery_status"] == "provider_result_unknown"
         ):
-            return
+            return False
 
         cancelled = task["user_cancelled_at"] is not None
+        if cancelled and preserve_if_cancelled:
+            return False
         final_error = "任务被取消" if cancelled else error_message
         final_url = None if final_error else image_url
         status = "completed" if final_url else "failed"
@@ -455,6 +498,8 @@ class SqlAlchemyFusedGenerationUnitOfWork:
                 and latest["claim_token"] == claim_token
                 and latest["user_cancelled_at"] is not None
             ):
+                if preserve_if_cancelled:
+                    return False
                 final_error = "任务被取消"
                 final_url = None
                 status = "failed"
@@ -469,7 +514,7 @@ class SqlAlchemyFusedGenerationUnitOfWork:
                     cancelled=True,
                 )
         if changed != 1:
-            return
+            return False
 
         fused_id = self.new_id()
         self._session.execute(
@@ -520,6 +565,7 @@ class SqlAlchemyFusedGenerationUnitOfWork:
                 .where(chat_messages.c.id == message_id)
                 .values(content=message_content)
             )
+        return True
 
     def _append_to_target_frame(
         self, prepared: PreparedFusedGeneration, fused_id: str

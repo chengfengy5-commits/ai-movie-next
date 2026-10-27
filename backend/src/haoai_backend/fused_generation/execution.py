@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 from dataclasses import dataclass
 from secrets import token_urlsafe
 from typing import TypeVar
 
 from starlette.concurrency import run_in_threadpool
 
+from haoai_backend.generation_contracts import StoredMedia
+
 from .domain import (
+    FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
     FUSED_UNKNOWN_REASON,
     FusedGenerationInput,
+    FusedGenerationInlineImage,
     FusedGenerationUnknown,
+    FusedGenerationUnknownReason,
     FusedTaskClaim,
     PreparedFusedGeneration,
 )
 from .errors import FusedGenerationDispatchedCancellation, ProviderGenerationFailure
 from .ports import (
+    FusedGenerationImageStorage,
     FusedGenerationRuntime,
     FusedGenerationStorage,
     FusedGenerationUnitOfWorkFactory,
@@ -29,6 +36,7 @@ class FusedGenerationExecution:
     runtime: FusedGenerationRuntime | None
     uow_factory: FusedGenerationUnitOfWorkFactory | None
     storage: FusedGenerationStorage | None = None
+    inline_image_storage: FusedGenerationImageStorage | None = None
 
     async def execute(self, prepared: PreparedFusedGeneration) -> None:
         if self.runtime is None or self.uow_factory is None:
@@ -73,7 +81,7 @@ class FusedGenerationExecution:
                     server_model=prepared.server_model,
                 )
             )
-            if not isinstance(output, FusedGenerationUnknown):
+            if not isinstance(output, (FusedGenerationUnknown, FusedGenerationInlineImage)):
                 provider_url = output.image_url if output is not None else None
                 if not isinstance(provider_url, str) or not provider_url.strip():
                     raise ProviderGenerationFailure("未获取到图片")
@@ -117,6 +125,10 @@ class FusedGenerationExecution:
             )
             return
 
+        if isinstance(output, FusedGenerationInlineImage):
+            await self._store_inline_image(prepared, claim_token, output)
+            return
+
         final_url = provider_url
         if self.storage is not None:
             try:
@@ -137,6 +149,84 @@ class FusedGenerationExecution:
 
         await self._finish(prepared, claim_token, image_url=final_url, error_message=None)
 
+    async def _store_inline_image(
+        self,
+        prepared: PreparedFusedGeneration,
+        claim_token: str,
+        image: FusedGenerationInlineImage,
+    ) -> None:
+        retention_attempted = False
+
+        async def retain_pending() -> None:
+            nonlocal retention_attempted
+            if retention_attempted:
+                return
+            retention_attempted = True
+            await self._retain_unknown(
+                prepared,
+                claim_token,
+                FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
+            )
+
+        try:
+            if self.inline_image_storage is None:
+                await retain_pending()
+                return
+
+            authorized, cancelled = await _authorize_inline_storage(
+                self.uow_factory,
+                prepared.task_id,
+                prepared.user_id,
+                claim_token,
+            )
+            if cancelled:
+                raise asyncio.CancelledError
+            if not authorized:
+                await retain_pending()
+                return
+
+            storing = asyncio.create_task(
+                run_in_threadpool(_store_inline_image, self.inline_image_storage, image)
+            )
+            try:
+                stored, cancelled = await _drain_owned_worker(storing)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                await retain_pending()
+                return
+            if cancelled:
+                raise asyncio.CancelledError
+            if not _stored_media_matches(stored, image):
+                await retain_pending()
+                return
+
+            authorized, cancelled = await _authorize_inline_storage(
+                self.uow_factory,
+                prepared.task_id,
+                prepared.user_id,
+                claim_token,
+            )
+            if cancelled:
+                raise asyncio.CancelledError
+            if not authorized:
+                await retain_pending()
+                return
+            finished = await self._finish(
+                prepared,
+                claim_token,
+                image_url=stored.locator,
+                error_message=None,
+                preserve_if_cancelled=True,
+            )
+            if not finished:
+                await retain_pending()
+        except asyncio.CancelledError:
+            await retain_pending()
+            raise
+        except Exception:
+            await retain_pending()
+
     async def _finish(
         self,
         prepared: PreparedFusedGeneration,
@@ -144,9 +234,10 @@ class FusedGenerationExecution:
         *,
         image_url: str | None,
         error_message: str | None,
-    ) -> None:
+        preserve_if_cancelled: bool = False,
+    ) -> bool:
         if self.uow_factory is None:
-            return
+            return False
         # Finalization is one transaction and is never automatically retried:
         # a lost commit acknowledgement must not duplicate an asset or refund.
         finishing = asyncio.create_task(
@@ -157,21 +248,26 @@ class FusedGenerationExecution:
                 claim_token,
                 image_url,
                 _safe_error(error_message, prepared.server_model.api_key) if error_message else None,
+                preserve_if_cancelled,
             )
         )
         try:
-            _, cancellation_requested = await _drain_owned_worker(finishing)
+            finished, cancellation_requested = await _drain_owned_worker(finishing)
         except Exception:
-            return
+            return False
         if cancellation_requested:
-            # The transaction is finished, but an unknown commit result is never retried.
+            if preserve_if_cancelled and finished is True:
+                # A committed inline result is terminal; do not overwrite it with retention.
+                return True
+            # An ambiguous finalization is never retried.
             raise asyncio.CancelledError
+        return finished is True
 
     async def _retain_unknown(
         self,
         prepared: PreparedFusedGeneration,
         claim_token: str,
-        safe_reason: str,
+        safe_reason: FusedGenerationUnknownReason,
     ) -> None:
         if self.uow_factory is None:
             return
@@ -216,22 +312,93 @@ def _claim(
         uow.close()
 
 
+async def _authorize_inline_storage(
+    uow_factory: FusedGenerationUnitOfWorkFactory | None,
+    task_id: str,
+    user_id: str,
+    claim_token: str,
+) -> tuple[bool, bool]:
+    if uow_factory is None:
+        return False, False
+    checking = asyncio.create_task(
+        run_in_threadpool(
+            _authorize_inline_storage_sync,
+            uow_factory,
+            task_id,
+            user_id,
+            claim_token,
+        )
+    )
+    try:
+        authorized, cancellation_requested = await _drain_owned_worker(checking)
+    except Exception:
+        return False, False
+    return authorized is True, cancellation_requested
+
+
+def _authorize_inline_storage_sync(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    task_id: str,
+    user_id: str,
+    claim_token: str,
+) -> bool:
+    uow = uow_factory()
+    try:
+        return uow.authorize_inline_image_storage(task_id, user_id, claim_token)
+    finally:
+        try:
+            uow.rollback()
+        finally:
+            uow.close()
+
+
+def _store_inline_image(
+    storage: FusedGenerationImageStorage,
+    image: FusedGenerationInlineImage,
+) -> StoredMedia:
+    return storage.store_inline_image(image)
+
+
+def _stored_media_matches(
+    stored: StoredMedia | None,
+    image: FusedGenerationInlineImage,
+) -> bool:
+    if (
+        type(stored) is not StoredMedia
+        or type(stored.locator) is not str
+        or not stored.locator.strip()
+        or type(stored.content_digest) is not str
+        or type(stored.size_bytes) is not int
+        or type(stored.media_type) is not str
+        or type(image.content) is not bytes
+    ):
+        return False
+    return (
+        stored.content_digest == hashlib.sha256(image.content).hexdigest()
+        and stored.size_bytes == len(image.content)
+        and stored.media_type == image.media_type
+    )
+
+
 def _finish(
     uow_factory: FusedGenerationUnitOfWorkFactory,
     prepared: PreparedFusedGeneration,
     claim_token: str,
     image_url: str | None,
     error_message: str | None,
-) -> None:
+    preserve_if_cancelled: bool = False,
+) -> bool:
     uow = uow_factory()
     try:
-        uow.finish_task(
+        finished = uow.finish_task(
             prepared,
             claim_token,
             image_url=image_url,
             error_message=error_message,
+            preserve_if_cancelled=preserve_if_cancelled,
         )
         uow.commit()
+        return finished is True
     except Exception:
         uow.rollback()
         raise
@@ -244,7 +411,7 @@ def _retain_unknown(
     task_id: str,
     user_id: str,
     claim_token: str,
-    safe_reason: str,
+    safe_reason: FusedGenerationUnknownReason,
 ) -> None:
     uow = uow_factory()
     try:
