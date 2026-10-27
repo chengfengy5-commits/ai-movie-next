@@ -34,13 +34,13 @@ class MemoryStorage implements StorageLike {
   removeItem(key: string): void { this.values.delete(key); }
 }
 
-function message(content: string): AssetGenerationHistoryMessage {
+function message(content: string, chatMode: "image" | "video" = "image"): AssetGenerationHistoryMessage {
   return {
     id: "history-message-1001",
     chapter_id: chapterId,
     asset_type: "character",
     asset_id: assetId,
-    chat_mode: "image",
+    chat_mode: chatMode,
     role: "assistant",
     content,
     model_name: "test-image-model",
@@ -70,6 +70,7 @@ beforeEach(() => {
 
 afterEach(() => {
   cleanup();
+  vi.restoreAllMocks();
   if (originalCreateObjectUrl === undefined) delete (URL as unknown as { createObjectURL?: unknown }).createObjectURL;
   else Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
   if (originalRevokeObjectUrl === undefined) delete (URL as unknown as { revokeObjectURL?: unknown }).revokeObjectURL;
@@ -160,6 +161,8 @@ describe("AssetGenerationHistoryDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "确认删除" }));
     await waitFor(() => expect(currentMessage).toBeNull());
     await screen.findByText("当前章节暂无图片记录。");
+    expect(screen.getByRole("status", { name: "历史消息 history-message-1001 操作状态" }))
+      .toHaveTextContent("删除已由独立读取确认。");
     expect(calls.filter((call) => call.method === "DELETE")).toHaveLength(1);
     expect(calls.filter((call) => call.method === "PUT")).toHaveLength(1);
     expect(calls.filter((call) => call.url.includes("/asset-chat-messages?") && call.method === "GET").length).toBeGreaterThanOrEqual(6);
@@ -310,5 +313,100 @@ describe("AssetGenerationHistoryDialog", () => {
     await screen.findByText("第 1 / 2 页");
     await waitFor(() => expect(mediaSignals[1]?.aborted).toBe(true));
     expect(mediaCalls).toHaveLength(2);
+  });
+
+  it("downloads a public HTTPS image through the history reader with an identity-based filename", async () => {
+    const imageUrl = "https://media.example.test/generated/history-image.png";
+    const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input.href : String(input);
+      calls.push({ url, init });
+      if (url.includes("/asset-chat-messages?") && (init.method ?? "GET") === "GET") {
+        return jsonResponse([message(imageUrl)]);
+      }
+      if (url === imageUrl) return pngResponse(imageUrl);
+      throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+    };
+
+    renderHistory(fetcher);
+    fireEvent.change(await screen.findByLabelText("选择历史所属章节"), { target: { value: chapterId } });
+    await screen.findByRole("button", { name: "下载" });
+
+    const downloads: Array<{ readonly href: string; readonly filename: string }> = [];
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:history-download-image");
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      downloads.push({ href: this.href, filename: this.download });
+    });
+    fireEvent.click(screen.getByRole("button", { name: "下载" }));
+
+    await screen.findByText("已交给浏览器下载；本地无法确认文件是否已写入磁盘。");
+    expect(downloads).toEqual([{ href: "blob:history-download-image", filename: "林照-history-message-1001.png" }]);
+    expect(createObjectUrl).toHaveBeenCalledWith(expect.objectContaining({ type: "image/png" }));
+    const mediaCall = calls.find((call) => call.url === imageUrl);
+    expect(mediaCall).toBeDefined();
+    expect(new Headers(mediaCall?.init.headers).has("Authorization")).toBe(false);
+    await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:history-download-image"));
+    click.mockRestore();
+  });
+
+  it("lets a pending protected video read stop, then downloads only after the current run resumes", async () => {
+    const videoUrl = "http://127.0.0.1:4175/uploads/history-video.mp4";
+    const videoMessage = message(videoUrl, "video");
+    let videoReadCount = 0;
+    const firstReadSignals: AbortSignal[] = [];
+    let announceFirstRead: (() => void) | undefined;
+    const firstReadStarted = new Promise<void>((resolve) => { announceFirstRead = resolve; });
+    const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input.href : String(input);
+      calls.push({ url, init });
+      if (url.includes("/asset-chat-messages?") && (init.method ?? "GET") === "GET") {
+        const requestedMode = new URL(url).searchParams.get("chat_mode");
+        return jsonResponse(requestedMode === "video" ? [videoMessage] : []);
+      }
+      if (url === videoUrl) {
+        videoReadCount += 1;
+        if (videoReadCount === 1) {
+          firstReadSignals.push(init.signal as AbortSignal);
+          announceFirstRead?.();
+          return await new Promise<Response>((_resolve, reject) => {
+            init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+          });
+        }
+        const response = new Response(new Uint8Array([0, 0, 0, 24, 0x66, 0x74, 0x79, 0x70]), {
+          headers: { "Content-Type": "video/mp4" },
+        });
+        return responseWithUrl(response, videoUrl);
+      }
+      throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+    };
+
+    renderHistory(fetcher);
+    fireEvent.change(await screen.findByLabelText("选择历史所属章节"), { target: { value: chapterId } });
+    fireEvent.click(await screen.findByRole("button", { name: "视频" }));
+    await screen.findByRole("button", { name: "下载" });
+    const downloads: Array<{ readonly href: string; readonly filename: string }> = [];
+    const createObjectUrl = vi.spyOn(URL, "createObjectURL").mockReturnValue("blob:history-download-video");
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(function (this: HTMLAnchorElement) {
+      downloads.push({ href: this.href, filename: this.download });
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "下载" }));
+    await firstReadStarted;
+    fireEvent.click(await screen.findByRole("button", { name: "停止本地读取" }));
+    await screen.findByText("已停止本地媒体读取，未交给浏览器下载。");
+    expect(firstReadSignals[0]?.aborted).toBe(true);
+    expect(downloads).toHaveLength(0);
+
+    fireEvent.click(screen.getByRole("button", { name: "下载" }));
+    await screen.findByText("已交给浏览器下载；本地无法确认文件是否已写入磁盘。");
+    expect(videoReadCount).toBe(2);
+    expect(downloads).toEqual([{ href: "blob:history-download-video", filename: "林照-history-message-1001.mp4" }]);
+    expect(createObjectUrl).toHaveBeenCalledWith(expect.objectContaining({ type: "video/mp4" }));
+    const protectedRead = calls.find((call) => call.url === videoUrl && call.init.method === "GET");
+    expect(protectedRead).toBeDefined();
+    expect(new Headers(protectedRead?.init.headers).get("Authorization")).toBe("Bearer captured-history-token");
+    await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:history-download-video"));
+    click.mockRestore();
   });
 });
