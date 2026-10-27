@@ -7,6 +7,11 @@ import type { ChatAssistantMessage } from "../../shared/api/chatAssistant";
 import { createApiServices, type WorkspaceServices } from "../../shared/api/services";
 import type { StoryboardModelChoice } from "../storyboard-generation/contracts";
 import { ChatAssistantPage, type ChatAssistantSourceIntent } from "./ChatAssistantPage";
+import {
+  chatCategoryPreferenceKey,
+  readChatCategoryPreference,
+  writeChatCategoryPreference,
+} from "./chatCategoryPreferences";
 
 const originalClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 
@@ -51,6 +56,13 @@ const model: StoryboardModelChoice = {
   cost_per_call: 2,
 };
 
+const reasoningModel: StoryboardModelChoice = {
+  ...model,
+  id: "model-952-reasoning",
+  name: "测试推理模型",
+  category: "reasoning",
+};
+
 const prompt: CreatorPrompt = {
   id: "prompt-952",
   category: "chat-assistant",
@@ -60,6 +72,14 @@ const prompt: CreatorPrompt = {
   sort_order: 1,
   is_system: true,
   user_id: "actor-952",
+};
+
+const alternatePrompt: CreatorPrompt = {
+  ...prompt,
+  id: "prompt-952-alternate",
+  name: "推理顾问",
+  system_prompt: "先梳理事实，再回答。",
+  user_prompt: "请给出分步说明。",
 };
 
 interface TaskReceiptFixture {
@@ -128,6 +148,8 @@ function setupFixture(options: {
   readonly initialTasks?: readonly TaskReceiptFixture[];
   readonly streamMode?: StreamMode;
   readonly assistantCreateResponseLost?: boolean;
+  readonly models?: readonly StoryboardModelChoice[];
+  readonly prompts?: readonly CreatorPrompt[];
 } = {}) {
   let messages = [...(options.initialMessages ?? [])];
   const tasksByMessage = new Map((options.initialTasks ?? []).map((task) => [task.message_id, task]));
@@ -233,11 +255,11 @@ function setupFixture(options: {
     listProps: vi.fn(async () => []),
     storyboardGeneration: {
       ...api.storyboardGeneration!,
-      listModels: vi.fn(async () => [model]),
+      listModels: vi.fn(async () => [...(options.models ?? [model])]),
     },
     creatorSettings: {
       ...api.creatorSettings!,
-      listPrompts: vi.fn(async (category) => category === "chat-assistant" ? [prompt] : []),
+      listPrompts: vi.fn(async (category) => category === "chat-assistant" ? [...(options.prompts ?? [prompt])] : []),
     },
   };
   return { services, calls, fetcher, get messages() { return messages; }, get streamBody() { return streamBody; } };
@@ -264,35 +286,67 @@ function renderPage(
 ) {
   const onUnauthorized = vi.fn();
   const onBack = vi.fn();
-  const rendered = render(
+  const renderWithServices = (nextServices: WorkspaceServices) => (
     <ChatAssistantPage
-      services={services}
+      services={nextServices}
       series={series}
       userId="actor-952"
       sessionGeneration={1}
       onUnauthorized={onUnauthorized}
       onBack={onBack}
       onNavigateSource={onNavigateSource}
-    />,
+    />
   );
-  return { ...rendered, onUnauthorized, onBack, onNavigateSource };
+  const rendered = render(renderWithServices(services));
+  return {
+    ...rendered,
+    onUnauthorized,
+    onBack,
+    onNavigateSource,
+    rerenderWithServices(nextServices: WorkspaceServices) {
+      rendered.rerender(renderWithServices(nextServices));
+    },
+  };
 }
 
 afterEach(() => {
   cleanup();
   window.sessionStorage.clear();
+  window.localStorage.clear();
   if (originalClipboardDescriptor === undefined) Reflect.deleteProperty(navigator, "clipboard");
   else Object.defineProperty(navigator, "clipboard", originalClipboardDescriptor);
   vi.restoreAllMocks();
 });
 
 describe("ChatAssistantPage", () => {
+  it("isolates saved selections by account, API, and chat category", () => {
+    const storage = new MemoryStorage();
+    const scope = { apiBaseUrl: "https://api.example.test/api", userId: "actor-pref" };
+    const preference = { modelId: model.id, promptId: prompt.id };
+
+    expect(writeChatCategoryPreference(scope, "general", preference, storage)).toBe(true);
+    expect(readChatCategoryPreference(scope, "general", storage)).toEqual(preference);
+    expect(readChatCategoryPreference(scope, "frame", storage)).toBeNull();
+    expect(readChatCategoryPreference({ ...scope, userId: "other-actor" }, "general", storage)).toBeNull();
+    expect(readChatCategoryPreference({ ...scope, apiBaseUrl: "https://other.example.test/api" }, "general", storage)).toBeNull();
+    expect(chatCategoryPreferenceKey(scope, "general")).not.toBe(chatCategoryPreferenceKey(scope, "frame"));
+
+    const unavailable = {
+      getItem: () => { throw new Error("storage unavailable"); },
+      setItem: () => { throw new Error("storage unavailable"); },
+    };
+    expect(readChatCategoryPreference(scope, "general", unavailable)).toBeNull();
+    expect(writeChatCategoryPreference(scope, "general", preference, unavailable)).toBe(false);
+  });
+
   it("persists server messages once, streams with the selected template, and verifies the terminal task", async () => {
     const user = userEvent.setup();
     const fixture = setupFixture();
     renderPage(fixture.services);
 
-    await user.selectOptions(await screen.findByLabelText("文本模型"), model.id);
+    const modelSelect = await screen.findByLabelText("文本模型");
+    await waitFor(() => expect(modelSelect).toBeEnabled());
+    await user.selectOptions(modelSelect, model.id);
     await user.selectOptions(screen.getByLabelText("提示词模板"), prompt.id);
     await user.type(screen.getByLabelText("发送给 AI 助手"), "你好");
     await user.click(screen.getByRole("button", { name: "发送消息" }));
@@ -322,12 +376,107 @@ describe("ChatAssistantPage", () => {
       .toHaveLength(2);
   });
 
+  it("restores model and prompt by target category and uses the restored choice in the chat stream", async () => {
+    const user = userEvent.setup();
+    const fixture = setupFixture({ models: [model, reasoningModel], prompts: [prompt, alternatePrompt] });
+    window.localStorage.clear();
+    renderPage(fixture.services);
+
+    const modelSelect = await screen.findByLabelText("文本模型");
+    const promptSelect = await screen.findByLabelText("提示词模板");
+    const targetSelect = await screen.findByLabelText("会话目标");
+    await waitFor(() => expect(modelSelect).toBeEnabled());
+    await user.selectOptions(modelSelect, model.id);
+    await user.selectOptions(promptSelect, prompt.id);
+
+    await user.selectOptions(targetSelect, "frame:0");
+    await waitFor(() => {
+      expect(modelSelect).toBeEnabled();
+      expect(modelSelect).toHaveValue("");
+      expect(promptSelect).toHaveValue("");
+    });
+    await user.selectOptions(modelSelect, reasoningModel.id);
+    await user.selectOptions(promptSelect, alternatePrompt.id);
+
+    await user.selectOptions(targetSelect, "chapter");
+    await waitFor(() => {
+      expect(modelSelect).toHaveValue(model.id);
+      expect(promptSelect).toHaveValue(prompt.id);
+    });
+    await user.selectOptions(targetSelect, "frame:0");
+    await waitFor(() => {
+      expect(modelSelect).toHaveValue(reasoningModel.id);
+      expect(promptSelect).toHaveValue(alternatePrompt.id);
+    });
+
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "继续分镜讨论");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    await screen.findByText("聊天已完成，并已核对原任务回执与服务器消息。");
+    expect(fixture.streamBody).toMatchObject({
+      model_id: reasoningModel.id,
+      prompt_id: alternatePrompt.id,
+      messages: [
+        { role: "system", content: alternatePrompt.system_prompt },
+        { role: "user", content: `${alternatePrompt.user_prompt}\n\n继续分镜讨论` },
+      ],
+    });
+  });
+
+  it("keeps a manually selected model and prompt across a catalog refresh when local storage fails", async () => {
+    const user = userEvent.setup();
+    const fixture = setupFixture({ models: [model, reasoningModel], prompts: [prompt, alternatePrompt] });
+    const preferenceScope = { apiBaseUrl: "http://127.0.0.1:4175/api", userId: "actor-952" };
+    expect(writeChatCategoryPreference(preferenceScope, "general", {
+      modelId: model.id,
+      promptId: prompt.id,
+    })).toBe(true);
+    const rendered = renderPage(fixture.services);
+    const modelSelect = await screen.findByLabelText("文本模型");
+    const promptSelect = await screen.findByLabelText("提示词模板");
+    await waitFor(() => expect(modelSelect).toBeEnabled());
+    expect(modelSelect).toHaveValue(model.id);
+    expect(promptSelect).toHaveValue(prompt.id);
+
+    const originalSetItem = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation((key, value) => {
+      if (key.startsWith("haoai:chat-assistant-selection:v1:")) throw new Error("storage unavailable");
+      originalSetItem.call(window.localStorage, key, value);
+    });
+    await user.selectOptions(modelSelect, reasoningModel.id);
+    await user.selectOptions(promptSelect, alternatePrompt.id);
+    expect(await screen.findByText("浏览器未能保存此分类的聊天偏好；当前选择仍可用于本次对话。")).toBeInTheDocument();
+
+    rendered.rerenderWithServices({
+      ...fixture.services,
+      storyboardGeneration: {
+        ...fixture.services.storyboardGeneration!,
+        listModels: vi.fn(async () => [model, reasoningModel]),
+      },
+      creatorSettings: {
+        ...fixture.services.creatorSettings!,
+        listPrompts: vi.fn(async (category) => category === "chat-assistant" ? [prompt, alternatePrompt] : []),
+      },
+    });
+    await waitFor(() => {
+      expect(modelSelect).toHaveValue(reasoningModel.id);
+      expect(promptSelect).toHaveValue(alternatePrompt.id);
+    });
+    expect(screen.getByText("浏览器未能保存此分类的聊天偏好；当前选择仍可用于本次对话。")).toBeInTheDocument();
+
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "仍可按当前选择发送");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    await screen.findByText("聊天已完成，并已核对原任务回执与服务器消息。");
+    expect(fixture.streamBody).toMatchObject({ model_id: reasoningModel.id, prompt_id: alternatePrompt.id });
+  });
+
   it("recovers a disconnected stream and never streams after an unknown assistant-message create", async () => {
     const user = userEvent.setup();
     const fixture = setupFixture({ streamMode: "disconnect" });
     renderPage(fixture.services);
 
-    await user.selectOptions(await screen.findByLabelText("文本模型"), model.id);
+    const modelSelect = await screen.findByLabelText("文本模型");
+    await waitFor(() => expect(modelSelect).toBeEnabled());
+    await user.selectOptions(modelSelect, model.id);
     await user.type(screen.getByLabelText("发送给 AI 助手"), "继续");
     await user.click(screen.getByRole("button", { name: "发送消息" }));
 

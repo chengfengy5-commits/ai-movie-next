@@ -13,6 +13,11 @@ import {
 } from "../../shared/api/chatAssistant";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import type { StoryboardModelChoice } from "../storyboard-generation/contracts";
+import {
+  chatPreferenceCategory,
+  readChatCategoryPreference,
+  writeChatCategoryPreference,
+} from "./chatCategoryPreferences";
 import "./chatAssistant.css";
 
 const PENDING_LOCATOR_PREFIX = "haoai.chat-assistant.pending.v1";
@@ -273,17 +278,32 @@ export function ChatAssistantPage({
   const [streamPreview, setStreamPreview] = useState("");
   const [streamNotice, setStreamNotice] = useState<string | null>(null);
   const [messageNotice, setMessageNotice] = useState<string | null>(null);
+  const [selectionPreferenceReadyFor, setSelectionPreferenceReadyFor] = useState<string | null>(null);
+  const [selectionPreferenceNotice, setSelectionPreferenceNotice] = useState<string | null>(null);
   const [deletingMessageId, setDeletingMessageId] = useState<string | null>(null);
   const streamControllerRef = useRef<AbortController | null>(null);
   const recoveryWaitControllerRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(false);
   const operationBusyRef = useRef(false);
   const restoredLocatorRef = useRef<string | null>(null);
+  const appliedSelectionPreferenceRef = useRef<{
+    readonly contextKey: string;
+    readonly models: StoryboardModelChoice[];
+    readonly prompts: CreatorPrompt[];
+  } | null>(null);
+  const editedSelectionContextRef = useRef<string | null>(null);
   const renderIdentityRef = useRef<object>({});
   const unauthorizedHandlerRef = useRef(onUnauthorized);
   unauthorizedHandlerRef.current = onUnauthorized;
   const target = useMemo(() => parseTargetKey(targetKey, chapterId), [chapterId, targetKey]);
   const targetSignature = targetScopeKey(target);
+  const selectionPreferenceCategory = chatPreferenceCategory(target);
+  const selectionPreferenceContextKey = JSON.stringify([
+    userId,
+    services.apiBaseUrl,
+    sessionGeneration,
+    selectionPreferenceCategory,
+  ]);
   const identitySignature = useMemo(() => ({
     userId,
     apiBaseUrl: services.apiBaseUrl,
@@ -305,7 +325,9 @@ export function ChatAssistantPage({
     && selectedModel !== null
     && target !== null
     && draft.trim() !== ""
+    && catalogError === null
     && !catalogLoading
+    && selectionPreferenceReadyFor === selectionPreferenceContextKey
     && !historyLoading
     && !directoryLoading
     && !sending
@@ -327,6 +349,7 @@ export function ChatAssistantPage({
     const settings = chatSettings(services);
     const catalog = services.storyboardGeneration;
     setCatalogLoading(true);
+    setSelectionPreferenceReadyFor(null);
     setCatalogError(null);
     setPageError(null);
     if (services.chatAssistant === undefined || catalog === undefined || settings === undefined) {
@@ -358,7 +381,6 @@ export function ChatAssistantPage({
           ? currentId
           : nextChapters[0]?.id ?? "");
       }
-      setModelId((currentId) => textModels.some((model) => model.id === currentId) ? currentId : "");
       setCatalogLoading(false);
       setCatalogError(null);
     }).catch((error: unknown) => {
@@ -370,6 +392,61 @@ export function ChatAssistantPage({
     });
     return () => { current = false; controller.abort(); };
   }, [series.id, services, sessionGeneration, userId]);
+
+  useEffect(() => {
+    if (catalogLoading || catalogError !== null || pending !== null || sending) return;
+
+    const previous = appliedSelectionPreferenceRef.current;
+    const sameContext = previous?.contextKey === selectionPreferenceContextKey;
+    const catalogChanged = sameContext && (previous.models !== models || previous.prompts !== prompts);
+    if (sameContext && !catalogChanged) {
+      setSelectionPreferenceReadyFor(selectionPreferenceContextKey);
+      return;
+    }
+
+    if (sameContext && catalogChanged && editedSelectionContextRef.current === selectionPreferenceContextKey) {
+      const modelIsInvalid = modelId !== "" && !models.some((model) => model.id === modelId);
+      const promptIsInvalid = promptId !== "" && !prompts.some((prompt) => prompt.id === promptId);
+      setModelId((currentId) => models.some((model) => model.id === currentId) ? currentId : "");
+      setPromptId((currentId) => currentId === "" || prompts.some((prompt) => prompt.id === currentId) ? currentId : "");
+      if (modelIsInvalid || promptIsInvalid) {
+        setSelectionPreferenceNotice("当前编辑的模型或提示词已不在新目录中，请重新选择。");
+      }
+    } else {
+      const saved = readChatCategoryPreference({ apiBaseUrl: services.apiBaseUrl, userId }, selectionPreferenceCategory);
+      const modelIsInvalid = saved !== null && saved.modelId !== ""
+        && !models.some((model) => model.id === saved.modelId);
+      const promptIsInvalid = saved !== null && saved.promptId !== ""
+        && !prompts.some((prompt) => prompt.id === saved.promptId);
+      setModelId(saved !== null && !modelIsInvalid ? saved.modelId : "");
+      setPromptId(saved !== null && !promptIsInvalid ? saved.promptId : "");
+      setSelectionPreferenceNotice(modelIsInvalid || promptIsInvalid
+        ? "此分类保存的模型或提示词已不可用，请重新选择。"
+        : null);
+      editedSelectionContextRef.current = null;
+    }
+
+    appliedSelectionPreferenceRef.current = {
+      contextKey: selectionPreferenceContextKey,
+      models,
+      prompts,
+    };
+    setSelectionPreferenceReadyFor(selectionPreferenceContextKey);
+  }, [
+    catalogError,
+    catalogLoading,
+    models,
+    pending,
+    promptId,
+    prompts,
+    editedSelectionContextRef,
+    selectionPreferenceCategory,
+    selectionPreferenceContextKey,
+    sending,
+    services.apiBaseUrl,
+    userId,
+    modelId,
+  ]);
 
   useEffect(() => {
     if (chapterId === "" || !chapters.some((chapter) => chapter.id === chapterId)) {
@@ -530,6 +607,30 @@ export function ChatAssistantPage({
     if (pending !== null || sending) return;
     setTargetKey(nextTargetKey);
     setMessageNotice(null);
+  }
+
+  function persistChatSelection(nextModelId: string, nextPromptId: string) {
+    const saved = writeChatCategoryPreference(
+      { apiBaseUrl: services.apiBaseUrl, userId },
+      selectionPreferenceCategory,
+      { modelId: nextModelId, promptId: nextPromptId },
+    );
+    setSelectionPreferenceNotice(saved
+      ? null
+      : "浏览器未能保存此分类的聊天偏好；当前选择仍可用于本次对话。",
+    );
+  }
+
+  function onModelChange(nextModelId: string) {
+    setModelId(nextModelId);
+    editedSelectionContextRef.current = selectionPreferenceContextKey;
+    persistChatSelection(nextModelId, promptId);
+  }
+
+  function onPromptChange(nextPromptId: string) {
+    setPromptId(nextPromptId);
+    editedSelectionContextRef.current = selectionPreferenceContextKey;
+    persistChatSelection(modelId, nextPromptId);
   }
 
   async function createConfirmedMessage(
@@ -922,6 +1023,7 @@ export function ChatAssistantPage({
 
       {series.can_enter !== true && <p className="chat-assistant-alert" role="alert">当前账号没有进入该剧集的权限。</p>}
       {catalogError !== null && <p className="chat-assistant-alert" role="alert">模型/提示词目录：{catalogError}</p>}
+      {selectionPreferenceNotice !== null && <p className="chat-assistant-note" role="status">{selectionPreferenceNotice}</p>}
       {directoryError !== null && <p className="chat-assistant-alert" role="alert">会话目标读取失败：{directoryError}</p>}
       {pageError !== null && <p className="chat-assistant-alert" role="alert">{pageError}</p>}
 
@@ -941,14 +1043,14 @@ export function ChatAssistantPage({
         </label>
         <label>
           <span>文本模型</span>
-          <select disabled={catalogLoading || models.length === 0 || pending !== null || sending} onChange={(event) => setModelId(event.target.value)} value={modelId}>
+          <select disabled={catalogLoading || selectionPreferenceReadyFor !== selectionPreferenceContextKey || models.length === 0 || pending !== null || sending} onChange={(event) => onModelChange(event.target.value)} value={modelId}>
             <option value="">选择模型</option>
             {models.map((model) => <option key={model.id} value={model.id}>{model.name} · {model.provider}</option>)}
           </select>
         </label>
         <label>
           <span>提示词模板</span>
-          <select disabled={catalogLoading || pending !== null || sending} onChange={(event) => setPromptId(event.target.value)} value={promptId}>
+          <select disabled={catalogLoading || selectionPreferenceReadyFor !== selectionPreferenceContextKey || pending !== null || sending} onChange={(event) => onPromptChange(event.target.value)} value={promptId}>
             <option value="">无需提示词</option>
             {prompts.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name}</option>)}
           </select>
@@ -1003,10 +1105,12 @@ export function ChatAssistantPage({
                       const context = parseChatContent(message.content);
                       setDraft(context.text);
                       if (context.metadata !== null) {
+                        editedSelectionContextRef.current = selectionPreferenceContextKey;
                         if (models.some((model) => model.id === context.metadata!.modelId)) setModelId(context.metadata.modelId);
                         setPromptId(context.metadata.promptId !== null && prompts.some((prompt) => prompt.id === context.metadata!.promptId)
                           ? context.metadata.promptId
                           : "");
+                        setSelectionPreferenceNotice(null);
                       }
                       setMessageNotice("已将原消息载入输入框；不会自动发送。");
                     }} type="button">重新编辑</button>
