@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ApiError } from "../../shared/api/errors";
-import type { ZhangyugePatServicePort } from "../../shared/api/zhangyugePat";
+import type { ZhangyugeBalanceSnapshot, ZhangyugePatServicePort } from "../../shared/api/zhangyugePat";
 import "./zhangyugePat.css";
 
 type UnknownPatWrite = "save" | "clear";
@@ -38,6 +38,25 @@ function isAmbiguousWriteFailure(error: unknown): boolean {
     || (error.status !== null && error.status >= 500);
 }
 
+function safeBalanceErrorMessage(error: unknown): string {
+  if (error instanceof ApiError && error.status === 400) {
+    return "服务无法使用已保存的章鱼哥凭据查询额度，请检查系统配置。";
+  }
+  if (error instanceof ApiError && error.status === 503) {
+    return "章鱼哥额度服务或已保存凭据暂不可用。";
+  }
+  return safeErrorMessage(error);
+}
+
+function formatMoney(value: number | null, currency: "USD" | "CNY"): string {
+  if (value === null) return "—";
+  return new Intl.NumberFormat("zh-CN", { style: "currency", currency }).format(value);
+}
+
+function formatExchangeRate(value: number): string {
+  return new Intl.NumberFormat("zh-CN", { maximumFractionDigits: 6 }).format(value);
+}
+
 export function ZhangyugePatPanel({
   actorId,
   isSuperuser,
@@ -53,6 +72,16 @@ export function ZhangyugePatPanel({
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [unknownWrite, setUnknownWrite] = useState<UnknownPatWrite | null>(null);
+  const [balance, setBalance] = useState<ZhangyugeBalanceSnapshot | null>(null);
+  const [balanceLoading, setBalanceLoading] = useState(false);
+  const [balanceError, setBalanceError] = useState<string | null>(null);
+  const [balanceNotice, setBalanceNotice] = useState<string | null>(null);
+  const hasBalanceData = balance !== null && [
+    balance.balanceUsd,
+    balance.balanceCny,
+    balance.usedUsd,
+    balance.usedCny,
+  ].some((value) => value !== null);
 
   const generation = useRef(0);
   const controller = useRef<AbortController | null>(null);
@@ -84,6 +113,10 @@ export function ZhangyugePatPanel({
     setStatusMessage(null);
     setErrorMessage(null);
     setUnknownWrite(null);
+    setBalance(null);
+    setBalanceLoading(false);
+    setBalanceError(null);
+    setBalanceNotice(null);
     setBusy(false);
     setLoading(isSuperuser && service !== undefined);
   }, [actorId, isSuperuser, service]);
@@ -123,6 +156,41 @@ export function ZhangyugePatPanel({
         controller.current = null;
         setBusy(false);
         if (initial) setLoading(false);
+      }
+    }
+  }, [isCurrent, isSuperuser, service]);
+
+  const readBalance = useCallback(async (): Promise<void> => {
+    if (!isSuperuser) return;
+    if (service === undefined) {
+      setBalanceError("章鱼哥额度服务暂不可用。");
+      return;
+    }
+    if (requestLock.current || unknownWriteRef.current !== null) return;
+
+    requestLock.current = true;
+    const ticket = ++generation.current;
+    const abortController = new AbortController();
+    controller.current = abortController;
+    setBusy(true);
+    setBalanceLoading(true);
+    setBalanceError(null);
+    setBalanceNotice(null);
+
+    try {
+      const result = await service.getBalance(abortController.signal);
+      if (!isCurrent(ticket, abortController.signal)) return;
+      setBalance(result);
+    } catch (error) {
+      if (!isCurrent(ticket, abortController.signal)) return;
+      if (error instanceof ApiError && error.status === 401) currentScope.current.onUnauthorized();
+      setBalanceError(safeBalanceErrorMessage(error));
+    } finally {
+      if (isCurrent(ticket, abortController.signal)) {
+        requestLock.current = false;
+        controller.current = null;
+        setBusy(false);
+        setBalanceLoading(false);
       }
     }
   }, [isCurrent, isSuperuser, service]);
@@ -176,6 +244,9 @@ export function ZhangyugePatPanel({
       setConfigured(kind === "save");
       setPat("");
       setStatusMessage(kind === "save" ? "PAT 已保存。" : "PAT 已清空。");
+      setBalance(null);
+      setBalanceError(null);
+      setBalanceNotice("PAT 设置已更新；如需额度，请重新查询服务器已保存的配置。");
     } catch (error) {
       if (!isCurrent(ticket, abortController.signal)) return;
       if (error instanceof ApiError && error.status === 401) currentScope.current.onUnauthorized();
@@ -184,6 +255,9 @@ export function ZhangyugePatPanel({
         setUnknownWrite(kind);
         setStatusMessage(null);
         setErrorMessage(null);
+        setBalance(null);
+        setBalanceError(null);
+        setBalanceNotice("PAT 写入结果未确认，旧额度快照已清除；余额使用服务器已保存配置查询。");
       } else {
         setErrorMessage(safeErrorMessage(error));
       }
@@ -258,6 +332,46 @@ export function ZhangyugePatPanel({
           清空已保存 PAT
         </button>
       </div>
+
+      <section className="zhangyuge-balance-panel" aria-labelledby="creator-zhangyuge-balance-title">
+        <h3 id="creator-zhangyuge-balance-title">章鱼哥余额与用量</h3>
+        <p>余额查询使用服务器已保存的 PAT 和系统模型 API Key；输入框中的新 PAT 不会随查询发送。</p>
+        <button
+          disabled={busy || loading || service === undefined || unknownWrite !== null}
+          onClick={() => void readBalance()}
+          type="button"
+        >
+          {balanceLoading ? "正在查询额度…" : balance === null ? "查询已保存配置的额度" : "刷新额度"}
+        </button>
+        {balanceNotice !== null && <p role="status">{balanceNotice}</p>}
+        {balanceError !== null && <p className="zhangyuge-pat-error" role="alert">{balanceError}</p>}
+        {balance !== null && (
+          <div className="zhangyuge-balance-results" aria-live="polite">
+            <p>服务器配置：PAT {balance.patConfigured ? "已配置" : "未配置"}；系统模型 API Key {balance.apiKeyConfigured ? "已配置" : "未配置"}。</p>
+            {!balance.patConfigured && !balance.apiKeyConfigured && (
+              <p role="status">服务器没有可用的已保存 PAT 或系统模型 API Key。</p>
+            )}
+            <dl>
+              <div><dt>剩余余额（USD）</dt><dd>{formatMoney(balance.balanceUsd, "USD")}</dd></div>
+              <div><dt>剩余余额（CNY）</dt><dd>{formatMoney(balance.balanceCny, "CNY")}</dd></div>
+              <div><dt>已用额度（USD）</dt><dd>{formatMoney(balance.usedUsd, "USD")}</dd></div>
+              <div><dt>已用额度（CNY）</dt><dd>{formatMoney(balance.usedCny, "CNY")}</dd></div>
+            </dl>
+            {!hasBalanceData && (
+              <p role="status">
+                {balance.hasErrors
+                  ? "未取得余额或用量数据；一个或多个额度来源查询失败。"
+                  : "未取得余额或用量数据。"}
+              </p>
+            )}
+            {balance.hasErrors && hasBalanceData && (
+              <p role="status">额度查询中有来源失败；展示数据可能不完整，请稍后手动刷新。</p>
+            )}
+            {balance.updatedAt !== null && <p>服务器更新时间：{balance.updatedAt}</p>}
+            <p>美元汇率：1 USD = {formatExchangeRate(balance.usdExchangeRate)} CNY</p>
+          </div>
+        )}
+      </section>
     </section>
   );
 }

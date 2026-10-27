@@ -17,7 +17,7 @@ import type {
 import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { CreatorSettingsPage } from "./CreatorSettingsPage";
 import type { ProviderQuotaAccount, ProviderQuotaAccountEditor, ProviderQuotaBalance, ProviderQuotaServicePort } from "../../shared/api/providerQuota";
-import type { ZhangyugePatServicePort } from "../../shared/api/zhangyugePat";
+import type { ZhangyugeBalanceSnapshot, ZhangyugePatServicePort } from "../../shared/api/zhangyugePat";
 
 afterEach(() => {
   cleanup();
@@ -40,6 +40,22 @@ function deferred<T>() {
     reject = fail;
   });
   return { promise, resolve, reject };
+}
+
+function zhangyugeBalance(overrides: Partial<ZhangyugeBalanceSnapshot> = {}): ZhangyugeBalanceSnapshot {
+  return {
+    balanceUsd: 0,
+    balanceCny: 0,
+    usedUsd: null,
+    usedCny: null,
+    quotaPerUnit: 500_000,
+    usdExchangeRate: 7.2,
+    patConfigured: true,
+    apiKeyConfigured: false,
+    hasErrors: true,
+    updatedAt: "2026-10-27 09:10:11",
+    ...overrides,
+  };
 }
 
 const ownerId = "creator-a";
@@ -1315,16 +1331,26 @@ describe("creator settings", () => {
   it("lets admins save PAT separately from clear and guards dirty navigation", async () => {
     const user = userEvent.setup();
     const { service: settingsService } = makeService();
-    let configured = false;
+    let configured = true;
     const patService: ZhangyugePatServicePort = {
       getStatus: vi.fn(async () => ({ configured })),
+      getBalance: vi.fn()
+        .mockResolvedValueOnce(zhangyugeBalance({ apiKeyConfigured: true }))
+        .mockResolvedValueOnce(zhangyugeBalance({
+          balanceUsd: null,
+          balanceCny: null,
+          usedUsd: null,
+          usedCny: null,
+          apiKeyConfigured: true,
+        })),
       save: vi.fn(async (pat) => { configured = pat.trim() !== ""; }),
     };
     const { onBack } = renderPage(settingsService, ownerId, true, undefined, patService);
     await screen.findByText("我的文本模型");
     await user.click(screen.getByRole("button", { name: "章鱼哥 PAT 设置" }));
-    expect(await screen.findByText("未检测到可用 PAT。")).toBeInTheDocument();
+    expect(await screen.findByText("已检测到可用 PAT。")).toBeInTheDocument();
     expect(patService.getStatus).toHaveBeenCalledOnce();
+    expect(patService.getBalance).not.toHaveBeenCalled();
 
     await user.click(screen.getByRole("button", { name: "保存 PAT" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/请输入新的 PAT/);
@@ -1332,6 +1358,17 @@ describe("creator settings", () => {
 
     const patInput = screen.getByLabelText("输入新的 PAT");
     await user.type(patInput, "fresh-pat-value");
+    expect(patService.getBalance).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "查询已保存配置的额度" }));
+    const balanceLabel = await screen.findByText("剩余余额（USD）");
+    expect(balanceLabel.parentElement).toHaveTextContent("0.00");
+    expect(screen.getByText("剩余余额（CNY）").parentElement).toHaveTextContent("0.00");
+    expect(screen.getByText("已用额度（USD）").parentElement).toHaveTextContent("—");
+    expect(await screen.findByText(/额度查询中有来源失败/)).toBeInTheDocument();
+    expect(screen.getByText(/PAT 已配置；系统模型 API Key 已配置/)).toBeInTheDocument();
+    expect(patService.getBalance).toHaveBeenCalledOnce();
+    expect(document.body.textContent).not.toContain("upstream detail");
+
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
     await user.click(screen.getByRole("button", { name: "收起 PAT 设置" }));
     expect(screen.getByRole("region", { name: "章鱼哥 PAT 配置" })).toBeInTheDocument();
@@ -1348,6 +1385,13 @@ describe("creator settings", () => {
     expect(patService.save).toHaveBeenCalledWith("fresh-pat-value", expect.any(AbortSignal));
     expect(patInput).toHaveValue("");
     expect(document.body.textContent).not.toContain("fresh-pat-value");
+    expect(screen.queryByText("剩余余额（USD）")).not.toBeInTheDocument();
+    expect(screen.getByText(/PAT 设置已更新；如需额度/)).toBeInTheDocument();
+    expect(patService.getBalance).toHaveBeenCalledOnce();
+
+    await user.click(screen.getByRole("button", { name: "查询已保存配置的额度" }));
+    expect(await screen.findByText("未取得余额或用量数据；一个或多个额度来源查询失败。")).toBeInTheDocument();
+    expect(patService.getBalance).toHaveBeenCalledTimes(2);
 
     await user.click(screen.getByRole("button", { name: "清空已保存 PAT" }));
     expect(confirmSpy).toHaveBeenCalledTimes(4);
@@ -1365,17 +1409,30 @@ describe("creator settings", () => {
       getStatus: vi.fn()
         .mockResolvedValueOnce({ configured: false })
         .mockResolvedValueOnce({ configured: true }),
+      getBalance: vi.fn(async () => zhangyugeBalance({
+        balanceUsd: null,
+        balanceCny: null,
+        usedUsd: 1.25,
+        usedCny: 9,
+        patConfigured: false,
+        apiKeyConfigured: true,
+      })),
       save: vi.fn(async () => { throw new ApiError("timeout", "timeout detail must not render"); }),
     };
     const { onBack } = renderPage(settingsService, ownerId, true, undefined, patService);
     await screen.findByText("我的文本模型");
     await user.click(screen.getByRole("button", { name: "章鱼哥 PAT 设置" }));
     await screen.findByText("未检测到可用 PAT。");
+    await user.click(screen.getByRole("button", { name: "查询已保存配置的额度" }));
+    expect(await screen.findByText("已用额度（USD）")).toBeInTheDocument();
+    expect(patService.getBalance).toHaveBeenCalledOnce();
     await user.type(screen.getByLabelText("输入新的 PAT"), "unknown-pat-value");
     await user.click(screen.getByRole("button", { name: "保存 PAT" }));
     expect(await screen.findByRole("alert")).toHaveTextContent(/结果未确认，不会自动重试/);
     expect(document.body.textContent).not.toContain("timeout detail");
     expect(patService.save).toHaveBeenCalledOnce();
+    expect(screen.queryByText("已用额度（USD）")).not.toBeInTheDocument();
+    expect(screen.getByText(/旧额度快照已清除/)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "保存 PAT" })).toBeDisabled();
 
     const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
@@ -1399,19 +1456,20 @@ describe("creator settings", () => {
   it("hides PAT controls from regular users and discards stale scope status", async () => {
     const user = userEvent.setup();
     const { service: settingsService } = makeService();
-    const oldStatus = deferred<{ configured: boolean }>();
     const regularUserService: ZhangyugePatServicePort = {
       getStatus: vi.fn(async () => ({ configured: true })),
+      getBalance: vi.fn(async () => zhangyugeBalance()),
       save: vi.fn(async () => undefined),
     };
+    const oldBalance = deferred<ZhangyugeBalanceSnapshot>();
     const oldScopeService: ZhangyugePatServicePort = {
-      getStatus: vi.fn()
-        .mockResolvedValueOnce({ configured: false })
-        .mockReturnValueOnce(oldStatus.promise),
+      getStatus: vi.fn(async () => ({ configured: false })),
+      getBalance: vi.fn(() => oldBalance.promise),
       save: vi.fn(async () => undefined),
     };
     const newScopeService: ZhangyugePatServicePort = {
       getStatus: vi.fn(async () => ({ configured: true })),
+      getBalance: vi.fn(async () => zhangyugeBalance()),
       save: vi.fn(async () => undefined),
     };
     const { onUnauthorized, view } = renderPage(settingsService, ownerId, false, undefined, regularUserService);
@@ -1432,8 +1490,9 @@ describe("creator settings", () => {
     expect(oldScopeService.getStatus).toHaveBeenCalledOnce();
     await screen.findByText("未检测到可用 PAT。");
     await user.type(screen.getByLabelText("输入新的 PAT"), "old-scope-draft");
-    await user.click(screen.getByRole("button", { name: "刷新配置状态" }));
-    expect(oldScopeService.getStatus).toHaveBeenCalledTimes(2);
+    await user.click(screen.getByRole("button", { name: "查询已保存配置的额度" }));
+    expect(oldScopeService.getBalance).toHaveBeenCalledOnce();
+    expect(oldScopeService.getStatus).toHaveBeenCalledOnce();
 
     view.rerender(<CreatorSettingsPage
       isSuperuser
@@ -1446,11 +1505,14 @@ describe("creator settings", () => {
     expect(await screen.findByText("已检测到可用 PAT。")).toBeInTheDocument();
     expect(screen.getByLabelText("输入新的 PAT")).toHaveValue("");
     await act(async () => {
-      oldStatus.resolve({ configured: false });
-      await oldStatus.promise;
+      oldBalance.resolve(zhangyugeBalance({ balanceUsd: 999 }));
+      await oldBalance.promise;
     });
-    expect(screen.queryByText("未检测到可用 PAT。")).not.toBeInTheDocument();
+    expect(screen.queryByText("999.00")).not.toBeInTheDocument();
+    expect(screen.queryByText("剩余余额（USD）")).not.toBeInTheDocument();
     expect(newScopeService.getStatus).toHaveBeenCalledOnce();
+    expect(newScopeService.getBalance).not.toHaveBeenCalled();
+    expect(regularUserService.getBalance).not.toHaveBeenCalled();
     expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
