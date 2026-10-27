@@ -2,15 +2,19 @@ import { cleanup, render, screen, waitFor, within } from "@testing-library/react
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Series, StoryboardAsset } from "../../shared/api/contracts";
-import type { MediaGenerationPort, MediaGenerationRun } from "../../shared/api/mediaGeneration";
+import { ApiError } from "../../shared/api/errors";
+import { MediaGenerationError, type MediaGenerationPort, type MediaGenerationRun } from "../../shared/api/mediaGeneration";
 import type { MediaReferenceUploadPort, MediaReferenceUploadRun } from "../../shared/api/mediaReferenceUpload";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
 import type { UserPreferences, UserPreferencesPort } from "../../shared/api/userPreferences";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { MediaGenerationPage } from "./MediaGenerationPage";
 import {
+  readSingleMediaModePreference,
   readSingleMediaPreference,
+  singleMediaModePreferenceKey,
   singleMediaPreferenceKey,
+  writeSingleMediaModePreference,
   writeSingleMediaPreference,
 } from "./mediaSelectionPreferences";
 
@@ -117,19 +121,20 @@ function generationPort(
     quotedAmount: 4,
     billingStatus: "charged" as const,
   })),
+  lookup: MediaGenerationRun["lookup"] = vi.fn(async () => ({
+    operation: "image.batch" as const,
+    tasks: [
+      { type: "scene" as const, assetId: "scene-926", assetName: "雨巷", messageId: "message-scene", taskId: "task-scene" },
+      { type: "character" as const, assetId: "character-926", assetName: "林舟", messageId: "message-character", taskId: "task-character" },
+    ],
+  })),
 ): MediaGenerationPort {
   const run: MediaGenerationRun = {
     isCurrent: () => true,
     submitImage,
     submitVideo,
     submitBatch,
-    lookup: vi.fn(async () => ({
-      operation: "image.batch" as const,
-      tasks: [
-        { type: "scene" as const, assetId: "scene-926", assetName: "雨巷", messageId: "message-scene", taskId: "task-scene" },
-        { type: "character" as const, assetId: "character-926", assetName: "林舟", messageId: "message-character", taskId: "task-character" },
-      ],
-    })),
+    lookup,
   };
   return { beginRun: vi.fn(() => run) };
 }
@@ -246,11 +251,12 @@ describe("MediaGenerationPage", () => {
   it("isolates local single-media selections by account, API, mode, and target category", () => {
     const storage = window.localStorage;
     const scope = { apiBaseUrl: "https://api.example.test/api", userId: "actor-media-pref" };
-    const imagePreference = { modelId: "image-model", promptId: "image-prompt", size: "16:9" };
+    const imagePreference = { modelId: "image-model", promptId: "image-prompt", size: "16:9", generationCount: 1 };
     const videoPreference = {
       modelId: "video-model",
       promptId: "video-prompt",
       size: "16:9",
+      generationCount: 1,
       duration: "10",
       resolution: "1080p",
     };
@@ -267,12 +273,105 @@ describe("MediaGenerationPage", () => {
     expect(singleMediaPreferenceKey(scope, "image", "frame"))
       .not.toBe(singleMediaPreferenceKey(scope, "video", "frame"));
 
+    expect(writeSingleMediaModePreference(scope, "frame", "image", storage)).toBe(true);
+    expect(readSingleMediaModePreference(scope, "frame", storage)).toEqual({ kind: "found", value: "image" });
+    expect(readSingleMediaModePreference({ ...scope, userId: "another-actor" }, "frame", storage)).toEqual({ kind: "missing" });
+    expect(singleMediaModePreferenceKey(scope, "frame")).not.toBe(singleMediaModePreferenceKey(scope, "general"));
+
     const unavailable = {
       getItem: () => { throw new Error("storage unavailable"); },
       setItem: () => { throw new Error("storage unavailable"); },
     } as unknown as Storage;
     expect(readSingleMediaPreference(scope, "image", "frame", unavailable)).toEqual({ kind: "unavailable" });
     expect(writeSingleMediaPreference(scope, "image", "frame", imagePreference, unavailable)).toBe(false);
+  });
+
+  it("restores a category mode into the existing image form and remembers its count", async () => {
+    const user = userEvent.setup();
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+    };
+    const scope = { apiBaseUrl: services.apiBaseUrl, userId: "actor-926" };
+    expect(writeSingleMediaModePreference(scope, "scene", "image")).toBe(true);
+    expect(writeSingleMediaPreference(scope, "image", "scene", {
+      modelId: "image-model-926",
+      promptId: "",
+      size: "1:1",
+      generationCount: 3,
+    })).toBe(true);
+    render(<MediaGenerationPage services={services} userId={scope.userId} sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.selectOptions(await screen.findByLabelText("视频目标"), "asset_message");
+    await user.selectOptions(screen.getByLabelText("素材类型"), "scene");
+    await waitFor(() => expect(screen.getByRole("button", { name: "普通图片" })).toHaveAttribute("aria-pressed", "true"));
+    await waitFor(() => expect(screen.getByLabelText("生成数量")).toHaveValue("3"));
+    expect(await screen.findByText("已恢复当前分类的图片模式。")).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByLabelText("图片模型"), "image-model-scene-926");
+    expect(screen.getByLabelText("生成数量")).toHaveValue("1");
+    expect(readSingleMediaPreference(scope, "image", "scene")).toMatchObject({
+      kind: "found",
+      value: { modelId: "image-model-scene-926", generationCount: 1 },
+    });
+  });
+
+  it("restores a manually remembered mode when returning to its target category", async () => {
+    const user = userEvent.setup();
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+    };
+    const scope = { apiBaseUrl: services.apiBaseUrl, userId: "actor-mode-return-1067" };
+    expect(writeSingleMediaModePreference(scope, "scene", "video")).toBe(true);
+    render(<MediaGenerationPage services={services} userId={scope.userId} sessionGeneration={1}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.selectOptions(await screen.findByLabelText("视频目标"), "asset_message");
+    await user.selectOptions(screen.getByLabelText("素材类型"), "character");
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    expect(readSingleMediaModePreference(scope, "character")).toEqual({ kind: "found", value: "image" });
+
+    await user.selectOptions(screen.getByLabelText("素材类型"), "scene");
+    await waitFor(() => expect(screen.getByRole("button", { name: "普通视频" })).toHaveAttribute("aria-pressed", "true"));
+    await user.selectOptions(screen.getByLabelText("素材类型"), "character");
+    await waitFor(() => expect(screen.getByRole("button", { name: "普通图片" })).toHaveAttribute("aria-pressed", "true"));
+  });
+
+  it("keeps a prompt typed before the model catalog finishes loading", async () => {
+    const user = userEvent.setup();
+    const baseSettings = creatorSettings();
+    let releaseCatalog: (() => void) | undefined;
+    const catalogGate = new Promise<void>((resolve) => { releaseCatalog = resolve; });
+    const delayedSettings: CreatorSettingsServicePort = {
+      ...baseSettings,
+      listModels: async (category, signal) => {
+        await catalogGate;
+        return baseSettings.listModels(category, signal);
+      },
+      listPrompts: async (category, signal) => {
+        await catalogGate;
+        return baseSettings.listPrompts(category, signal);
+      },
+    };
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: delayedSettings,
+    };
+    expect(writeSingleMediaModePreference({ apiBaseUrl: services.apiBaseUrl, userId: "actor-mode-draft-1067" }, "general", "image"))
+      .toBe(true);
+    render(<MediaGenerationPage services={services} userId="actor-mode-draft-1067" sessionGeneration={1}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.type(screen.getByLabelText("视频提示词"), "目录加载时输入的内容");
+    expect(screen.getByRole("button", { name: "普通视频" })).toHaveAttribute("aria-pressed", "true");
+    releaseCatalog?.();
+
+    expect(await screen.findByText("当前表单已有编辑或参考内容；为保留当前输入，暂不自动切换到此分类记住的模式。可手动选择图片或视频。"))
+      .toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "普通视频" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("目录加载时输入的内容");
   });
 
   it("submits a normal image to the selected storyboard message and links it to My Tasks", async () => {
@@ -361,6 +460,668 @@ describe("MediaGenerationPage", () => {
 
     await user.click(screen.getByRole("button", { name: "查看我的任务" }));
     expect(onOpenTasks).toHaveBeenCalledTimes(1);
+  });
+
+  it("submits a selected image count as ordered single requests with independent keys and nullable message ids", async () => {
+    const user = userEvent.setup();
+    let sequence = 0;
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => {
+      sequence += 1;
+      return {
+        operation: "image.single",
+        submissionId: `count-submission-${sequence}`,
+        taskId: `count-task-${sequence}`,
+        messageId: null,
+        status: "queued",
+        quotedAmount: 1,
+        billingStatus: "charged",
+      };
+    });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "同一冻结正文");
+    await user.selectOptions(screen.getByLabelText("生成数量"), "3");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+
+    expect(await screen.findByText(/3 项图片任务已按顺序受理/u)).toBeInTheDocument();
+    expect(submitImage).toHaveBeenCalledTimes(3);
+    const inputs = submitImage.mock.calls.map(([input]) => input);
+    expect(inputs.map((input) => input.idempotencyKey)).toHaveLength(3);
+    expect(new Set(inputs.map((input) => input.idempotencyKey)).size).toBe(3);
+    expect(inputs.map(({ modelId, prompt, target }) => ({ modelId, prompt, target }))).toEqual([
+      { modelId: "image-model-926", prompt: "同一冻结正文", target: { kind: "standalone" } },
+      { modelId: "image-model-926", prompt: "同一冻结正文", target: { kind: "standalone" } },
+      { modelId: "image-model-926", prompt: "同一冻结正文", target: { kind: "standalone" } },
+    ]);
+    expect(inputs[0]?.idempotencyKey).not.toBe(inputs[1]?.idempotencyKey);
+    expect(screen.getAllByText(/提交回执状态：queued；消息编号：—/u)).toHaveLength(3);
+    expect(screen.getAllByText(/消息编号：—/u)).toHaveLength(3);
+  });
+
+  it("submits a selected video count in order with frozen video parameters", async () => {
+    const user = userEvent.setup();
+    let sequence = 0;
+    const submitVideo = vi.fn<MediaGenerationRun["submitVideo"]>(async () => {
+      sequence += 1;
+      return {
+        operation: "video.single",
+        submissionId: `video-count-submission-${sequence}`,
+        taskId: `video-count-task-${sequence}`,
+        messageId: null,
+        status: "queued",
+        quotedAmount: 1,
+        billingStatus: "charged",
+      };
+    });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), submitVideo),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "普通视频" }));
+    await user.selectOptions(await screen.findByLabelText("视频模型"), "video-model-926");
+    await user.type(screen.getByLabelText("视频提示词"), "冻结的视频提示词");
+    await user.selectOptions(screen.getByLabelText("生成数量"), "2");
+    await user.click(screen.getByRole("button", { name: "提交视频任务" }));
+
+    expect(await screen.findByText(/2 项视频任务已按顺序受理/u)).toBeInTheDocument();
+    expect(submitVideo).toHaveBeenCalledTimes(2);
+    const inputs = submitVideo.mock.calls.map(([input]) => input);
+    expect(new Set(inputs.map((input) => input.idempotencyKey)).size).toBe(2);
+    expect(inputs.map(({ modelId, prompt, target, size, duration, resolution }) => ({
+      modelId, prompt, target, size, duration, resolution,
+    }))).toEqual([
+      {
+        modelId: "video-model-926",
+        prompt: "冻结的视频提示词",
+        target: { kind: "standalone" },
+        size: "16:9",
+        duration: 5,
+        resolution: "720p",
+      },
+      {
+        modelId: "video-model-926",
+        prompt: "冻结的视频提示词",
+        target: { kind: "standalone" },
+        size: "16:9",
+        duration: 5,
+        resolution: "720p",
+      },
+    ]);
+    expect(screen.getAllByText(/消息编号：—/u)).toHaveLength(2);
+  });
+
+  it("refreshes each accepted task only when its receipt identity matches, including a null message id", async () => {
+    const user = userEvent.setup();
+    let sequence = 0;
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => {
+      sequence += 1;
+      return {
+        operation: "image.single",
+        submissionId: `status-submission-${sequence}`,
+        taskId: `status-task-${sequence}`,
+        messageId: sequence === 1 ? null : "status-message-2",
+        status: "queued",
+        quotedAmount: 1,
+        billingStatus: "charged",
+      };
+    });
+    const getTaskReceipt = vi.fn<NonNullable<WorkspaceServices["getTaskReceipt"]>>(async (taskId) => ({
+      id: taskId,
+      type: "image-single",
+      messageId: taskId === "status-task-1" ? null : "wrong-message-id",
+      status: taskId === "status-task-1" ? "processing" : "completed",
+      result: null,
+      billingStatus: "charged",
+      quotedAmount: 1,
+      progress: 35,
+      progressMessage: null,
+      externalTaskId: null,
+      externalProvider: null,
+      createdAt: null,
+      updatedAt: null,
+    }));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+      getTaskReceipt,
+    };
+    render(<MediaGenerationPage services={services} userId="actor-task-status-1067" sessionGeneration={1}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "按原任务身份读取状态");
+    await user.selectOptions(screen.getByLabelText("生成数量"), "2");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+    await screen.findByText(/2 项图片任务已按顺序受理/u);
+
+    expect(getTaskReceipt).not.toHaveBeenCalled();
+    const firstItem = screen.getByText("第 1 项 · 已受理").closest("li");
+    const secondItem = screen.getByText("第 2 项 · 已受理").closest("li");
+    expect(firstItem).not.toBeNull();
+    expect(secondItem).not.toBeNull();
+    await user.click(within(firstItem!).getByRole("button", { name: "刷新第 1 项任务状态" }));
+    await user.click(within(secondItem!).getByRole("button", { name: "刷新第 2 项任务状态" }));
+
+    await within(firstItem!).findByText("任务状态：processing · 35%");
+    expect(within(secondItem!).getByText("任务状态与原受理回执不匹配，未显示本次状态。"))
+      .toBeInTheDocument();
+    expect(within(secondItem!).queryByText(/任务状态：completed/u)).not.toBeInTheDocument();
+    expect(getTaskReceipt.mock.calls.map(([taskId]) => taskId)).toEqual(["status-task-1", "status-task-2"]);
+  });
+
+  it("keeps a single-item request and its unknown status visible for recovery", async () => {
+    const user = userEvent.setup();
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => {
+      throw new MediaGenerationError("unknown-outcome", "响应超时");
+    });
+    const lookup = vi.fn<MediaGenerationRun["lookup"]>(async () => {
+      throw new MediaGenerationError("unknown-outcome", "仍无核对回执");
+    });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage, lookup),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-single-unknown-1067" sessionGeneration={1}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "待确认时仍可核对的正文");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+
+    expect(await screen.findByText("第 1 项 · 受理待确认")).toBeInTheDocument();
+    expect(screen.getByText("本组继续使用提交时冻结的请求；已受理项目和待确认项目会保留在这里。")).toBeInTheDocument();
+    expect(submitImage).toHaveBeenCalledOnce();
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: /按原请求重试本项/u })).toBeInTheDocument();
+  });
+
+  it("keeps the new actor request busy when the prior actor submit resolves late", async () => {
+    const user = userEvent.setup();
+    let finishFirst: ((receipt: Awaited<ReturnType<MediaGenerationRun["submitImage"]>>) => void) | undefined;
+    let finishSecond: ((receipt: Awaited<ReturnType<MediaGenerationRun["submitImage"]>>) => void) | undefined;
+    const receipt = (suffix: string) => ({
+      operation: "image.single" as const,
+      submissionId: `scope-submission-${suffix}`,
+      taskId: `scope-task-${suffix}`,
+      messageId: null,
+      status: "queued" as const,
+      quotedAmount: 1,
+      billingStatus: "charged" as const,
+    });
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>()
+      .mockImplementationOnce(() => new Promise((resolve) => { finishFirst = resolve; }))
+      .mockImplementationOnce(() => new Promise((resolve) => { finishSecond = resolve; }));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+    };
+    const props = { services, sessionGeneration: 1, onUnauthorized: vi.fn(), onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage {...props} userId="actor-scope-old-1067" />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "旧scope迟到不会释放新操作");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+    expect(await screen.findByText("第 1 项 · 提交中")).toBeInTheDocument();
+
+    rerender(<MediaGenerationPage {...props} userId="actor-scope-new-1067" />);
+    const submitButton = await screen.findByRole("button", { name: "提交图片任务" });
+    await waitFor(() => expect(submitButton).toBeEnabled());
+    await user.click(submitButton);
+    await screen.findByText("第 1 项 · 提交中");
+    expect(submitImage).toHaveBeenCalledTimes(2);
+
+    finishFirst?.(receipt("old"));
+    await waitFor(() => expect(screen.getByRole("button", { name: "提交图片任务" })).toBeDisabled());
+    finishSecond?.(receipt("new"));
+    expect(await screen.findByText("图片任务已受理：queued · 服务报价 1 积分 · 计费状态 charged。"))
+      .toBeInTheDocument();
+    expect(screen.getByText("scope-task-new")).toBeInTheDocument();
+  });
+
+  it("ignores an old-scope lookup 401 while keeping a new lookup busy", async () => {
+    const user = userEvent.setup();
+    let submission = 0;
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => {
+      submission += 1;
+      throw new MediaGenerationError("unknown-outcome", `第${submission}次响应未知`);
+    });
+    const receipt = (suffix: string) => ({
+      operation: "image.single" as const,
+      submissionId: `lookup-scope-submission-${suffix}`,
+      taskId: `lookup-scope-task-${suffix}`,
+      messageId: null,
+      status: "queued" as const,
+      quotedAmount: 1,
+      billingStatus: "charged" as const,
+    });
+    const lookupResolvers: Array<(receipt: Awaited<ReturnType<MediaGenerationRun["lookup"]>>) => void> = [];
+    const lookupRejectors: Array<(error: unknown) => void> = [];
+    const lookup = vi.fn<MediaGenerationRun["lookup"]>(() => new Promise((resolve, reject) => {
+      lookupResolvers.push(resolve);
+      lookupRejectors.push(reject);
+    }));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage, lookup),
+    };
+    const onUnauthorized = vi.fn();
+    const props = { services, sessionGeneration: 1, onUnauthorized, onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage {...props} userId="actor-lookup-old-1067" />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "按原scope核对未知结果");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+    await waitFor(() => expect(lookup).toHaveBeenCalledTimes(1));
+    expect(screen.getByRole("button", { name: "正在核对…" })).toBeDisabled();
+
+    rerender(<MediaGenerationPage {...props} userId="actor-lookup-new-1067" />);
+    const submitButton = await screen.findByRole("button", { name: "提交图片任务" });
+    await waitFor(() => expect(submitButton).toBeEnabled());
+    await user.click(submitButton);
+    await waitFor(() => expect(lookup).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: "正在核对…" })).toBeDisabled();
+
+    const unauthorizedCallsBeforeStaleLookup = onUnauthorized.mock.calls.length;
+    lookupRejectors[0]?.(new ApiError("http", "Unauthorized", 401));
+    await waitFor(() => expect(screen.getByRole("button", { name: "正在核对…" })).toBeDisabled());
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(onUnauthorized).toHaveBeenCalledTimes(unauthorizedCallsBeforeStaleLookup);
+    expect(screen.queryByRole("button", { name: "重新核对提交" })).not.toBeInTheDocument();
+    lookupResolvers[1]?.(receipt("new"));
+    expect(await screen.findByText(/1 项图片任务已按顺序受理/u)).toBeInTheDocument();
+    expect(screen.getByText("lookup-scope-task-new")).toBeInTheDocument();
+  });
+
+  it("stops after an unknown second image and resumes that same key/body without replaying the first", async () => {
+    const user = userEvent.setup();
+    const receipt = (index: number) => ({
+      operation: "image.single" as const,
+      submissionId: `recovery-submission-${index}`,
+      taskId: `recovery-task-${index}`,
+      messageId: null,
+      status: "queued" as const,
+      quotedAmount: 1,
+      billingStatus: "charged" as const,
+    });
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>()
+      .mockResolvedValueOnce(receipt(1))
+      .mockRejectedValueOnce(new MediaGenerationError("unknown-outcome", "第二项响应超时"))
+      .mockResolvedValueOnce(receipt(2))
+      .mockResolvedValueOnce(receipt(3));
+    const lookup = vi.fn<MediaGenerationRun["lookup"]>(async () => {
+      throw new MediaGenerationError("unknown-outcome", "仍无核对回执");
+    });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage, lookup),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "恢复时不重算的正文");
+    await user.selectOptions(screen.getByLabelText("生成数量"), "3");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+
+    await screen.findByText("提交状态尚未确认。页面保留了本次请求，请先核对状态再继续。");
+    expect(submitImage).toHaveBeenCalledTimes(2);
+    expect(lookup).toHaveBeenCalledOnce();
+    expect(lookup.mock.calls[0]?.[0]).toEqual({
+      operation: "image.single",
+      idempotencyKey: submitImage.mock.calls[1]?.[0].idempotencyKey,
+    });
+    expect(submitImage.mock.calls[1]?.[0].idempotencyKey).not.toBe(submitImage.mock.calls[0]?.[0].idempotencyKey);
+
+    await user.click(screen.getByRole("button", { name: /按原请求重试本项/u }));
+    expect(await screen.findByText(/3 项图片任务已按顺序受理/u)).toBeInTheDocument();
+    expect(submitImage).toHaveBeenCalledTimes(4);
+    expect(submitImage.mock.calls[1]?.[0]).toBe(submitImage.mock.calls[2]?.[0]);
+    expect(submitImage.mock.calls[0]?.[0].idempotencyKey).not.toBe(submitImage.mock.calls[3]?.[0].idempotencyKey);
+    expect(submitImage.mock.calls[1]?.[0].prompt).toBe("恢复时不重算的正文");
+    expect(submitImage.mock.calls[3]?.[0].prompt).toBe("恢复时不重算的正文");
+    expect(submitImage.mock.calls[3]?.[0].idempotencyKey).not.toBe(submitImage.mock.calls[1]?.[0].idempotencyKey);
+    expect(screen.getByText(/第 1 项 · 已受理/u)).toBeInTheDocument();
+    expect(screen.getByText(/第 2 项 · 已受理/u)).toBeInTheDocument();
+    expect(screen.getByText(/第 3 项 · 已受理/u)).toBeInTheDocument();
+  });
+
+  it("keeps an unknown group across a same-owner services refresh and checks its original key", async () => {
+    const user = userEvent.setup();
+    const receipt = (index: number) => ({
+      operation: "image.single" as const,
+      submissionId: `refresh-submission-${index}`,
+      taskId: `refresh-task-${index}`,
+      messageId: null,
+      status: "queued" as const,
+      quotedAmount: 1,
+      billingStatus: "charged" as const,
+    });
+    let resolveOldLookup: ((result: Awaited<ReturnType<MediaGenerationRun["lookup"]>>) => void) | undefined;
+    const oldSubmitImage = vi.fn<MediaGenerationRun["submitImage"]>()
+      .mockResolvedValueOnce(receipt(1))
+      .mockRejectedValueOnce(new MediaGenerationError("unknown-outcome", "第二项提交结果未知"));
+    const oldLookup = vi.fn<MediaGenerationRun["lookup"]>(() => new Promise((resolve) => {
+      resolveOldLookup = resolve;
+    }));
+    const newSubmitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => receipt(3));
+    const newLookup = vi.fn<MediaGenerationRun["lookup"]>(async () => receipt(2));
+    const oldRun: MediaGenerationRun = {
+      isCurrent: () => true,
+      submitImage: oldSubmitImage,
+      submitVideo: vi.fn(async () => { throw new Error("Unexpected video submit."); }),
+      submitBatch: vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
+      lookup: oldLookup,
+    };
+    const newRun: MediaGenerationRun = {
+      isCurrent: () => true,
+      submitImage: newSubmitImage,
+      submitVideo: vi.fn(async () => { throw new Error("Unexpected video submit."); }),
+      submitBatch: vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
+      lookup: newLookup,
+    };
+    const baseServices = createDemoServices(window.localStorage);
+    const services: WorkspaceServices = {
+      ...baseServices,
+      creatorSettings: creatorSettings(),
+      mediaGeneration: { beginRun: vi.fn(() => oldRun) },
+    };
+    const refreshedServices: WorkspaceServices = {
+      ...services,
+      mediaGeneration: { beginRun: vi.fn(() => newRun) },
+    };
+    const props = { userId: "actor-services-refresh-1067", sessionGeneration: 1, onUnauthorized: vi.fn(), onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage {...props} services={services} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "服务刷新后继续使用同一冻结组");
+    await user.selectOptions(screen.getByLabelText("生成数量"), "3");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+
+    await waitFor(() => expect(oldLookup).toHaveBeenCalledOnce());
+    expect(screen.getByText("第 1 项 · 已受理")).toBeInTheDocument();
+    expect(screen.getByText("第 2 项 · 受理待确认")).toBeInTheDocument();
+    expect(screen.getByText("第 3 项 · 因前项停止而未提交")).toBeInTheDocument();
+    const firstKey = oldSubmitImage.mock.calls[0]?.[0].idempotencyKey;
+    const uncertainKey = oldSubmitImage.mock.calls[1]?.[0].idempotencyKey;
+    expect(firstKey).toBeDefined();
+    expect(uncertainKey).toBeDefined();
+
+    rerender(<MediaGenerationPage {...props} services={refreshedServices} />);
+    const lookupButton = await screen.findByRole("button", { name: "重新核对提交" });
+    await waitFor(() => expect(lookupButton).toBeEnabled());
+    expect(screen.getByText("第 1 项 · 已受理")).toBeInTheDocument();
+    expect(screen.getByText("第 2 项 · 受理待确认")).toBeInTheDocument();
+    expect(screen.getByText("核对若确认本项已受理，后续未提交项目会按原请求继续；已受理项目不会重复提交。"))
+      .toBeInTheDocument();
+    expect(newLookup).not.toHaveBeenCalled();
+
+    await user.click(lookupButton);
+    await waitFor(() => expect(newLookup).toHaveBeenCalledOnce());
+    expect(newLookup.mock.calls[0]?.[0]).toEqual({
+      operation: "image.single",
+      idempotencyKey: uncertainKey,
+    });
+    expect(await screen.findByText(/3 项图片任务已按顺序受理/u)).toBeInTheDocument();
+    expect(oldSubmitImage).toHaveBeenCalledTimes(2);
+    expect(newSubmitImage).toHaveBeenCalledOnce();
+    expect(newSubmitImage.mock.calls[0]?.[0].idempotencyKey).not.toBe(firstKey);
+    expect(newSubmitImage.mock.calls[0]?.[0].idempotencyKey).not.toBe(uncertainKey);
+    expect(screen.getByText(/refresh-task-1/u)).toBeInTheDocument();
+    expect(screen.getByText(/refresh-task-2/u)).toBeInTheDocument();
+    expect(screen.getByText(/refresh-task-3/u)).toBeInTheDocument();
+
+    resolveOldLookup?.(receipt(99));
+    await waitFor(() => expect(screen.getByText(/3 项图片任务已按顺序受理/u)).toBeInTheDocument());
+    expect(newSubmitImage).toHaveBeenCalledOnce();
+  });
+
+  it("keeps an unknown group and offers stop-local-tracking when refreshed services cannot recover it", async () => {
+    const user = userEvent.setup();
+    let resolveOldLookup: ((result: Awaited<ReturnType<MediaGenerationRun["lookup"]>>) => void) | undefined;
+    const receipt = (index: number) => ({
+      operation: "image.single" as const,
+      submissionId: `unavailable-refresh-submission-${index}`,
+      taskId: `unavailable-refresh-task-${index}`,
+      messageId: null,
+      status: "queued" as const,
+      quotedAmount: 1,
+      billingStatus: "charged" as const,
+    });
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>()
+      .mockResolvedValueOnce(receipt(1))
+      .mockRejectedValueOnce(new MediaGenerationError("unknown-outcome", "第二项提交结果未知"));
+    const lookup = vi.fn<MediaGenerationRun["lookup"]>(() => new Promise((resolve) => {
+      resolveOldLookup = resolve;
+    }));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage, lookup),
+    };
+    const unavailableServices = (({ mediaGeneration: _mediaGeneration, ...withoutGeneration }) => withoutGeneration)(services);
+    const props = { userId: "actor-refresh-unavailable-1067", sessionGeneration: 1, onUnauthorized: vi.fn(), onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage {...props} services={services} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "保留未知组直到显式停止跟踪");
+    await user.selectOptions(screen.getByLabelText("生成数量"), "2");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+    await waitFor(() => expect(lookup).toHaveBeenCalledOnce());
+
+    rerender(<MediaGenerationPage {...props} services={unavailableServices} />);
+    expect(await screen.findByRole("button", { name: "停止本地跟踪" })).toBeEnabled();
+    expect(screen.getByText("第 1 项 · 已受理")).toBeInTheDocument();
+    expect(screen.getByText("第 2 项 · 受理待确认")).toBeInTheDocument();
+    expect(screen.getByText("当前服务没有媒体生成恢复入口；原请求仍保留，停止本地跟踪前不会继续提交。"))
+      .toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "停止本地跟踪" }));
+    expect(screen.queryByText("提交状态尚未确认。页面保留了本次请求，请先核对状态再继续。"))
+      .not.toBeInTheDocument();
+    expect(screen.getByText("第 1 项 · 已受理")).toBeInTheDocument();
+    expect(screen.getByText("第 2 项 · 受理待确认")).toBeInTheDocument();
+    expect(screen.getByText(/已停止本地跟踪；原提交仍待确认/u)).toBeInTheDocument();
+    expect(submitImage).toHaveBeenCalledTimes(2);
+
+    resolveOldLookup?.(receipt(9));
+    await waitFor(() => expect(screen.getByText("第 2 项 · 受理待确认")).toBeInTheDocument());
+    expect(submitImage).toHaveBeenCalledTimes(2);
+  });
+
+  it("preserves an in-flight batch key across a same-owner services refresh and ignores its late receipt", async () => {
+    const user = userEvent.setup();
+    let finishOldSubmit: ((receipt: Awaited<ReturnType<MediaGenerationRun["submitBatch"]>>) => void) | undefined;
+    let finishNewLookup: ((receipt: Awaited<ReturnType<MediaGenerationRun["lookup"]>>) => void) | undefined;
+    const receipt = (taskId: string) => ({
+      operation: "image.batch" as const,
+      tasks: [{ type: "character" as const, assetId: "character-926", assetName: "林舟", messageId: `message-${taskId}`, taskId }],
+    });
+    const oldSubmitBatch = vi.fn<MediaGenerationRun["submitBatch"]>(() => new Promise((resolve) => {
+      finishOldSubmit = resolve;
+    }));
+    const newSubmitBatch = vi.fn<MediaGenerationRun["submitBatch"]>(async () => ({ operation: "image.batch", tasks: [] }));
+    const newLookup = vi.fn<MediaGenerationRun["lookup"]>(() => new Promise((resolve) => {
+      finishNewLookup = resolve;
+    }));
+    const oldRun: MediaGenerationRun = {
+      isCurrent: () => true,
+      submitImage: vi.fn(async () => { throw new Error("Unexpected image submit."); }),
+      submitVideo: vi.fn(async () => { throw new Error("Unexpected video submit."); }),
+      submitBatch: oldSubmitBatch,
+      lookup: vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
+    };
+    const newRun: MediaGenerationRun = {
+      isCurrent: () => true,
+      submitImage: vi.fn(async () => { throw new Error("Unexpected image submit."); }),
+      submitVideo: vi.fn(async () => { throw new Error("Unexpected video submit."); }),
+      submitBatch: newSubmitBatch,
+      lookup: newLookup,
+    };
+    const series = seriesFixture();
+    const chapter = { ...chapterFixture(), content: [] };
+    const baseServices = createDemoServices(window.localStorage);
+    const services: WorkspaceServices = {
+      ...baseServices,
+      creatorSettings: creatorSettings(),
+      mediaGeneration: { beginRun: vi.fn(() => oldRun) },
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
+      listCharacters: vi.fn(async () => [characterFixture()]),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const refreshedServices: WorkspaceServices = {
+      ...services,
+      mediaGeneration: { beginRun: vi.fn(() => newRun) },
+    };
+    const props = { userId: "actor-batch-refresh-1067", sessionGeneration: 1, onUnauthorized: vi.fn(), onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage {...props} services={services} />);
+
+    await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
+    const assetChoices = await screen.findByRole("group", { name: /选择生成素材/ });
+    await user.click(within(assetChoices).getByRole("checkbox", { name: /林舟/ }));
+    await user.click(screen.getByRole("button", { name: "提交 1 项批量任务" }));
+    await waitFor(() => expect(oldSubmitBatch).toHaveBeenCalledOnce());
+    const frozenInput = oldSubmitBatch.mock.calls[0]?.[0];
+    expect(frozenInput).toBeDefined();
+
+    rerender(<MediaGenerationPage {...props} services={refreshedServices} />);
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(""));
+    const lookupButton = await screen.findByRole("button", { name: "重新核对提交" });
+    await waitFor(() => expect(lookupButton).toBeEnabled());
+    expect(newLookup).not.toHaveBeenCalled();
+    expect(newSubmitBatch).not.toHaveBeenCalled();
+
+    await user.click(lookupButton);
+    await waitFor(() => expect(newLookup).toHaveBeenCalledOnce());
+    expect(newLookup.mock.calls[0]?.[0]).toEqual({
+      operation: "image.batch",
+      idempotencyKey: frozenInput!.idempotencyKey,
+      batchAssets: [{ type: "character", id: "character-926" }],
+    });
+
+    finishOldSubmit?.(receipt("late-task"));
+    expect(await screen.findByRole("button", { name: "正在核对…" })).toBeDisabled();
+    expect(screen.getByText("提交状态尚未确认。页面保留了本次请求，请先核对状态再继续。"))
+      .toBeInTheDocument();
+
+    finishNewLookup?.(receipt("current-task"));
+    expect(await screen.findByText("已核对原批量请求。批量请求已回读，共 1 项；每项仍可在“我的任务”中查看。"))
+      .toBeInTheDocument();
+    expect(screen.getByText(/current-task/u)).toBeInTheDocument();
+    expect(screen.queryByText(/late-task/u)).not.toBeInTheDocument();
+    expect(oldSubmitBatch).toHaveBeenCalledOnce();
+    expect(newSubmitBatch).not.toHaveBeenCalled();
+  });
+
+  it("reports a current batch lookup 401 after a same-owner services refresh", async () => {
+    const user = userEvent.setup();
+    let finishOldSubmit: ((receipt: Awaited<ReturnType<MediaGenerationRun["submitBatch"]>>) => void) | undefined;
+    const receipt = {
+      operation: "image.batch" as const,
+      tasks: [{ type: "character" as const, assetId: "character-926", assetName: "林舟", messageId: "late-message", taskId: "late-task" }],
+    };
+    const oldSubmitBatch = vi.fn<MediaGenerationRun["submitBatch"]>(() => new Promise((resolve) => {
+      finishOldSubmit = resolve;
+    }));
+    const onUnauthorized = vi.fn();
+    const newLookup = vi.fn<MediaGenerationRun["lookup"]>(async () => {
+      throw new ApiError("http", "Unauthorized", 401);
+    });
+    const oldRun: MediaGenerationRun = {
+      isCurrent: () => true,
+      submitImage: vi.fn(async () => { throw new Error("Unexpected image submit."); }),
+      submitVideo: vi.fn(async () => { throw new Error("Unexpected video submit."); }),
+      submitBatch: oldSubmitBatch,
+      lookup: vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
+    };
+    const newRun: MediaGenerationRun = {
+      isCurrent: () => true,
+      submitImage: vi.fn(async () => { throw new Error("Unexpected image submit."); }),
+      submitVideo: vi.fn(async () => { throw new Error("Unexpected video submit."); }),
+      submitBatch: vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
+      lookup: newLookup,
+    };
+    const series = seriesFixture();
+    const chapter = { ...chapterFixture(), content: [] };
+    const baseServices = createDemoServices(window.localStorage);
+    const services: WorkspaceServices = {
+      ...baseServices,
+      creatorSettings: creatorSettings(),
+      mediaGeneration: { beginRun: vi.fn(() => oldRun) },
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
+      listCharacters: vi.fn(async () => [characterFixture()]),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const refreshedServices: WorkspaceServices = {
+      ...services,
+      mediaGeneration: { beginRun: vi.fn(() => newRun) },
+    };
+    const props = { userId: "actor-batch-401-refresh-1067", sessionGeneration: 1, onUnauthorized, onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage {...props} services={services} />);
+
+    await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
+    const assetChoices = await screen.findByRole("group", { name: /选择生成素材/ });
+    await user.click(within(assetChoices).getByRole("checkbox", { name: /林舟/ }));
+    await user.click(screen.getByRole("button", { name: "提交 1 项批量任务" }));
+    await waitFor(() => expect(oldSubmitBatch).toHaveBeenCalledOnce());
+    const originalKey = oldSubmitBatch.mock.calls[0]?.[0].idempotencyKey;
+    expect(originalKey).toBeDefined();
+
+    rerender(<MediaGenerationPage {...props} services={refreshedServices} />);
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(""));
+    const lookupButton = await screen.findByRole("button", { name: "重新核对提交" });
+    await waitFor(() => expect(lookupButton).toBeEnabled());
+    const unauthorizedCallsBeforeLookup = onUnauthorized.mock.calls.length;
+    await user.click(lookupButton);
+
+    await waitFor(() => expect(onUnauthorized).toHaveBeenCalledTimes(unauthorizedCallsBeforeLookup + 1));
+    expect(newLookup).toHaveBeenCalledOnce();
+    expect(newLookup.mock.calls[0]?.[0]).toEqual({
+      operation: "image.batch",
+      idempotencyKey: originalKey,
+      batchAssets: [{ type: "character", id: "character-926" }],
+    });
+    expect(oldSubmitBatch).toHaveBeenCalledOnce();
+    expect(screen.queryByText(/late-task/u)).not.toBeInTheDocument();
+
+    finishOldSubmit?.(receipt);
+    await waitFor(() => expect(screen.queryByText(/late-task/u)).not.toBeInTheDocument());
+    expect(onUnauthorized).toHaveBeenCalledTimes(unauthorizedCallsBeforeLookup + 1);
+    expect(oldSubmitBatch).toHaveBeenCalledOnce();
   });
 
   it("does not add a late upload URL after the page session scope changes", async () => {
@@ -474,12 +1235,22 @@ describe("MediaGenerationPage", () => {
     });
   });
 
-  it("keeps an in-flight video request stable when refreshed options no longer include its duration", async () => {
+  it("keeps an in-flight video request frozen and treats its late result as unknown after a same-owner refresh", async () => {
     const user = userEvent.setup();
     let finishSubmission: ((value: Awaited<ReturnType<MediaGenerationRun["submitVideo"]>>) => void) | undefined;
-    const submitVideo = vi.fn<MediaGenerationRun["submitVideo"]>(() => new Promise((resolve) => {
-      finishSubmission = resolve;
-    }));
+    const submitVideo = vi.fn<MediaGenerationRun["submitVideo"]>()
+      .mockImplementationOnce(() => new Promise((resolve) => {
+        finishSubmission = resolve;
+      }))
+      .mockResolvedValueOnce({
+        operation: "video.single",
+        submissionId: "video-submission-frozen-retry",
+        taskId: "video-task-frozen-retry",
+        messageId: "video-message-frozen-retry",
+        status: "queued",
+        quotedAmount: 3,
+        billingStatus: "charged",
+      });
     const baseCatalog = creatorSettings();
     let videoCatalogReads = 0;
     const catalogA: CreatorSettingsServicePort = {
@@ -535,17 +1306,21 @@ describe("MediaGenerationPage", () => {
       quotedAmount: 3,
       billingStatus: "charged",
     });
-    await screen.findByText(/视频任务已受理/u);
+    expect(await screen.findByText("第 1 项 · 受理待确认")).toBeInTheDocument();
     rerender(<MediaGenerationPage services={servicesA} {...props} />);
-    expect(screen.getByText(/视频任务已受理/u)).toBeInTheDocument();
+    expect(screen.getByText("第 1 项 · 受理待确认")).toBeInTheDocument();
     expect(submitVideo).toHaveBeenCalledOnce();
     expect(submitVideo.mock.calls[0]![0].duration).toBe(10);
-
-    await user.click(screen.getByRole("button", { name: "普通图片" }));
-    await user.click(screen.getByRole("button", { name: "普通视频" }));
     expect(await screen.findByText("所选时长已不受当前模型支持，请重新选择。", { selector: "p" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "提交视频任务" })).toBeDisabled();
-    expect(submitVideo).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "重新核对提交" })).toBeEnabled();
+    expect(screen.getByLabelText("时长（秒）")).toHaveValue("5");
+
+    await user.click(screen.getByRole("button", { name: /按原请求重试本项/u }));
+    expect(await screen.findByText(/视频任务已受理/u)).toBeInTheDocument();
+    expect(submitVideo).toHaveBeenCalledTimes(2);
+    expect(submitVideo.mock.calls[1]?.[0]).toBe(submitVideo.mock.calls[0]?.[0]);
+    expect(submitVideo.mock.calls[1]?.[0].duration).toBe(10);
+    expect(submitVideo.mock.calls[1]?.[0].idempotencyKey).toBe(submitVideo.mock.calls[0]?.[0].idempotencyKey);
   });
 
   it("keeps a manual prompt until saved options are explicitly applied and preserves it for a blank saved prompt", async () => {
