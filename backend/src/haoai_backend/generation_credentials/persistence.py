@@ -25,12 +25,20 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from haoai_backend.authentication.tables import users
 from haoai_backend.generation_catalog.tables import model_configs, system_models
 
 from .domain import CredentialScope, PreparedPayload
+from .payload_application import stage_prepared_payload
+from .payload_ports import (
+    PayloadBindingSnapshot,
+    PayloadVersionSnapshot,
+    PreparedPayloadStoreError,
+    StoredPreparedPayload,
+)
 
 
 metadata = MetaData()
@@ -569,70 +577,102 @@ class RegistryPayloadRepository:
         payload_id: str,
         created_at: Any,
     ):
-        from .domain import PreparedPayloadStaged, RegistryConflict
+        from .domain import RegistryConflict
 
         if not isinstance(payload, PreparedPayload):
             return RegistryConflict("payload_invalid", "加密任务数据无效")
         repository = RegistryReadRepository(caller_session)
         with caller_session.no_autoflush:
-            binding = repository.lock_binding(payload.scope)
-            if (
-                binding is None
-                or not binding["enabled"]
-                or int(binding["current_version"]) != payload.binding_version
-            ):
-                return RegistryConflict("payload_binding_changed", "凭据绑定已变化")
-            version = repository.read_version(payload.binding_id, payload.binding_version)
-            if (
-                version is None
-                or version["principal_id"] != payload.principal_id
-                or version["source"] != payload.scope.source
-                or version["row_id"] != payload.scope.row_id
-                or version["owner_or_system"] != payload.scope.owner_or_system
-                or version["provider"] != payload.scope.provider
-            ):
-                return RegistryConflict("payload_binding_mismatch", "凭据绑定无法确认")
-            existing = repository.find_payload(
-                payload.actor_id, payload.operation, payload.server_attempt_id
-            )
-            if existing is not None:
-                return _payload_replay(existing, payload)
-            inserted = repository.insert_payload(
-                payload, payload_id=payload_id, created_at=created_at
-            )
-            if inserted == 1:
-                return PreparedPayloadStaged(payload_id, reused=False)
-            raced = repository.find_payload(
-                payload.actor_id, payload.operation, payload.server_attempt_id
-            )
-            if raced is None:
-                return RegistryConflict("payload_insert_raced", "加密任务数据暂时无法确认")
-            return _payload_replay(raced, payload)
+            try:
+                return stage_prepared_payload(
+                    _CallerSessionPreparedPayloadStore(repository),
+                    payload,
+                    payload_id=payload_id,
+                    created_at=created_at,
+                )
+            except PreparedPayloadStoreError:
+                return RegistryConflict(
+                    "payload_stage_failed",
+                    "任务数据暂时无法保存，请回滚当前事务",
+                )
 
 
-def _payload_replay(existing: dict[str, Any], payload: PreparedPayload):
-    from .domain import PreparedPayloadStaged, RegistryConflict
+class _CallerSessionPreparedPayloadStore:
+    """Adapt existing caller-session repository projections to the narrow port."""
 
-    equal = all(
-        existing[field] == value
-        for field, value in (
-            ("command_proof", payload.command_proof),
-            ("context_fingerprint", payload.context_fingerprint),
-            ("schema_version", payload.schema_version),
-            ("projector_version", payload.projector_version),
-            ("reference_policy_version", payload.reference_policy_version),
-            ("target_ref", payload.target_ref),
-            ("model_ref", payload.model_ref),
-            ("grant_ref", payload.grant_ref),
-            ("binding_id", payload.binding_id),
-            ("binding_version", payload.binding_version),
-            ("principal_id", payload.principal_id),
-            ("source", payload.scope.source),
-            ("row_id", payload.scope.row_id),
-            ("owner_or_system", payload.scope.owner_or_system),
-            ("provider", payload.scope.provider),
+    def __init__(self, repository: RegistryReadRepository) -> None:
+        self._repository = repository
+
+    def lock_binding(self, scope: CredentialScope) -> PayloadBindingSnapshot | None:
+        try:
+            binding = self._repository.lock_binding(scope)
+        except SQLAlchemyError:
+            raise PreparedPayloadStoreError from None
+        if binding is None:
+            return None
+        return PayloadBindingSnapshot(
+            enabled=bool(binding["enabled"]),
+            current_version=int(binding["current_version"]),
         )
-    )
-    if not equal:
-        return RegistryConflict("payload_attempt_conflict", "任务数据尝试已用于不同内容")
-    return PreparedPayloadStaged(existing["prepared_payload_id"], reused=True)
+
+    def read_version(self, binding_id: str, version: int) -> PayloadVersionSnapshot | None:
+        try:
+            row = self._repository.read_version(binding_id, version)
+        except SQLAlchemyError:
+            raise PreparedPayloadStoreError from None
+        if row is None:
+            return None
+        return PayloadVersionSnapshot(
+            principal_id=row["principal_id"],
+            source=row["source"],
+            row_id=row["row_id"],
+            owner_or_system=row["owner_or_system"],
+            provider=row["provider"],
+        )
+
+    def find_payload(
+        self,
+        actor_id: str,
+        operation: str,
+        attempt_id: str,
+    ) -> StoredPreparedPayload | None:
+        try:
+            row = self._repository.find_payload(actor_id, operation, attempt_id)
+        except SQLAlchemyError:
+            raise PreparedPayloadStoreError from None
+        if row is None:
+            return None
+        return StoredPreparedPayload(
+            prepared_payload_id=row["prepared_payload_id"],
+            command_proof=row["command_proof"],
+            context_fingerprint=row["context_fingerprint"],
+            schema_version=row["schema_version"],
+            projector_version=row["projector_version"],
+            reference_policy_version=row["reference_policy_version"],
+            target_ref=row["target_ref"],
+            model_ref=row["model_ref"],
+            grant_ref=row["grant_ref"],
+            binding_id=row["binding_id"],
+            binding_version=row["binding_version"],
+            principal_id=row["principal_id"],
+            source=row["source"],
+            row_id=row["row_id"],
+            owner_or_system=row["owner_or_system"],
+            provider=row["provider"],
+        )
+
+    def insert_payload_if_absent(
+        self,
+        payload: PreparedPayload,
+        *,
+        payload_id: str,
+        created_at: Any,
+    ) -> int:
+        try:
+            return self._repository.insert_payload(
+                payload,
+                payload_id=payload_id,
+                created_at=created_at,
+            )
+        except SQLAlchemyError:
+            raise PreparedPayloadStoreError from None
