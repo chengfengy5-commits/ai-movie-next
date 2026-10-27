@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, TypeVar, cast
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, TypeVar, cast
 
 from sqlalchemy import (
     Boolean,
@@ -44,6 +44,11 @@ from .payload_ports import (
     PayloadVersionSnapshot,
     PreparedPayloadStoreError,
     StoredPreparedPayload,
+)
+from .registry_ports import (
+    LegacyConfigFacts,
+    RegistrySchemaProbeResult,
+    RegistryStoreError,
 )
 
 
@@ -279,17 +284,6 @@ REGISTRY_TABLES = (
     prepared_payloads,
     credential_schema_migrations,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class LegacyConfigFacts:
-    scope: CredentialScope
-    category: str
-    provider: str
-    model: str | None
-    base_url: str | None = field(repr=False)
-    api_key: str = field(repr=False)
-    active: bool
 
 
 class RegistryReadRepository:
@@ -810,3 +804,165 @@ class CallerSessionBindingCaptureStore:
         principal_id: str,
     ) -> BindingCapturePrincipal | None:
         return self._repository.find_capture_principal(principal_id)
+
+
+class _RegistryReadStoreAdapter:
+    """Expose registry projections without leaking the SQLAlchemy repository."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._repository = RegistryReadRepository(session)
+
+    @contextmanager
+    def without_autoflush(self) -> Iterator[None]:
+        try:
+            with self._session.no_autoflush:
+                yield
+        except SQLAlchemyError:
+            raise RegistryStoreError from None
+
+    def lock_config(
+        self,
+        scope: CredentialScope,
+        *,
+        require_active: bool = True,
+        require_api_key: bool = True,
+    ) -> LegacyConfigFacts | None:
+        return self._run(
+            lambda: self._repository.lock_config(
+                scope,
+                require_active=require_active,
+                require_api_key=require_api_key,
+            )
+        )
+
+    def find_attempt(self, attempt_id: str) -> dict[str, Any] | None:
+        return self._run(lambda: self._repository.find_attempt(attempt_id))
+
+    def lock_binding(self, scope: CredentialScope) -> dict[str, Any] | None:
+        return self._run(lambda: self._repository.lock_binding(scope))
+
+    def read_version(
+        self,
+        binding_id: str,
+        version: int,
+    ) -> dict[str, Any] | None:
+        return self._run(lambda: self._repository.read_version(binding_id, version))
+
+    def read_versions(self, binding_id: str) -> tuple[dict[str, Any], ...]:
+        return self._run(lambda: self._repository.read_versions(binding_id))
+
+    def find_principal(self, principal_id: str) -> dict[str, Any] | None:
+        return self._run(lambda: self._repository.find_principal(principal_id))
+
+    def _run(self, operation: Callable[[], _Result]) -> _Result:
+        try:
+            return operation()
+        except SQLAlchemyError:
+            raise RegistryStoreError from None
+
+
+class CallerSessionRegistryMutationStore(_RegistryReadStoreAdapter):
+    """Adapt named registry mutations to the original caller-owned Session."""
+
+    def lock_user(self, user_id: str) -> dict[str, Any] | None:
+        return self._run(lambda: self._repository.lock_user(user_id))
+
+    def find_principal_identity(
+        self,
+        *,
+        provider: str,
+        issuer_namespace: str,
+        stable_account_subject: str,
+        owner_scope: str,
+    ) -> dict[str, Any] | None:
+        return self._run(
+            lambda: self._repository.find_principal_identity(
+                provider=provider,
+                issuer_namespace=issuer_namespace,
+                stable_account_subject=stable_account_subject,
+                owner_scope=owner_scope,
+            )
+        )
+
+    def insert_principal_if_absent(self, values: dict[str, object]) -> int:
+        return self._run(
+            lambda: self._repository.insert_do_nothing(credential_principals, values)
+        )
+
+    def insert_binding_if_absent(self, values: dict[str, object]) -> int:
+        return self._run(
+            lambda: self._repository.insert_do_nothing(credential_bindings, values)
+        )
+
+    def insert_version_if_absent(self, values: dict[str, object]) -> int:
+        return self._run(
+            lambda: self._repository.insert_do_nothing(credential_versions, values)
+        )
+
+    def cas_binding(
+        self,
+        *,
+        binding_id: str,
+        expected_revision: int,
+        expected_version: int,
+        next_version: int,
+        enabled: bool,
+        updated_at: object,
+    ) -> int:
+        return self._run(
+            lambda: self._repository.cas_binding(
+                binding_id=binding_id,
+                expected_revision=expected_revision,
+                expected_version=expected_version,
+                next_version=next_version,
+                enabled=enabled,
+                updated_at=updated_at,
+            )
+        )
+
+
+class IndependentRegistryReadScopeFactory:
+    """Create a fresh read repository and close its Session after each scope."""
+
+    def __init__(self, session_factory: Callable[[], Session]) -> None:
+        self._session_factory = session_factory
+
+    @contextmanager
+    def __call__(self) -> Iterator["_RegistryReadStoreAdapter"]:
+        try:
+            session = self._session_factory()
+        except SQLAlchemyError:
+            raise RegistryStoreError from None
+        try:
+            yield _RegistryReadStoreAdapter(session)
+        finally:
+            session.close()
+
+
+class CallerSessionRegistrySchemaProbe:
+    """Keep foundation-first schema checks at the SQLAlchemy boundary."""
+
+    def check(self, caller_context: object) -> RegistrySchemaProbeResult:
+        from haoai_backend.generation_runtime.readiness import check_generation_readiness
+
+        from .schema import check_credential_registry_schema, check_legacy_projection_schema
+
+        try:
+            session = cast(Session, caller_context)
+            with session.no_autoflush:
+                foundation = check_generation_readiness(session)
+                if foundation.status != "ready":
+                    issues = tuple(f"foundation:{issue.code}" for issue in foundation.issues)
+                    return RegistrySchemaProbeResult("not_ready", issues)
+                connection = session.connection()
+                owned = check_credential_registry_schema(connection)
+                legacy = check_legacy_projection_schema(connection)
+                issues = (*owned.issues, *legacy.issues)
+                status = "ready" if owned.ready and legacy.ready else "not_ready"
+                return RegistrySchemaProbeResult(status, tuple(issues))
+        except SQLAlchemyError as exc:
+            return RegistrySchemaProbeResult(
+                "not_ready",
+                (f"schema_check_failed:{type(exc).__name__}",),
+            )
