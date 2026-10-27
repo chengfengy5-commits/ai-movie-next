@@ -136,6 +136,7 @@ vi.mock("./FrameAssetReferencesPanel", async (importOriginal) => {
 
 const series: Series = demoSeries[0]!;
 const apiBaseUrl = "http://127.0.0.1:4175/api";
+const restoreOverrides: Array<() => void> = [];
 
 function chapter(
   id: string,
@@ -331,6 +332,19 @@ function clearOriginalTextPanelPositions(): void {
   for (const key of Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))) {
     if (key?.startsWith(prefix)) localStorage.removeItem(key);
   }
+}
+
+function installDocumentExecCommand(
+  execute: ((command: string, showUI?: boolean, value?: string) => boolean) | undefined,
+): () => void {
+  const descriptor = Object.getOwnPropertyDescriptor(document, "execCommand");
+  Object.defineProperty(document, "execCommand", { configurable: true, value: execute });
+  const restore = () => {
+    if (descriptor === undefined) Reflect.deleteProperty(document, "execCommand");
+    else Object.defineProperty(document, "execCommand", descriptor);
+  };
+  restoreOverrides.push(restore);
+  return restore;
 }
 
 function stubPointerCapture(element: HTMLElement) {
@@ -644,6 +658,7 @@ function makeFrameStructureServices(initialChapter: Chapter, resumeFrameId: stri
 
 describe("read-only chapter browser", () => {
   afterEach(() => {
+    for (const restore of restoreOverrides.splice(0).reverse()) restore();
     cleanup();
     clearOriginalTextPanelPositions();
     personalNotesBridge.onLocateResume = null;
@@ -4194,6 +4209,307 @@ describe("read-only chapter browser", () => {
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument());
   });
 
+  it.each([
+    { label: "fires an input event", dispatchInput: true },
+    { label: "does not fire an input event", dispatchInput: false },
+  ])("fills the opening original through a reversible edit when execCommand $label", async ({ dispatchInput }) => {
+    const user = userEvent.setup();
+    const openingOriginal = "原文第一行\n<b>原文第二行</b>";
+    const current = chapter("chapter-original-fill", "原文回填章节", [{
+      text: "当前正文",
+      original_text: openingOriginal,
+      storyboard: [],
+      editor_note: "保留字段",
+    }]);
+    const { services, updateChapter } = makeServices([current], {}, false, true);
+    installDocumentExecCommand((command, showUI, value) => {
+      expect(command).toBe("insertText");
+      expect(showUI).toBe(false);
+      const textarea = document.activeElement;
+      if (!(textarea instanceof HTMLTextAreaElement)) return false;
+      const setValue = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+      setValue?.call(textarea, value ?? "");
+      if (dispatchInput) fireEvent.input(textarea, { inputType: "insertText", data: value ?? "" });
+      return true;
+    });
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "原文回填章节 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = editor.getByRole("textbox", { name: "镜头文字" });
+    expect(textbox).toHaveValue("当前正文");
+    await user.click(editor.getByRole("button", { name: "回填打开时原文" }));
+
+    expect(textbox).toHaveValue(openingOriginal);
+    expect(updateChapter).not.toHaveBeenCalled();
+    await user.click(editor.getByRole("button", { name: "保存文字" }));
+    await waitFor(() => expect(updateChapter).toHaveBeenCalledTimes(1));
+    expect(updateChapter).toHaveBeenCalledWith(series.id, current.id, {
+      content: [{ text: openingOriginal, original_text: openingOriginal, storyboard: [], editor_note: "保留字段" }],
+    }, expect.any(AbortSignal));
+  });
+
+  it.each([
+    { label: "execCommand is unavailable", execute: undefined },
+    { label: "execCommand reports failure", execute: () => false },
+  ])("keeps the draft unchanged when $label", async ({ execute }) => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-original-fill-failure", "回填失败章节", [{
+      text: "保留当前正文",
+      original_text: "未回填原文",
+      storyboard: [],
+    }]);
+    const { services, updateChapter } = makeServices([current], {}, false, true);
+    installDocumentExecCommand(execute);
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "回填失败章节 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = editor.getByRole("textbox", { name: "镜头文字" });
+    await user.click(editor.getByRole("button", { name: "回填打开时原文" }));
+
+    expect(textbox).toHaveValue("保留当前正文");
+    expect(await editor.findByRole("alert")).toHaveTextContent(/原文未回填|草稿保持不变/);
+    expect(updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("saves and independently verifies before moving to the next frame without reacquiring its lock", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-edit-sequence", "连续编辑章节", [
+      { text: "第一镜原文", original_text: "第一镜打开原文", storyboard: ["sequence-frame-1"], extra: { keep: 1 } },
+      { text: "第二镜文字", original_text: "第二镜打开原文", storyboard: ["sequence-frame-2"], extra: { keep: 2 } },
+    ]);
+    const assets = [asset("sequence-frame-1", current.id), asset("sequence-frame-2", current.id)];
+    const base = makeServices([current], { [current.id]: assets }, false, true);
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-28T00:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    base.getChapterEditLock.mockResolvedValueOnce({ locked: false }).mockResolvedValue(ownedLock);
+    const teamSeries: Series = { ...series, team_id: "team-sequence", team_name: "团队" };
+    renderBrowser(base.services, vi.fn(), vi.fn(), teamSeries);
+
+    const firstCard = await screen.findByRole("article", { name: "连续编辑章节 · 镜头 1" });
+    await user.click(within(firstCard).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const initialTextarea = editor.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(initialTextarea);
+    await user.type(initialTextarea, "保存后继续的第一镜草稿");
+    const listReadsBeforeMove = base.listChapters.mock.calls.length;
+    await user.click(editor.getByRole("button", { name: "下一镜头" }));
+
+    await waitFor(() => expect(base.updateChapter).toHaveBeenCalledTimes(1));
+    const nextDialog = await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    const nextEditor = within(nextDialog);
+    const nextTextarea = nextEditor.getByRole("textbox", { name: "镜头文字" });
+    await waitFor(() => expect(nextTextarea).toHaveValue("第二镜文字"));
+    expect(nextTextarea).not.toBe(initialTextarea);
+    expect(base.updateChapter).toHaveBeenCalledWith(series.id, current.id, {
+      content: [
+        { text: "保存后继续的第一镜草稿", original_text: "第一镜打开原文", storyboard: ["sequence-frame-1"], extra: { keep: 1 } },
+        { text: "第二镜文字", original_text: "第二镜打开原文", storyboard: ["sequence-frame-2"], extra: { keep: 2 } },
+      ],
+    }, expect.any(AbortSignal));
+    expect(base.listChapters.mock.calls.length - listReadsBeforeMove).toBeGreaterThanOrEqual(4);
+    expect(base.acquireChapterEditLock).toHaveBeenCalledTimes(1);
+    expect(base.getChapterEditLock.mock.calls.filter((call) => call[2] !== undefined).length).toBeGreaterThanOrEqual(3);
+    expect(nextEditor.getByRole("region", { name: "打开时原文" })).toHaveTextContent("第二镜打开原文");
+    expect(nextEditor.getByRole("region", { name: "镜头 2 的关联素材" })).toBeInTheDocument();
+
+    await user.click(nextEditor.getByRole("button", { name: "上一镜头" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "镜头文字" })).toHaveValue("保存后继续的第一镜草稿"));
+    expect(base.updateChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("closes after an explicit overwrite rebases the same cursor and releases its original lock", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-overwrite-rebase", "覆盖重基线章节", [
+      {
+        text: "初始正文",
+        original_text: "镜头一原文",
+        storyboard: ["overwrite-rebase-frame-1"],
+        extra: { keep: "frame-one" },
+      },
+      {
+        text: "第二镜原文",
+        storyboard: ["overwrite-rebase-frame-2"],
+        extra: { revision: "initial" },
+      },
+    ]);
+    const base = makeServices(
+      [current],
+      {
+        [current.id]: [
+          asset("overwrite-rebase-frame-1", current.id),
+          asset("overwrite-rebase-frame-2", current.id),
+        ],
+      },
+      false,
+      true,
+    );
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: "2026-10-28T00:00:00Z",
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    const lease = {} as ChapterEditLockLeaseHandle;
+    base.getChapterEditLock.mockImplementation(async (_chapterId, _signal, suppliedLease) => (
+      suppliedLease === undefined ? { locked: false } : ownedLock
+    ));
+    base.acquireChapterEditLock.mockResolvedValue({ state: ownedLock, lease });
+    const teamSeries: Series = { ...series, team_id: "team-frame-overwrite-rebase", team_name: "团队" };
+    renderBrowser(base.services, vi.fn(), vi.fn(), teamSeries);
+
+    const firstFrame = await screen.findByRole("article", { name: "覆盖重基线章节 · 镜头 1" });
+    await user.click(within(firstFrame).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = editor.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "明确覆盖后的正文");
+
+    const conflictChapter = chapter(current.id, current.title, [
+      {
+        text: "服务器冲突正文",
+        original_text: "镜头一原文",
+        storyboard: ["overwrite-rebase-frame-1"],
+        extra: { keep: "frame-one" },
+      },
+      {
+        text: "第二镜原文",
+        storyboard: ["overwrite-rebase-frame-2"],
+        extra: { revision: "initial" },
+      },
+    ]);
+    base.setCurrentChapters([conflictChapter]);
+    await user.click(editor.getByRole("button", { name: "保存文字" }));
+
+    const serverText = await editor.findByRole("region", { name: "服务器当前镜头文字" });
+    expect(serverText).toHaveTextContent("服务器冲突正文");
+    expect(textbox).toHaveValue("明确覆盖后的正文");
+    expect(base.updateChapter).not.toHaveBeenCalled();
+
+    base.setCurrentChapters([chapter(current.id, current.title, [
+      {
+        text: "服务器冲突正文",
+        original_text: "镜头一原文",
+        storyboard: ["overwrite-rebase-frame-1"],
+        extra: { keep: "frame-one" },
+      },
+      {
+        text: "第二镜并发更新",
+        storyboard: ["overwrite-rebase-frame-2"],
+        extra: { revision: "concurrent" },
+        server_only: { preserve: true },
+      },
+    ])]);
+    await user.click(editor.getByRole("button", { name: "以草稿覆盖当前文字" }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument());
+    expect(base.updateChapter).toHaveBeenCalledTimes(1);
+    expect(base.updateChapter).toHaveBeenCalledWith(series.id, current.id, {
+      content: [
+        {
+          text: "明确覆盖后的正文",
+          original_text: "镜头一原文",
+          storyboard: ["overwrite-rebase-frame-1"],
+          extra: { keep: "frame-one" },
+        },
+        {
+          text: "第二镜并发更新",
+          storyboard: ["overwrite-rebase-frame-2"],
+          extra: { revision: "concurrent" },
+          server_only: { preserve: true },
+        },
+      ],
+    }, expect.any(AbortSignal));
+    expect(base.acquireChapterEditLock).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(base.releaseChapterEditLock).toHaveBeenCalledTimes(1));
+    expect(base.releaseChapterEditLock).toHaveBeenCalledWith(current.id, expect.any(AbortSignal), lease);
+  });
+
+  it("rejects a late close and reader 401 from the previous frame cursor", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-editor-stale-cursor", "旧游标回调章节", [
+      { text: "第一镜正文", character: ["stale-cursor-character"], storyboard: [] },
+      { text: "第二镜正文", character: [], storyboard: [] },
+    ]);
+    const base = makeServices([current], {}, false, true);
+    const pendingCharacters = deferred<Character[]>();
+    base.services.listCharacters = vi.fn(async () => pendingCharacters.promise);
+    const onUnauthorized = vi.fn();
+    renderBrowser(base.services, vi.fn(), onUnauthorized);
+
+    const firstFrame = await screen.findByRole("article", { name: "旧游标回调章节 · 镜头 1" });
+    await user.click(within(firstFrame).getByRole("button", { name: "编辑文字" }));
+    const firstDialog = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const staleClose = captureButtonHandler(firstDialog.getByRole("button", { name: "关闭文字编辑" }));
+    await user.click(firstDialog.getByRole("button", { name: "角色" }));
+    await waitFor(() => expect(base.services.listCharacters).toHaveBeenCalledTimes(1));
+    await user.click(firstDialog.getByRole("button", { name: "下一镜头" }));
+
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "镜头文字" })).toHaveValue("第二镜正文"));
+    staleClose();
+    expect(screen.getByRole("dialog", { name: "编辑分镜文字" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "镜头文字" })).toHaveValue("第二镜正文");
+
+    await act(async () => {
+      pendingCharacters.reject(new ApiError("http", "expired", 401));
+      await pendingCharacters.promise.catch(() => undefined);
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(screen.getByRole("dialog", { name: "编辑分镜文字" })).toBeInTheDocument();
+    expect(screen.getByRole("textbox", { name: "镜头文字" })).toHaveValue("第二镜正文");
+  });
+
+  it("stays on the current frame after a preflight conflict and blocks navigation after an unknown write", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-edit-sequence-unknown", "连续编辑保护章节", [
+      { text: "原始第一镜", original_text: "第一镜原文", storyboard: ["sequence-unknown-1"] },
+      { text: "第二镜", storyboard: ["sequence-unknown-2"] },
+    ]);
+    const assets = [asset("sequence-unknown-1", current.id), asset("sequence-unknown-2", current.id)];
+    const preflight = makeServices([current], { [current.id]: assets }, false, true);
+    renderBrowser(preflight.services);
+    const firstCard = await screen.findByRole("article", { name: "连续编辑保护章节 · 镜头 1" });
+    await user.click(within(firstCard).getByRole("button", { name: "编辑文字" }));
+    const editor = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = editor.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "草稿不应切镜");
+    preflight.setCurrentChapters([chapter(current.id, current.title, [
+      { text: "服务器并发修改", original_text: "第一镜原文", storyboard: ["sequence-unknown-1"] },
+      { text: "第二镜", storyboard: ["sequence-unknown-2"] },
+    ])]);
+    await user.click(editor.getByRole("button", { name: "下一镜头" }));
+
+    expect(await editor.findByRole("region", { name: "服务器当前镜头文字" })).toHaveTextContent("服务器并发修改");
+    expect(textbox).toHaveValue("草稿不应切镜");
+    expect(preflight.updateChapter).not.toHaveBeenCalled();
+    expect(editor.getByRole("button", { name: "下一镜头" })).toBeDisabled();
+
+    preflight.setCurrentChapters([chapter(current.id, current.title, [
+      { text: "服务器并发修改", original_text: "第一镜原文", storyboard: ["sequence-unknown-1"] },
+      { text: "第二镜", storyboard: ["sequence-unknown-2"] },
+    ])]);
+    await user.clear(textbox);
+    await user.type(textbox, "请求已发出但未知");
+    preflight.updateChapter.mockRejectedValueOnce(new ApiError("network", "PUT响应丢失"));
+    await user.click(editor.getByRole("button", { name: "保存文字" }));
+    await waitFor(() => expect(preflight.updateChapter).toHaveBeenCalledTimes(1));
+    expect(await editor.findByText(/不能再次提交或切镜/)).toBeInTheDocument();
+    expect(editor.getByRole("button", { name: "下一镜头" })).toBeDisabled();
+    expect(preflight.updateChapter).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the opening original-text snapshot separate from the draft after a conflict read", async () => {
     clearOriginalTextPanelPositions();
     const user = userEvent.setup();
@@ -4240,6 +4556,73 @@ describe("read-only chapter browser", () => {
       .map((key) => localStorage.getItem(key) ?? "");
     expect(savedOriginalValues.join("\n")).not.toContain("打开时原文");
     expect(savedOriginalValues.join("\n")).not.toContain("仍在编辑的草稿");
+  });
+
+  it("keeps the real reference reader mounted when hidden and shown inside the editor", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-editor-reference-reader", "编辑器素材章节", [{
+      text: "正文",
+      original_text: "打开原文",
+      character: ["reference-reader-character"],
+    }]);
+    const { services, updateChapter } = makeServices([current], {}, false, true);
+    const listCharacters = vi.fn(async () => []);
+    services.listCharacters = listCharacters;
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "编辑器素材章节 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const editorElement = await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    const editor = within(editorElement);
+    const panel = await editor.findByRole("region", { name: "镜头 1 的关联素材" });
+    expect(editor.getByRole("region", { name: "打开时原文" })).toHaveTextContent("打开原文");
+    expect(editorElement.contains(panel)).toBe(true);
+    await user.click(within(panel).getByRole("button", { name: "角色" }));
+    await waitFor(() => expect(listCharacters).toHaveBeenCalledTimes(1));
+    await user.click(within(panel).getByRole("button", { name: "关闭" }));
+    expect(panel).not.toBeVisible();
+    await user.click(editor.getByRole("button", { name: "显示关联素材" }));
+
+    expect(await editor.findByRole("region", { name: "镜头 1 的关联素材" })).toBe(panel);
+    expect(listCharacters).toHaveBeenCalledTimes(1);
+    expect(updateChapter).not.toHaveBeenCalled();
+  });
+
+  it("hides the old reference reader when a conflict refresh removes the current frame", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-editor-reference-owner-change", "素材所有者变化章节", [{
+      text: "原始正文",
+      original_text: "打开原文",
+      character: ["reference-owner-character"],
+    }]);
+    const { services, updateChapter, setCurrentChapters } = makeServices(
+      [current], {}, false, true,
+    );
+    const listCharacters = vi.fn(async () => []);
+    services.listCharacters = listCharacters;
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "素材所有者变化章节 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const dialogElement = await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    const dialog = within(dialogElement);
+    const panel = await dialog.findByRole("region", { name: "镜头 1 的关联素材" });
+    await user.click(within(panel).getByRole("button", { name: "角色" }));
+    await waitFor(() => expect(listCharacters).toHaveBeenCalledTimes(1));
+
+    const textbox = dialog.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "保留草稿");
+    setCurrentChapters([chapter(current.id, current.title, [])]);
+    await user.click(dialog.getByRole("button", { name: "保存文字" }));
+
+    expect(await dialog.findByRole("region", { name: "服务器当前镜头文字" })).toBeInTheDocument();
+    expect(textbox).toHaveValue("保留草稿");
+    expect(panel).not.toBeVisible();
+    expect(await dialog.findByText("当前镜头关联素材来源已变化，旧读取已隐藏。")).toBeInTheDocument();
+    expect(dialog.queryByRole("button", { name: "显示关联素材" })).not.toBeInTheDocument();
+    expect(listCharacters).toHaveBeenCalledTimes(1);
+    expect(updateChapter).not.toHaveBeenCalled();
   });
 
   it("keeps the editor and pending save mounted while hiding, floating, and reopening the original panel", async () => {
@@ -4439,6 +4822,149 @@ describe("read-only chapter browser", () => {
     expect(updateChapter).toHaveBeenCalledTimes(1);
     expect(listChapters.mock.calls.length).toBeGreaterThanOrEqual(3);
     expect(await screen.findByText("服务器已落库")).toBeInTheDocument();
+  });
+
+  it("keeps an unknown write bound to its original frame when another frame replaces that position", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-unknown-replaced", "未知写入身份章节", [
+      { text: "A原文", storyboard: ["unknown-frame-a"], frame_key: "A" },
+      { text: "C原文", storyboard: ["unknown-frame-c"], frame_key: "C" },
+    ]);
+    const { services, updateChapter, setCurrentChapters } = makeServices(
+      [current], {
+        [current.id]: [
+          asset("unknown-frame-a", current.id),
+          asset("unknown-frame-b", current.id),
+          asset("unknown-frame-c", current.id),
+        ],
+      }, false, true,
+    );
+    updateChapter.mockImplementationOnce(async () => {
+      setCurrentChapters([chapter(current.id, current.title, [
+        { text: "A的新草稿", storyboard: ["unknown-frame-b"], frame_key: "B" },
+        { text: "C原文", storyboard: ["unknown-frame-c"], frame_key: "C" },
+      ])]);
+      throw new ApiError("network", "写入响应丢失");
+    });
+    renderBrowser(services);
+
+    const article = await screen.findByRole("article", { name: "未知写入身份章节 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = dialog.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "A的新草稿");
+    await user.click(dialog.getByRole("button", { name: "保存文字" }));
+    await waitFor(() => expect(updateChapter).toHaveBeenCalledTimes(1));
+    expect(await dialog.findByText(/草稿已冻结，请只读核对/)).toBeInTheDocument();
+
+    await user.click(dialog.getByRole("button", { name: "只读核对来源" }));
+    expect(await dialog.findByText("最新章节和素材目录没有确认原写入结果。草稿继续冻结，不会自动重发。")).toBeInTheDocument();
+    expect(textbox).toHaveValue("A的新草稿");
+    expect(dialog.getByRole("button", { name: "下一镜头" })).toBeDisabled();
+    expect(dialog.getByRole("button", { name: "只读核对来源" })).toBeEnabled();
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("unfreezes an unknown write after a later read confirms the original frame structure", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-unknown-confirmed", "原镜头核对章节", [
+      { text: "A原文", storyboard: ["confirmed-frame-a"], frame_key: "A" },
+      { text: "B原文", storyboard: ["confirmed-frame-b"], frame_key: "B" },
+    ]);
+    const { services, updateChapter, setCurrentChapters } = makeServices(
+      [current], {
+        [current.id]: [asset("confirmed-frame-a", current.id), asset("confirmed-frame-b", current.id)],
+      }, false, true,
+    );
+    updateChapter.mockRejectedValueOnce(new ApiError("network", "写入响应丢失"));
+    renderBrowser(services);
+
+    const article = await screen.findByRole("article", { name: "原镜头核对章节 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = dialog.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "A已确认草稿");
+    await user.click(dialog.getByRole("button", { name: "保存文字" }));
+    expect(await dialog.findByRole("button", { name: "只读核对来源" })).toBeInTheDocument();
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+
+    setCurrentChapters([chapter(current.id, current.title, [
+      { text: "A已确认草稿", storyboard: ["confirmed-frame-a"], frame_key: "A" },
+      { text: "B原文", storyboard: ["confirmed-frame-b"], frame_key: "B" },
+    ])]);
+    await user.click(dialog.getByRole("button", { name: "只读核对来源" }));
+    expect(await dialog.findByText("原写入已通过章节与素材目录核对，可以继续编辑。")).toBeInTheDocument();
+    expect(textbox).toHaveValue("A已确认草稿");
+    expect(dialog.getByRole("button", { name: "下一镜头" })).toBeEnabled();
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+
+    await user.click(dialog.getByRole("button", { name: "下一镜头" }));
+    await waitFor(() => expect(screen.getByRole("textbox", { name: "镜头文字" })).toHaveValue("B原文"));
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("confirms a dispatched HTTP 408 text write through fresh reads without a second PUT", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-408-confirmed", "408写入确认章节", [
+      { text: "保存前", storyboard: ["408-confirmed-asset"], retained: true },
+    ]);
+    const { services, updateChapter, setCurrentChapters } = makeServices(
+      [current], { [current.id]: [asset("408-confirmed-asset", current.id)] }, false, true,
+    );
+    updateChapter.mockImplementationOnce(async (_seriesId, _chapterId, update) => {
+      if (update.content === undefined) throw new Error("Expected the frozen frame payload.");
+      setCurrentChapters([chapter(current.id, current.title, update.content)]);
+      throw new ApiError("http", "gateway timed out after dispatch", 408);
+    });
+    renderBrowser(services);
+
+    const article = await screen.findByRole("article", { name: "408写入确认章节 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = dialog.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "服务器已核对");
+    await user.click(dialog.getByRole("button", { name: "保存文字" }));
+
+    await waitFor(() => expect(updateChapter).toHaveBeenCalledTimes(1));
+    expect(await screen.findByText("服务器已核对")).toBeInTheDocument();
+    expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument();
+    expect(updateChapter).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks another save and frame navigation when a dispatched HTTP 408 cannot be confirmed", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-frame-408-unconfirmed", "408结果未知章节", [
+      { text: "A原文", storyboard: ["408-unknown-a"] },
+      { text: "B原文", storyboard: ["408-unknown-b"] },
+    ]);
+    const { services, updateChapter } = makeServices(
+      [current], {
+        [current.id]: [asset("408-unknown-a", current.id), asset("408-unknown-b", current.id)],
+      }, false, true,
+    );
+    updateChapter.mockRejectedValueOnce(new ApiError("http", "gateway timed out after dispatch", 408));
+    renderBrowser(services);
+
+    const article = await screen.findByRole("article", { name: "408结果未知章节 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    const textbox = dialog.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "尚未确认的草稿");
+    await user.click(dialog.getByRole("button", { name: "保存文字" }));
+    expect(await dialog.findByText(/请求可能仍在处理中/)).toBeInTheDocument();
+    expect(dialog.getByRole("button", { name: "下一镜头" })).toBeDisabled();
+    expect(dialog.queryByRole("button", { name: "保存文字" })).not.toBeInTheDocument();
+
+    await user.click(dialog.getByRole("button", { name: "只读核对来源" }));
+    expect(await dialog.findByText(/最新章节和素材目录没有确认原写入结果/)).toBeInTheDocument();
+    expect(textbox).toHaveValue("尚未确认的草稿");
+    expect(dialog.getByRole("button", { name: "下一镜头" })).toBeDisabled();
+    expect(dialog.queryByRole("button", { name: "保存文字" })).not.toBeInTheDocument();
+    expect(updateChapter).toHaveBeenCalledTimes(1);
   });
 
   it("clears the current session on a text preflight 401 without sending the chapter PUT", async () => {

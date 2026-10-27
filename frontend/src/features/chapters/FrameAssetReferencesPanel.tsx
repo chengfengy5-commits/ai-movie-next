@@ -26,7 +26,10 @@ import {
   writeFrameAssetReferenceScrollTop,
   type FrameAssetReferenceScrollScope,
 } from "./frameAssetReferenceScrollPreferences";
-import { useFloatingPanelPosition } from "./useFloatingPanelPosition";
+import {
+  useFloatingPanelPosition,
+  type FloatingPanelPresentation,
+} from "./useFloatingPanelPosition";
 
 export interface FrameAssetReferenceOwner {
   userId: string;
@@ -51,6 +54,10 @@ export interface FrameAssetReferencesPanelProps {
   owner: FrameAssetReferenceOwner;
   currentScope: FrameAssetReferenceScope;
   onClose(owner: FrameAssetReferenceOwner): void;
+  onHide?(owner: FrameAssetReferenceOwner): void;
+  hidden?: boolean;
+  initialPresentation?: FloatingPanelPresentation;
+  isOwnerCurrent?: () => boolean;
   onNavigateToAsset?(target: FrameAssetReferenceAssetTarget): void;
   onUnauthorized(): void;
 }
@@ -218,6 +225,10 @@ export function FrameAssetReferencesPanel({
   owner,
   currentScope,
   onClose,
+  onHide,
+  hidden = false,
+  initialPresentation = "inline",
+  isOwnerCurrent,
   onNavigateToAsset,
   onUnauthorized,
 }: FrameAssetReferencesPanelProps) {
@@ -256,7 +267,7 @@ export function FrameAssetReferencesPanel({
     apiBaseUrl: boundOwner.services.apiBaseUrl,
     ownerToken: boundOwner,
     isOwnerCurrent: () => isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch),
-    initialPresentation: "inline",
+    initialPresentation,
     defaultRightOffset: 400,
     defaultTop: 60,
     remeasureKey: floatingRemeasureKey,
@@ -271,6 +282,18 @@ export function FrameAssetReferencesPanel({
         : null;
   const unauthorizedCallback = useRef(onUnauthorized);
   unauthorizedCallback.current = onUnauthorized;
+  const ownerCurrentCallback = useRef(isOwnerCurrent);
+  ownerCurrentCallback.current = isOwnerCurrent;
+
+  function parentOwnerIsCurrent(): boolean {
+    const current = ownerCurrentCallback.current;
+    if (current === undefined) return true;
+    try {
+      return current();
+    } catch {
+      return false;
+    }
+  }
 
   function invalidateRead() {
     readGeneration.current += 1;
@@ -283,7 +306,8 @@ export function FrameAssetReferencesPanel({
       && candidate.openEpoch === openEpoch
       && owner === boundOwner
       && !scopeInvalidatedRef.current
-      && sameScope(boundOwner, currentScopeRef.current);
+      && sameScope(boundOwner, currentScopeRef.current)
+      && parentOwnerIsCurrent();
   }
 
   function scrollPreferenceScope(category: FrameAssetReferenceCategory): FrameAssetReferenceScrollScope | null {
@@ -456,7 +480,8 @@ export function FrameAssetReferencesPanel({
       && activeController.current === controller
       && readGeneration.current === generation
       && selectedCategoryRef.current === category
-      && sameScope(boundOwner, currentScopeRef.current);
+      && sameScope(boundOwner, currentScopeRef.current)
+      && parentOwnerIsCurrent();
 
     void readDirectory(boundOwner.services, category, boundOwner.seriesId, controller.signal).then((items) => {
       if (!isCurrent()) {
@@ -508,6 +533,13 @@ export function FrameAssetReferencesPanel({
 
   function close() {
     if (scopeInvalidatedRef.current) {
+      return;
+    }
+    if (onHide !== undefined) {
+      saveCurrentScrollPosition();
+      cancelScrollRestore();
+      floatingPosition.cancelDrag();
+      onHide(boundOwner);
       return;
     }
     saveCurrentScrollPosition();
@@ -586,6 +618,7 @@ export function FrameAssetReferencesPanel({
       assetId,
       isCurrent: () => !scopeInvalidatedRef.current
         && sameScope(boundOwner, currentScopeRef.current)
+        && parentOwnerIsCurrent()
         && selectedCategoryRef.current === category
         && readStateRef.current === readyState
         && readGeneration.current === generation
@@ -606,6 +639,7 @@ export function FrameAssetReferencesPanel({
       className={floatingModeActive
         ? "frame-asset-references-panel is-floating"
         : "frame-asset-references-panel"}
+      hidden={hidden}
       ref={floatingPosition.panelRef}
       style={floatingModeActive && floatingPosition.visiblePosition !== null
         ? { left: floatingPosition.visiblePosition.left, top: floatingPosition.visiblePosition.top, right: "auto" }

@@ -55,14 +55,20 @@ describe("frame asset reference panel position preferences", () => {
     const storage = memoryStorage();
     const assets = createFrameAssetReferencePanelPositionScope("position-user", "http://127.0.0.1:4175/api");
     const original = createFramePanelPositionScope("position-user", "http://127.0.0.1:4175/api", "frame-original");
+    const extractScript = createFramePanelPositionScope("position-user", "http://127.0.0.1:4175/api", "extract-script");
     expect(assets).not.toBeNull();
     expect(original).not.toBeNull();
-    if (assets === null || original === null) throw new Error("Both current scopes should be valid.");
+    expect(extractScript).not.toBeNull();
+    if (assets === null || original === null || extractScript === null) {
+      throw new Error("All current scopes should be valid.");
+    }
 
     expect(writeFrameAssetReferencePanelPosition(assets, { left: 700, top: 80 }, storage)).toBe("saved");
     expect(readFramePanelPosition(original, storage)).toEqual({ kind: "missing" });
     expect(writeFramePanelPosition(original, { left: 1020, top: 60 }, storage)).toBe("saved");
-    expect(storage.records.size).toBe(2);
+    expect(readFramePanelPosition(extractScript, storage)).toEqual({ kind: "missing" });
+    expect(writeFramePanelPosition(extractScript, { left: 1020, top: 60 }, storage)).toBe("saved");
+    expect(storage.records.size).toBe(3);
     const expectedAssetKey = `haoai.frame-asset-reference-panel-position.v1:${encodeURIComponent(JSON.stringify([
       "position-user",
       "http://127.0.0.1:4175/api",
@@ -72,12 +78,17 @@ describe("frame asset reference panel position preferences", () => {
     expect(Array.from(storage.records.keys())).toEqual(expect.arrayContaining([
       expect.stringMatching(/^haoai\.frame-asset-reference-panel-position\.v1:/),
       expect.stringMatching(/^haoai\.frame-original-reference-panel-position\.v1:/),
+      expect.stringMatching(/^haoai\.frame-extract-script-panel-position\.v1:/),
     ]));
     expect(readFrameAssetReferencePanelPosition(assets, storage)).toEqual({
       kind: "stored",
       position: { left: 700, top: 80 },
     });
     expect(readFramePanelPosition(original, storage)).toEqual({
+      kind: "stored",
+      position: { left: 1020, top: 60 },
+    });
+    expect(readFramePanelPosition(extractScript, storage)).toEqual({
       kind: "stored",
       position: { left: 1020, top: 60 },
     });

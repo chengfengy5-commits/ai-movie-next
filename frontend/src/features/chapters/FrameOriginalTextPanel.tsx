@@ -4,11 +4,13 @@ import type { FrameOriginalTextSnapshot } from "./frameOriginalTextSnapshot";
 
 interface FrameOriginalTextPanelProps {
   readonly snapshot: FrameOriginalTextSnapshot;
+  readonly hidden?: boolean;
   readonly userId: string | null | undefined;
   readonly apiBaseUrl: string | null | undefined;
   readonly lifecycleSignal: AbortSignal;
   readonly isOwnerCurrent: () => boolean;
   readonly onHide: () => void;
+  readonly onRestoreToEditor?: () => void;
 }
 
 function snapshotMessage(snapshot: FrameOriginalTextSnapshot): string | null {
@@ -19,11 +21,13 @@ function snapshotMessage(snapshot: FrameOriginalTextSnapshot): string | null {
 
 export function FrameOriginalTextPanel({
   snapshot,
+  hidden = false,
   userId,
   apiBaseUrl,
   lifecycleSignal,
   isOwnerCurrent,
   onHide,
+  onRestoreToEditor,
 }: FrameOriginalTextPanelProps) {
   const position = useFloatingPanelPosition({
     panelKind: "frame-original",
@@ -52,6 +56,7 @@ export function FrameOriginalTextPanel({
       className={position.floatingActive
         ? "frame-original-text-panel is-floating"
         : "frame-original-text-panel"}
+      hidden={hidden}
       ref={position.panelRef}
       style={position.floatingActive && position.visiblePosition !== null
         ? { left: position.visiblePosition.left, top: position.visiblePosition.top, right: "auto" }
@@ -63,6 +68,16 @@ export function FrameOriginalTextPanel({
           <h3 id="frame-original-text-panel-title">打开时原文</h3>
         </div>
         <div className="frame-original-text-panel-controls">
+          {snapshot.kind === "text" && snapshot.value !== "" && onRestoreToEditor !== undefined && (
+            <button
+              className="secondary-button"
+              disabled={lifecycleSignal.aborted}
+              onClick={onRestoreToEditor}
+              type="button"
+            >
+              回填打开时原文
+            </button>
+          )}
           {position.isSmallViewport && position.presentation === "floating" && (
             <span className="frame-original-text-panel-note" role="status">
               小屏幕下显示在编辑器内，桌面位置已保留。
