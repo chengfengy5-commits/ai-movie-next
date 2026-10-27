@@ -22,6 +22,11 @@ import {
 } from "./frameOptimizeSafety";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import { useSeriesDialogFocus } from "../series/useSeriesDialogFocus";
+import {
+  isFrameOptimizeConcurrency,
+  readFrameOptimizeConcurrencyPreference,
+  writeFrameOptimizeConcurrencyPreference,
+} from "./frameOptimizeConcurrencyPreference";
 import "./frameOptimize.css";
 
 export type FrameOptimizeAssetNames = ContentAssetNames;
@@ -139,7 +144,11 @@ export function FrameOptimizeDialog({
   const [promptId, setPromptId] = useState("");
   const [selectedIndices, setSelectedIndices] = useState<Set<number>>(() => new Set());
   const [enableThinking, setEnableThinking] = useState(false);
-  const [concurrency, setConcurrency] = useState(5);
+  const [concurrency, setConcurrency] = useState(() => readFrameOptimizeConcurrencyPreference({
+    apiBaseUrl: services.apiBaseUrl,
+    userId,
+  }));
+  const [concurrencyPreferenceNotice, setConcurrencyPreferenceNotice] = useState<string | null>(null);
   const [phase, setPhase] = useState<DialogPhase>("loading");
   const [runningTaskCheck, setRunningTaskCheck] = useState<RunningTaskCheck>("checking");
   const [taskId, setTaskId] = useState<string | null>(null);
@@ -168,6 +177,18 @@ export function FrameOptimizeDialog({
   prepareSubmitRef.current = prepareSubmit;
   verifySourceRef.current = verifyTaskSource;
   restoreRef.current = restoreOriginals;
+
+  function updateConcurrency(value: number): void {
+    setConcurrency(value);
+    if (!isFrameOptimizeConcurrency(value)) {
+      setConcurrencyPreferenceNotice(null);
+      return;
+    }
+    const saved = writeFrameOptimizeConcurrencyPreference({ apiBaseUrl: services.apiBaseUrl, userId }, value);
+    setConcurrencyPreferenceNotice(saved
+      ? null
+      : "浏览器未能保存并发偏好；当前值仍可用于本次优化。");
+  }
   const focus = useSeriesDialogFocus({ active: true, canDismiss: true, onDismiss: onClose });
   const frames = Array.isArray(chapter.content) ? chapter.content : [];
   const stableIndices = frames.flatMap((frame, index) => {
@@ -638,8 +659,9 @@ export function FrameOptimizeDialog({
             </label>
             <label className="frame-optimize-label">
               并发设置（3–10）
-              <input max={10} min={3} onChange={(event) => setConcurrency(Number(event.currentTarget.value))} type="number" value={concurrency} />
+              <input max={10} min={3} onChange={(event) => updateConcurrency(Number(event.currentTarget.value))} type="number" value={concurrency} />
             </label>
+            {concurrencyPreferenceNotice !== null && <p className="frame-optimize-muted" role="status">{concurrencyPreferenceNotice}</p>}
             <p className="frame-optimize-muted">并发值作为服务器请求配置；当前 worker 的实际执行仍为串行，不代表已验证并行处理。</p>
           </>
         )}
