@@ -51,6 +51,7 @@ import {
   type QuickReferenceSettings,
   type QuickReferenceTarget,
 } from "./quickReference";
+import { resolveQuickReferenceStyle } from "./quickReferenceStyle";
 import {
   readSingleMediaPreference,
   writeSingleMediaPreference,
@@ -2212,17 +2213,28 @@ export function MediaGenerationPage({
         setQuickReferenceActionMessage("当前目标没有可用的章节上下文，快速引用未应用。");
         return;
       }
-      if (plan.baseDescription.trim() === "" && plan.imageReferences.length === 0
-        && plan.audioReferences.length === 0 && plan.voiceNotes.length === 0) {
+      const styleCategory = capturedMode === "video"
+        ? "video"
+        : target.kind === "frame_message" ? "storyboard" : target.assetType;
+      const style = resolveQuickReferenceStyle({
+        series: selectedSeries,
+        prompts,
+        category: styleCategory,
+        ...(capturedMode === "video" ? { fallbackCategories: ["storyboard"] as const } : {}),
+      });
+      const imageReferences = [...plan.imageReferences];
+      if (style.imageUrl !== null && !imageReferences.includes(style.imageUrl)) imageReferences.push(style.imageUrl);
+      if (plan.baseDescription.trim() === "" && imageReferences.length === 0
+        && plan.audioReferences.length === 0 && plan.voiceNotes.length === 0 && style.promptText === "") {
         setQuickReferenceActionMessage("当前上下文没有可引用的描述或素材，输入未更改。");
         return;
       }
-      if (plan.imageReferences.length > REFERENCE_COUNT_LIMIT.image
+      if (imageReferences.length > REFERENCE_COUNT_LIMIT.image
         || plan.audioReferences.length > REFERENCE_COUNT_LIMIT.audio) {
         setQuickReferenceActionMessage("当前上下文的参考素材超过可提交上限；输入未更改，请先缩小引用范围。");
         return;
       }
-      if (!isImage && (!plan.imageReferences.every(isSafeHttpMediaReference)
+      if (!isImage && (!imageReferences.every(isSafeHttpMediaReference)
         || !plan.audioReferences.every(isSafeHttpMediaReference))) {
         setQuickReferenceActionMessage("当前视频服务只接受安全的公开 HTTP(S) 参考素材；受保护上传地址或内嵌图片暂未接通，输入未更改。");
         return;
@@ -2232,7 +2244,7 @@ export function MediaGenerationPage({
       const finalImageIndexes = new Map<string, number>();
       const indexByPreparedImage = new Map<string, number>();
       let totalImageBytes = 0;
-      for (const source of plan.imageReferences) {
+      for (const source of imageReferences) {
         let prepared = source;
         if (capturedMode === "image" && isSafeCanvasUploadPath(source)) {
           if (capturedServices.canvasData === undefined) {
@@ -2274,7 +2286,7 @@ export function MediaGenerationPage({
       if (!isCurrentAction()) return;
 
       const finalAudioIndexes = new Map(plan.audioReferences.map((url, index) => [url, index + 1] as const));
-      const description = formatQuickReferenceDescription(plan, finalImageIndexes, finalAudioIndexes);
+      const description = formatQuickReferenceDescription(plan, finalImageIndexes, finalAudioIndexes, style);
       let matchedDuration: ReturnType<typeof matchQuickReferenceDuration> | null = null;
       if (!isImage && capturedSettings.matchDuration) {
         matchedDuration = matchQuickReferenceDuration(description, videoOptions.durations);

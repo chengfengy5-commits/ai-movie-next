@@ -38,6 +38,11 @@ export interface QuickReferencePlan {
   readonly voiceNotes: readonly string[];
 }
 
+export interface QuickReferenceStyleReference {
+  readonly promptText: string;
+  readonly imageUrl: string | null;
+}
+
 export interface BuildQuickReferencePlanInput {
   readonly mode: QuickReferenceMode;
   readonly target: QuickReferenceTarget;
@@ -296,6 +301,7 @@ function directAssetDescription(
   if (storyboard === undefined) return null;
   const frame = input.chapterContent?.find((candidate) => idList(isRecord(candidate) ? candidate.storyboard : null).includes(target.assetId));
   return validText(isRecord(frame) ? frame.text : null)
+    ?? validText(isRecord(frame) ? frame.original_text : null)
     ?? [storyboard.name, storyboard.description].filter((part) => validText(part) !== null).join("\n");
 }
 
@@ -348,6 +354,7 @@ export function buildQuickReferencePlan(input: BuildQuickReferencePlanInput): Qu
 
   const frameRecord = isRecord(frame) ? frame : {};
   const baseDescription = validText(frameRecord.text)
+    ?? validText(frameRecord.original_text)
     ?? (input.target.kind === "asset_message"
       ? [input.storyboardAssets.find((item) => item.id === storyboardId)?.name,
         input.storyboardAssets.find((item) => item.id === storyboardId)?.description]
@@ -442,6 +449,7 @@ export function formatQuickReferenceDescription(
   plan: QuickReferencePlan,
   finalImageIndexes: ReadonlyMap<string, number>,
   finalAudioIndexes: ReadonlyMap<string, number>,
+  style: QuickReferenceStyleReference = { promptText: "", imageUrl: null },
 ): string {
   const sections = [plan.baseDescription.trim()].filter((section) => section !== "");
   const imageLines = plan.imageLabels.flatMap(({ url, label }) => {
@@ -449,6 +457,11 @@ export function formatQuickReferenceDescription(
     return index === undefined ? [] : [`图片${index} = ${label}`];
   });
   if (imageLines.length > 0) sections.push(`【图片参考】\n${imageLines.join("\n")}`);
+  if (style.promptText.trim() !== "") sections.push(style.promptText.trim());
+  const styleImageIndex = style.imageUrl === null ? undefined : finalImageIndexes.get(style.imageUrl);
+  if (styleImageIndex !== undefined) {
+    sections.push(`【风格参考图】（仅供视觉风格/画风参考，如3D渲染、二次元、水墨等风格方向，不涉及角色外貌、服装、道具等具体信息）\n图片${styleImageIndex} = 风格参考`);
+  }
   if (plan.voiceNotes.length > 0) sections.push(`【角色音色】\n${plan.voiceNotes.join("\n")}`);
   const audioLines = plan.audioLabels.flatMap(({ url, label }) => {
     const index = finalAudioIndexes.get(url);

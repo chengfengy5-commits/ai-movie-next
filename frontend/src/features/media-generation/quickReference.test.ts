@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Character, FusedAsset, Prop, Scene, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
+import type { CreatorPrompt } from "../../shared/api/creatorSettings";
 import {
   buildQuickReferencePlan,
   defaultQuickReferenceSettings,
@@ -9,8 +10,81 @@ import {
   quickReferenceEditsMatch,
   restoreQuickReferenceSettings,
 } from "./quickReference";
+import { resolveQuickReferenceStyle } from "./quickReferenceStyle";
 
 describe("quick reference preferences and context", () => {
+  it("resolves owner and shared style text and images by the requested category chain", () => {
+    const prompt: CreatorPrompt = {
+      id: "style-prompt",
+      category: "style",
+      name: "剧集风格",
+      user_prompt: JSON.stringify({
+        video: "视频专属风格",
+        storyboard: "分镜回退风格",
+        general: "通用风格",
+        video_image: "https://cdn.example.test/video-style.png",
+        storyboard_image: "/uploads/storyboard-style.png",
+        character_image: "https://cdn.example.test/character-style.png",
+      }),
+      system_prompt: "系统提示词不优先",
+      sort_order: 0,
+      user_id: "owner",
+    };
+    const ownerSeries = { style_prompt_id: prompt.id, style_prompt: "剧集共享兜底" };
+
+    expect(resolveQuickReferenceStyle({
+      series: ownerSeries,
+      prompts: [prompt],
+      category: "video",
+      fallbackCategories: ["storyboard"],
+    })).toEqual({ promptText: "【风格提示词】\n视频专属风格", imageUrl: "https://cdn.example.test/video-style.png" });
+    expect(resolveQuickReferenceStyle({
+      series: ownerSeries,
+      prompts: [{ ...prompt, user_prompt: JSON.stringify({ storyboard: "分镜回退风格", storyboard_image: "/uploads/storyboard-style.png" }) }],
+      category: "video",
+      fallbackCategories: ["storyboard"],
+    })).toEqual({ promptText: "【风格提示词】\n分镜回退风格", imageUrl: "/uploads/storyboard-style.png" });
+    expect(resolveQuickReferenceStyle({
+      series: ownerSeries,
+      prompts: [{ ...prompt, user_prompt: "", system_prompt: "纯文本系统风格" }],
+      category: "scene",
+    })).toEqual({ promptText: "【风格提示词】\n纯文本系统风格", imageUrl: null });
+    expect(resolveQuickReferenceStyle({
+      series: { style_prompt_id: "shared-style-prompt", style_prompt: JSON.stringify({ default: "共享风格", scene_image: "https://cdn.example.test/scene-style.png" }) },
+      prompts: [],
+      category: "scene",
+    })).toEqual({ promptText: "【风格提示词】\n共享风格", imageUrl: "https://cdn.example.test/scene-style.png" });
+  });
+
+  it("does not use style text without a style ID or fall back to image-only JSON", () => {
+    const styleText = JSON.stringify({ character_image: "https://cdn.example.test/character.png" });
+    expect(resolveQuickReferenceStyle({
+      series: { style_prompt_id: null, style_prompt: styleText },
+      prompts: [],
+      category: "character",
+    })).toEqual({ promptText: "", imageUrl: null });
+    expect(resolveQuickReferenceStyle({
+      series: { style_prompt_id: "", style_prompt: styleText },
+      prompts: [],
+      category: "character",
+    })).toEqual({ promptText: "", imageUrl: null });
+    expect(resolveQuickReferenceStyle({
+      series: { style_prompt_id: "style", style_prompt: null },
+      prompts: [{
+        id: "style", category: "style", name: "风格", user_prompt: styleText, sort_order: 0, user_id: "owner",
+      }],
+      category: "character",
+    })).toEqual({ promptText: "", imageUrl: "https://cdn.example.test/character.png" });
+    expect(resolveQuickReferenceStyle({
+      series: { style_prompt_id: "style", style_prompt: null },
+      prompts: [{
+        id: "style", category: "style", name: "风格",
+        user_prompt: JSON.stringify({ character: "角色文本", scene: "场景文本" }), sort_order: 0, user_id: "owner",
+      }],
+      category: "prop",
+    })).toEqual({ promptText: "", imageUrl: null });
+  });
+
   it("migrates legacy flat leaves and preserves other mode values and unknown keys on a leaf update", () => {
     const latest = {
       quick_ref_settings: { scene: false, characterVoice: false, custom_setting: "keep" },
@@ -110,5 +184,27 @@ describe("quick reference preferences and context", () => {
       context: "第2镜 7.2秒",
     });
     expect(matchQuickReferenceDuration("没有时长数字", [5, 10]).duration).toBeNull();
+  });
+
+  it("uses original frame text before the existing storyboard fallback", () => {
+    const settings = defaultQuickReferenceSettings();
+    const storyboard: StoryboardAsset = {
+      id: "storyboard", series_id: "series", chapter_id: "chapter", frame_index: 0,
+      name: "镜头资产名", description: "镜头资产描述", image_url: null,
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    };
+    const build = (frame: StoryboardFrame) => buildQuickReferencePlan({
+      mode: "image",
+      target: { kind: "asset_message", assetType: "storyboard", assetId: storyboard.id },
+      settings: settings.image,
+      chapterContent: [frame],
+      storyboardAssets: [storyboard],
+      characters: [], scenes: [], props: [], fusedAssets: [],
+    });
+
+    expect(build({ storyboard: [storyboard.id], text: "", original_text: "原始镜头正文" } as StoryboardFrame)?.baseDescription)
+      .toBe("原始镜头正文");
+    expect(build({ storyboard: [storyboard.id], text: "", original_text: "" } as StoryboardFrame)?.baseDescription)
+      .toBe("镜头资产名\n镜头资产描述");
   });
 });
