@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 import re
 import threading
 from collections.abc import AsyncIterator, Callable, Coroutine, Mapping, Sequence
@@ -236,7 +237,7 @@ class ManxiaobaiVideoProvider:
 
         origin = self._validated_origin()
         try:
-            status_code, body = await self._request_bytes(
+            status_code, body, cleanup_completed = await self._request_bytes(
                 method="POST",
                 url=f"{origin}{VIDEO_COLLECTION_PATH}",
                 headers={
@@ -256,6 +257,30 @@ class ManxiaobaiVideoProvider:
         except (_HttpRequestFailed, _ResponseTooLarge):
             return self._unknown_create(intent)
 
+        if status_code == 408:
+            return self._unknown_create(intent)
+        if status_code == 200:
+            try:
+                parsed = parse_manxiaobai_create_response(body)
+            except ManxiaobaiCodecError:
+                return self._unknown_create(intent)
+
+            external_id = parsed.source_id
+            if not self._valid_provider_id(external_id):
+                return self._unknown_create(intent)
+            if _contains_secret_echo(external_id, credential.secret):
+                return self._unknown_create(intent)
+            return ExternalOperationRef(
+                intent_id=intent.external_submission_id,
+                attempt_id=intent.attempt_id,
+                provider=PROVIDER_ID,
+                external_id=external_id,
+                create_outcome="submitted",
+                last_safe_provider_state="submitted",
+            )
+
+        if not cleanup_completed:
+            return self._unknown_create(intent)
         if status_code != 200:
             if 400 <= status_code < 500:
                 return ExternalOperationRef(
@@ -267,24 +292,7 @@ class ManxiaobaiVideoProvider:
                 )
             return self._unknown_create(intent)
 
-        try:
-            parsed = parse_manxiaobai_create_response(body)
-        except ManxiaobaiCodecError:
-            return self._unknown_create(intent)
-
-        external_id = parsed.source_id
-        if not self._valid_provider_id(external_id):
-            return self._unknown_create(intent)
-        if _contains_secret_echo(external_id, credential.secret):
-            return self._unknown_create(intent)
-        return ExternalOperationRef(
-            intent_id=intent.external_submission_id,
-            attempt_id=intent.attempt_id,
-            provider=PROVIDER_ID,
-            external_id=external_id,
-            create_outcome="submitted",
-            last_safe_provider_state="submitted",
-        )
+        return self._unknown_create(intent)
 
     async def _query_once(
         self,
@@ -307,7 +315,7 @@ class ManxiaobaiVideoProvider:
         origin = self._validated_origin()
         path_id = _encode_path_segment(external_ref.external_id or "")
         try:
-            status_code, body = await self._request_bytes(
+            status_code, body, cleanup_completed = await self._request_bytes(
                 method="GET",
                 url=f"{origin}{VIDEO_COLLECTION_PATH}/{path_id}",
                 headers={"Authorization": f"Bearer {credential.secret}"},
@@ -322,6 +330,10 @@ class ManxiaobaiVideoProvider:
                 "configuration_unavailable", "provider query is unavailable"
             ) from None
 
+        if not cleanup_completed:
+            raise self._error(
+                "configuration_unavailable", "provider query is unavailable"
+            )
         if status_code != 200:
             raise self._error(
                 "configuration_unavailable",
@@ -394,40 +406,48 @@ class ManxiaobaiVideoProvider:
         content: bytes | None,
         timeout_seconds: float,
         mark_create_started: bool,
-    ) -> tuple[int, bytes]:
-        try:
-            client = self._http_client_factory()
-        except Exception:
-            raise _ClientUnavailable from None
-
+    ) -> tuple[int, bytes, bool]:
+        request_timeout = self._remaining_request_timeout(timeout_seconds)
+        deadline = asyncio.get_running_loop().time() + request_timeout
+        client: AsyncHttpClient | None = None
         response: object | None = None
+        iterator: object | None = None
+        result: tuple[int, bytes, bool] | None = None
+        request_started = False
         try:
-            if mark_create_started:
-                self._create_started = True
-            try:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    content=content,
-                    timeout_seconds=timeout_seconds,
-                    follow_redirects=False,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                raise _HttpRequestFailed from None
+            async with asyncio.timeout_at(deadline):
+                try:
+                    client = self._http_client_factory()
+                except Exception:
+                    raise _ClientUnavailable from None
+                if mark_create_started:
+                    self._create_started = True
+                request_started = True
+                try:
+                    response = await client.request(
+                        method,
+                        url,
+                        headers=headers,
+                        content=content,
+                        timeout_seconds=request_timeout,
+                        follow_redirects=False,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    raise _HttpRequestFailed from None
 
-            status_code = getattr(response, "status_code", None)
-            if type(status_code) is not int or not 100 <= status_code <= 599:
-                raise _HttpRequestFailed
-            if status_code != 200:
-                result = (status_code, b"")
-            else:
-                result = (status_code, await _read_bounded_response(response))
+                status_code = getattr(response, "status_code", None)
+                if type(status_code) is not int or not 100 <= status_code <= 599:
+                    raise _HttpRequestFailed
+                if status_code != 200:
+                    result = (status_code, b"", True)
+                else:
+                    body, iterator = await _read_bounded_response(response, deadline)
+                    result = (status_code, body, True)
         except BaseException as error:
             try:
-                await _close_resources(response, client)
+                await _close_resources_until(deadline, iterator, response, client)
             except asyncio.CancelledError:
                 if not isinstance(error, asyncio.CancelledError):
                     raise
@@ -435,15 +455,47 @@ class ManxiaobaiVideoProvider:
                 pass
             if isinstance(
                 error,
-                (asyncio.CancelledError, _ResponseTooLarge, _HttpRequestFailed),
+                (
+                    asyncio.CancelledError,
+                    _ResponseTooLarge,
+                    _HttpRequestFailed,
+                    _ClientUnavailable,
+                ),
             ):
                 raise
             if isinstance(error, Exception):
-                raise _HttpRequestFailed from None
+                if request_started:
+                    raise _HttpRequestFailed from None
+                raise _ClientUnavailable from None
             raise
 
-        await _close_resources(response, client)
-        return result
+        assert result is not None
+        cleanup_completed = await _close_resources_until(
+            deadline, iterator, response, client
+        )
+        return result[0], result[1], result[2] and cleanup_completed
+
+    def _remaining_request_timeout(self, request_limit: float) -> float:
+        try:
+            now = self._clock()
+            deadline = self._committed_intent.deadline_at
+            if (
+                not isinstance(now, datetime)
+                or now.tzinfo is None
+                or now.utcoffset() is None
+                or not isinstance(deadline, datetime)
+                or deadline.tzinfo is None
+                or deadline.utcoffset() is None
+            ):
+                raise ValueError
+            remaining = (
+                deadline.astimezone(timezone.utc) - now.astimezone(timezone.utc)
+            ).total_seconds()
+        except Exception:
+            raise _HttpRequestFailed from None
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise _HttpRequestFailed
+        return min(request_limit, remaining)
 
     def _observation(
         self,
@@ -757,7 +809,9 @@ class ManxiaobaiVideoProvider:
         return GenerationError(code, detail)
 
 
-async def _read_bounded_response(response: object) -> bytes:
+async def _read_bounded_response(
+    response: object, deadline: float
+) -> tuple[bytes, object]:
     headers = getattr(response, "headers", {})
     if isinstance(headers, Mapping):
         for key, value in headers.items():
@@ -787,16 +841,14 @@ async def _read_bounded_response(response: object) -> bytes:
         body = b"".join(pieces)
     except asyncio.CancelledError as original_cancel:
         try:
-            await _close_resource(iterator)
+            await _close_resource_until_deadline(iterator, deadline)
         except asyncio.CancelledError:
             pass
         raise original_cancel
     except BaseException:
-        await _close_resource(iterator)
+        await _close_resource_until_deadline(iterator, deadline)
         raise
-    else:
-        await _close_resource(iterator)
-        return body
+    return body, iterator
 
 
 async def _close_resource(resource: object | None) -> None:
@@ -817,16 +869,32 @@ async def _close_resource(resource: object | None) -> None:
         return
 
 
-async def _close_resources(*resources: object | None) -> None:
+async def _close_resource_until_deadline(
+    resource: object | None, deadline: float
+) -> bool:
+    try:
+        async with asyncio.timeout_at(deadline):
+            await _close_resource(resource)
+    except TimeoutError:
+        return False
+    return True
+
+
+async def _close_resources_until(
+    deadline: float, *resources: object | None
+) -> bool:
     first_error: BaseException | None = None
+    cleanup_completed = True
     for resource in resources:
         try:
-            await _close_resource(resource)
+            if not await _close_resource_until_deadline(resource, deadline):
+                cleanup_completed = False
         except BaseException as error:
             if first_error is None:
                 first_error = error
     if first_error is not None:
         raise first_error
+    return cleanup_completed
 
 
 def _https_origin(value: object) -> str | None:
