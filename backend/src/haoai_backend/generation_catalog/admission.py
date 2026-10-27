@@ -224,6 +224,7 @@ def prepare_admission(
                     _validate_reference_policy(
                         item,
                         details.params,
+                        provider=details.provider,
                     )
                     prompt = _select_prompt(catalog, account.user_id, item)
                     if prompt is not None and item.prompt_operation in {
@@ -539,7 +540,12 @@ def _effective_prompt_digest(item: _ItemSpec, selection: PromptSelection | None)
     return None
 
 
-def _validate_reference_policy(item: _ItemSpec, params: object) -> None:
+def _validate_reference_policy(
+    item: _ItemSpec,
+    params: object,
+    *,
+    provider: str | None = None,
+) -> None:
     references = {
         "reference_images": item.reference_images,
         "reference_audios": item.reference_audios,
@@ -551,6 +557,21 @@ def _validate_reference_policy(item: _ItemSpec, params: object) -> None:
         raise CatalogError("text operation does not accept media references")
     if item.category is ModelCategory.TEXT:
         return
+    if item.category is ModelCategory.VIDEO:
+        route = provider.lower() if isinstance(provider, str) else None
+        if route == "aistarslab":
+            if (
+                len(item.reference_images) > 9
+                or len(item.reference_audios) > 5
+                or len(item.reference_videos) > 5
+            ):
+                raise CatalogError("AIStarsLab reference count exceeds its provider limits")
+        elif route in {"xai", "manxiaobai"} and (
+            item.reference_audios or item.reference_videos
+        ):
+            raise CatalogError(
+                "selected video provider does not accept audio or video references"
+            )
     parsed = params
     if isinstance(parsed, str):
         try:

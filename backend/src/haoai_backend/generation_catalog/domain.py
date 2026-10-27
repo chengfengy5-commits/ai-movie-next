@@ -89,6 +89,7 @@ class CatalogModel:
     credential_configured: bool = False
     active: bool = True
     sort_order: int = 0
+    provider: str | None = None
 
     def __post_init__(self) -> None:
         _require_public_label(self.id, "model id")
@@ -97,6 +98,8 @@ class CatalogModel:
             _require_public_label(self.wire_model, "model wire_model")
         if self.owner_id is not None:
             _require_text(self.owner_id, "model owner_id")
+        if self.provider is not None:
+            _require_text(self.provider, "model provider")
         try:
             category = ModelCategory(self.category)
         except (TypeError, ValueError) as exc:

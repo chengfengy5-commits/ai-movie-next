@@ -43,7 +43,12 @@ from haoai_backend.generation_catalog.admission_types import (
     LockedTargetFacts,
     PreparedItemFacts,
 )
+from haoai_backend.generation_catalog.admission import (
+    _ItemSpec,
+    _validate_reference_policy,
+)
 from haoai_backend.generation_catalog.domain import (
+    CatalogError,
     ModelCategory,
     ModelSelection,
     ModelSource,
@@ -880,6 +885,44 @@ class _G2PublicObservations:
         return cls([], [], [], [], [])
 
 
+@pytest.mark.parametrize(
+    ("field_name", "maximum"),
+    (
+        ("reference_images", 9),
+        ("reference_audios", 5),
+        ("reference_videos", 5),
+    ),
+)
+def test_aistarslab_video_reference_policy_enforces_provider_group_limits(
+    field_name: str,
+    maximum: int,
+) -> None:
+    valid_item = _ItemSpec(
+        index=0,
+        category=ModelCategory.VIDEO,
+        model_id="aistarslab-model",
+        **{
+            field_name: tuple(
+                f"https://media.example.test/{field_name}/{index}"
+                for index in range(maximum)
+            )
+        },
+    )
+    _validate_reference_policy(valid_item, {}, provider="aistarslab")
+
+    over_limit_item = replace(
+        valid_item,
+        **{
+            field_name: tuple(
+                f"https://media.example.test/{field_name}/{index}"
+                for index in range(maximum + 1)
+            )
+        },
+    )
+    with pytest.raises(CatalogError, match="AIStarsLab reference count"):
+        _validate_reference_policy(over_limit_item, {}, provider="aistarslab")
+
+
 def _joint_sqlite_schema(engine: Engine) -> None:
     def enable_foreign_keys(connection, _record) -> None:
         cursor = connection.cursor()
@@ -1131,6 +1174,11 @@ def _joint_registered_capabilities(
     owner_or_system = (
         _G2_JOINT_ACTOR_ID if model_source is ModelSource.USER else "system"
     )
+    endpoint_base_url = (
+        "https://provider.example.test/openapi"
+        if _G2_JOINT_PROVIDER == "aistarslab"
+        else "https://provider.example.test/v2"
+    )
     scope = CredentialScope(
         model_source.value,
         _G2_JOINT_MODEL_ID,
@@ -1151,7 +1199,7 @@ def _joint_registered_capabilities(
         valid_until=_G2_JOINT_NOW + timedelta(days=30),
         revoked_at=None,
         endpoint_policy=CredentialEndpointPolicy.from_base_url(
-            "https://provider.example.test/v2",
+            endpoint_base_url,
             allowed_content_paths=("/v1/files/{file_id}",),
         ),
         guard_key_id=crypto.guard_key_id,
