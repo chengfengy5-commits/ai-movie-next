@@ -6,6 +6,7 @@ import asyncio
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import socket
@@ -19,8 +20,9 @@ import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 import pytest
@@ -176,18 +178,54 @@ class _FakeS3Client:
         *,
         close_failures: int = 0,
         state: dict[str, Any] | None = None,
+        endpoint_url: str = "https://r2.example.test",
     ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.head_bucket_calls: list[str] = []
         self.close_calls = 0
         self.close_failures = close_failures
         self.state = state or {}
+        self.endpoint_url = endpoint_url
+        self._before_send_handlers: list[Any] = []
+        self.meta = SimpleNamespace(
+            service_model=_FakeS3ServiceModel(),
+            events=_FakeS3Events(self._before_send_handlers),
+        )
+
+    def _dispatch(self, operation: str, bucket: str, key: str) -> None:
+        endpoint = urlsplit(self.endpoint_url)
+        path = endpoint.path.rstrip("/")
+        path += f"/{quote(bucket, safe='')}/{quote(key, safe='/~')}"
+        request_url = f"{endpoint.scheme}://{endpoint.netloc}{path}"
+        request = SimpleNamespace(url=request_url)
+        event_name = f"before-send.s3.{operation}"
+        for handler in tuple(self._before_send_handlers):
+            handler(request=request, event_name=event_name)
+        self.state.setdefault("owned_send_requests", []).append(
+            (operation, request_url)
+        )
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
+        self._dispatch("PutObject", kwargs["Bucket"], kwargs["Key"])
+        body_bytes = kwargs["Body"].read()
+        objects = self.state.setdefault("objects", {})
+        object_key = (kwargs["Bucket"], kwargs["Key"])
+        if object_key in objects and kwargs.get("IfNoneMatch") == "*":
+            return {
+                "ResponseMetadata": {
+                    "HTTPStatusCode": 412,
+                    "RequestId": "synthetic-existing-object",
+                }
+            }
+        if self.state.get("put_mode") != "ack_unknown":
+            objects[object_key] = {
+                "body": body_bytes,
+                "content_type": kwargs["ContentType"],
+            }
         self.calls.append(
             {
                 **kwargs,
-                "body_bytes": kwargs["Body"].read(),
+                "body_bytes": body_bytes,
             }
         )
         put_started = self.state.get("put_started")
@@ -203,6 +241,28 @@ class _FakeS3Client:
                 "HTTPStatusCode": 200,
                 "RequestId": "synthetic-request-id",
             }
+        }
+
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, Any]:
+        self._dispatch("GetObject", Bucket, Key)
+        object_value = self.state.get("objects", {}).get((Bucket, Key))
+        if object_value is None:
+            return {
+                "ResponseMetadata": {
+                    "HTTPStatusCode": 404,
+                    "RequestId": "synthetic-object-not-found",
+                },
+                "Body": io.BytesIO(b""),
+            }
+        body = object_value["body"]
+        return {
+            "Body": io.BytesIO(body),
+            "ContentLength": len(body),
+            "ContentType": object_value["content_type"],
+            "ResponseMetadata": {
+                "HTTPStatusCode": 200,
+                "RequestId": "synthetic-object-read",
+            },
         }
 
     def head_bucket(self, *, Bucket: str) -> None:
@@ -225,9 +285,30 @@ class _FakeBotoSession:
         client = _FakeS3Client(
             close_failures=self.state["close_failures"],
             state=self.state,
+            endpoint_url=str(kwargs["endpoint_url"]),
         )
         self.state["clients"].append(client)
         return client
+
+
+class _FakeS3Events:
+    def __init__(self, handlers: list[Any]) -> None:
+        self._handlers = handlers
+
+    def register_first(self, event_name: str, handler: Any) -> None:
+        assert event_name == "before-send.s3"
+        self._handlers.insert(0, handler)
+
+
+class _FakeS3ServiceModel:
+    def operation_model(self, name: str) -> object:
+        members = {
+            "Bucket": object(),
+            "Key": object(),
+        }
+        if name == "PutObject":
+            members["IfNoneMatch"] = object()
+        return SimpleNamespace(input_shape=SimpleNamespace(members=members))
 
 
 def _sdk_factories(
@@ -2150,12 +2231,30 @@ def test_fused_only_server_host_runs_url_and_inline_results_through_owned_storag
         )
         assert request_options["follow_redirects"] is False
         assert len(public_library.get_calls) == (2 if output_kind == "url" else 1)
-        assert len(sdk_state["clients"]) == 1
-        assert len(sdk_state["clients"][0].calls) == 1
+        assert len(sdk_state["clients"]) == 2
+        assert sum(len(client.calls) for client in sdk_state["clients"]) == 1
         storage_call = sdk_state["clients"][0].calls[0]
         assert storage_call["ContentType"] == "image/png"
         assert storage_call["body_bytes"] == _prepared_png()
+        assert storage_call["IfNoneMatch"] == "*"
         assert storage_call["Key"].split("/")[3] == "generation"
+        assert [method for method, _url in sdk_state["owned_send_requests"]] == [
+            "PutObject",
+            "GetObject",
+        ]
+        expected_endpoint = urlsplit(configuration.r2_configuration.endpoint_url)
+        expected_path = (
+            f"{expected_endpoint.path.rstrip('/')}/"
+            f"{quote(configuration.r2_configuration.bucket, safe='')}/"
+            f"{quote(storage_call['Key'], safe='/~')}"
+        )
+        for _method, request_url in sdk_state["owned_send_requests"]:
+            sent = urlsplit(request_url)
+            assert (sent.scheme, sent.netloc, sent.path) == (
+                expected_endpoint.scheme,
+                expected_endpoint.netloc,
+                expected_path,
+            )
 
         with host.app.state.server_engine.connect() as connection:
             assets = connection.execute(select(fused_asset_rows)).mappings().all()
@@ -2793,7 +2892,7 @@ def test_fused_host_recovery_accepts_snapshot_ready_using_reserved_ids_and_promp
                     assert task["status"] == "completed"
                     assert task["message_id"] == reserved_message_id
                     assert len(provider_client.calls) == 1
-                    assert len(sdk_state["clients"]) == 1
+                    assert len(sdk_state["clients"]) == 2
                     return await client.get(
                         "/api/fused-assets/submissions",
                         headers={"Authorization": f"Bearer {token}"},

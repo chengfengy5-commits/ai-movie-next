@@ -100,6 +100,7 @@ from .media_uploads import MediaUploadApplication, build_media_uploads_router
 from .media_uploads.authentication import create_media_upload_identity_resolver
 from .fused_generation import (
     FusedGenerationImageStorage,
+    FusedGenerationPlannedMediaStorage,
     FusedGenerationRuntime,
     FusedGenerationStorage,
 )
@@ -286,6 +287,7 @@ def create_app(
     fused_generation_runtime: FusedGenerationRuntime | None = None,
     fused_generation_storage: FusedGenerationStorage | None = None,
     fused_generation_inline_image_storage: FusedGenerationImageStorage | None = None,
+    fused_generation_planned_media_storage: FusedGenerationPlannedMediaStorage | None = None,
     fused_generation_credential_registry: CredentialRegistry | None = None,
     fused_generation_credential_crypto: CredentialCrypto | None = None,
     fused_generation_proof_authority: HmacProofAuthority | None = None,
@@ -1372,6 +1374,7 @@ def create_app(
         uow_factory=fused_uow_factory,
         storage=fused_generation_storage,
         inline_image_storage=fused_generation_inline_image_storage,
+        planned_media_storage=fused_generation_planned_media_storage,
         credential_registry=fused_generation_credential_registry,
         credential_crypto=fused_generation_credential_crypto,
         proof_authority=fused_generation_proof_authority,
@@ -1400,6 +1403,7 @@ def create_app(
             ),
             storage=fused_generation_storage,
             inline_image_storage=fused_generation_inline_image_storage,
+            planned_media_storage=fused_generation_planned_media_storage,
             credential_registry=fused_generation_credential_registry,
             credential_crypto=fused_generation_credential_crypto,
             proof_authority=fused_generation_proof_authority,

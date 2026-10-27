@@ -19,12 +19,16 @@ from haoai_backend.generation_core.schema import (
     FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM,
     FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
     FUSED_GENERATION_SUBMISSIONS_TABLE_NAME,
+    FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM,
+    FUSED_MEDIA_WRITES_SCHEMA_VERSION,
+    FUSED_MEDIA_WRITES_TABLE_NAME,
     GENERATION_MIGRATION_HISTORY_TABLE,
     GENERATION_RECORD_TABLE_NAMES,
     GENERATION_SCHEMA_CHECKSUM,
     GENERATION_SCHEMA_VERSION,
     check_canvas_result_target_schema,
     check_fused_generation_submission_schema,
+    check_fused_media_write_schema,
     check_foundation_schema,
     check_generation_record_schema,
     check_generation_version_set,
@@ -98,6 +102,12 @@ def _expected_migrations() -> tuple[tuple[str, str, str, tuple[str, ...]], ...]:
             "0003_fused_generation_submissions.sql",
             FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM,
             (FUSED_GENERATION_SUBMISSIONS_TABLE_NAME,),
+        ),
+        (
+            FUSED_MEDIA_WRITES_SCHEMA_VERSION,
+            "0004_fused_media_writes.sql",
+            FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM,
+            (FUSED_MEDIA_WRITES_TABLE_NAME,),
         ),
     )
 
@@ -232,6 +242,13 @@ def apply_generation_migrations(
             raise MigrationPreconditionError(
                 "version 0003 structures exist without their history row"
             )
+        if (
+            FUSED_MEDIA_WRITES_SCHEMA_VERSION not in applied
+            and FUSED_MEDIA_WRITES_TABLE_NAME in table_names
+        ):
+            raise MigrationPreconditionError(
+                "version 0004 structures exist without their history row"
+            )
         if GENERATION_SCHEMA_VERSION not in applied and (
             set(GENERATION_RECORD_TABLE_NAMES) & table_names
         ):
@@ -248,6 +265,9 @@ def apply_generation_migrations(
         if FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION in applied:
             submissions = check_fused_generation_submission_schema(catalog)
             _require_ready(submissions)
+        if FUSED_MEDIA_WRITES_SCHEMA_VERSION in applied:
+            media_writes = check_fused_media_write_schema(catalog)
+            _require_ready(media_writes)
 
         to_apply = tuple(item for item in migrations if item.version not in applied)
         if not to_apply:
@@ -282,6 +302,7 @@ def apply_generation_migrations(
                 check_generation_record_schema(catalog),
                 check_canvas_result_target_schema(catalog),
                 check_fused_generation_submission_schema(catalog),
+                check_fused_media_write_schema(catalog),
                 check_migration_history_schema(catalog),
             )
             final_rows = _applied_rows(connection)

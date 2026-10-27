@@ -11,6 +11,10 @@ from unittest.mock import patch
 from urllib.parse import urlsplit
 
 from haoai_backend.generation_contracts import ReferenceInput, StoredMedia, TransferFailure
+from haoai_backend.media_storage.owned_write_values import (
+    OwnedObjectMaterial,
+    OwnedObjectPlan,
+)
 from haoai_backend.media_storage.pinned_http import EncodedRequestTarget, PinnedPublicMediaFetcher
 from haoai_backend.media_storage.public_fetch_policy import PublicFetchPolicy
 from haoai_backend.media_storage.remote_staging import RemoteStaging
@@ -140,6 +144,95 @@ def _make_policy() -> PublicFetchPolicy:
 
 
 class RemoteTransferTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owned_prepare_uses_pinned_fetch_and_returns_material_without_storage_put(
+        self,
+    ) -> None:
+        payload = b"pinned-provider-output"
+        response = Response((payload,), content_length=str(len(payload)))
+        library = HttpLibrary(response)
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        staging = RemoteStaging(Path(temp.name))
+        policy = SafeMediaPolicy((MediaTypeRule("image/png", ".png"),))
+        fetcher = PinnedPublicMediaFetcher(
+            _make_policy(),
+            policy,
+            http_library=library,
+            staging=staging,
+        )
+
+        class PlanOnlyStorage:
+            pending_resource_cleanup_count = 0
+
+            def __init__(self) -> None:
+                self.calls = 0
+                self.content: bytes | None = None
+
+            async def prepare_download(
+                self,
+                download,
+                *,
+                owner_ref,
+                submission_ref,
+                slot,
+                provider_result_digest,
+                max_bytes,
+            ):
+                self.calls += 1
+                with download.open_reader() as reader:
+                    self.content = reader.read(max_bytes + 1)
+                material_digest = hashlib.sha256(self.content).hexdigest()
+                plan = OwnedObjectPlan(
+                    write_id="0123456789abcdef0123456789abcdef",
+                    owner_ref=owner_ref,
+                    submission_ref=submission_ref,
+                    slot=slot,
+                    provider_result_digest=provider_result_digest,
+                    material_sha256=material_digest,
+                    media_type=download.media_type,
+                    size_bytes=len(self.content),
+                    config_fingerprint=hashlib.sha256(b"configuration").hexdigest(),
+                    config_version=1,
+                    bucket="media-bucket",
+                    object_key=(
+                        "2026/10/28/generation/"
+                        "0123456789abcdef0123456789abcdef.png"
+                    ),
+                    public_base="https://media.example.test",
+                )
+                return OwnedObjectMaterial(plan, self.content)
+
+        storage = PlanOnlyStorage()
+        slots = asyncio.Semaphore(1)
+        transfer = RemoteMediaTransfer(
+            fetcher,
+            staging,
+            storage,  # type: ignore[arg-type]
+            shared_slots=slots,
+        )
+        material = await transfer.prepare_owned(
+            ReferenceInput(
+                kind="public_http",
+                locator="https://provider.example.test/output.png",
+            ),
+            owner_ref="owner-42",
+            submission_ref="submission-77",
+            slot="primary",
+            provider_result_digest=hashlib.sha256(b"provider URL result").hexdigest(),
+            max_bytes=1024,
+            timeout_seconds=2,
+        )
+
+        self.assertIsInstance(material, OwnedObjectMaterial)
+        self.assertEqual(material.content, payload)
+        self.assertEqual(storage.calls, 1)
+        self.assertEqual(storage.content, payload)
+        self.assertEqual(response.closed, True)
+        self.assertEqual(library.session_value.closed, True)
+        self.assertEqual(library.connector_value.closed, True)
+        self.assertEqual(staging.pending_cleanup_count, 0)
+        self.assertEqual(slots._value, 1)
+
     async def test_collision_exhaustion_preserves_preexisting_caller_file(self) -> None:
         with tempfile.TemporaryDirectory() as raw_directory:
             directory = Path(raw_directory)

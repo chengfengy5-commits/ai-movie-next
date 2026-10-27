@@ -10,6 +10,7 @@ from starlette.concurrency import run_in_threadpool
 from haoai_backend.fused_generation.domain import FusedGenerationStorageUnknown
 from haoai_backend.fused_generation.media_storage import (
     SynchronousFusedGenerationImageStorage,
+    SynchronousFusedGenerationPlannedMediaStorage,
 )
 from haoai_backend.fused_generation.openai_runtime import FusedOpenAIImageRuntime
 from haoai_backend.generation_contracts import ReferenceInput, StoredMedia, TransferFailure
@@ -38,6 +39,7 @@ class FusedGenerationHostConfiguration:
     runtime: FusedOpenAIImageRuntime = field(repr=False)
     storage: FusedGenerationURLStorage = field(repr=False)
     inline_image_storage: SynchronousFusedGenerationImageStorage = field(repr=False)
+    planned_media_storage: SynchronousFusedGenerationPlannedMediaStorage = field(repr=False)
     credential_registry: CredentialRegistry = field(repr=False)
     credential_crypto: CredentialCrypto = field(repr=False)
     proof_authority: HmacProofAuthority = field(repr=False)
@@ -127,6 +129,7 @@ def build_fused_generation_host_configuration(
         runtime=runtime,
         storage=FusedGenerationURLStorage(media_store),
         inline_image_storage=SynchronousFusedGenerationImageStorage(media_store),
+        planned_media_storage=SynchronousFusedGenerationPlannedMediaStorage(media_store),
         credential_registry=registry,
         credential_crypto=capabilities.crypto,
         proof_authority=capabilities.proof_authority,

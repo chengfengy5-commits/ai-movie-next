@@ -7,6 +7,7 @@ from .domain import (
 )
 from .ports import (
     FusedGenerationImageStorage,
+    FusedGenerationPlannedMediaStorage,
     FusedGenerationRuntime,
     FusedGenerationStorage,
 )
@@ -14,6 +15,7 @@ from .ports import (
 __all__ = [
     "FusedGenerationInlineImage",
     "FusedGenerationImageStorage",
+    "FusedGenerationPlannedMediaStorage",
     "FusedGenerationOutput",
     "FusedGenerationRuntime",
     "FusedGenerationStorage",

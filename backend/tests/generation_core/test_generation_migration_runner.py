@@ -13,6 +13,8 @@ from haoai_backend.generation_core.schema import (
     CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
     FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM,
     FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
+    FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM,
+    FUSED_MEDIA_WRITES_SCHEMA_VERSION,
     GENERATION_MIGRATION_HISTORY_TABLE,
     GENERATION_SCHEMA_CHECKSUM,
     GENERATION_SCHEMA_VERSION,
@@ -21,6 +23,7 @@ from haoai_backend.generation_core.schema import (
     FoundationBase,
     GenerationResultTargetRow,
     FusedGenerationSubmissionRow,
+    FusedMediaWriteRow,
 )
 
 
@@ -99,6 +102,7 @@ def test_explicit_migration_applies_once_and_records_checksum() -> None:
         GENERATION_SCHEMA_VERSION,
         CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
         FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
+        FUSED_MEDIA_WRITES_SCHEMA_VERSION,
     )
     assert second.status == "already_current"
     assert second.applied_versions == ()
@@ -111,6 +115,7 @@ def test_explicit_migration_applies_once_and_records_checksum() -> None:
     )
     assert GenerationResultTargetRow.__tablename__ in inspect(engine).get_table_names()
     assert FusedGenerationSubmissionRow.__tablename__ in inspect(engine).get_table_names()
+    assert FusedMediaWriteRow.__tablename__ in inspect(engine).get_table_names()
     with engine.connect() as connection:
         rows = connection.execute(
             text(
@@ -123,6 +128,7 @@ def test_explicit_migration_applies_once_and_records_checksum() -> None:
         (GENERATION_SCHEMA_VERSION, GENERATION_SCHEMA_CHECKSUM),
         (CANVAS_RESULT_TARGETS_SCHEMA_VERSION, CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM),
         (FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION, FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM),
+        (FUSED_MEDIA_WRITES_SCHEMA_VERSION, FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM),
     ]
     assert any(
         tuple(item.get("column_names") or ()) == ("owner_id", "result_ref")
@@ -131,7 +137,7 @@ def test_explicit_migration_applies_once_and_records_checksum() -> None:
     engine.dispose()
 
 
-def test_valid_v1_database_upgrades_to_v2_without_losing_existing_rows() -> None:
+def test_valid_v1_database_upgrades_to_current_without_losing_existing_rows() -> None:
     engine = _foundation_engine()
     migration_path = MIGRATION_DIRECTORY / "0001_generation_shared_records.sql"
     migration_sql = migration_path.read_text(encoding="utf-8")
@@ -171,12 +177,14 @@ def test_valid_v1_database_upgrades_to_v2_without_losing_existing_rows() -> None
     assert result.applied_versions == (
         CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
         FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
+        FUSED_MEDIA_WRITES_SCHEMA_VERSION,
     )
     assert user_ids == ["preserved-v1-user"]
     assert versions == [
         GENERATION_SCHEMA_VERSION,
         CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
         FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
+        FUSED_MEDIA_WRITES_SCHEMA_VERSION,
     ]
     engine.dispose()
 
@@ -353,6 +361,7 @@ def test_migration_refuses_v2_page_index_with_wrong_columns_without_repair() -> 
         GENERATION_SCHEMA_VERSION,
         CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
         FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
+        FUSED_MEDIA_WRITES_SCHEMA_VERSION,
     ]
     engine.dispose()
 

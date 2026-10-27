@@ -14,6 +14,10 @@ from haoai_backend.generation_credentials.domain import (
     HmacProofAuthority,
     SealedMaterial,
 )
+from haoai_backend.media_storage.owned_write_values import (
+    OwnedObjectMaterial,
+    OwnedObjectPlan,
+)
 
 from .domain import (
     FusedFrameTarget,
@@ -25,6 +29,8 @@ from .domain import (
 
 _SNAPSHOT_VERSION = 1
 _SNAPSHOT_PROOF_PURPOSE = "fused-generation-snapshot-v1"
+_OWNED_MEDIA_MATERIAL_VERSION = 1
+_OWNED_MEDIA_MATERIAL_PURPOSE = "fused-owned-media-material-v1"
 
 
 def seal_json_value(
@@ -256,6 +262,194 @@ def verify_snapshot_proof(
                 binding=binding,
             ),
             signature,
+        )
+    )
+
+
+def owned_object_plan_to_document(plan: OwnedObjectPlan) -> dict[str, object]:
+    if type(plan) is not OwnedObjectPlan:
+        raise TypeError("owned object plan is invalid")
+    return {
+        "version": plan.plan_version,
+        "write_id": plan.write_id,
+        "owner_ref": plan.owner_ref,
+        "submission_ref": plan.submission_ref,
+        "slot": plan.slot,
+        "provider_result_digest": plan.provider_result_digest,
+        "material_sha256": plan.material_sha256,
+        "media_type": plan.media_type,
+        "size_bytes": plan.size_bytes,
+        "config_fingerprint": plan.config_fingerprint,
+        "config_version": plan.config_version,
+        "bucket": plan.bucket,
+        "object_key": plan.object_key,
+        "public_base": plan.public_base,
+        "plan_version": plan.plan_version,
+    }
+
+
+def owned_object_plan_from_document(value: object) -> OwnedObjectPlan | None:
+    if not isinstance(value, Mapping) or set(value) != {
+        "version",
+        "write_id",
+        "owner_ref",
+        "submission_ref",
+        "slot",
+        "provider_result_digest",
+        "material_sha256",
+        "media_type",
+        "size_bytes",
+        "config_fingerprint",
+        "config_version",
+        "bucket",
+        "object_key",
+        "public_base",
+        "plan_version",
+    }:
+        return None
+    if value.get("version") != _OWNED_MEDIA_MATERIAL_VERSION:
+        return None
+    try:
+        return OwnedObjectPlan(
+            write_id=_text(value["write_id"]),
+            owner_ref=_text(value["owner_ref"]),
+            submission_ref=_text(value["submission_ref"]),
+            slot=_text(value["slot"]),
+            provider_result_digest=_text(value["provider_result_digest"]),
+            material_sha256=_text(value["material_sha256"]),
+            media_type=_text(value["media_type"]),
+            size_bytes=_integer(value["size_bytes"]),
+            config_fingerprint=_text(value["config_fingerprint"]),
+            config_version=_integer(value["config_version"]),
+            bucket=_text(value["bucket"]),
+            object_key=_text(value["object_key"]),
+            public_base=_text(value["public_base"]),
+            plan_version=_integer(value["plan_version"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def owned_object_plan_from_journal(
+    row: Mapping[str, object],
+) -> OwnedObjectPlan | None:
+    try:
+        plan = OwnedObjectPlan(
+            write_id=_text(row["write_id"]),
+            owner_ref=_text(row["owner_id"]),
+            submission_ref=_text(row["submission_id"]),
+            slot=_text(row["slot"]),
+            provider_result_digest=_text(row["provider_result_digest"]),
+            material_sha256=_text(row["material_sha256"]),
+            media_type=_text(row["media_type"]),
+            size_bytes=_integer(row["size_bytes"]),
+            config_fingerprint=_text(row["config_fingerprint"]),
+            config_version=_integer(row["config_version"]),
+            bucket=_text(row["bucket"]),
+            object_key=_text(row["object_key"]),
+            public_base=_text(row["public_base"]),
+            plan_version=_integer(row["plan_version"]),
+        )
+        key_digest = hashlib.sha256(plan.object_key.encode("utf-8")).hexdigest()
+        return plan if row.get("object_key_digest") == key_digest else None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def seal_owned_media_material(
+    material: OwnedObjectMaterial,
+    *,
+    crypto: CredentialCrypto,
+    submission_id: str,
+    owner_id: str,
+    request_digest: str,
+    task_id: str,
+    binding: CredentialBinding,
+) -> tuple[str, str, str, str]:
+    if type(material) is not OwnedObjectMaterial:
+        raise TypeError("owned media material is invalid")
+    document = {
+        "version": _OWNED_MEDIA_MATERIAL_VERSION,
+        "plan": owned_object_plan_to_document(material.plan),
+        "content": base64.b64encode(material.content).decode("ascii"),
+    }
+    return seal_json_value(
+        document,
+        crypto=crypto,
+        submission_id=submission_id,
+        owner_id=owner_id,
+        request_digest=request_digest,
+        task_id=task_id,
+        binding=binding,
+        purpose=_OWNED_MEDIA_MATERIAL_PURPOSE,
+    )
+
+
+def open_owned_media_material(
+    ciphertext: object,
+    nonce: object,
+    key_id: object,
+    algorithm_version: object,
+    *,
+    crypto: CredentialCrypto,
+    submission_id: str,
+    owner_id: str,
+    request_digest: str,
+    task_id: str,
+    binding: CredentialBinding,
+) -> OwnedObjectMaterial | None:
+    document = open_json_value(
+        ciphertext,
+        nonce,
+        key_id,
+        algorithm_version,
+        crypto=crypto,
+        submission_id=submission_id,
+        owner_id=owner_id,
+        request_digest=request_digest,
+        task_id=task_id,
+        binding=binding,
+        purpose=_OWNED_MEDIA_MATERIAL_PURPOSE,
+    )
+    if not isinstance(document, Mapping) or set(document) != {
+        "version",
+        "plan",
+        "content",
+    }:
+        return None
+    if document.get("version") != _OWNED_MEDIA_MATERIAL_VERSION:
+        return None
+    plan = owned_object_plan_from_document(document.get("plan"))
+    encoded_content = document.get("content")
+    if plan is None or type(encoded_content) is not str:
+        return None
+    try:
+        content = base64.b64decode(encoded_content, validate=True)
+        return OwnedObjectMaterial(plan=plan, content=content)
+    except (TypeError, ValueError):
+        return None
+
+
+def owned_plan_matches_journal(
+    row: Mapping[str, object], plan: OwnedObjectPlan
+) -> bool:
+    return all(
+        row.get(name) == value
+        for name, value in (
+            ("write_id", plan.write_id),
+            ("owner_id", plan.owner_ref),
+            ("submission_id", plan.submission_ref),
+            ("slot", plan.slot),
+            ("provider_result_digest", plan.provider_result_digest),
+            ("material_sha256", plan.material_sha256),
+            ("media_type", plan.media_type),
+            ("size_bytes", plan.size_bytes),
+            ("config_fingerprint", plan.config_fingerprint),
+            ("config_version", plan.config_version),
+            ("bucket", plan.bucket),
+            ("object_key", plan.object_key),
+            ("public_base", plan.public_base),
+            ("plan_version", plan.plan_version),
         )
     )
 

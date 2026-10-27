@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from urllib.parse import quote
 from uuid import uuid4
 
-from sqlalchemy import insert, select, update
+from sqlalchemy import and_, insert, select, update
 from sqlalchemy.orm import Session
 
 from haoai_backend.authentication.tables import user_credits
@@ -24,7 +26,10 @@ from haoai_backend.generation_core.base_schema import (
     CreditLogRow,
     TaskSubmissionRow,
 )
-from haoai_backend.generation_core.schema import FusedGenerationSubmissionRow
+from haoai_backend.generation_core.schema import (
+    FusedGenerationSubmissionRow,
+    FusedMediaWriteRow,
+)
 from haoai_backend.generation_credentials.application import CredentialRegistry
 from haoai_backend.generation_credentials.binding_capture_ports import (
     CapturedCredentialBinding,
@@ -63,6 +68,7 @@ from .ownership import FUSED_SERVER_CONTROL_MARKER, is_server_controlled_fused_t
 _LEGACY_FERNET_PREFIX = "gAAAAA"
 _user_credits = user_credits
 _fused_submissions = FusedGenerationSubmissionRow.__table__
+_fused_media_writes = FusedMediaWriteRow.__table__
 _task_submissions = TaskSubmissionRow.__table__
 
 
@@ -1207,6 +1213,733 @@ class SqlAlchemyFusedGenerationUnitOfWork:
         )
         return updated.rowcount == 1
 
+    def fused_media_write_by_submission(
+        self, submission_id: str, *, slot: str = "primary"
+    ) -> Mapping[str, object] | None:
+        row = self._session.execute(
+            select(_fused_media_writes).where(
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.slot == slot,
+            )
+        ).mappings().one_or_none()
+        return dict(row) if row is not None else None
+
+    def persist_fused_media_plan(
+        self,
+        *,
+        submission_id: str,
+        task_id: str,
+        owner_id: str,
+        claim_token: str,
+        generation: int,
+        result_digest: str,
+        result_kind: str,
+        material_sha256: str,
+        media_type: str,
+        size_bytes: int,
+        config_fingerprint: str,
+        config_version: int,
+        bucket: str,
+        object_key: str,
+        public_base: str,
+        write_id: str,
+        plan_version: int,
+        encrypted_material: str,
+        material_nonce: str,
+        material_key_id: str,
+        material_algorithm: str,
+    ) -> bool:
+        ledger, task = self._lock_fused_media_owner_task(
+            submission_id,
+            task_id,
+            owner_id,
+            claim_token,
+            generation,
+            allowed_stages=("result_known",),
+        )
+        if ledger is None or task is None or ledger["result_digest"] != result_digest:
+            return False
+        key_digest = hashlib.sha256(object_key.encode("utf-8")).hexdigest()
+        existing = self._session.execute(
+            select(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.slot == "primary",
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        values = {
+            "write_id": write_id,
+            "submission_id": submission_id,
+            "owner_id": owner_id,
+            "task_id": task_id,
+            "slot": "primary",
+            "provider_result_digest": result_digest,
+            "result_kind": result_kind,
+            "material_sha256": material_sha256,
+            "media_type": media_type,
+            "size_bytes": size_bytes,
+            "config_fingerprint": config_fingerprint,
+            "config_version": config_version,
+            "bucket": bucket,
+            "object_key": object_key,
+            "object_key_digest": key_digest,
+            "public_base": public_base,
+            "plan_version": plan_version,
+            "encrypted_material": encrypted_material,
+            "material_nonce": material_nonce,
+            "material_key_id": material_key_id,
+            "material_algorithm": material_algorithm,
+        }
+        if existing is not None:
+            return all(existing.get(key) == value for key, value in values.items())
+        now = self.current_time()
+        self._session.execute(
+            insert(_fused_media_writes).values(
+                **values,
+                phase="planned",
+                revision=1,
+                next_verify_at=now,
+                attempt_count=0,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        return True
+
+    def claim_fused_media_put(
+        self,
+        *,
+        submission_id: str,
+        task_id: str,
+        owner_id: str,
+        claim_token: str,
+        generation: int,
+        write_nonce: str,
+    ) -> bool:
+        ledger, task = self._lock_fused_media_owner_task(
+            submission_id,
+            task_id,
+            owner_id,
+            claim_token,
+            generation,
+            allowed_stages=("result_known", "media_started"),
+        )
+        if ledger is None or task is None:
+            return False
+        write = self._session.execute(
+            select(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.task_id == task_id,
+                _fused_media_writes.c.owner_id == owner_id,
+                _fused_media_writes.c.phase == "planned",
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if write is None:
+            return False
+        changed = self._session.execute(
+            update(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write["write_id"],
+                _fused_media_writes.c.phase == "planned",
+                _fused_media_writes.c.revision == write["revision"],
+            )
+            .values(
+                phase="put_started",
+                revision=write["revision"] + 1,
+                put_nonce=write_nonce,
+                put_owner=claim_token,
+                put_generation=generation,
+                updated_at=self.current_time(),
+            )
+        )
+        if changed.rowcount != 1:
+            return False
+        if ledger["stage"] == "result_known":
+            changed_ledger = self._session.execute(
+                update(_fused_submissions)
+                .where(
+                    _fused_submissions.c.submission_id == submission_id,
+                    _fused_submissions.c.stage == "result_known",
+                )
+                .values(stage="media_started", updated_at=self.current_time())
+            )
+            if changed_ledger.rowcount != 1:
+                return False
+        return True
+
+    def fused_media_put_claim_matches(
+        self,
+        *,
+        submission_id: str,
+        task_id: str,
+        owner_id: str,
+        claim_token: str,
+        generation: int,
+        write_nonce: str,
+    ) -> bool:
+        ledger = self._session.execute(
+            select(_fused_submissions.c.stage, _fused_submissions.c.task_id, _fused_submissions.c.owner_id)
+            .where(_fused_submissions.c.submission_id == submission_id)
+        ).mappings().one_or_none()
+        task = self._session.execute(
+            select(
+                AITaskRow.type,
+                AITaskRow.user_id,
+                AITaskRow.status,
+                AITaskRow.claim_token,
+                AITaskRow.execution_generation,
+                AITaskRow.request_data,
+                AITaskRow.user_cancelled_at,
+            ).where(AITaskRow.id == task_id)
+        ).mappings().one_or_none()
+        write = self._session.execute(
+            select(
+                _fused_media_writes.c.phase,
+                _fused_media_writes.c.put_nonce,
+                _fused_media_writes.c.put_owner,
+                _fused_media_writes.c.put_generation,
+                _fused_media_writes.c.task_id,
+                _fused_media_writes.c.owner_id,
+            ).where(
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.slot == "primary",
+            )
+        ).mappings().one_or_none()
+        return bool(
+            ledger is not None
+            and task is not None
+            and write is not None
+            and ledger["stage"] == "media_started"
+            and ledger["task_id"] == task_id
+            and ledger["owner_id"] == owner_id
+            and write["phase"] == "put_started"
+            and write["put_nonce"] == write_nonce
+            and write["put_owner"] == claim_token
+            and write["put_generation"] == generation
+            and write["task_id"] == task_id
+            and write["owner_id"] == owner_id
+            and task["type"] == "fused"
+            and task["user_id"] == owner_id
+            and task["status"] == "processing"
+            and task["claim_token"] == claim_token
+            and task["execution_generation"] == generation
+            and task["user_cancelled_at"] is None
+            and is_server_controlled_fused_task(task["type"], task["request_data"])
+        )
+
+    def record_fused_media_put_outcome(
+        self, submission_id: str, write_id: str, *, unknown: bool
+    ) -> bool:
+        ledger = self._session.execute(
+            select(_fused_submissions)
+            .where(_fused_submissions.c.submission_id == submission_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        if ledger is None:
+            return False
+        task = self._session.execute(
+            select(AITaskRow.id)
+            .where(AITaskRow.id == ledger["task_id"])
+            .with_for_update()
+        ).first()
+        if task is None:
+            return False
+        write = self._session.execute(
+            select(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write_id,
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.phase == "put_started",
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if write is None:
+            return False
+        if not unknown:
+            return True
+        now = self.current_time()
+        delay = _media_verify_backoff(write["attempt_count"])
+        changed = self._session.execute(
+            update(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write_id,
+                _fused_media_writes.c.phase == "put_started",
+            )
+            .values(
+                phase="ack_unknown",
+                revision=write["revision"] + 1,
+                next_verify_at=now + timedelta(seconds=delay),
+                updated_at=now,
+            )
+        )
+        if changed.rowcount != 1:
+            return False
+        self._session.execute(
+            update(_fused_submissions)
+            .where(
+                _fused_submissions.c.submission_id == submission_id,
+                _fused_submissions.c.stage == "media_started",
+            )
+            .values(stage="media_ack_unknown", updated_at=now)
+        )
+        return True
+
+    def claim_fused_media_verification(
+        self,
+        *,
+        submission_id: str,
+        owner_id: str,
+        verifier_token: str,
+        lease_seconds: int,
+        allow_active_task: bool = False,
+        expected_claim_token: str | None = None,
+        expected_generation: int | None = None,
+    ) -> Mapping[str, object] | None:
+        if type(lease_seconds) is not int or not 1 <= lease_seconds <= 300:
+            raise ValueError("media verification lease is invalid")
+        ledger = self._session.execute(
+            select(_fused_submissions)
+            .where(
+                _fused_submissions.c.submission_id == submission_id,
+                _fused_submissions.c.owner_id == owner_id,
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if ledger is None or ledger["stage"] not in {"media_started", "media_ack_unknown"}:
+            return None
+        task = self._session.execute(
+            select(
+                AITaskRow.type,
+                AITaskRow.user_id,
+                AITaskRow.status,
+                AITaskRow.claim_token,
+                AITaskRow.execution_generation,
+                AITaskRow.request_data,
+                AITaskRow.user_cancelled_at,
+                AITaskRow.lease_until,
+            )
+            .where(AITaskRow.id == ledger["task_id"])
+            .with_for_update()
+        ).mappings().one_or_none()
+        if (
+            task is None
+            or task["type"] != "fused"
+            or task["user_id"] != owner_id
+            or task["status"]
+            not in ({"processing", "cancelling"} if allow_active_task else {"processing"})
+            or (task["user_cancelled_at"] is not None and not allow_active_task)
+            or not is_server_controlled_fused_task(task["type"], task["request_data"])
+        ):
+            return None
+        if allow_active_task:
+            if (
+                expected_claim_token is None
+                or expected_generation is None
+                or task["claim_token"] != expected_claim_token
+                or task["execution_generation"] != expected_generation
+            ):
+                return None
+        elif task["lease_until"] is None or task["lease_until"] >= self.current_time():
+            return None
+        write = self._session.execute(
+            select(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.owner_id == owner_id,
+                _fused_media_writes.c.phase.in_(("put_started", "ack_unknown", "verified")),
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if write is None or write["put_owner"] != task["claim_token"] or write["put_generation"] != task["execution_generation"]:
+            return None
+        now = self.current_time()
+        if (
+            write["phase"] != "verified"
+            and write["next_verify_at"] > now
+            and not allow_active_task
+        ):
+            return None
+        if write["verify_lease_until"] is not None and write["verify_lease_until"] >= now:
+            return None
+        changed = self._session.execute(
+            update(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write["write_id"],
+                _fused_media_writes.c.revision == write["revision"],
+                _fused_media_writes.c.phase == write["phase"],
+            )
+            .values(
+                verify_owner=verifier_token,
+                verify_lease_until=now + timedelta(seconds=lease_seconds),
+                revision=write["revision"] + 1,
+                updated_at=now,
+            )
+        )
+        if changed.rowcount != 1:
+            return None
+        return dict(write)
+
+    def record_fused_media_verification(
+        self,
+        *,
+        submission_id: str,
+        write_id: str,
+        verifier_token: str,
+        status: str,
+        observed_sha256: str | None = None,
+        observed_size_bytes: int | None = None,
+        media_type: str | None = None,
+        locator: str | None = None,
+        request_id: str | None = None,
+    ) -> bool:
+        ledger = self._session.execute(
+            select(_fused_submissions)
+            .where(_fused_submissions.c.submission_id == submission_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        if ledger is None:
+            return False
+        task = self._session.execute(
+            select(AITaskRow.id)
+            .where(AITaskRow.id == ledger["task_id"])
+            .with_for_update()
+        ).first()
+        if task is None:
+            return False
+        write = self._session.execute(
+            select(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write_id,
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.verify_owner == verifier_token,
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if write is None:
+            return False
+        now = self.current_time()
+        if status == "verified":
+            expected_locator = (
+                f"{write['public_base']}/{quote(write['object_key'], safe='/')}"
+            )
+            if (
+                observed_sha256 != write["material_sha256"]
+                or observed_size_bytes != write["size_bytes"]
+                or media_type != write["media_type"]
+                or type(locator) is not str
+                or locator != expected_locator
+            ):
+                return False
+            values = {
+                "phase": "verified",
+                "verified_sha256": observed_sha256,
+                "verified_media_type": media_type,
+                "verified_size_bytes": observed_size_bytes,
+                "verified_at": now,
+                "verified_locator": locator,
+                "verification_request_id": request_id,
+                "next_verify_at": now,
+            }
+        elif status in {"not_found_pending", "unavailable"}:
+            values = {
+                "phase": "ack_unknown",
+                "verify_owner": None,
+                "verify_lease_until": None,
+                "next_verify_at": now + timedelta(
+                    seconds=_media_verify_backoff(write["attempt_count"])
+                ),
+            }
+        elif status == "content_conflict":
+            values = {
+                "phase": "content_conflict",
+                "verify_owner": None,
+                "verify_lease_until": None,
+                "next_verify_at": now + timedelta(days=3650),
+            }
+        else:
+            return False
+        changed = self._session.execute(
+            update(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write_id,
+                _fused_media_writes.c.verify_owner == verifier_token,
+                _fused_media_writes.c.revision == write["revision"],
+            )
+            .values(
+                **values,
+                attempt_count=write["attempt_count"] + 1,
+                revision=write["revision"] + 1,
+                updated_at=now,
+            )
+        )
+        if changed.rowcount != 1:
+            return False
+        if status in {"not_found_pending", "unavailable"}:
+            self._session.execute(
+                update(_fused_submissions)
+                .where(
+                    _fused_submissions.c.submission_id == submission_id,
+                    _fused_submissions.c.stage == "media_started",
+                )
+                .values(stage="media_ack_unknown", updated_at=now)
+            )
+        return True
+
+    def complete_verified_fused_media(
+        self,
+        prepared: PreparedFusedGeneration,
+        *,
+        write_id: str,
+        verifier_token: str,
+        locator: str,
+    ) -> bool:
+        submission_id = prepared.submission_id
+        if submission_id is None or not locator:
+            return False
+        ledger = self._session.execute(
+            select(_fused_submissions)
+            .where(
+                _fused_submissions.c.submission_id == submission_id,
+                _fused_submissions.c.task_id == prepared.task_id,
+                _fused_submissions.c.owner_id == prepared.user_id,
+                _fused_submissions.c.stage.in_(("media_started", "media_ack_unknown")),
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if ledger is None:
+            return False
+        task = self._session.execute(
+            select(
+                AITaskRow.type,
+                AITaskRow.user_id,
+                AITaskRow.status,
+                AITaskRow.claim_token,
+                AITaskRow.execution_generation,
+                AITaskRow.request_data,
+                AITaskRow.user_cancelled_at,
+                AITaskRow.message_id,
+                AITaskRow.recovery_status,
+            )
+            .where(AITaskRow.id == prepared.task_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        if (
+            task is None
+            or task["type"] != "fused"
+            or task["user_id"] != prepared.user_id
+            or task["status"] != "processing"
+            or task["user_cancelled_at"] is not None
+            or not is_server_controlled_fused_task(task["type"], task["request_data"])
+        ):
+            return False
+        write = self._session.execute(
+            select(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write_id,
+                _fused_media_writes.c.submission_id == submission_id,
+                _fused_media_writes.c.owner_id == prepared.user_id,
+                _fused_media_writes.c.task_id == prepared.task_id,
+                _fused_media_writes.c.phase == "verified",
+                _fused_media_writes.c.verify_owner == verifier_token,
+                _fused_media_writes.c.verified_locator == locator,
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if (
+            write is None
+            or task["claim_token"] != write["put_owner"]
+            or task["execution_generation"] != write["put_generation"]
+            or task["recovery_status"] not in {"ready", "provider_result_unknown"}
+        ):
+            return False
+        now = self.current_time()
+        changed = self._session.execute(
+            update(AITaskRow.__table__)
+            .where(
+                AITaskRow.id == prepared.task_id,
+                AITaskRow.type == "fused",
+                AITaskRow.user_id == prepared.user_id,
+                AITaskRow.status == "processing",
+                AITaskRow.claim_token == write["put_owner"],
+                AITaskRow.execution_generation == write["put_generation"],
+                AITaskRow.user_cancelled_at.is_(None),
+                AITaskRow.recovery_status.in_(("ready", "provider_result_unknown")),
+            )
+            .values(
+                status="completed",
+                result=locator,
+                progress=100,
+                progress_message="融合图已生成",
+                claim_token=None,
+                updated_at=now,
+            )
+        )
+        if changed.rowcount != 1:
+            return False
+        fused_id = self.new_id()
+        self._session.execute(
+            insert(fused_assets).values(
+                id=fused_id,
+                series_id=prepared.series_id,
+                member_type=prepared.member_type,
+                members=json.dumps(prepared.members, ensure_ascii=False),
+                name=prepared.name,
+                image_url=locator,
+                size=prepared.size,
+                status="completed",
+                error_message=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        changed_ledger = self._session.execute(
+            update(_fused_submissions)
+            .where(
+                _fused_submissions.c.submission_id == submission_id,
+                _fused_submissions.c.stage.in_(("media_started", "media_ack_unknown")),
+                _fused_submissions.c.result_digest == write["provider_result_digest"],
+            )
+            .values(stage="completed", asset_id=fused_id, updated_at=now)
+        )
+        if changed_ledger.rowcount != 1:
+            return False
+        attached = self._append_to_target_frame(prepared, fused_id)
+        message_id = task["message_id"]
+        if message_id:
+            content = locator
+            if not attached and prepared.target_frame is not None:
+                content = f"{locator}\n融合资产已保存，但目标分镜已变化，请从融合资产列表中查看。"
+            self._session.execute(
+                update(chat_messages)
+                .where(chat_messages.c.id == message_id)
+                .values(content=content)
+            )
+        changed_write = self._session.execute(
+            update(_fused_media_writes)
+            .where(
+                _fused_media_writes.c.write_id == write_id,
+                _fused_media_writes.c.phase == "verified",
+                _fused_media_writes.c.verify_owner == verifier_token,
+                _fused_media_writes.c.revision == write["revision"],
+            )
+            .values(
+                phase="applied",
+                revision=write["revision"] + 1,
+                asset_id=fused_id,
+                applied_at=now,
+                updated_at=now,
+            )
+        )
+        return changed_write.rowcount == 1
+
+    def recoverable_fused_media_writes(
+        self, *, limit: int = 32
+    ) -> tuple[Mapping[str, object], ...]:
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("media recovery scan limit is invalid")
+        now = self.current_time()
+        task_table = AITaskRow.__table__
+        rows = self._session.execute(
+            select(
+                _fused_media_writes.c.submission_id,
+                _fused_media_writes.c.owner_id,
+            )
+            .join(
+                _fused_submissions,
+                and_(
+                    _fused_submissions.c.submission_id
+                    == _fused_media_writes.c.submission_id,
+                    _fused_submissions.c.task_id == _fused_media_writes.c.task_id,
+                    _fused_submissions.c.owner_id == _fused_media_writes.c.owner_id,
+                ),
+            )
+            .join(task_table, task_table.c.id == _fused_media_writes.c.task_id)
+            .where(
+                _fused_media_writes.c.phase.in_(("put_started", "ack_unknown", "verified")),
+                _fused_media_writes.c.next_verify_at <= now,
+                (
+                    _fused_media_writes.c.verify_lease_until.is_(None)
+                    | (_fused_media_writes.c.verify_lease_until < now)
+                ),
+                _fused_submissions.c.stage.in_(
+                    ("media_started", "media_ack_unknown")
+                ),
+                task_table.c.type == "fused",
+                task_table.c.user_id == _fused_media_writes.c.owner_id,
+                task_table.c.status == "processing",
+                task_table.c.user_cancelled_at.is_(None),
+                task_table.c.claim_token.is_not(None),
+                _fused_media_writes.c.put_owner == task_table.c.claim_token,
+                _fused_media_writes.c.put_generation
+                == task_table.c.execution_generation,
+                task_table.c.lease_until.is_not(None),
+                task_table.c.lease_until < now,
+                task_table.c.request_data.like(
+                    '%"server_controlled_execution": "fused_generation_runtime_v1"%'
+                ),
+            )
+            .order_by(
+                _fused_media_writes.c.next_verify_at,
+                _fused_media_writes.c.updated_at,
+                _fused_media_writes.c.submission_id,
+            )
+            .limit(limit)
+        ).mappings().all()
+        return tuple(dict(row) for row in rows)
+
+    def _lock_fused_media_owner_task(
+        self,
+        submission_id: str,
+        task_id: str,
+        owner_id: str,
+        claim_token: str,
+        generation: int,
+        *,
+        allowed_stages: tuple[str, ...],
+    ) -> tuple[Mapping[str, Any] | None, Mapping[str, Any] | None]:
+        ledger = self._session.execute(
+            select(_fused_submissions)
+            .where(
+                _fused_submissions.c.submission_id == submission_id,
+                _fused_submissions.c.task_id == task_id,
+                _fused_submissions.c.owner_id == owner_id,
+                _fused_submissions.c.stage.in_(allowed_stages),
+            )
+            .with_for_update()
+        ).mappings().one_or_none()
+        if ledger is None:
+            return None, None
+        task = self._session.execute(
+            select(
+                AITaskRow.type,
+                AITaskRow.user_id,
+                AITaskRow.status,
+                AITaskRow.claim_token,
+                AITaskRow.execution_generation,
+                AITaskRow.request_data,
+                AITaskRow.user_cancelled_at,
+                AITaskRow.recovery_status,
+            )
+            .where(AITaskRow.id == task_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        if (
+            task is None
+            or task["type"] != "fused"
+            or task["user_id"] != owner_id
+            or task["status"] != "processing"
+            or task["claim_token"] != claim_token
+            or task["execution_generation"] != generation
+            or task["user_cancelled_at"] is not None
+            or task["recovery_status"] == "provider_result_unknown"
+            or not is_server_controlled_fused_task(task["type"], task["request_data"])
+        ):
+            return None, None
+        return ledger, task
+
     def retain_dispatch_unknown(self, submission_id: str) -> bool:
         row = self._session.execute(
             select(
@@ -1754,3 +2487,8 @@ def _chapter_frames(content: object) -> list[object]:
 def _frame_identity(frame: Mapping[str, object]) -> str:
     stable_frame = {key: value for key, value in frame.items() if key != "fused"}
     return json.dumps(stable_frame, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _media_verify_backoff(attempt_count: object) -> int:
+    attempts = attempt_count if type(attempt_count) is int and attempt_count >= 0 else 0
+    return min(300, 2 ** min(attempts, 8))

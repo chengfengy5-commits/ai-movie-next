@@ -25,6 +25,13 @@ from .domain import (
     PreparedFusedGeneration,
 )
 from haoai_backend.generation_contracts import StoredMedia
+from haoai_backend.media_storage.owned_write_values import (
+    OwnedObjectMaterial,
+    OwnedObjectPlan,
+    OwnedObjectPutResult,
+    OwnedObjectVerification,
+    OwnedObjectWritePermit,
+)
 
 
 class FusedGenerationRuntime(Protocol):
@@ -47,6 +54,29 @@ class FusedGenerationImageStorage(Protocol):
     """Synchronous owned-media adapter for validated inline image bytes."""
 
     def store_inline_image(self, image: FusedGenerationInlineImage) -> StoredMedia: ...
+
+
+class FusedGenerationPlannedMediaStorage(Protocol):
+    """Prepare, conditionally write, and independently verify fused media."""
+
+    def prepare_public_image(
+        self, image_url: str, *, owner_id: str, submission_id: str, result_digest: str
+    ) -> OwnedObjectMaterial: ...
+
+    def prepare_inline_image(
+        self,
+        image: FusedGenerationInlineImage,
+        *,
+        owner_id: str,
+        submission_id: str,
+        result_digest: str,
+    ) -> OwnedObjectMaterial: ...
+
+    def put_planned(
+        self, material: OwnedObjectMaterial, permit: OwnedObjectWritePermit
+    ) -> OwnedObjectPutResult: ...
+
+    def verify_planned(self, plan: OwnedObjectPlan) -> OwnedObjectVerification: ...
 
 
 class FusedGenerationUnitOfWork(Protocol):
@@ -204,6 +234,92 @@ class FusedGenerationUnitOfWork(Protocol):
         claim_token: str,
         generation: int,
     ) -> bool: ...
+    def fused_media_write_by_submission(
+        self, submission_id: str, *, slot: str = "primary"
+    ) -> Mapping[str, object] | None: ...
+    def persist_fused_media_plan(
+        self,
+        *,
+        submission_id: str,
+        task_id: str,
+        owner_id: str,
+        claim_token: str,
+        generation: int,
+        result_digest: str,
+        result_kind: str,
+        material_sha256: str,
+        media_type: str,
+        size_bytes: int,
+        config_fingerprint: str,
+        config_version: int,
+        bucket: str,
+        object_key: str,
+        public_base: str,
+        write_id: str,
+        plan_version: int,
+        encrypted_material: str,
+        material_nonce: str,
+        material_key_id: str,
+        material_algorithm: str,
+    ) -> bool: ...
+    def claim_fused_media_put(
+        self,
+        *,
+        submission_id: str,
+        task_id: str,
+        owner_id: str,
+        claim_token: str,
+        generation: int,
+        write_nonce: str,
+    ) -> bool: ...
+    def fused_media_put_claim_matches(
+        self,
+        *,
+        submission_id: str,
+        task_id: str,
+        owner_id: str,
+        claim_token: str,
+        generation: int,
+        write_nonce: str,
+    ) -> bool: ...
+    def record_fused_media_put_outcome(
+        self, submission_id: str, write_id: str, *, unknown: bool
+    ) -> bool: ...
+    def claim_fused_media_verification(
+        self,
+        *,
+        submission_id: str,
+        owner_id: str,
+        verifier_token: str,
+        lease_seconds: int,
+        allow_active_task: bool = False,
+        expected_claim_token: str | None = None,
+        expected_generation: int | None = None,
+    ) -> Mapping[str, object] | None: ...
+    def record_fused_media_verification(
+        self,
+        *,
+        submission_id: str,
+        write_id: str,
+        verifier_token: str,
+        status: str,
+        observed_sha256: str | None = None,
+        observed_size_bytes: int | None = None,
+        media_type: str | None = None,
+        locator: str | None = None,
+        request_id: str | None = None,
+    ) -> bool: ...
+    def complete_verified_fused_media(
+        self,
+        prepared: PreparedFusedGeneration,
+        *,
+        write_id: str,
+        verifier_token: str,
+        locator: str,
+    ) -> bool: ...
+    def recoverable_fused_media_writes(
+        self, *, limit: int = 32
+    ) -> tuple[Mapping[str, object], ...]: ...
     def retain_interrupted_media_write(self, submission_id: str) -> bool: ...
     def retain_dispatch_unknown(self, submission_id: str) -> bool: ...
     def authorize_media_storage(

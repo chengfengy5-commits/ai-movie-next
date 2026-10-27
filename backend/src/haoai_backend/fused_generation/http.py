@@ -25,6 +25,7 @@ from .durable_application import (
 )
 from .ports import (
     FusedGenerationImageStorage,
+    FusedGenerationPlannedMediaStorage,
     FusedGenerationRuntime,
     FusedGenerationStorage,
     FusedGenerationUnitOfWorkFactory,
@@ -51,6 +52,7 @@ def build_fused_generation_router(
     resolve_receipt_actor: ActorResolver | None = None,
     storage: FusedGenerationStorage | None = None,
     inline_image_storage: FusedGenerationImageStorage | None = None,
+    planned_media_storage: FusedGenerationPlannedMediaStorage | None = None,
     credential_registry: CredentialRegistry | None = None,
     credential_crypto: CredentialCrypto | None = None,
     proof_authority: HmacProofAuthority | None = None,
@@ -63,6 +65,7 @@ def build_fused_generation_router(
             uow_factory=uow_factory,
             storage=storage,
             inline_image_storage=inline_image_storage,
+            planned_media_storage=planned_media_storage,
             credential_registry=credential_registry,
             credential_crypto=credential_crypto,
             proof_authority=proof_authority,

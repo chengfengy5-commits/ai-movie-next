@@ -9,7 +9,7 @@ import stat
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import BinaryIO, Protocol
+from typing import BinaryIO, Literal, Protocol
 from urllib.parse import urlsplit
 
 
@@ -267,13 +267,20 @@ class R2ClientSettings:
     total_max_attempts: int = R2_MAX_ATTEMPTS
     connect_timeout_seconds: float = 10
     read_timeout_seconds: float = 60
+    operation_policy: Literal["legacy_transfer", "owned_once"] = "legacy_transfer"
 
     def __post_init__(self) -> None:
+        expected_attempts = {
+            "legacy_transfer": R2_MAX_ATTEMPTS,
+            "owned_once": 1,
+        }.get(self.operation_policy)
         if (
             self.region != R2_REGION
             or self.signature_version != "s3v4"
             or self.retry_mode != "standard"
-            or self.total_max_attempts != R2_MAX_ATTEMPTS
+            or expected_attempts is None
+            or type(self.total_max_attempts) is not int
+            or self.total_max_attempts != expected_attempts
         ):
             raise TransferConfigurationError("R2 client retry and signing policy is fixed")
         for timeout in (self.connect_timeout_seconds, self.read_timeout_seconds):
@@ -294,6 +301,17 @@ class SecretHandle(Protocol):
     def reveal(self) -> SecretValue: ...
 
 
+@dataclass(frozen=True, slots=True)
+class S3ObjectRead:
+    status_code: int
+    content_length: int | None
+    content_type: str | None
+    content_range: str | None
+    body: BinaryIO = field(repr=False, compare=False)
+    etag: str | None = field(default=None, repr=False, compare=False)
+    request_id: str | None = field(default=None, repr=False, compare=False)
+
+
 class S3Client(Protocol):
     def put_object(
         self,
@@ -305,6 +323,22 @@ class S3Client(Protocol):
         CacheControl: str,
     ) -> WriteReceipt: ...
     def close(self) -> None: ...
+
+
+class PlannedS3Client(S3Client, Protocol):
+    """Additional operations used only by durable planned-key writes."""
+
+    def put_object_if_absent(
+        self,
+        *,
+        Bucket: str,
+        Key: str,
+        Body: BinaryIO,
+        ContentType: str,
+        CacheControl: str,
+    ) -> WriteReceipt: ...
+
+    def get_object_stream(self, *, Bucket: str, Key: str) -> S3ObjectRead: ...
 
 
 class S3ClientFactory(Protocol):

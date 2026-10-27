@@ -145,10 +145,13 @@ class OwnedMediaRuntime:
             except BaseException:
                 retain_slot = True
                 raise
+            storage_pending = getattr(
+                services.storage, "pending_resource_cleanup_count", 0
+            )
             retain_slot = (
                 isinstance(result, TransferFailure)
                 and result.code == "cleanup_failure"
-            )
+            ) or (type(storage_pending) is int and storage_pending > 0)
             return result
         finally:
             try:
