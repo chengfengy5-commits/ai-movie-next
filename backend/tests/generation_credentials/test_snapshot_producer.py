@@ -569,6 +569,7 @@ def test_upstream_model_name_uses_locked_wire_value_or_fixed_legacy_default() ->
     assert _snapshot_model_name(video, "HAOAI", None) == "grok-imagine-video-1.5-preview"
     assert _snapshot_model_name(video, "manxiaobai", None) == "grok-video-1.0"
     assert _snapshot_model_name(video, "xai", None) == "grok-imagine-video"
+    assert _snapshot_model_name(video, "aistarslab", None) == "test-video"
     with pytest.raises(_UnsafeSnapshot, match="wire_model_unavailable"):
         _snapshot_model_name(image, "openai ", None)
     with pytest.raises(_UnsafeSnapshot, match="wire_model_unavailable"):

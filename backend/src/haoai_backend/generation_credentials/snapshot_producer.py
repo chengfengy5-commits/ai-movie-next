@@ -2243,6 +2243,7 @@ def _snapshot_model_name(operation: str, provider: str, wire_model: str | None) 
             "haoai": "grok-imagine-video-1.5-preview",
             "manxiaobai": "grok-video-1.0",
             "xai": "grok-imagine-video",
+            "aistarslab": "test-video",
         }
         default = defaults.get(route)
         if default is not None:

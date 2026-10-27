@@ -40,8 +40,9 @@ def _video_environment(
     *,
     model_source: ModelSource = ModelSource.SYSTEM,
     wallet_credits: int | None = 500,
+    provider: str = "xai",
 ):
-    monkeypatch.setattr(joint_fixtures, "_G2_JOINT_PROVIDER", "xai")
+    monkeypatch.setattr(joint_fixtures, "_G2_JOINT_PROVIDER", provider)
     insert_catalog_model = joint_fixtures._joint_insert_catalog_model
 
     def insert_video_model(connection, source: ModelSource) -> None:
@@ -52,7 +53,16 @@ def _video_environment(
             .where(table.c.id == joint_fixtures._G2_JOINT_MODEL_ID)
             .values(
                 category="video",
-                model="grok-imagine-video",
+                model=(
+                    "47:seedance-2.0"
+                    if provider == "aistarslab"
+                    else "grok-imagine-video"
+                ),
+                base_url=(
+                    "https://provider.example.test/openapi"
+                    if provider == "aistarslab"
+                    else "https://provider.example.test/v2"
+                ),
                 params=json.dumps(
                     {
                         "billing_mode": "per_second",
@@ -86,7 +96,7 @@ def _video_environment(
     )
 
 
-def _video_request() -> dict[str, object]:
+def _video_request(provider: str) -> dict[str, object]:
     return {
         "model_id": joint_fixtures._G2_JOINT_MODEL_ID,
         "prompt": "A quiet room at sunset",
@@ -99,16 +109,24 @@ def _video_request() -> dict[str, object]:
             "https://ref.example.test/image-b?ordered=2",
             "https://ref.example.test/image-a?ordered=1",
         ],
-        "reference_audios": [
-            "https://ref.example.test/audio-a?ordered=1",
-            "https://ref.example.test/audio-b?ordered=2",
-            "https://ref.example.test/audio-a?ordered=1",
-        ],
-        "reference_videos": [
-            "https://ref.example.test/video-a?ordered=1",
-            "https://ref.example.test/video-b?ordered=2",
-            "https://ref.example.test/video-a?ordered=1",
-        ],
+        "reference_audios": (
+            [
+                "https://ref.example.test/audio-a?ordered=1",
+                "https://ref.example.test/audio-b?ordered=2",
+                "https://ref.example.test/audio-a?ordered=1",
+            ]
+            if provider == "aistarslab"
+            else []
+        ),
+        "reference_videos": (
+            [
+                "https://ref.example.test/video-a?ordered=1",
+                "https://ref.example.test/video-b?ordered=2",
+                "https://ref.example.test/video-a?ordered=1",
+            ]
+            if provider == "aistarslab"
+            else []
+        ),
     }
 
 
@@ -120,7 +138,7 @@ def _admit_video_task(environment, *, key: str) -> tuple[str, str]:
             caller,
             operation="video.single",
             raw_key=key,
-            request=_video_request(),
+            request=_video_request(joint_fixtures._G2_JOINT_PROVIDER),
         )
         if not isinstance(staged, AdmissionStaged):
             raise AssertionError("authenticated producer did not stage video.single")

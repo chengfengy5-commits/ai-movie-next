@@ -795,7 +795,7 @@ def _query_resume_item_is_valid(graph: _LockedGraph, now: datetime) -> bool:
             external.get("step_id") == step.get("id"),
             external.get("submission_key")
             == f"video-single-create-v1:{unit.get('id')}:{step.get('id')}",
-            external.get("provider") in {"xai", "manxiaobai"},
+            external.get("provider") in {"xai", "manxiaobai", "aistarslab"},
             _nonempty_string(external.get("model_ref")),
             external.get("request_digest") == unit.get("input_digest"),
             external.get("submission_status") in {"submitted", "unknown"},

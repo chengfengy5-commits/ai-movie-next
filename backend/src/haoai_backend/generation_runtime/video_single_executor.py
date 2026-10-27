@@ -51,6 +51,15 @@ from haoai_backend.generation_credentials.domain import (
 from haoai_backend.generation_providers.video.manxiaobai_provider import (
     ManxiaobaiVideoProvider,
 )
+from haoai_backend.generation_providers.video.aistarslab_codec import (
+    MAX_REFERENCE_AUDIOS,
+    MAX_REFERENCE_IMAGES,
+    MAX_REFERENCE_VIDEOS,
+)
+from haoai_backend.generation_providers.video.aistarslab_provider import (
+    AistarslabReferenceInputs,
+    AistarslabVideoProvider,
+)
 from haoai_backend.generation_providers.video.xai_provider import XaiVideoProvider
 from haoai_backend.media_uploads.domain import (
     MAX_VIDEO_BYTES,
@@ -63,6 +72,7 @@ PollWaiter = Callable[[CancellationSignal, float], bool]
 _POLL_POLICY: dict[str, tuple[int, float]] = {
     "xai": (1200, 3.0),
     "manxiaobai": (720, 5.0),
+    "aistarslab": (540, 10.0),
 }
 _PENDING_STATES = frozenset({"pending", "queued", "processing"})
 _COMPLETED_STATES = frozenset({"completed", "done"})
@@ -496,6 +506,9 @@ class VideoSingleExecutor:
         )
 
     def _prepare_references(self, verified, guard: _AuthorityGuard):
+        if verified.snapshot.model_ref.provider == "aistarslab":
+            return self._prepare_aistarslab_references(verified, guard)
+
         image_references = verified.reference_images
         if not image_references:
             return ()
@@ -534,10 +547,70 @@ class VideoSingleExecutor:
             )
         return tuple(prepared)
 
+    def _prepare_aistarslab_references(
+        self,
+        verified,
+        guard: _AuthorityGuard,
+    ) -> AistarslabReferenceInputs | TransferFailure:
+        groups = (
+            (verified.reference_images, MAX_REFERENCE_IMAGES),
+            (verified.reference_audios, MAX_REFERENCE_AUDIOS),
+            (verified.reference_videos, MAX_REFERENCE_VIDEOS),
+        )
+        if any(len(references) > maximum for references, maximum in groups):
+            return TransferFailure(
+                "invalid_frozen_snapshot",
+                "视频参考素材数量超过 AIStarsLab 支持范围",
+            )
+
+        if not any(references for references, _maximum in groups):
+            return AistarslabReferenceInputs()
+
+        store = self._configuration.media_store_factory()
+        prepared_groups: list[tuple[ReferenceInput, ...]] = []
+        for locators, _maximum in groups:
+            prepared: list[ReferenceInput] = []
+            for locator in locators:
+                guard.require_live()
+                if not _valid_reference_url(locator):
+                    return TransferFailure(
+                        "invalid_frozen_snapshot",
+                        "视频参考地址无法通过安全检查",
+                    )
+                normalized = store.prepare_reference(
+                    ReferenceInput(kind="public_http", locator=locator),
+                    None,
+                    self._configuration,
+                )
+                guard.require_live()
+                if (
+                    not isinstance(normalized, PreparedReference)
+                    or normalized.kind not in {"public_http", "managed_url"}
+                    or not _valid_reference_url(normalized.locator)
+                    or normalized.content is not None
+                ):
+                    return TransferFailure(
+                        "invalid_frozen_snapshot",
+                        "视频参考地址无法通过安全检查",
+                    )
+                prepared.append(
+                    ReferenceInput(
+                        kind=normalized.kind,
+                        locator=normalized.locator,
+                    )
+                )
+            prepared_groups.append(tuple(prepared))
+
+        return AistarslabReferenceInputs(
+            images=prepared_groups[0],
+            audios=prepared_groups[1],
+            videos=prepared_groups[2],
+        )
+
     def _build_provider(self, verified, intent, guard: _AuthorityGuard):
         snapshot = verified.snapshot
         binding = verified.credential_binding
-        if snapshot.model_ref.provider == "xai":
+        if snapshot.model_ref.provider in {"xai", "aistarslab"}:
             http_factory = lambda: _GatedHttpContext(
                 self._configuration.http_client_factory,
                 guard,
@@ -552,6 +625,23 @@ class VideoSingleExecutor:
             purpose,
             guard,
         )
+        if snapshot.model_ref.provider == "aistarslab":
+            return AistarslabVideoProvider(
+                owner_scope=OwnerTaskScope(
+                    snapshot.grant_snapshot.actor_id,
+                    verified.task_id,
+                    "video.single",
+                ),
+                frozen_snapshot=snapshot,
+                committed_intent=intent,
+                original_model_reference=snapshot.model_ref,
+                original_credential_binding=binding,
+                credential_binding_ref=snapshot.credential_binding_ref,
+                wire_model=snapshot.model_name,
+                http_client_factory=http_factory,
+                credential_resolver=resolver,
+                clock=self._configuration.db_clock,
+            )
         if snapshot.model_ref.provider == "xai":
             return XaiVideoProvider(
                 owner_scope=OwnerTaskScope(

@@ -25,7 +25,11 @@ def _claimed_video_task(
     request: pytest.FixtureRequest,
     raw_key: str,
 ):
-    environment = video_fixtures._video_environment(monkeypatch, tmp_path)
+    environment = video_fixtures._video_environment(
+        monkeypatch,
+        tmp_path,
+        provider="aistarslab",
+    )
     request.addfinalizer(environment.engine.dispose)
     task_id, _ = video_fixtures._admit_video_task(environment, key=raw_key)
     clock = [video_fixtures._NOW]
@@ -78,13 +82,13 @@ def test_video_intent_commits_once_and_returns_only_after_fresh_readback(
     assert prepared.verified_input is not None
     assert prepared.intent is not None
     assert prepared.intent.step_id
-    assert prepared.intent.provider == "xai"
+    assert prepared.intent.provider == "aistarslab"
     assert prepared.intent.deadline_at - prepared.intent.first_intent_at == timedelta(
         hours=2
     )
     verified = prepared.verified_input
     assert verified.server_attempt_id
-    assert verified.snapshot.model_ref.provider == "xai"
+    assert verified.snapshot.model_ref.provider == "aistarslab"
     assert len(verified.reference_images) == 3
     assert len(verified.reference_audios) == 3
     assert len(verified.reference_videos) == 3
@@ -153,7 +157,7 @@ def test_unknown_video_intent_commit_is_confirmed_without_reposting(
     def session_factory():
         nonlocal factory_calls
         factory_calls += 1
-        return CommitThenRaise() if factory_calls == 1 else Session(environment.engine)
+        return CommitThenRaise() if factory_calls == 2 else Session(environment.engine)
 
     def id_factory() -> str:
         created_ids.append("video-intent-unknown-id")
@@ -165,7 +169,7 @@ def test_unknown_video_intent_commit_is_confirmed_without_reposting(
         id_factory=id_factory,
     ).prepare(claim)
 
-    assert factory_calls == 2
+    assert factory_calls == 3
     assert created_ids == ["video-intent-unknown-id"]
     assert prepared.disposition == "committed"
     assert prepared.intent is not None

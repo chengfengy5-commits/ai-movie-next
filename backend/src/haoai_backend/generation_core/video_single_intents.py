@@ -733,7 +733,7 @@ def _query_resume_graph_is_valid(
             row.get("step_id") == step.get("id"),
             row.get("submission_key")
             == _intent_submission_key(str(unit.get("id")), str(step.get("id"))),
-            row.get("provider") in {"xai", "manxiaobai"},
+            row.get("provider") in {"xai", "manxiaobai", "aistarslab"},
             _nonempty_string(row.get("model_ref")),
             row.get("request_digest") == unit.get("input_digest"),
             intent == first_intent,
@@ -778,7 +778,8 @@ def _intent_from_existing_submission(
         or row.get("provider") != verified.snapshot.model_ref.provider
         or row.get("model_ref") != verified.snapshot.model_ref.model_id
         or row.get("request_digest") != binding.request_digest
-        or verified.snapshot.model_ref.provider not in {"xai", "manxiaobai"}
+        or verified.snapshot.model_ref.provider
+        not in {"xai", "manxiaobai", "aistarslab"}
     ):
         return None
     return CommittedIntent(

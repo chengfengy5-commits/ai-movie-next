@@ -71,16 +71,25 @@ class _ProviderResponse:
 
 
 class _ProviderClient:
-    def __init__(self, calls: list[tuple[str, str]]) -> None:
+    def __init__(self, calls: list[tuple[str, str]], provider: str) -> None:
         self.calls = calls
+        self.provider = provider
 
     async def request(self, method: str, url: str, **_kwargs: object) -> _ProviderResponse:
         self.calls.append((method, url))
         if method == "POST":
-            body = {"request_id": _PROVIDER_TASK_ID}
+            body = (
+                {"code": 0, "data": {"taskId": _PROVIDER_TASK_ID}}
+                if self.provider == "aistarslab"
+                else {"request_id": _PROVIDER_TASK_ID}
+            )
         else:
             assert method == "GET"
-            body = {"status": "done", "video": {"url": _VIDEO_URL}}
+            body = (
+                {"code": 0, "data": {"status": 3, "outputs": [_VIDEO_URL]}}
+                if self.provider == "aistarslab"
+                else {"status": "done", "video": {"url": _VIDEO_URL}}
+            )
         return _ProviderResponse(json.dumps(body).encode("utf-8"))
 
 
@@ -96,9 +105,9 @@ class _ProviderContext:
 
 
 class _ProviderFactory:
-    def __init__(self) -> None:
+    def __init__(self, provider: str = "xai") -> None:
         self.calls: list[tuple[str, str]] = []
-        self.client = _ProviderClient(self.calls)
+        self.client = _ProviderClient(self.calls, provider)
 
     def __call__(self) -> _ProviderContext:
         return _ProviderContext(self.client)
@@ -260,9 +269,14 @@ class _FakeS3Session:
         return _FakeS3Client(self.uploaded)
 
 
-def _build_video_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def _build_video_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    provider: str = "xai",
+):
     admission_module = media_integration.admission_staging_module
-    monkeypatch.setattr(admission_module, "_G2_JOINT_PROVIDER", "xai")
+    monkeypatch.setattr(admission_module, "_G2_JOINT_PROVIDER", provider)
     original_insert_model = admission_module._joint_insert_catalog_model
 
     def insert_model(connection, source: ModelSource) -> None:
@@ -273,7 +287,16 @@ def _build_video_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             .where(table.c.id == media_integration._G2_JOINT_MODEL_ID)
             .values(
                 category="video",
-                model="grok-imagine-video",
+                model=(
+                    "47:seedance-2.0"
+                    if provider == "aistarslab"
+                    else "grok-imagine-video"
+                ),
+                base_url=(
+                    "https://provider.example.test/openapi"
+                    if provider == "aistarslab"
+                    else "https://provider.example.test/v2"
+                ),
                 params=json.dumps(
                     {
                         "billing_mode": "per_second",
@@ -473,11 +496,13 @@ def test_video_single_configuration_is_opt_in_and_builds_cold_host(
         load_server_configuration(full_environment)
 
 
+@pytest.mark.parametrize("provider", ("xai", "aistarslab"))
 def test_server_lifespan_runs_video_single_through_shared_image_host(
+    provider: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    fixture = _build_video_fixture(tmp_path, monkeypatch)
+    fixture = _build_video_fixture(tmp_path, monkeypatch, provider=provider)
     _, credentials_file = server_credentials._provisioned_bundle(tmp_path)
     _add_worker_capacity_column(fixture.engine)
 
@@ -508,7 +533,7 @@ def test_server_lifespan_runs_video_single_through_shared_image_host(
         "load_registry_capabilities",
         load_fixture_capabilities,
     )
-    provider_factory = _ProviderFactory()
+    provider_factory = _ProviderFactory(provider)
     media_library = _PinnedMediaLibrary(_MediaResponse())
     uploaded: list[dict[str, object]] = []
     monkeypatch.setattr(
@@ -611,7 +636,7 @@ def test_server_lifespan_runs_video_single_through_shared_image_host(
                 "exp": datetime.now(timezone.utc) + timedelta(hours=1),
             }
         )
-        key = "server-video-single-host-966"
+        key = f"server-video-single-host-966-{provider}"
         headers = {
             "Authorization": f"Bearer {token}",
             "Idempotency-Key": key,
@@ -668,9 +693,14 @@ def test_server_lifespan_runs_video_single_through_shared_image_host(
         accepted_quoted_amount = asyncio.run(run())
 
         assert [method for method, _url in provider_factory.calls] == ["POST", "GET"]
-        assert provider_factory.calls[1][1].endswith(
-            f"/v1/videos/{_PROVIDER_TASK_ID}"
-        )
+        if provider == "aistarslab":
+            assert provider_factory.calls[1][1].endswith(
+                f"/openapi/generation/status?taskId={_PROVIDER_TASK_ID}"
+            )
+        else:
+            assert provider_factory.calls[1][1].endswith(
+                f"/v1/videos/{_PROVIDER_TASK_ID}"
+            )
         assert len(uploaded) == 1
         stored = uploaded[0]
         assert stored["body"] == _VIDEO_BYTES
