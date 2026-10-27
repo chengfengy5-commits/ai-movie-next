@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import math
 from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import AbstractAsyncContextManager
 from datetime import datetime, timezone
@@ -68,6 +69,10 @@ class _BodyTooLarge(ValueError):
     """A provider response exceeded the adapter's fixed memory bound."""
 
 
+class _RequestFailed(Exception):
+    """The request budget is unavailable or expired before dispatch."""
+
+
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -88,6 +93,21 @@ def _safe_query_error(status: str, secret: str) -> str | None:
         return None
     message = "xAI reported a provider failure"
     return None if secret and secret in message else message
+
+
+def _contains_secret_echo(value: str, secret: str) -> bool:
+    if not secret:
+        return False
+
+    candidate = value
+    for _ in range(4):
+        if secret.casefold() in candidate.casefold():
+            return True
+        decoded = unquote_plus(candidate)
+        if decoded == candidate:
+            break
+        candidate = decoded
+    return False
 
 
 def _safe_media_locator(raw_locator: object, secret: str) -> str | None:
@@ -499,14 +519,15 @@ class XaiVideoProvider:
         return credential
 
     @staticmethod
-    async def _read_bounded(response: AsyncHttpResponse) -> bytes:
+    async def _read_bounded(
+        response: AsyncHttpResponse, deadline: float
+    ) -> tuple[bytes, object]:
         candidate = response.iter_bytes(chunk_size=_RESPONSE_CHUNK_SIZE)
         iterator = await candidate if inspect.isawaitable(candidate) else candidate
         if not hasattr(iterator, "__aiter__"):
             raise TypeError("provider response iterator is invalid")
 
         body = bytearray()
-        pending_error: BaseException | None = None
         try:
             async for chunk in iterator:
                 if not isinstance(chunk, bytes):
@@ -514,20 +535,45 @@ class XaiVideoProvider:
                 if len(body) + len(chunk) > _RESPONSE_BODY_LIMIT:
                     raise _BodyTooLarge("provider response exceeded its byte limit")
                 body.extend(chunk)
-            return bytes(body)
-        except BaseException as exc:
-            pending_error = exc
+        except BaseException:
+            try:
+                await XaiVideoProvider._close_iterator_until(iterator, deadline)
+            except BaseException:
+                pass
             raise
-        finally:
-            close = getattr(iterator, "aclose", None)
-            if callable(close):
-                try:
-                    close_result = close()
-                    if inspect.isawaitable(close_result):
-                        await close_result
-                except BaseException:
-                    if pending_error is None:
-                        raise
+
+        return bytes(body), iterator
+
+    @staticmethod
+    async def _close_iterator_until(iterator: object, deadline: float) -> bool:
+        close = getattr(iterator, "aclose", None)
+        if not callable(close):
+            return True
+        try:
+            async with asyncio.timeout_at(deadline):
+                close_result = close()
+                if inspect.isawaitable(close_result):
+                    await close_result
+        except TimeoutError:
+            return False
+        return True
+
+    @staticmethod
+    async def _close_client_context_until(
+        context: AbstractAsyncContextManager[AsyncHttpClient],
+        deadline: float,
+        error: BaseException | None,
+    ) -> bool:
+        try:
+            async with asyncio.timeout_at(deadline):
+                await context.__aexit__(
+                    type(error) if error is not None else None,
+                    error,
+                    error.__traceback__ if error is not None else None,
+                )
+        except TimeoutError:
+            return False
+        return True
 
     @staticmethod
     def _unknown_create(intent: CommittedIntent) -> ExternalOperationRef:
@@ -555,59 +601,114 @@ class XaiVideoProvider:
         }
 
         request_started = False
+        response_status: int | None = None
+        body: bytes | None = None
+        iterator: object | None = None
+        operation_error: BaseException | None = None
+        client_context: AbstractAsyncContextManager[AsyncHttpClient] | None = None
+        client_entered = False
+        deadline = 0.0
         try:
-            async with self._http_client_factory() as client:
+            request_timeout = self._remaining_request_timeout(_CREATE_TIMEOUT_SECONDS)
+            deadline = asyncio.get_running_loop().time() + request_timeout
+            async with asyncio.timeout_at(deadline):
+                client_context = self._http_client_factory()
+                client = await client_context.__aenter__()
+                client_entered = True
                 request_started = True
                 response = await client.request(
                     "POST",
                     f"{origin}/v1/videos/generations",
                     headers=headers,
                     content=content,
-                    timeout_seconds=_CREATE_TIMEOUT_SECONDS,
+                    timeout_seconds=request_timeout,
                     follow_redirects=False,
                 )
-                status_code = response.status_code
-                if isinstance(status_code, bool) or not isinstance(status_code, int):
-                    return self._unknown_create(intent)
-                if 400 <= status_code < 500:
-                    return ExternalOperationRef(
-                        intent_id=intent.external_submission_id,
-                        attempt_id=intent.attempt_id,
-                        provider=intent.provider,
-                        external_id=None,
-                        create_outcome="definitive_failure",
-                        last_safe_provider_state=str(status_code),
-                    )
-                if status_code != 200:
-                    return self._unknown_create(intent)
-                body = await self._read_bounded(response)
-        except asyncio.CancelledError:
-            raise
-        except _BodyTooLarge:
+                response_status = response.status_code
+                if (
+                    isinstance(response_status, bool)
+                    or not isinstance(response_status, int)
+                ):
+                    response_status = None
+                elif response_status == 200:
+                    body, iterator = await self._read_bounded(response, deadline)
+        except BaseException as exc:
+            operation_error = exc
+
+        cleanup_completed = True
+        cleanup_cancel: asyncio.CancelledError | None = None
+        cleanup_error: BaseException | None = None
+        if iterator is not None:
+            try:
+                cleanup_completed = await self._close_iterator_until(
+                    iterator, deadline
+                ) and cleanup_completed
+            except asyncio.CancelledError as exc:
+                cleanup_cancel = exc
+            except BaseException as exc:
+                cleanup_error = exc
+        if client_entered and client_context is not None:
+            try:
+                cleanup_completed = await self._close_client_context_until(
+                    client_context, deadline, operation_error
+                ) and cleanup_completed
+            except asyncio.CancelledError as exc:
+                cleanup_cancel = cleanup_cancel or exc
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+
+        if isinstance(operation_error, asyncio.CancelledError):
+            raise operation_error
+        if cleanup_cancel is not None:
+            raise cleanup_cancel
+        if operation_error is not None and not isinstance(operation_error, Exception):
+            raise operation_error
+
+        if response_status == 200 and body is not None:
+            try:
+                parsed = parse_create_response(200, body)
+            except (XaiHTTPResponseError, XaiResponseParseError, TypeError, ValueError):
+                return self._unknown_create(intent)
+
+            request_id = parsed.request_id
+            if (
+                isinstance(request_id, str)
+                and request_id.strip()
+                and not _contains_secret_echo(request_id, credential.secret)
+            ):
+                return ExternalOperationRef(
+                    intent_id=intent.external_submission_id,
+                    attempt_id=intent.attempt_id,
+                    provider=intent.provider,
+                    external_id=request_id,
+                    create_outcome="submitted",
+                )
             return self._unknown_create(intent)
-        except Exception as exc:
+
+        if operation_error is not None:
             if request_started:
                 return self._unknown_create(intent)
             raise _freeze_error(
                 "configuration_unavailable",
                 "the xAI HTTP client is unavailable",
-            ) from exc
+            ) from operation_error
 
-        try:
-            parsed = parse_create_response(200, body)
-        except (XaiHTTPResponseError, XaiResponseParseError, TypeError, ValueError):
+        if not cleanup_completed or cleanup_error is not None:
             return self._unknown_create(intent)
 
-        request_id = parsed.request_id
-        if not isinstance(request_id, str) or not request_id.strip():
+        if response_status == 408:
             return self._unknown_create(intent)
-        return ExternalOperationRef(
-            intent_id=intent.external_submission_id,
-            attempt_id=intent.attempt_id,
-            provider=intent.provider,
-            external_id=request_id,
-            create_outcome="submitted",
-        )
+        if response_status is not None and 400 <= response_status < 500:
+            return ExternalOperationRef(
+                intent_id=intent.external_submission_id,
+                attempt_id=intent.attempt_id,
+                provider=intent.provider,
+                external_id=None,
+                create_outcome="definitive_failure",
+                last_safe_provider_state=str(response_status),
+            )
+
+        return self._unknown_create(intent)
 
     def _validate_external_ref(self, external_ref: ExternalOperationRef) -> None:
         if not isinstance(external_ref, ExternalOperationRef):
@@ -710,56 +811,115 @@ class XaiVideoProvider:
         encoded_id = quote(cast(str, external_ref.external_id), safe="")
 
         request_started = False
+        response_status: int | None = None
+        body: bytes | None = None
+        iterator: object | None = None
+        operation_error: BaseException | None = None
+        client_context: AbstractAsyncContextManager[AsyncHttpClient] | None = None
+        client_entered = False
+        deadline = 0.0
         try:
-            async with self._http_client_factory() as client:
+            request_timeout = self._remaining_request_timeout(_QUERY_TIMEOUT_SECONDS)
+            deadline = asyncio.get_running_loop().time() + request_timeout
+            async with asyncio.timeout_at(deadline):
+                client_context = self._http_client_factory()
+                client = await client_context.__aenter__()
+                client_entered = True
                 request_started = True
                 response = await client.request(
                     "GET",
                     f"{origin}/v1/videos/{encoded_id}",
                     headers=headers,
-                    timeout_seconds=_QUERY_TIMEOUT_SECONDS,
+                    timeout_seconds=request_timeout,
                     follow_redirects=False,
                 )
-                status_code = response.status_code
-                if isinstance(status_code, bool) or not isinstance(status_code, int):
+                response_status = response.status_code
+                if (
+                    isinstance(response_status, bool)
+                    or not isinstance(response_status, int)
+                ):
                     raise _freeze_error(
                         "evidence_conflict_or_invalid",
                         "xAI returned an invalid HTTP status",
                     )
-                if status_code != 200:
-                    payload: FrozenJSON = cast(
-                        FrozenJSON, {"http_status": status_code}
-                    )
-                    digest = hashlib.sha256(
-                        f"http-status:{status_code}".encode("ascii")
-                    ).hexdigest()
-                    return self._observation(
-                        snapshot=snapshot,
-                        external_ref=external_ref,
-                        status=str(status_code),
-                        payload=payload,
-                        body_digest=digest,
-                    )
-                body = await self._read_bounded(response)
-        except asyncio.CancelledError:
-            raise
-        except _BodyTooLarge as exc:
+                if response_status == 200:
+                    body, iterator = await self._read_bounded(response, deadline)
+        except BaseException as exc:
+            operation_error = exc
+
+        cleanup_completed = True
+        cleanup_cancel: asyncio.CancelledError | None = None
+        cleanup_error: BaseException | None = None
+        if iterator is not None:
+            try:
+                cleanup_completed = await self._close_iterator_until(
+                    iterator, deadline
+                ) and cleanup_completed
+            except asyncio.CancelledError as exc:
+                cleanup_cancel = exc
+            except BaseException as exc:
+                cleanup_error = exc
+        if client_entered and client_context is not None:
+            try:
+                cleanup_completed = await self._close_client_context_until(
+                    client_context, deadline, operation_error
+                ) and cleanup_completed
+            except asyncio.CancelledError as exc:
+                cleanup_cancel = cleanup_cancel or exc
+            except BaseException as exc:
+                cleanup_error = cleanup_error or exc
+
+        if isinstance(operation_error, asyncio.CancelledError):
+            raise operation_error
+        if cleanup_cancel is not None:
+            raise cleanup_cancel
+        if isinstance(operation_error, _BodyTooLarge):
             raise _freeze_error(
                 "evidence_conflict_or_invalid",
                 "xAI query response exceeded the bounded body limit",
-            ) from exc
-        except GenerationError:
-            raise
-        except Exception as exc:
+            ) from operation_error
+        if isinstance(operation_error, GenerationError):
+            raise operation_error
+        if operation_error is not None and not isinstance(operation_error, Exception):
+            raise operation_error
+
+        if operation_error is not None:
             if request_started:
                 raise _freeze_error(
                     "configuration_unavailable",
                     "the xAI query could not be completed",
-                ) from exc
+                ) from operation_error
             raise _freeze_error(
                 "configuration_unavailable",
                 "the xAI HTTP client is unavailable",
-            ) from exc
+            ) from operation_error
+
+        if not cleanup_completed or cleanup_error is not None:
+            raise _freeze_error(
+                "configuration_unavailable",
+                "the xAI query could not be completed",
+            )
+
+        if response_status != 200:
+            payload: FrozenJSON = cast(
+                FrozenJSON, {"http_status": response_status}
+            )
+            digest = hashlib.sha256(
+                f"http-status:{response_status}".encode("ascii")
+            ).hexdigest()
+            return self._observation(
+                snapshot=snapshot,
+                external_ref=external_ref,
+                status=str(response_status),
+                payload=payload,
+                body_digest=digest,
+            )
+
+        if body is None:
+            raise _freeze_error(
+                "configuration_unavailable",
+                "the xAI query could not be completed",
+            )
 
         try:
             parsed = parse_query_response(200, body)
@@ -782,3 +942,25 @@ class XaiVideoProvider:
             media_locator=media_locator,
             safe_error=safe_error,
         )
+
+    def _remaining_request_timeout(self, request_limit: float) -> float:
+        try:
+            now = self._clock()
+            deadline = self._original_intent.deadline_at
+            if (
+                not isinstance(now, datetime)
+                or now.tzinfo is None
+                or now.utcoffset() is None
+                or not isinstance(deadline, datetime)
+                or deadline.tzinfo is None
+                or deadline.utcoffset() is None
+            ):
+                raise ValueError
+            remaining = (
+                deadline.astimezone(timezone.utc) - now.astimezone(timezone.utc)
+            ).total_seconds()
+        except Exception:
+            raise _RequestFailed from None
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise _RequestFailed
+        return min(request_limit, remaining)

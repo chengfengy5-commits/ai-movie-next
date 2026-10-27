@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 import unittest
+from collections.abc import Callable
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import quote
 
 from haoai_backend.generation_contracts import (
@@ -44,11 +46,13 @@ class AsyncChunkIterator:
         owner: FakeResponse | None = None,
         close_error: BaseException | None = None,
         next_error: BaseException | None = None,
+        next_delay: float = 0.0,
     ) -> None:
         self._chunks = list(chunks)
         self._owner = owner
         self._close_error = close_error
         self._next_error = next_error
+        self._next_delay = next_delay
         self.closed = False
         self.close_attempts = 0
 
@@ -60,6 +64,8 @@ class AsyncChunkIterator:
             raise self._next_error
         if not self._chunks:
             raise StopAsyncIteration
+        if self._next_delay > 0:
+            await asyncio.sleep(self._next_delay)
         return self._chunks.pop(0)
 
     async def aclose(self) -> None:
@@ -83,6 +89,8 @@ class FakeResponse:
         iterator_close_error: BaseException | None = None,
         iterator_next_error: BaseException | None = None,
         response_close_error: BaseException | None = None,
+        iterator_next_delay: float = 0.0,
+        response_close_delay: float = 0.0,
     ) -> None:
         self.status_code = status_code
         self.headers = headers or {}
@@ -91,6 +99,8 @@ class FakeResponse:
         self.iterator_close_error = iterator_close_error
         self.iterator_next_error = iterator_next_error
         self.response_close_error = response_close_error
+        self.iterator_next_delay = iterator_next_delay
+        self.response_close_delay = response_close_delay
         self.iterator_closed = False
         self.closed = False
         self.close_attempts = 0
@@ -104,6 +114,7 @@ class FakeResponse:
             self,
             close_error=self.iterator_close_error,
             next_error=self.iterator_next_error,
+            next_delay=self.iterator_next_delay,
         )
         if self.iterator_mode == "direct":
             return self.iterator
@@ -115,7 +126,11 @@ class FakeResponse:
 
     async def aclose(self) -> None:
         self.close_attempts += 1
-        self.closed = True
+        try:
+            if self.response_close_delay > 0:
+                await asyncio.sleep(self.response_close_delay)
+        finally:
+            self.closed = True
         if self.response_close_error is not None:
             raise self.response_close_error
 
@@ -127,6 +142,8 @@ class FakeClient:
         *,
         error: BaseException | None = None,
         close_error: BaseException | None = None,
+        request_delay: float = 0.0,
+        close_delay: float = 0.0,
     ) -> None:
         self.response = response
         self.error = error
@@ -134,9 +151,13 @@ class FakeClient:
         self.calls: list[tuple[str, str, dict[str, object]]] = []
         self.closed = False
         self.close_attempts = 0
+        self.request_delay = request_delay
+        self.close_delay = close_delay
 
     async def request(self, method: str, url: str, **kwargs: object) -> FakeResponse:
         self.calls.append((method, url, kwargs))
+        if self.request_delay > 0:
+            await asyncio.sleep(self.request_delay)
         if self.error is not None:
             raise self.error
         assert self.response is not None
@@ -144,7 +165,11 @@ class FakeClient:
 
     async def aclose(self) -> None:
         self.close_attempts += 1
-        self.closed = True
+        try:
+            if self.close_delay > 0:
+                await asyncio.sleep(self.close_delay)
+        finally:
+            self.closed = True
         if self.close_error is not None:
             raise self.close_error
 
@@ -204,7 +229,7 @@ class ManxiaobaiVideoProviderTests(unittest.TestCase):
             snapshot_ref="execution-snapshot-ref-1",
             committed_at=NOW,
             first_intent_at=NOW,
-            deadline_at=NOW,
+            deadline_at=NOW + timedelta(minutes=10),
         )
 
     @staticmethod
@@ -238,11 +263,16 @@ class ManxiaobaiVideoProviderTests(unittest.TestCase):
         owner_scope: OwnerTaskScope | None = None,
         wire_model: str | None = "grok-video-1.5-preview",
         client_factory: object | None = None,
+        client_request_delay: float = 0.0,
+        client_close_delay: float = 0.0,
+        intent: CommittedIntent | None = None,
+        clock: Callable[[], datetime] | None = None,
     ) -> ManxiaobaiVideoProvider:
         selected_snapshot = snapshot or self.snapshot
         selected_binding = binding or self.binding
         selected_model_reference = model_reference or selected_snapshot.model_ref
         selected_scope = owner_scope or self.scope
+        selected_intent = intent or self.intent
 
         def resolver(
             original: CredentialBinding, purpose: str
@@ -254,7 +284,11 @@ class ManxiaobaiVideoProviderTests(unittest.TestCase):
 
         def default_client_factory() -> FakeClient:
             client = FakeClient(
-                response, error=client_error, close_error=client_close_error
+                response,
+                error=client_error,
+                close_error=client_close_error,
+                request_delay=client_request_delay,
+                close_delay=client_close_delay,
             )
             self.clients.append(client)
             return client
@@ -264,7 +298,7 @@ class ManxiaobaiVideoProviderTests(unittest.TestCase):
             owner_scope=selected_scope,
             snapshot_ref="execution-snapshot-ref-1",
             frozen_snapshot=selected_snapshot,
-            committed_intent=self.intent,
+            committed_intent=selected_intent,
             original_model_reference=selected_model_reference,
             trusted_model_owner_id=selected_model_reference.owner_id,
             credential_binding_ref=selected_snapshot.credential_binding_ref,
@@ -274,7 +308,7 @@ class ManxiaobaiVideoProviderTests(unittest.TestCase):
             wire_model=wire_model,
             credential_resolver=resolver,  # type: ignore[arg-type]
             http_client_factory=factory,  # type: ignore[arg-type]
-            clock=lambda: NOW,
+            clock=clock or (lambda: NOW),
         )
         self.providers.append(provider)
         return provider
@@ -343,6 +377,213 @@ class ManxiaobaiVideoProviderTests(unittest.TestCase):
         self.assertTrue(response.iterator_closed)
         self.assertTrue(response.closed)
         self.assertTrue(client.closed)
+
+    def test_create_deadline_bounds_body_read_and_normal_resource_cleanup(self) -> None:
+        cases = (
+            ("body", FakeResponse(200, b'{"id":"slow-body"}', iterator_next_delay=0.2), 0.0),
+            ("cleanup", FakeResponse(200, b'{"id":"slow-cleanup"}'), 0.2),
+        )
+        for stage, response, close_delay in cases:
+            with self.subTest(stage=stage):
+                self.clients.clear()
+                self.credential_calls.clear()
+                intent = replace(
+                    self.intent, deadline_at=NOW + timedelta(milliseconds=40)
+                )
+                provider = self.make_provider(
+                    response=response,
+                    intent=intent,
+                    client_close_delay=close_delay,
+                )
+
+                result = provider.submit_async_media(self.snapshot, (), intent)
+
+                if stage == "cleanup":
+                    self.assertEqual(result.create_outcome, "submitted")
+                    self.assertEqual(result.external_id, "slow-cleanup")
+                    repeated = provider.submit_async_media(
+                        self.snapshot, (), intent
+                    )
+                    self.assertEqual(repeated.external_id, "slow-cleanup")
+                else:
+                    self.assertEqual(result.create_outcome, "unknown")
+                    self.assertIsNone(result.external_id)
+                self.assertEqual(len(self.clients), 1)
+                self.assertEqual(len(self.clients[0].calls), 1)
+                self.assertEqual(self.clients[0].calls[0][0], "POST")
+                self.assertTrue(response.closed)
+                self.assertTrue(self.clients[0].closed)
+
+    def test_body_timeout_bounds_following_normal_resource_cleanup(self) -> None:
+        response = FakeResponse(
+            200,
+            b'{"id":"body-did-not-finish"}',
+            iterator_next_delay=0.2,
+            response_close_delay=0.2,
+        )
+        intent = replace(
+            self.intent, deadline_at=NOW + timedelta(milliseconds=40)
+        )
+        provider = self.make_provider(
+            response=response,
+            intent=intent,
+            client_close_delay=0.2,
+        )
+
+        started_at = time.perf_counter()
+        result = provider.submit_async_media(self.snapshot, (), intent)
+        elapsed = time.perf_counter() - started_at
+
+        self.assertEqual(result.create_outcome, "unknown")
+        self.assertEqual(len(self.clients), 1)
+        self.assertEqual(len(self.clients[0].calls), 1)
+        self.assertGreaterEqual(response.close_attempts, 1)
+        self.assertGreaterEqual(self.clients[0].close_attempts, 1)
+        self.assertLess(elapsed, 0.15)
+
+    def test_create_deadline_bounds_headers_body_and_all_normal_cleanup(self) -> None:
+        cases = (
+            ("headers", FakeResponse(200, b'{"id":"unused"}'), 0.2, 0.0),
+            ("body", FakeResponse(200, b'{"id":"unused"}', iterator_next_delay=0.2), 0.0, 0.0),
+            ("response cleanup", FakeResponse(200, b'{"id":"unused"}', response_close_delay=0.2), 0.0, 0.0),
+            ("client cleanup", FakeResponse(200, b'{"id":"unused"}'), 0.0, 0.2),
+        )
+        for stage, response, request_delay, client_close_delay in cases:
+            with self.subTest(stage=stage):
+                self.clients.clear()
+                self.credential_calls.clear()
+                intent = replace(
+                    self.intent, deadline_at=NOW + timedelta(milliseconds=50)
+                )
+                provider = self.make_provider(
+                    response=response,
+                    intent=intent,
+                    client_request_delay=request_delay,
+                    client_close_delay=client_close_delay,
+                )
+
+                result = provider.submit_async_media(self.snapshot, (), intent)
+
+                if stage in ("response cleanup", "client cleanup"):
+                    self.assertEqual(result.create_outcome, "submitted")
+                    self.assertEqual(result.external_id, "unused")
+                    repeated = provider.submit_async_media(
+                        self.snapshot, (), intent
+                    )
+                    self.assertEqual(repeated.external_id, "unused")
+                else:
+                    self.assertEqual(result.create_outcome, "unknown")
+                    self.assertIsNone(result.external_id)
+                self.assertEqual(len(self.clients), 1)
+                self.assertEqual(len(self.clients[0].calls), 1)
+                self.assertEqual(self.clients[0].calls[0][0], "POST")
+                self.assertAlmostEqual(
+                    self.clients[0].calls[0][2]["timeout_seconds"], 0.05
+                )
+                if stage != "headers":
+                    self.assertTrue(response.closed)
+                self.assertTrue(self.clients[0].closed)
+
+    def test_query_deadline_bounds_body_and_cleanup_while_preserving_original_id(self) -> None:
+        cases = (
+            ("body", FakeResponse(200, b'{"status":"processing"}', iterator_next_delay=0.2), 0.0),
+            ("response cleanup", FakeResponse(200, b'{"status":"processing"}', response_close_delay=0.2), 0.0),
+            ("client cleanup", FakeResponse(200, b'{"status":"processing"}'), 0.2),
+        )
+        for stage, response, client_close_delay in cases:
+            with self.subTest(stage=stage):
+                self.clients.clear()
+                self.credential_calls.clear()
+                intent = replace(
+                    self.intent, deadline_at=NOW + timedelta(milliseconds=50)
+                )
+                provider = self.make_provider(
+                    response=response,
+                    intent=intent,
+                    client_close_delay=client_close_delay,
+                )
+                original_id = "original/video-id"
+                original_ref = self.submitted_ref(original_id)
+
+                with self.assertRaises(GenerationError) as raised:
+                    provider.query_existing(self.snapshot, original_ref)
+
+                self.assertEqual(raised.exception.safe_detail, "provider query is unavailable")
+                self.assertEqual(len(self.clients), 1)
+                client = self.clients[0]
+                self.assertEqual(len(client.calls), 1)
+                method, url, options = client.calls[0]
+                self.assertEqual(method, "GET")
+                self.assertEqual(url, f"{ORIGIN}/v1/videos/{quote(original_id, safe='')}")
+                self.assertEqual(options["headers"], {"Authorization": f"Bearer {SECRET}"})
+                self.assertAlmostEqual(options["timeout_seconds"], 0.05)
+                self.assertEqual(
+                    self.credential_calls,
+                    [(self.binding, "query")],
+                )
+                self.assertTrue(response.closed)
+                self.assertTrue(client.closed)
+
+    def test_deadline_caps_create_and_query_timeout_arguments(self) -> None:
+        intent = replace(self.intent, deadline_at=NOW + timedelta(seconds=12))
+        create = self.make_provider(
+            response=FakeResponse(200, b'{"id":"created"}'), intent=intent
+        )
+        create.submit_async_media(self.snapshot, (), intent)
+        self.assertEqual(
+            self.clients[0].calls[0][2]["timeout_seconds"], 12.0
+        )
+
+        self.clients.clear()
+        query = self.make_provider(
+            response=FakeResponse(200, b'{"status":"processing"}'), intent=intent
+        )
+        query.query_existing(self.snapshot, self.submitted_ref("original-id"))
+        self.assertEqual(
+            self.clients[0].calls[0][2]["timeout_seconds"], 12.0
+        )
+
+    def test_invalid_or_expired_deadlines_reject_before_client_creation(self) -> None:
+        def broken_clock() -> datetime:
+            raise RuntimeError("private clock details")
+
+        cases = (
+            ("broken clock", NOW + timedelta(minutes=1), broken_clock),
+            ("naive clock", NOW + timedelta(minutes=1), lambda: datetime(2026, 10, 12, 12, 0)),
+            ("naive deadline", datetime(2026, 10, 12, 12, 1), lambda: NOW),
+            ("expired deadline", NOW, lambda: NOW),
+        )
+        for name, deadline, clock in cases:
+            with self.subTest(case=name):
+                self.clients.clear()
+                self.credential_calls.clear()
+                intent = replace(self.intent, deadline_at=deadline)
+                provider = self.make_provider(
+                    response=FakeResponse(200, b'{"id":"unused"}'),
+                    intent=intent,
+                    clock=clock,
+                )
+
+                result = provider.submit_async_media(self.snapshot, (), intent)
+                self.assertEqual(result.create_outcome, "unknown")
+                with self.assertRaises(GenerationError):
+                    provider.query_existing(self.snapshot, self.submitted_ref("original-id"))
+
+                self.assertEqual(self.clients, [])
+
+    def test_create_http_408_is_unknown_and_never_reposted(self) -> None:
+        response = FakeResponse(408, b'{"id":"not-known"}')
+        provider = self.make_provider(response=response)
+
+        result = provider.submit_async_media(self.snapshot, (), self.intent)
+        repeated = provider.submit_async_media(self.snapshot, (), self.intent)
+
+        self.assertEqual(result.create_outcome, "unknown")
+        self.assertIsNone(result.external_id)
+        self.assertEqual(repeated, result)
+        self.assertEqual(len(self.clients), 1)
+        self.assertEqual(len(self.clients[0].calls), 1)
+        self.assertFalse(response.iterator_closed)
 
     def test_create_keeps_catalog_identity_separate_from_wire_model_and_settings(self) -> None:
         snapshot = self.make_snapshot(

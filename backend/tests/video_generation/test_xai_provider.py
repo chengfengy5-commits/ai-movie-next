@@ -5,8 +5,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import time
 import unittest
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from typing import Literal
@@ -48,6 +49,7 @@ class FakeResponse:
         body: bytes = b"{}",
         *,
         block: bool = False,
+        body_delay: float = 0.0,
     ) -> None:
         self.status_code = status_code
         self.headers: Mapping[str, str] = {}
@@ -56,6 +58,7 @@ class FakeResponse:
             for index in range(0, len(body), 64 * 1024)
         )
         self._block = block
+        self._body_delay = body_delay
         self.iter_called = False
         self.iterator_closed = False
         self.iterator_waiting = asyncio.Event()
@@ -70,6 +73,8 @@ class FakeResponse:
                 if self._block:
                     self.iterator_waiting.set()
                     await self._release_iterator.wait()
+                if self._body_delay > 0:
+                    await asyncio.sleep(self._body_delay)
                 for chunk in self._chunks:
                     yield chunk
             finally:
@@ -97,11 +102,16 @@ class FakeClient:
         self,
         response: FakeResponse | None = None,
         error: Exception | None = None,
+        *,
+        request_delay: float = 0.0,
+        exit_delay: float = 0.0,
     ) -> None:
         self.response = response
         self.error = error
         self.calls: list[dict[str, object]] = []
         self.closed = False
+        self.request_delay = request_delay
+        self.exit_delay = exit_delay
 
     async def request(
         self,
@@ -123,6 +133,8 @@ class FakeClient:
                 "follow_redirects": follow_redirects,
             }
         )
+        if self.request_delay > 0:
+            await asyncio.sleep(self.request_delay)
         if self.error is not None:
             raise self.error
         if self.response is None:
@@ -138,7 +150,11 @@ class FakeClientContext:
         return self.client
 
     async def __aexit__(self, exc_type: object, exc: object, tb: object) -> Literal[False]:
-        self.client.closed = True
+        try:
+            if self.client.exit_delay > 0:
+                await asyncio.sleep(self.client.exit_delay)
+        finally:
+            self.client.closed = True
         return False
 
 
@@ -287,6 +303,9 @@ def _fixture(
     credential: BoundCredential | Literal["unavailable"] | None = None,
     model_params: Mapping[str, object] | None = None,
     original_intent: CommittedIntent | None = None,
+    request_delay: float = 0.0,
+    client_exit_delay: float = 0.0,
+    clock: Callable[[], datetime] | None = None,
 ) -> ProviderFixture:
     snapshot = _snapshot(model_params=model_params)
     intent = original_intent or _intent()
@@ -297,7 +316,12 @@ def _fixture(
         principal_id=binding.original_principal_id,
         secret="fake-secret-value",
     )
-    client = FakeClient(response=response, error=request_error)
+    client = FakeClient(
+        response=response,
+        error=request_error,
+        request_delay=request_delay,
+        exit_delay=client_exit_delay,
+    )
     client_factory = FakeClientFactory(client)
     resolver_calls: list[tuple[CredentialBinding, str]] = []
 
@@ -318,7 +342,7 @@ def _fixture(
         wire_model=_WIRE_MODEL,
         http_client_factory=client_factory,
         credential_resolver=resolve,
-        clock=lambda: _NOW,
+        clock=clock or (lambda: _NOW),
     )
     return ProviderFixture(
         provider=provider,
@@ -605,6 +629,205 @@ class XaiVideoProviderTests(unittest.TestCase):
         self.assertTrue(response.iterator_closed)
         self.assertTrue(fixture.client.closed)
         self.assertEqual(len(fixture.client.calls), 1)
+
+    def test_create_deadline_bounds_body_read_and_normal_context_cleanup(self) -> None:
+        cases = (
+            ("body", FakeResponse(body=b'{"request_id":"slow-body"}', body_delay=0.2), 0.0),
+            ("cleanup", FakeResponse(body=b'{"request_id":"slow-cleanup"}'), 0.2),
+        )
+        for stage, response, exit_delay in cases:
+            with self.subTest(stage=stage):
+                intent = replace(
+                    _intent(), deadline_at=_NOW + timedelta(milliseconds=40)
+                )
+                fixture = _fixture(
+                    response=response,
+                    original_intent=intent,
+                    client_exit_delay=exit_delay,
+                )
+
+                result = fixture.provider.submit_async_media(
+                    fixture.snapshot, (), intent
+                )
+
+                if stage == "cleanup":
+                    self.assertEqual(result.create_outcome, "submitted")
+                    self.assertEqual(result.external_id, "slow-cleanup")
+                else:
+                    self.assertEqual(result.create_outcome, "unknown")
+                    self.assertIsNone(result.external_id)
+                self.assertEqual(len(fixture.client.calls), 1)
+                self.assertEqual(fixture.client.calls[0]["method"], "POST")
+                self.assertTrue(fixture.client.closed)
+
+    def test_body_timeout_bounds_following_normal_context_cleanup(self) -> None:
+        intent = replace(_intent(), deadline_at=_NOW + timedelta(milliseconds=40))
+        response = FakeResponse(
+            body=b'{"request_id":"body-did-not-finish"}', body_delay=0.2
+        )
+        fixture = _fixture(
+            response=response,
+            original_intent=intent,
+            client_exit_delay=0.2,
+        )
+
+        started_at = time.perf_counter()
+        result = fixture.provider.submit_async_media(
+            fixture.snapshot, (), intent
+        )
+        elapsed = time.perf_counter() - started_at
+
+        self.assertEqual(result.create_outcome, "unknown")
+        self.assertEqual(len(fixture.client.calls), 1)
+        self.assertTrue(response.iterator_closed)
+        self.assertTrue(fixture.client.closed)
+        self.assertLess(elapsed, 0.15)
+
+    def test_cleanup_timeout_never_preserves_request_id_echoing_original_secret(self) -> None:
+        intent = replace(_intent(), deadline_at=_NOW + timedelta(milliseconds=40))
+        fixture = _fixture(
+            response=FakeResponse(
+                body=b'{"request_id":"fake-secret-value"}'
+            ),
+            original_intent=intent,
+            client_exit_delay=0.2,
+        )
+
+        result = fixture.provider.submit_async_media(
+            fixture.snapshot, (), intent
+        )
+
+        self.assertEqual(result.create_outcome, "unknown")
+        self.assertIsNone(result.external_id)
+        self.assertNotIn("fake-secret-value", repr(result))
+        self.assertEqual(len(fixture.client.calls), 1)
+        self.assertEqual(fixture.client.calls[0]["method"], "POST")
+
+    def test_create_deadline_bounds_headers_body_and_context_cleanup(self) -> None:
+        cases = (
+            ("headers", FakeResponse(body=b'{"request_id":"unused"}'), 0.2, 0.0),
+            ("body", FakeResponse(body=b'{"request_id":"unused"}', body_delay=0.2), 0.0, 0.0),
+            ("cleanup", FakeResponse(body=b'{"request_id":"unused"}'), 0.0, 0.2),
+        )
+        for stage, response, request_delay, exit_delay in cases:
+            with self.subTest(stage=stage):
+                intent = replace(
+                    _intent(), deadline_at=_NOW + timedelta(milliseconds=50)
+                )
+                fixture = _fixture(
+                    response=response,
+                    original_intent=intent,
+                    request_delay=request_delay,
+                    client_exit_delay=exit_delay,
+                )
+
+                result = fixture.provider.submit_async_media(
+                    fixture.snapshot, (), intent
+                )
+
+                if stage == "cleanup":
+                    self.assertEqual(result.create_outcome, "submitted")
+                    self.assertEqual(result.external_id, "unused")
+                else:
+                    self.assertEqual(result.create_outcome, "unknown")
+                    self.assertIsNone(result.external_id)
+                self.assertEqual(fixture.client_factory.calls, 1)
+                self.assertEqual(len(fixture.client.calls), 1)
+                self.assertEqual(fixture.client.calls[0]["method"], "POST")
+                self.assertAlmostEqual(fixture.client.calls[0]["timeout_seconds"], 0.05)
+                self.assertTrue(fixture.client.closed)
+
+    def test_query_deadline_bounds_body_read_and_context_cleanup_without_losing_original_id(self) -> None:
+        cases = (
+            ("body", FakeResponse(body=b'{"status":"processing"}', body_delay=0.2), 0.0),
+            ("cleanup", FakeResponse(body=b'{"status":"processing"}'), 0.2),
+        )
+        for stage, response, exit_delay in cases:
+            with self.subTest(stage=stage):
+                intent = replace(
+                    _intent(), deadline_at=_NOW + timedelta(milliseconds=50)
+                )
+                fixture = _fixture(
+                    response=response,
+                    original_intent=intent,
+                    client_exit_delay=exit_delay,
+                )
+                original_ref = _external_ref(intent, external_id="req/14")
+
+                with self.assertRaises(GenerationError) as raised:
+                    fixture.provider.query_existing(fixture.snapshot, original_ref)
+
+                self.assertEqual(raised.exception.safe_detail, "the xAI query could not be completed")
+                self.assertEqual(len(fixture.client.calls), 1)
+                call = fixture.client.calls[0]
+                self.assertEqual(call["method"], "GET")
+                self.assertEqual(call["url"], "https://api.x.ai/v1/videos/req%2F14")
+                self.assertEqual(call["headers"], {"Authorization": "Bearer fake-secret-value"})
+                self.assertAlmostEqual(call["timeout_seconds"], 0.05)
+                self.assertTrue(fixture.client.closed)
+
+    def test_deadline_caps_create_and_query_timeout_arguments(self) -> None:
+        intent = replace(_intent(), deadline_at=_NOW + timedelta(seconds=12))
+        create_fixture = _fixture(
+            response=FakeResponse(body=b'{"request_id":"created"}'),
+            original_intent=intent,
+        )
+        create_fixture.provider.submit_async_media(create_fixture.snapshot, (), intent)
+        self.assertEqual(create_fixture.client.calls[0]["timeout_seconds"], 12.0)
+
+        query_fixture = _fixture(
+            response=FakeResponse(body=b'{"status":"processing"}'),
+            original_intent=intent,
+        )
+        query_fixture.provider.query_existing(
+            query_fixture.snapshot,
+            _external_ref(intent, external_id="original-id"),
+        )
+        self.assertEqual(query_fixture.client.calls[0]["timeout_seconds"], 12.0)
+
+    def test_invalid_or_expired_deadlines_reject_before_http_client_creation(self) -> None:
+        def broken_clock() -> datetime:
+            raise RuntimeError("private clock details")
+
+        cases = (
+            ("broken clock", _NOW + timedelta(minutes=1), broken_clock),
+            ("naive clock", _NOW + timedelta(minutes=1), lambda: datetime(2026, 10, 12, 3, 0)),
+            ("naive deadline", datetime(2026, 10, 12, 3, 1), lambda: _NOW),
+            ("expired deadline", _NOW, lambda: _NOW),
+        )
+        for name, deadline, clock in cases:
+            with self.subTest(case=name):
+                intent = replace(_intent(), deadline_at=deadline)
+                fixture = _fixture(
+                    response=FakeResponse(body=b'{"request_id":"unused"}'),
+                    original_intent=intent,
+                    clock=clock,
+                )
+
+                with self.assertRaises(GenerationError):
+                    fixture.provider.submit_async_media(fixture.snapshot, (), intent)
+                with self.assertRaises(GenerationError):
+                    fixture.provider.query_existing(
+                        fixture.snapshot,
+                        _external_ref(intent, external_id="original-id"),
+                    )
+
+                self.assertEqual(fixture.client_factory.calls, 0)
+                self.assertEqual(fixture.client.calls, [])
+
+    def test_create_http_408_is_unknown_without_reading_or_reposting(self) -> None:
+        response = FakeResponse(status_code=408, body=b'{"request_id":"not-known"}')
+        fixture = _fixture(response=response)
+
+        result = fixture.provider.submit_async_media(
+            fixture.snapshot, (), fixture.intent
+        )
+
+        self.assertEqual(result.create_outcome, "unknown")
+        self.assertIsNone(result.external_id)
+        self.assertFalse(response.iter_called)
+        self.assertEqual(len(fixture.client.calls), 1)
+        self.assertEqual(fixture.client.calls[0]["method"], "POST")
 
     def test_create_accepts_direct_async_generator_iterator(self) -> None:
         response = DirectGeneratorResponse(body=b'{"request_id":"direct-iterator"}')
