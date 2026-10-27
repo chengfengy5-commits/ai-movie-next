@@ -20,6 +20,7 @@ import { AccountPage } from "../features/account/AccountPage";
 import { TeamsPage } from "../features/teams/TeamsPage";
 import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 import type { ProviderQuotaServicePort } from "../shared/api/providerQuota";
+import type { ZhangyugePatServicePort } from "../shared/api/zhangyugePat";
 import {
   createTeamCollaborationWriteScope,
   sameTeamCollaborationWriteScope,
@@ -515,6 +516,9 @@ function Dashboard() {
   const providerQuotaService = (services as typeof services & {
     providerQuota?: ProviderQuotaServicePort;
   }).providerQuota;
+  const zhangyugePatService = (services as typeof services & {
+    zhangyugePat?: ZhangyugePatServicePort;
+  }).zhangyugePat;
 
   return (
     <div className="workspace-shell">
@@ -888,6 +892,7 @@ function Dashboard() {
               key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
               {...(creatorSettingsService === undefined ? {} : { service: creatorSettingsService })}
               {...(providerQuotaService === undefined ? {} : { providerQuotaService })}
+              {...(zhangyugePatService === undefined ? {} : { zhangyugePatService })}
               isSuperuser={state.user.is_superuser}
               userId={state.user.id}
               onUnauthorized={logoutFromWorkspace}

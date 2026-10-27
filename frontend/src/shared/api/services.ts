@@ -149,6 +149,8 @@ import {
 } from "./creatorSettings";
 import { createProviderQuotaHttp } from "./providerQuotaHttp";
 import type { ProviderQuotaAccountInput, ProviderQuotaProbeInput, ProviderQuotaServicePort } from "./providerQuota";
+import { createZhangyugePatHttp } from "./zhangyugePatHttp";
+import type { ZhangyugePatServicePort } from "./zhangyugePat";
 import type { FrameReviewServicePort } from "./frameReview";
 import type { FrameOptimizeServicePort } from "./frameOptimize";
 import {
@@ -337,6 +339,7 @@ export interface WorkspaceServices {
   readonly frameOptimize?: FrameOptimizeServicePort;
   readonly creatorSettings?: CreatorSettingsServicePort;
   readonly providerQuota?: ProviderQuotaServicePort;
+  readonly zhangyugePat?: ZhangyugePatServicePort;
   exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
   importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
   logout(): void;
@@ -2157,6 +2160,8 @@ type ApiEndpoint =
   | "providerQuotaUpdateAccount"
   | "providerQuotaDeleteAccount"
   | "providerQuotaProbe"
+  | "zhangyugePatStatus"
+  | "zhangyugePatSave"
   | "creatorModel"
   | "promoteCreatorModelToSystem"
   | "demoteCreatorModelToPersonal"
@@ -2354,6 +2359,12 @@ function apiRequestDefinition(
   }
   if (endpoint === "providerQuotaProbe") {
     return { path: "/provider-quota/probe", method: "POST" };
+  }
+  if (endpoint === "zhangyugePatStatus") {
+    return { path: "/zhangyuge/pat", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "zhangyugePatSave") {
+    return { path: "/zhangyuge/pat", method: "POST", expectedStatus: 200 };
   }
   if (endpoint === "testCreatorModelConnection") {
     return { path: "/models/test-connection", method: "POST" };
@@ -3241,6 +3252,13 @@ export function createApiServices(
           undefined,
           { providerQuotaAccountId: call.accountId },
         );
+      }
+      return requestForCurrentApiSession(call.endpoint, token, signal);
+    }),
+    zhangyugePat: createZhangyugePatHttp(async (call, signal) => {
+      const token = requireApiToken(storage);
+      if (call.endpoint === "zhangyugePatSave") {
+        return requestForCurrentApiSession(call.endpoint, token, signal, { pat: call.pat });
       }
       return requestForCurrentApiSession(call.endpoint, token, signal);
     }),
