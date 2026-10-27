@@ -1,3 +1,56 @@
+.frame-asset-references-panel.is-floating {
+  position: fixed;
+  z-index: 1200;
+  top: 60px;
+  right: 400px;
+  left: auto;
+  width: min(360px, calc(100vw - 40px));
+  max-width: calc(100vw - 40px);
+  max-height: 80vh;
+  margin: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 12px 36px rgb(26 48 39 / 23%);
+}
+
+.frame-asset-references-panel.is-floating .frame-asset-references-heading {
+  position: sticky;
+  z-index: 1;
+  top: 0;
+  background: #f8fbf9;
+}
+
+.frame-asset-reference-panel-controls {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.frame-asset-reference-drag-handle {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.frame-asset-reference-drag-handle:active {
+  cursor: grabbing;
+}
+
+.frame-asset-reference-drag-handle:focus-visible {
+  outline: 2px solid #8cb8a8;
+  outline-offset: 2px;
+}
+
+.frame-asset-reference-position-feedback,
+.frame-asset-reference-position-note {
+  margin: 0;
+  color: #8a7651;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
 .frame-asset-reference-scroll-viewport {
   max-height: min(42vh, 420px);
   min-height: 0;
@@ -22,5 +75,20 @@
 @media (max-height: 640px) {
   .frame-asset-reference-scroll-viewport {
     max-height: 36vh;
+  }
+}
+
+@media (max-width: 768px) {
+  .frame-asset-references-panel.is-floating {
+    position: static;
+    top: auto;
+    right: auto;
+    left: auto;
+    width: auto;
+    max-width: none;
+    max-height: none;
+    margin-top: 11px;
+    overflow: visible;
+    box-shadow: none;
   }
 }

@@ -16,6 +16,12 @@ import {
   uniqueStoryboardFrameId,
   writeFrameAssetReferenceScrollTop,
 } from "./frameAssetReferenceScrollPreferences";
+import {
+  createFrameAssetReferencePanelPositionScope,
+  defaultFrameAssetReferencePanelPosition,
+  readFrameAssetReferencePanelPosition,
+  writeFrameAssetReferencePanelPosition,
+} from "./frameAssetReferencePanelPositionPreferences";
 
 const seriesId = "reference-panel-series";
 
@@ -221,6 +227,34 @@ function setScrollBounds(element: HTMLElement, scrollHeight: number, clientHeigh
   });
 }
 
+function setViewportSize(width: number, height: number): void {
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: width });
+  Object.defineProperty(window, "innerHeight", { configurable: true, value: height });
+}
+
+function setPanelBounds(element: HTMLElement, width: number, height: number): void {
+  vi.spyOn(element, "getBoundingClientRect").mockReturnValue(new DOMRect(0, 0, width, height));
+}
+
+function stubPointerCapture(element: HTMLElement) {
+  const captured = new Set<number>();
+  const setPointerCapture = vi.fn((pointerId: number) => captured.add(pointerId));
+  const hasPointerCapture = vi.fn((pointerId: number) => captured.has(pointerId));
+  const releasePointerCapture = vi.fn((pointerId: number) => { captured.delete(pointerId); });
+  Object.defineProperties(element, {
+    setPointerCapture: { configurable: true, value: setPointerCapture },
+    hasPointerCapture: { configurable: true, value: hasPointerCapture },
+    releasePointerCapture: { configurable: true, value: releasePointerCapture },
+  });
+  return { setPointerCapture, hasPointerCapture, releasePointerCapture };
+}
+
+function panelPositionScope(owner: FrameAssetReferenceOwner) {
+  const scope = createFrameAssetReferencePanelPositionScope(owner.userId, owner.services.apiBaseUrl);
+  if (scope === null) throw new Error("Test owner must have a stable account and API scope.");
+  return scope;
+}
+
 function LayoutCommitObserver({ onCommit }: { onCommit(): void }) {
   useLayoutEffect(() => {
     onCommit();
@@ -232,6 +266,7 @@ describe("frame asset references panel", () => {
   afterEach(() => {
     cleanup();
     window.localStorage.clear();
+    setViewportSize(1024, 768);
   });
 
   it("does not fetch on open, shows only text, and reads only the selected category", async () => {
@@ -859,5 +894,352 @@ describe("frame asset references panel", () => {
 
     expect(oldViewport.scrollTop).toBe(0);
     expect(readFrameAssetReferenceScrollTop(preferenceScope)).toEqual({ kind: "stored", scrollTop: 180 });
+  });
+
+  it("switches presentation without remounting the panel or rereading its selected category", async () => {
+    const user = userEvent.setup();
+    const sourceFrame = stableStoryboardFrame("floating-frame-inline", { character: ["character-1"] });
+    const listCharacters = vi.fn(async () => [character()]);
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services({ listCharacters }));
+    const rendered = renderPanel(owner);
+
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(await screen.findByText("<b>沈照</b>", { selector: "strong" })).toBeInTheDocument();
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    const viewport = screen.getByRole("region", { name: "关联素材列表" });
+    setPanelBounds(panelElement, 360, 320);
+    setScrollBounds(viewport, 600, 180);
+    viewport.scrollTop = 92;
+    fireEvent.scroll(viewport);
+
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(screen.getByRole("region", { name: "镜头 1 的关联素材" })).toBe(panelElement);
+    expect(screen.getByRole("region", { name: "关联素材列表" })).toBe(viewport);
+    expect(panelElement).toHaveClass("is-floating");
+    expect(viewport.scrollTop).toBe(92);
+
+    await user.click(screen.getByRole("button", { name: "回到镜头内" }));
+    expect(screen.getByRole("region", { name: "镜头 1 的关联素材" })).toBe(panelElement);
+    expect(panelElement).not.toHaveClass("is-floating");
+    expect(viewport.scrollTop).toBe(92);
+    expect(listCharacters).toHaveBeenCalledOnce();
+    expect(rendered.container.querySelectorAll(".frame-asset-reference-scroll-viewport")).toHaveLength(1);
+  });
+
+  it("reads saved coordinates only after explicit floating and clamps to measured bounds without autosaving", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1280, 720);
+    const sourceFrame = stableStoryboardFrame("floating-frame-clamp");
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+    const scope = panelPositionScope(owner);
+    expect(writeFrameAssetReferencePanelPosition(scope, { left: 2000, top: 1000 })).toBe("saved");
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    setPanelBounds(panelElement, 360, 600);
+
+    expect(panelElement).not.toHaveClass("is-floating");
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(panelElement).toHaveClass("is-floating");
+    expect(panelElement.style.left).toBe("900px");
+    expect(panelElement.style.top).toBe("100px");
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 2000, top: 1000 },
+    });
+
+    await user.click(screen.getByRole("button", { name: "回到镜头内" }));
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(panelElement.style.left).toBe("900px");
+    expect(panelElement.style.top).toBe("100px");
+  });
+
+  it("restores the original desktop position after a narrower viewport temporarily clamps it", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1400, 900);
+    const sourceFrame = stableStoryboardFrame("floating-frame-resize-projection");
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+    const scope = panelPositionScope(owner);
+    expect(writeFrameAssetReferencePanelPosition(scope, { left: 900, top: 100 })).toBe("saved");
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    setPanelBounds(panelElement, 360, 300);
+
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(panelElement.style.left).toBe("900px");
+    act(() => {
+      setViewportSize(1000, 900);
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(panelElement.style.left).toBe("620px");
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 900, top: 100 },
+    });
+
+    act(() => {
+      setViewportSize(1400, 900);
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(panelElement.style.left).toBe("900px");
+    expect(panelElement.style.top).toBe("100px");
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 900, top: 100 },
+    });
+  });
+
+  it("reclamps visually when selected category data makes the floating panel taller", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1400, 900);
+    const sourceFrame = stableStoryboardFrame("floating-frame-content-growth", { character: ["character-1"] });
+    const pendingCharacters = deferred<Character[]>();
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services({
+      listCharacters: vi.fn(() => pendingCharacters.promise),
+    }));
+    const scope = panelPositionScope(owner);
+    expect(writeFrameAssetReferencePanelPosition(scope, { left: 600, top: 500 })).toBe("saved");
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    let measuredHeight = 300;
+    vi.spyOn(panelElement, "getBoundingClientRect").mockImplementation(() => new DOMRect(0, 0, 360, measuredHeight));
+
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(panelElement.style.top).toBe("500px");
+    const dragHandle = screen.getByRole("button", { name: "拖动关联素材浮窗；也可按方向键移动" });
+    stubPointerCapture(dragHandle);
+    fireEvent.pointerDown(dragHandle, { pointerId: 9, button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(dragHandle, { pointerId: 9, clientX: 10, clientY: 30 });
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(screen.getByRole("status")).toHaveTextContent("正在读取角色");
+    measuredHeight = 700;
+    await act(async () => {
+      pendingCharacters.resolve([character()]);
+      await pendingCharacters.promise;
+    });
+
+    expect(await screen.findByText("<b>沈照</b>", { selector: "strong" })).toBeInTheDocument();
+    expect(panelElement.style.top).toBe("180px");
+    fireEvent.pointerCancel(dragHandle, { pointerId: 9 });
+    expect(panelElement.style.top).toBe("180px");
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 600, top: 500 },
+    });
+  });
+
+  it("saves only on a captured pointerup and restores the position when explicitly floated again", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1400, 900);
+    const sourceFrame = stableStoryboardFrame("floating-frame-drag");
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+    const scope = panelPositionScope(owner);
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    setPanelBounds(panelElement, 360, 300);
+
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(panelElement.style.left).toBe("640px");
+    expect(panelElement.style.top).toBe("60px");
+    const handle = screen.getByRole("button", { name: "拖动关联素材浮窗；也可按方向键移动" });
+    const capture = stubPointerCapture(handle);
+    const resetButton = screen.getByRole("button", { name: "恢复默认位置" });
+    fireEvent.pointerDown(resetButton, { pointerId: 1, button: 0, clientX: 10, clientY: 10 });
+    expect(capture.setPointerCapture).not.toHaveBeenCalled();
+
+    fireEvent.pointerDown(handle, { pointerId: 7, button: 0, clientX: 100, clientY: 80 });
+    fireEvent.pointerMove(handle, { pointerId: 7, clientX: 200, clientY: 160 });
+    expect(panelElement.style.left).toBe("740px");
+    expect(panelElement.style.top).toBe("140px");
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({ kind: "missing" });
+    fireEvent.pointerUp(handle, { pointerId: 7, clientX: 200, clientY: 160 });
+    expect(capture.setPointerCapture).toHaveBeenCalledWith(7);
+    expect(capture.releasePointerCapture).toHaveBeenCalledWith(7);
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 740, top: 140 },
+    });
+
+    await user.click(screen.getByRole("button", { name: "回到镜头内" }));
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(panelElement.style.left).toBe("740px");
+    expect(panelElement.style.top).toBe("140px");
+  });
+
+  it("keeps floating usable without account or API identity and explains why it will not persist", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1400, 900);
+    const sourceFrame = stableStoryboardFrame("floating-frame-unscoped");
+    const owner = {
+      ...createOwner(chapter(sourceFrame), sourceFrame, services({ apiBaseUrl: null })),
+      userId: " ",
+    };
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    setPanelBounds(panelElement, 360, 300);
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(screen.getByText("当前账号或接口身份不完整，浮窗仍可使用，但位置不会记住。"))
+      .toBeInTheDocument();
+
+    const handle = screen.getByRole("button", { name: "拖动关联素材浮窗；也可按方向键移动" });
+    stubPointerCapture(handle);
+    fireEvent.pointerDown(handle, { pointerId: 21, button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(handle, { pointerId: 21, clientX: 40, clientY: 50 });
+    expect(panelElement.style.left).toBe("680px");
+    expect(panelElement.style.top).toBe("110px");
+    fireEvent.pointerUp(handle, { pointerId: 21, clientX: 40, clientY: 50 });
+    expect(window.localStorage.length).toBe(0);
+  });
+
+  it("keeps floating usable and reports local-storage read and write failures", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1400, 900);
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(() => { throw new Error("Storage blocked."); });
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => { throw new Error("Storage blocked."); });
+    const sourceFrame = stableStoryboardFrame("floating-frame-storage-denied");
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    setPanelBounds(panelElement, 360, 300);
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    expect(screen.getByText("浏览器未能读取已保存位置；已使用默认位置，可继续移动。"))
+      .toBeInTheDocument();
+
+    const handle = screen.getByRole("button", { name: "拖动关联素材浮窗；也可按方向键移动" });
+    stubPointerCapture(handle);
+    fireEvent.pointerDown(handle, { pointerId: 22, button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(handle, { pointerId: 22, clientX: 40, clientY: 50 });
+    fireEvent.pointerUp(handle, { pointerId: 22, clientX: 40, clientY: 50 });
+    expect(panelElement.style.left).toBe("680px");
+    expect(panelElement.style.top).toBe("110px");
+    expect(screen.getByText("浏览器未能记住浮窗位置；仍可继续使用和移动。"))
+      .toBeInTheDocument();
+  });
+
+  it("cancels a mobile drag without overwriting the desktop position and restores it on resize", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1400, 900);
+    const sourceFrame = stableStoryboardFrame("floating-frame-mobile");
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+    const scope = panelPositionScope(owner);
+    expect(writeFrameAssetReferencePanelPosition(scope, { left: 600, top: 100 })).toBe("saved");
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    setPanelBounds(panelElement, 360, 300);
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    const handle = screen.getByRole("button", { name: "拖动关联素材浮窗；也可按方向键移动" });
+    const capture = stubPointerCapture(handle);
+    fireEvent.pointerDown(handle, { pointerId: 3, button: 0, clientX: 10, clientY: 10 });
+    fireEvent.pointerMove(handle, { pointerId: 3, clientX: 90, clientY: 70 });
+    expect(panelElement.style.left).toBe("680px");
+
+    act(() => {
+      setViewportSize(700, 900);
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(panelElement).not.toHaveClass("is-floating");
+    expect(screen.getByText("小屏幕下暂时显示在镜头内，桌面位置已保留。")).toBeInTheDocument();
+    expect(capture.releasePointerCapture).toHaveBeenCalledWith(3);
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 600, top: 100 },
+    });
+
+    act(() => {
+      setViewportSize(1400, 900);
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(panelElement).toHaveClass("is-floating");
+    expect(panelElement.style.left).toBe("600px");
+    expect(panelElement.style.top).toBe("100px");
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 600, top: 100 },
+    });
+  });
+
+  it.each(["pointercancel", "close", "scope change"] as const)(
+    "does not persist a canceled drag or accept its late pointerup after %s",
+    async (cancelReason) => {
+      const user = userEvent.setup();
+      setViewportSize(1400, 900);
+      const sourceFrame = stableStoryboardFrame(`floating-frame-cancel-${cancelReason}`);
+      const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+      const scope = panelPositionScope(owner);
+      expect(writeFrameAssetReferencePanelPosition(scope, { left: 320, top: 80 })).toBe("saved");
+      const panel = renderPanel(owner);
+      const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+      setPanelBounds(panelElement, 360, 300);
+      await user.click(screen.getByRole("button", { name: "浮动查看" }));
+      const handle = screen.getByRole("button", { name: "拖动关联素材浮窗；也可按方向键移动" });
+      const capture = stubPointerCapture(handle);
+      fireEvent.pointerDown(handle, { pointerId: 5, button: 0, clientX: 10, clientY: 10 });
+      fireEvent.pointerMove(handle, { pointerId: 5, clientX: 100, clientY: 90 });
+
+      if (cancelReason === "pointercancel") {
+        fireEvent.pointerCancel(handle, { pointerId: 5 });
+        expect(panelElement.style.left).toBe("320px");
+      } else if (cancelReason === "close") {
+        await user.click(screen.getByRole("button", { name: "关闭" }));
+        expect(screen.queryByRole("region", { name: "镜头 1 的关联素材" })).not.toBeInTheDocument();
+      } else {
+        panel.rerender(
+          <FrameAssetReferencesPanel
+            currentScope={{ ...currentScope(owner), userId: "another-position-owner" }}
+            onClose={vi.fn()}
+            onUnauthorized={vi.fn()}
+            owner={owner}
+          />,
+        );
+        expect(screen.queryByRole("region", { name: "镜头 1 的关联素材" })).not.toBeInTheDocument();
+      }
+
+      fireEvent.pointerUp(handle, { pointerId: 5, clientX: 800, clientY: 600 });
+      expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+        kind: "stored",
+        position: { left: 320, top: 80 },
+      });
+      expect(capture.releasePointerCapture).toHaveBeenCalledWith(5);
+    },
+  );
+
+  it("lets keyboard movement and explicit reset supersede a pointer drag", async () => {
+    const user = userEvent.setup();
+    setViewportSize(1400, 900);
+    const sourceFrame = stableStoryboardFrame("floating-frame-keyboard");
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+    const scope = panelPositionScope(owner);
+    expect(writeFrameAssetReferencePanelPosition(scope, { left: 300, top: 80 })).toBe("saved");
+    renderPanel(owner);
+    const panelElement = screen.getByRole("region", { name: "镜头 1 的关联素材" });
+    setPanelBounds(panelElement, 360, 300);
+    await user.click(screen.getByRole("button", { name: "浮动查看" }));
+    const handle = screen.getByRole("button", { name: "拖动关联素材浮窗；也可按方向键移动" });
+    const capture = stubPointerCapture(handle);
+
+    fireEvent.pointerDown(handle, { pointerId: 11, button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(handle, { pointerId: 11, clientX: 100, clientY: 100 });
+    fireEvent.keyDown(handle, { key: "ArrowRight" });
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 416, top: 180 },
+    });
+    fireEvent.pointerUp(handle, { pointerId: 11, clientX: 900, clientY: 700 });
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({
+      kind: "stored",
+      position: { left: 416, top: 180 },
+    });
+
+    fireEvent.pointerDown(handle, { pointerId: 12, button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(handle, { pointerId: 12, clientX: 80, clientY: 80 });
+    await user.click(screen.getByRole("button", { name: "恢复默认位置" }));
+    const defaultPosition = defaultFrameAssetReferencePanelPosition(
+      { width: 360, height: 300 },
+      { width: 1400, height: 900 },
+    );
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({ kind: "stored", position: defaultPosition });
+    fireEvent.pointerUp(handle, { pointerId: 12, clientX: 900, clientY: 700 });
+    expect(readFrameAssetReferencePanelPosition(scope)).toEqual({ kind: "stored", position: defaultPosition });
+    expect(capture.releasePointerCapture).toHaveBeenCalledWith(11);
+    expect(capture.releasePointerCapture).toHaveBeenCalledWith(12);
   });
 });
