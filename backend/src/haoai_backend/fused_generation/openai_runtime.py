@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import inspect
 import json
 from collections.abc import Callable, Mapping
@@ -27,8 +29,20 @@ from haoai_backend.media_storage.public_fetch_policy import (
     UnsafeRemoteURL,
     parse_public_http_url,
 )
+from haoai_backend.media_uploads.domain import (
+    MAX_IMAGE_BYTES,
+    InvalidMediaUpload,
+    upload_spec,
+    validate_upload_content,
+)
 
-from .domain import FusedGenerationInput, FusedGenerationOutput, FusedGenerationUnknown
+from .domain import (
+    FusedGenerationInput,
+    FusedGenerationInlineImage,
+    FusedGenerationOutput,
+    FusedGenerationRuntimeOutput,
+    FusedGenerationUnknown,
+)
 from .errors import FusedGenerationDispatchedCancellation, ProviderGenerationFailure
 
 _DEFAULT_PROVIDER_ORIGINS = ("https://api.openai.com",)
@@ -38,9 +52,11 @@ _MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 _REFERENCE_TIMEOUT_SECONDS = 30.0
 _PROVIDER_TIMEOUT_SECONDS = 180.0
 _RESPONSE_CHUNK_BYTES = 64 * 1024
+_MAX_INLINE_IMAGE_BASE64_CHARS = 4 * ((MAX_IMAGE_BYTES + 2) // 3)
 _REFERENCE_MEDIA_TYPES = frozenset(
     {"image/bmp", "image/gif", "image/jpeg", "image/png", "image/webp"}
 )
+_INLINE_IMAGE_EXTENSIONS = (".jpg", ".png", ".gif", ".webp", ".bmp")
 _UNKNOWN = FusedGenerationUnknown()
 
 HttpClientFactory = Callable[
@@ -91,7 +107,7 @@ class FusedOpenAIImageRuntime:
 
     async def generate(
         self, request: FusedGenerationInput
-    ) -> FusedGenerationOutput | FusedGenerationUnknown:
+    ) -> FusedGenerationRuntimeOutput:
         base_url = self._validated_base_url(request)
         references = await self._prepare_references(request.reference_images)
         try:
@@ -144,10 +160,20 @@ class FusedOpenAIImageRuntime:
                         OpenAIImageCodecError,
                     ):
                         return _UNKNOWN
-                    if output.kind != "url" or not _is_safe_image_url(output.value):
-                        # A base64 or malformed success may represent a paid create.
-                        return _UNKNOWN
-                    return FusedGenerationOutput(image_url=output.value)
+                    if output.kind == "url":
+                        if not _is_safe_image_url(output.value):
+                            return _UNKNOWN
+                        return FusedGenerationOutput(image_url=output.value)
+                    if output.kind == "base64":
+                        image = _decode_inline_image(output.value)
+                        if image is None:
+                            return _UNKNOWN
+                        content, media_type = image
+                        return FusedGenerationInlineImage(
+                            content=content,
+                            media_type=media_type,
+                        )
+                    return _UNKNOWN
         except _ProviderRejected as rejected:
             raise ProviderGenerationFailure(
                 f"图片 provider 拒绝了请求 (HTTP {rejected.status_code})"
@@ -274,6 +300,30 @@ def _is_safe_image_url(value: str) -> bool:
     except UnsafeRemoteURL:
         return False
     return True
+
+
+def _decode_inline_image(value: str) -> tuple[bytes, str] | None:
+    if type(value) is not str or not value or len(value) > _MAX_INLINE_IMAGE_BASE64_CHARS:
+        return None
+    try:
+        content = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+    if (
+        not content
+        or len(content) > MAX_IMAGE_BYTES
+        or base64.b64encode(content).decode("ascii") != value
+    ):
+        return None
+
+    for extension in _INLINE_IMAGE_EXTENSIONS:
+        try:
+            spec = upload_spec("image", f"fused-output{extension}")
+            validate_upload_content(spec, content)
+        except (InvalidMediaUpload, ValueError):
+            continue
+        return content, spec.content_type
+    return None
 
 
 async def _read_bounded_response(response: AsyncHttpResponse) -> bytes:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from dataclasses import replace
 from datetime import datetime, timedelta
@@ -20,6 +21,9 @@ from haoai_backend.authentication.tables import (
 )
 from haoai_backend.chat_data.tables import chat_messages, metadata as chat_metadata
 from haoai_backend.fused_generation.domain import (
+    FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
+    FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE,
+    FusedGenerationInlineImage,
     FUSED_UNKNOWN_PROGRESS_MESSAGE,
     FUSED_UNKNOWN_REASON,
     FusedFrameTarget,
@@ -43,6 +47,7 @@ from haoai_backend.generation_catalog.tables import (
     system_prompts,
 )
 from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
+from haoai_backend.generation_contracts import StoredMedia
 from haoai_backend.series_data.tables import (
     chapters,
     characters,
@@ -465,6 +470,17 @@ def test_unknown_retention_accepts_existing_cancelling_status_and_preserves_it(
             .values(status="cancelling")
         )
 
+    late_inline_finish = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert not late_inline_finish.finish_task(
+        prepared,
+        "claim-c",
+        image_url="https://media.example.test/fused/owned.png",
+        error_message=None,
+        preserve_if_cancelled=True,
+    )
+    late_inline_finish.commit()
+    late_inline_finish.close()
+
     uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
     assert uow.retain_unknown(
         prepared.task_id, prepared.user_id, "claim-c", FUSED_UNKNOWN_REASON
@@ -476,9 +492,15 @@ def test_unknown_retention_accepts_existing_cancelling_status_and_preserves_it(
         task = connection.execute(
             select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
         ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
     assert task["status"] == "cancelling"
     assert task["claim_token"] == "claim-c"
     assert task["recovery_status"] == "provider_result_unknown"
+    assert assets == []
+    assert wallet == 12
+    assert logs == []
 
 
 def test_unknown_retention_does_not_take_ownership_of_unmarked_legacy_fused_task(
@@ -513,6 +535,61 @@ def test_unknown_retention_does_not_take_ownership_of_unmarked_legacy_fused_task
     assert assets == []
     assert wallet == 12
     assert logs == []
+
+
+def test_inline_storage_authorization_rechecks_owner_marker_status_and_token(fused_database):
+    engine, factory = fused_database
+    prepared = replace(_prepared(), task_id="inline-storage-authorization")
+    _stage_task(factory, prepared)
+
+    claim_uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    claim = claim_uow.claim_task(
+        prepared.task_id,
+        "claim-inline",
+        expected_user_id=prepared.user_id,
+    )
+    assert claim is not None
+    claim_uow.commit()
+    claim_uow.close()
+
+    authorized = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert authorized.authorize_inline_image_storage(
+        prepared.task_id, prepared.user_id, "claim-inline"
+    )
+    assert not authorized.authorize_inline_image_storage(
+        prepared.task_id, "other-owner", "claim-inline"
+    )
+    assert not authorized.authorize_inline_image_storage(
+        prepared.task_id, prepared.user_id, "wrong-token"
+    )
+    authorized.rollback()
+    authorized.close()
+
+    with engine.begin() as connection:
+        connection.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.id == prepared.task_id)
+            .values(request_data="{}")
+        )
+    unmarked = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert not unmarked.authorize_inline_image_storage(
+        prepared.task_id, prepared.user_id, "claim-inline"
+    )
+    unmarked.rollback()
+    unmarked.close()
+
+    with engine.begin() as connection:
+        connection.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.id == prepared.task_id)
+            .values(status="cancelling")
+        )
+    cancelling = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert not cancelling.authorize_inline_image_storage(
+        prepared.task_id, prepared.user_id, "claim-inline"
+    )
+    cancelling.rollback()
+    cancelling.close()
 
 
 def test_execution_does_not_claim_fused_task_for_wrong_prepared_owner(fused_database):
@@ -616,6 +693,9 @@ def test_real_sqlite_retain_commit_ack_unknown_is_not_retried_or_finalized(
     assert logs == []
 
 
+_CANCEL_INJECTIONS: list[str] = []
+
+
 class CancelBeforeTerminalSession(Session):
     task_id = ""
     injected = False
@@ -628,12 +708,40 @@ class CancelBeforeTerminalSession(Session):
             and any(getattr(key, "key", key) == "status" for key in statement._values)
         ):
             self.injected = True
+            _CANCEL_INJECTIONS.append(self.task_id)
             super().execute(
                 update(AITaskRow.__table__)
                 .where(AITaskRow.id == self.task_id)
                 .values(user_cancelled_at=NOW)
             )
         return super().execute(statement, *args, **kwargs)
+
+
+class InlineImageRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.image = FusedGenerationInlineImage(
+            content=b"synthetic inline image bytes",
+            media_type="image/png",
+        )
+
+    async def generate(self, _request):
+        self.calls += 1
+        return self.image
+
+
+class InlineImageStorage:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def store_inline_image(self, image):
+        self.calls += 1
+        return StoredMedia(
+            locator="https://media.example.test/fused/owned.png",
+            content_digest=hashlib.sha256(image.content).hexdigest(),
+            media_type=image.media_type,
+            size_bytes=len(image.content),
+        )
 
 
 def test_cancel_committed_between_read_and_terminal_compare_wins(fused_database):
@@ -682,6 +790,50 @@ def test_cancel_committed_between_read_and_terminal_compare_wins(fused_database)
     assert asset["image_url"] is None
     assert asset["error_message"] == "任务被取消"
     assert json.loads(chapter_content)[0]["fused"] == [asset["id"]]
+
+
+def test_inline_image_terminal_cancel_race_is_retained_without_refund(fused_database):
+    engine, factory = fused_database
+    prepared = _prepared()
+    _stage_task(factory, prepared)
+
+    CancelBeforeTerminalSession.task_id = prepared.task_id
+    CancelBeforeTerminalSession.injected = False
+    _CANCEL_INJECTIONS.clear()
+    raced_factory = sessionmaker(
+        engine,
+        class_=CancelBeforeTerminalSession,
+        expire_on_commit=False,
+        future=True,
+    )
+    runtime = InlineImageRuntime()
+    storage = InlineImageStorage()
+    execution = FusedGenerationExecution(
+        runtime,
+        fused_generation_uow_factory(raced_factory),
+        inline_image_storage=storage,
+    )
+    asyncio.run(execution.execute(prepared))
+    asyncio.run(execution.execute(prepared))
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+    assert runtime.calls == storage.calls == 1
+    assert _CANCEL_INJECTIONS == [prepared.task_id]
+    assert task["status"] == "processing"
+    assert task["claim_token"]
+    assert task["user_cancelled_at"] == NOW
+    assert task["recovery_status"] == "provider_result_unknown"
+    assert task["result"] == FUSED_MEDIA_STORAGE_UNKNOWN_REASON
+    assert task["progress_message"] == FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE
+    assert assets == []
+    assert wallet == 12
+    assert logs == []
 
 
 class ChangeChapterBeforeCompareSession(Session):

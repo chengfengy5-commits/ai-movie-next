@@ -10,13 +10,15 @@ from haoai_backend.shared.identity import TrustedActor
 
 from .domain import (
     FusedGenerationInput,
-    FusedGenerationOutput,
-    FusedGenerationUnknown,
+    FusedGenerationInlineImage,
+    FusedGenerationRuntimeOutput,
+    FusedGenerationUnknownReason,
     FusedPromptText,
     FusedServerImageModel,
     FusedTaskClaim,
     PreparedFusedGeneration,
 )
+from haoai_backend.generation_contracts import StoredMedia
 
 
 class FusedGenerationRuntime(Protocol):
@@ -24,13 +26,19 @@ class FusedGenerationRuntime(Protocol):
 
     async def generate(
         self, request: FusedGenerationInput
-    ) -> FusedGenerationOutput | FusedGenerationUnknown: ...
+    ) -> FusedGenerationRuntimeOutput: ...
 
 
 class FusedGenerationStorage(Protocol):
     """Optional transfer adapter; returning None means keep the provider URL."""
 
     async def store_generated_image(self, provider_url: str) -> str | None: ...
+
+
+class FusedGenerationImageStorage(Protocol):
+    """Synchronous owned-media adapter for validated inline image bytes."""
+
+    def store_inline_image(self, image: FusedGenerationInlineImage) -> StoredMedia: ...
 
 
 class FusedGenerationUnitOfWork(Protocol):
@@ -47,12 +55,15 @@ class FusedGenerationUnitOfWork(Protocol):
     def claim_task(
         self, task_id: str, claim_token: str, *, expected_user_id: str
     ) -> FusedTaskClaim | None: ...
+    def authorize_inline_image_storage(
+        self, task_id: str, user_id: str, claim_token: str
+    ) -> bool: ...
     def retain_unknown(
         self,
         task_id: str,
         user_id: str,
         claim_token: str,
-        safe_reason: str,
+        safe_reason: FusedGenerationUnknownReason,
     ) -> bool: ...
     def finish_task(
         self,
@@ -61,7 +72,8 @@ class FusedGenerationUnitOfWork(Protocol):
         *,
         image_url: str | None,
         error_message: str | None,
-    ) -> None: ...
+        preserve_if_cancelled: bool = False,
+    ) -> bool: ...
     def commit(self) -> None: ...
     def rollback(self) -> None: ...
     def close(self) -> None: ...

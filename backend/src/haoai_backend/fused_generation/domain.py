@@ -3,10 +3,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import Any, Literal, Mapping, TypeAlias
 
 FUSED_UNKNOWN_REASON = "图片生成结果待核对，请勿重新提交"
 FUSED_UNKNOWN_PROGRESS_MESSAGE = "图片生成结果待核对"
+FUSED_MEDIA_STORAGE_UNKNOWN_REASON = "图片已返回，媒体保存结果待核对"
+FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE = "图片已返回，保存结果待核对"
+FUSED_UNKNOWN_REASONS = frozenset(
+    {FUSED_UNKNOWN_REASON, FUSED_MEDIA_STORAGE_UNKNOWN_REASON}
+)
+FusedGenerationUnknownReason: TypeAlias = Literal[
+    "图片生成结果待核对，请勿重新提交",
+    "图片已返回，媒体保存结果待核对",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,10 +89,23 @@ class FusedGenerationOutput:
 
 
 @dataclass(frozen=True, slots=True)
+class FusedGenerationInlineImage:
+    """Validated provider image bytes awaiting one owned-media write."""
+
+    content: bytes = field(repr=False)
+    media_type: str
+
+
+@dataclass(frozen=True, slots=True)
 class FusedGenerationUnknown:
     """A provider create may have happened, but no safe output was obtained."""
 
     reason: str = field(default=FUSED_UNKNOWN_REASON, init=False)
+
+
+FusedGenerationRuntimeOutput: TypeAlias = (
+    FusedGenerationOutput | FusedGenerationInlineImage | FusedGenerationUnknown
+)
 
 
 @dataclass(frozen=True, slots=True)

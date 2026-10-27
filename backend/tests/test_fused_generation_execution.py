@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import threading
 from datetime import datetime
 
 import pytest
 
 from haoai_backend.fused_generation.domain import (
+    FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
     FusedGenerationOutput,
+    FusedGenerationInlineImage,
     FusedGenerationUnknown,
     FusedServerImageModel,
     FusedTaskClaim,
@@ -18,6 +21,7 @@ from haoai_backend.fused_generation.errors import (
     ProviderGenerationFailure,
 )
 from haoai_backend.fused_generation.execution import FusedGenerationExecution
+from haoai_backend.generation_contracts import StoredMedia
 
 
 SERVER_SECRET = "provider-secret-do-not-persist"
@@ -54,12 +58,14 @@ def _prepared() -> PreparedFusedGeneration:
 class ExecutionState:
     def __init__(self) -> None:
         self.user_id = "owner-a"
+        self.server_owned = True
         self.status = "processing"
         self.cancelled = False
         self.active_sessions = 0
         self.open_count = 0
         self.close_count = 0
         self.claim_count = 0
+        self.storage_authorize_count = 0
         self.finish_count = 0
         self.finish_attempt_count = 0
         self.retain_attempt_count = 0
@@ -139,21 +145,44 @@ class FakeUnitOfWork:
         self.state.retain_count += 1
         self.state.recovery_status = "provider_result_unknown"
         self.state.result = safe_reason
-        self.state.progress_message = "图片生成结果待核对"
+        self.state.progress_message = (
+            "图片已返回，保存结果待核对"
+            if safe_reason == FUSED_MEDIA_STORAGE_UNKNOWN_REASON
+            else "图片生成结果待核对"
+        )
         return True
 
-    def finish_task(self, prepared, claim_token, *, image_url, error_message):
+    def authorize_inline_image_storage(self, task_id, user_id, claim_token):
+        self.state.storage_authorize_count += 1
+        return (
+            self.state.server_owned
+            and user_id == self.state.user_id
+            and self.state.status == "processing"
+            and self.state.claim_token == claim_token
+            and self.state.recovery_status != "provider_result_unknown"
+        )
+
+    def finish_task(
+        self,
+        prepared,
+        claim_token,
+        *,
+        image_url,
+        error_message,
+        preserve_if_cancelled=False,
+    ):
         self.state.finish_attempt_count += 1
         if (
             self.state.status != "processing"
             or self.state.claim_token != claim_token
             or self.state.recovery_status == "provider_result_unknown"
         ):
-            return
+            return False
         self.state.finish_count += 1
         self.state.finish_args.append((image_url, error_message))
         self.state.status = "completed" if image_url else "failed"
         self.state.claim_token = None
+        return True
 
     def commit(self):
         self.state.commit_count += 1
@@ -206,7 +235,15 @@ class BlockingClaimFactory:
 
 
 class BlockingFinishUnitOfWork(FakeUnitOfWork):
-    def finish_task(self, prepared, claim_token, *, image_url, error_message):
+    def finish_task(
+        self,
+        prepared,
+        claim_token,
+        *,
+        image_url,
+        error_message,
+        preserve_if_cancelled=False,
+    ):
         self.state.events.append("finish-start")
         self.state.finish_started.set()
         if not self.state.finish_release.wait(timeout=5):
@@ -216,6 +253,7 @@ class BlockingFinishUnitOfWork(FakeUnitOfWork):
             claim_token,
             image_url=image_url,
             error_message=error_message,
+            preserve_if_cancelled=preserve_if_cancelled,
         )
 
     def commit(self):
@@ -236,6 +274,18 @@ class BlockingFinishFactory:
     def __call__(self):
         self.calls += 1
         if self.calls == 2:
+            return BlockingFinishUnitOfWork(self.state)
+        return FakeUnitOfWork(self.state)
+
+
+class BlockingInlineFinishFactory:
+    def __init__(self, state: ExecutionState) -> None:
+        self.state = state
+        self.calls = 0
+
+    def __call__(self):
+        self.calls += 1
+        if self.calls == 4:
             return BlockingFinishUnitOfWork(self.state)
         return FakeUnitOfWork(self.state)
 
@@ -266,6 +316,34 @@ class Runtime:
         if self.error is not None:
             raise self.error
         return self.output
+
+
+class FakeInlineImageStorage:
+    def __init__(self, *, wrong_digest: bool = False, block: bool = False) -> None:
+        self.calls = 0
+        self.image = None
+        self.wrong_digest = wrong_digest
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.block = block
+        self.thread_id = None
+
+    def store_inline_image(self, image):
+        self.calls += 1
+        self.image = image
+        self.thread_id = threading.get_ident()
+        self.started.set()
+        if self.block and not self.release.wait(timeout=5):
+            raise AssertionError("inline storage worker was not released")
+        digest = hashlib.sha256(image.content).hexdigest()
+        if self.wrong_digest:
+            digest = "0" * 64
+        return StoredMedia(
+            locator="https://media.example.test/fused/owned.png",
+            content_digest=digest,
+            media_type=image.media_type,
+            size_bytes=len(image.content),
+        )
 
 
 class FailingStorage:
@@ -330,6 +408,161 @@ def test_provider_result_unknown_is_retained_and_duplicate_execution_does_not_re
     assert state.progress_message == "图片生成结果待核对"
     assert state.retain_count == 1
     assert state.finish_count == 0
+
+
+def test_inline_image_requires_owned_media_receipt_before_success_finalization():
+    state = ExecutionState()
+    image = FusedGenerationInlineImage(b"synthetic-image-bytes", "image/png")
+    runtime = Runtime(state, output=image)
+    storage = FakeInlineImageStorage()
+    execution = FusedGenerationExecution(
+        runtime,
+        Factory(state),
+        inline_image_storage=storage,
+    )
+
+    asyncio.run(execution.execute(_prepared()))
+
+    assert runtime.calls == 1
+    assert storage.calls == 1
+    assert storage.image is image
+    assert storage.thread_id != threading.get_ident()
+    assert state.storage_authorize_count == 2
+    assert state.status == "completed"
+    assert state.finish_args == [
+        ("https://media.example.test/fused/owned.png", None)
+    ]
+    assert state.retain_count == 0
+
+
+def test_inline_image_without_storage_capability_is_retained_without_refund():
+    state = ExecutionState()
+    image = FusedGenerationInlineImage(b"synthetic-image-bytes", "image/png")
+    runtime = Runtime(state, output=image)
+
+    asyncio.run(FusedGenerationExecution(runtime, Factory(state)).execute(_prepared()))
+
+    assert runtime.calls == 1
+    assert state.status == "processing"
+    assert state.claim_token is not None
+    assert state.recovery_status == "provider_result_unknown"
+    assert state.result == FUSED_MEDIA_STORAGE_UNKNOWN_REASON
+    assert state.progress_message == "图片已返回，保存结果待核对"
+    assert state.finish_count == 0
+    assert state.retain_count == 1
+
+
+def test_inline_storage_requires_fresh_owner_and_marker_authorization():
+    state = ExecutionState()
+    state.server_owned = False
+    image = FusedGenerationInlineImage(b"synthetic-image-bytes", "image/png")
+    runtime = Runtime(state, output=image)
+    storage = FakeInlineImageStorage()
+    execution = FusedGenerationExecution(
+        runtime,
+        Factory(state),
+        inline_image_storage=storage,
+    )
+
+    asyncio.run(execution.execute(_prepared()))
+
+    assert runtime.calls == 1
+    assert state.storage_authorize_count == 1
+    assert storage.calls == 0
+    assert state.status == "processing"
+    assert state.claim_token is not None
+    assert state.recovery_status == "provider_result_unknown"
+    assert state.finish_count == 0
+    assert state.retain_count == 1
+
+
+def test_inline_storage_mismatch_is_retained_and_not_retried():
+    state = ExecutionState()
+    image = FusedGenerationInlineImage(b"synthetic-image-bytes", "image/png")
+    runtime = Runtime(state, output=image)
+    storage = FakeInlineImageStorage(wrong_digest=True)
+    execution = FusedGenerationExecution(
+        runtime,
+        Factory(state),
+        inline_image_storage=storage,
+    )
+
+    asyncio.run(execution.execute(_prepared()))
+    asyncio.run(execution.execute(_prepared()))
+
+    assert runtime.calls == 1
+    assert storage.calls == 1
+    assert state.status == "processing"
+    assert state.claim_token is not None
+    assert state.result == FUSED_MEDIA_STORAGE_UNKNOWN_REASON
+    assert state.finish_count == 0
+    assert state.retain_count == 1
+
+
+def test_cancellation_during_inline_storage_drains_worker_and_retains_unknown():
+    state = ExecutionState()
+    image = FusedGenerationInlineImage(b"synthetic-image-bytes", "image/png")
+    runtime = Runtime(state, output=image)
+    storage = FakeInlineImageStorage(block=True)
+    execution = FusedGenerationExecution(
+        runtime,
+        Factory(state),
+        inline_image_storage=storage,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(execution.execute(_prepared()))
+        assert await asyncio.to_thread(storage.started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert state.finish_count == 0
+        storage.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert runtime.calls == 1
+    assert storage.calls == 1
+    assert state.status == "processing"
+    assert state.claim_token is not None
+    assert state.recovery_status == "provider_result_unknown"
+    assert state.result == FUSED_MEDIA_STORAGE_UNKNOWN_REASON
+    assert state.finish_count == 0
+    assert state.retain_count == 1
+
+
+def test_cancel_during_inline_finish_accepts_committed_terminal_without_retention():
+    state = ExecutionState()
+    image = FusedGenerationInlineImage(b"synthetic-image-bytes", "image/png")
+    runtime = Runtime(state, output=image)
+    storage = FakeInlineImageStorage()
+    execution = FusedGenerationExecution(
+        runtime,
+        BlockingInlineFinishFactory(state),
+        inline_image_storage=storage,
+    )
+
+    async def exercise():
+        task = asyncio.create_task(execution.execute(_prepared()))
+        assert await asyncio.to_thread(state.finish_started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        state.finish_release.set()
+        await task
+
+    asyncio.run(exercise())
+
+    assert runtime.calls == storage.calls == 1
+    assert state.status == "completed"
+    assert state.claim_token is None
+    assert state.finish_count == 1
+    assert state.retain_attempt_count == 0
+    assert state.retain_count == 0
+    assert state.open_count == state.close_count
+    assert state.active_sessions == 0
 
 
 def test_dispatched_cancellation_retains_unknown_before_propagating_cancellation():

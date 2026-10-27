@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import concurrent.futures
+import hashlib
 import json
+import struct
 import threading
-from dataclasses import dataclass
+import zlib
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -34,6 +39,9 @@ from haoai_backend.fused_generation.errors import ProviderGenerationFailure
 from haoai_backend.fused_generation.execution import FusedGenerationExecution
 from haoai_backend.fused_generation.openai_runtime import FusedOpenAIImageRuntime
 from haoai_backend.fused_generation.persistence import fused_generation_uow_factory
+from haoai_backend.fused_generation.media_storage import (
+    SynchronousFusedGenerationImageStorage,
+)
 from haoai_backend.generation_catalog.tables import (
     metadata as catalog_metadata,
     model_configs,
@@ -42,7 +50,19 @@ from haoai_backend.generation_catalog.tables import (
     system_prompts,
 )
 from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
-from haoai_backend.generation_contracts import PreparedReference
+from haoai_backend.generation_contracts import PreparedReference, StoredMedia
+from haoai_backend.media_storage.owned_media_runtime import (
+    OwnedMediaDependencies,
+    OwnedMediaRuntime,
+)
+from haoai_backend.media_storage.sync_facade import SynchronousMediaStore
+from haoai_backend.media_storage.transfer_types import (
+    MediaTypeRule,
+    R2Configuration,
+    SafeMediaPolicy,
+    SecretValue,
+    WriteReceipt,
+)
 from haoai_backend.series_data.tables import (
     chapters,
     characters,
@@ -144,6 +164,77 @@ class FakePublicMediaFetcher:
 
 
 @dataclass
+class FakeR2State:
+    mode: str = "success"
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    clients: list[Any] = field(default_factory=list)
+    stored_media: list[StoredMedia] = field(default_factory=list)
+    close_calls: int = 0
+    started: threading.Event = field(default_factory=threading.Event)
+    release: threading.Event = field(default_factory=threading.Event)
+
+
+class FakeR2Client:
+    def __init__(self, state: FakeR2State) -> None:
+        self.state = state
+
+    def put_object(self, **kwargs: Any) -> WriteReceipt:
+        body = kwargs["Body"].read()
+        self.state.calls.append(
+            {
+                "bucket": kwargs["Bucket"],
+                "key": kwargs["Key"],
+                "content_type": kwargs["ContentType"],
+                "cache_control": kwargs["CacheControl"],
+                "body": body,
+                "thread_id": threading.get_ident(),
+            }
+        )
+        self.state.started.set()
+        if self.state.mode == "storage_block" and not self.state.release.wait(timeout=5):
+            raise TimeoutError("synthetic storage wait expired")
+        if self.state.mode == "ack_unknown":
+            raise TimeoutError("synthetic write acknowledgement lost")
+        if self.state.mode == "wrong_receipt":
+            return WriteReceipt("unexpected-key.png", 200, "synthetic-request-id")
+        return WriteReceipt(kwargs["Key"], 200, "synthetic-request-id")
+
+    def close(self) -> None:
+        self.state.close_calls += 1
+        if self.state.mode == "cleanup_failure" and self.state.close_calls == 1:
+            raise OSError("synthetic SDK cleanup failure")
+
+
+class FakeR2ClientFactory:
+    def __init__(self, state: FakeR2State) -> None:
+        self.state = state
+
+    def create(self, settings, access_key, secret_key) -> FakeR2Client:
+        client = FakeR2Client(self.state)
+        self.state.clients.append(client)
+        return client
+
+
+class SyntheticSecretHandle:
+    def __init__(self, value: str) -> None:
+        self._value = SecretValue(value)
+
+    def reveal(self) -> SecretValue:
+        return self._value
+
+
+class RecordingFusedImageStorage(SynchronousFusedGenerationImageStorage):
+    def __init__(self, media_store: SynchronousMediaStore, state: FakeR2State) -> None:
+        super().__init__(media_store)
+        self.state = state
+
+    def store_inline_image(self, image) -> StoredMedia:
+        stored = super().store_inline_image(image)
+        self.state.stored_media.append(stored)
+        return stored
+
+
+@dataclass
 class AppFixture:
     engine: Any
     app: FastAPI
@@ -154,6 +245,9 @@ class AppFixture:
     token_for: Callable[[str, bool], str]
     runtime: FakeRuntime
     storage: FailingStorage
+    inline_image_storage: RecordingFusedImageStorage
+    inline_storage_state: FakeR2State
+    inline_media_runtime: OwnedMediaRuntime
     authentication_runtime: AuthenticationRuntime
     business_factory: Callable[[], ObservedSession]
 
@@ -429,26 +523,71 @@ def fused_app(tmp_path: Path):
     loop_threads: list[int] = []
     runtime = FakeRuntime(events, business_sessions)
     storage = FailingStorage(events)
+    inline_storage_state = FakeR2State()
+    media_directory = tmp_path / "fused-inline-media"
+    media_directory.mkdir()
+    media_configuration = R2Configuration(
+        endpoint_url="https://objects.example.test",
+        bucket="fused-test-media",
+        public_base_url="https://cdn.example.test/media",
+        transfer_tmp_dir=media_directory,
+        business_type="generation",
+        environment="test",
+        connect_timeout_seconds=1,
+        read_timeout_seconds=1,
+    )
+    inline_media_runtime = OwnedMediaRuntime(
+        OwnedMediaDependencies(
+            transfer_tmp_dir=media_directory,
+            getaddrinfo=None,
+            http_library=None,
+            media_policy=SafeMediaPolicy((MediaTypeRule("image/png", ".png"),)),
+            r2_configuration=media_configuration,
+            access_key=SyntheticSecretHandle("synthetic-access-key"),
+            secret_key=SyntheticSecretHandle("synthetic-secret-key"),
+            s3_client_factory=FakeR2ClientFactory(inline_storage_state),
+        ),
+        loop_factory=asyncio.new_event_loop,
+        thread_factory=threading.Thread,
+        executor_factory=concurrent.futures.ThreadPoolExecutor,
+    )
+    synchronous_media_store = SynchronousMediaStore(
+        inline_media_runtime,
+        mode="url_or_inline",
+        reference_stager=None,
+        staging_directory=None,
+    )
+    inline_image_storage = RecordingFusedImageStorage(
+        synchronous_media_store,
+        inline_storage_state,
+    )
     app = create_app(
         session_factory=business_factory,
         authentication_runtime=authentication_runtime,
         fused_generation_runtime=runtime,
         fused_generation_storage=storage,
+        fused_generation_inline_image_storage=inline_image_storage,
     )
-    yield AppFixture(
-        engine=engine,
-        app=app,
-        events=events,
-        auth_sessions=auth_sessions,
-        business_sessions=business_sessions,
-        loop_threads=loop_threads,
-        token_for=token_for,
-        runtime=runtime,
-        storage=storage,
-        authentication_runtime=authentication_runtime,
-        business_factory=business_factory,
-    )
-    engine.dispose()
+    try:
+        yield AppFixture(
+            engine=engine,
+            app=app,
+            events=events,
+            auth_sessions=auth_sessions,
+            business_sessions=business_sessions,
+            loop_threads=loop_threads,
+            token_for=token_for,
+            runtime=runtime,
+            storage=storage,
+            inline_image_storage=inline_image_storage,
+            inline_storage_state=inline_storage_state,
+            inline_media_runtime=inline_media_runtime,
+            authentication_runtime=authentication_runtime,
+            business_factory=business_factory,
+        )
+    finally:
+        inline_media_runtime.close()
+        engine.dispose()
 
 
 def _request(
@@ -520,8 +659,32 @@ def _configure_openai_runtime(
         authentication_runtime=fixture.authentication_runtime,
         fused_generation_runtime=runtime,
         fused_generation_storage=fixture.storage,
+        fused_generation_inline_image_storage=fixture.inline_image_storage,
     )
     return runtime, client, media_fetcher
+
+
+def _synthetic_png() -> bytes:
+    def chunk(kind: bytes, data: bytes) -> bytes:
+        payload = kind + data
+        return (
+            struct.pack(">I", len(data))
+            + payload
+            + struct.pack(">I", zlib.crc32(payload) & 0xFFFFFFFF)
+        )
+
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 6, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(b"\x00\xff\x00\x00\xff"))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _base64_response(image_bytes: bytes) -> FakeProviderResponse:
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    body = json.dumps({"data": [{"b64_json": encoded}]}).encode("utf-8")
+    return FakeProviderResponse(200, body)
 
 
 def _prepared_for_duplicate_execution(
@@ -1082,6 +1245,197 @@ def test_real_openai_runtime_url_success_creates_asset_once_through_jwt_route(
         ).execute(duplicate)
     )
     assert len(client.calls) == 1
+
+
+def test_real_openai_base64_result_uses_owned_storage_before_asset_success(
+    fused_app: AppFixture,
+):
+    fixture = fused_app
+    image_bytes = _synthetic_png()
+    runtime, client, fetcher = _configure_openai_runtime(
+        fixture,
+        _base64_response(image_bytes),
+    )
+
+    response = _request(fixture, token=fixture.token_for("owner", False), body=_body())
+
+    assert response.status_code == 200, response.text
+    task_id = response.json()["task_id"]
+    assert len(client.calls) == 1
+    assert fixture.storage.urls == []
+    assert fetcher.calls
+    assert len(fixture.inline_storage_state.calls) == 1
+    assert len(fixture.inline_storage_state.stored_media) == 1
+    storage_call = fixture.inline_storage_state.calls[0]
+    stored = fixture.inline_storage_state.stored_media[0]
+    assert storage_call["body"] == image_bytes
+    assert storage_call["content_type"] == "image/png"
+    assert storage_call["bucket"] == "fused-test-media"
+    assert stored.content_digest == hashlib.sha256(image_bytes).hexdigest()
+    assert stored.size_bytes == len(image_bytes)
+    assert stored.media_type == "image/png"
+    assert stored.locator == (
+        f"https://cdn.example.test/media/{storage_call['key']}"
+    )
+
+    with fixture.engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+        ).mappings().one()
+        message = connection.execute(
+            select(chat_messages).where(chat_messages.c.id == task["message_id"])
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(
+            select(user_credits.c.credits).where(user_credits.c.user_id == "owner")
+        ).scalar_one()
+        logs = connection.execute(
+            select(CreditLogRow.__table__).where(CreditLogRow.user_id == "owner")
+        ).mappings().all()
+        chapter_content = connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-owner")
+        ).scalar_one()
+    assert task["status"] == "completed"
+    assert task["claim_token"] is None
+    assert message["content"] == stored.locator
+    assert len(assets) == 1
+    assert assets[0]["status"] == "completed"
+    assert assets[0]["image_url"] == stored.locator
+    assert wallet == 16
+    assert len(logs) == 1 and logs[0]["type"] == "usage"
+    assert json.loads(chapter_content)[0]["fused"] == [assets[0]["id"]]
+
+    duplicate = _prepared_for_duplicate_execution(task_id, task["message_id"])
+    asyncio.run(
+        FusedGenerationExecution(
+            runtime,
+            fused_generation_uow_factory(fixture.business_factory),
+            inline_image_storage=fixture.inline_image_storage,
+        ).execute(duplicate)
+    )
+    assert len(client.calls) == 1
+    assert len(fixture.inline_storage_state.calls) == 1
+
+
+@pytest.mark.parametrize(
+    "storage_mode",
+    ["ack_unknown", "wrong_receipt", "cleanup_failure"],
+    ids=["write-ack-unknown", "wrong-receipt-key", "sdk-cleanup-failure"],
+)
+def test_unverified_inline_storage_retains_claim_without_refund_or_retry(
+    fused_app: AppFixture,
+    storage_mode: str,
+):
+    fixture = fused_app
+    fixture.inline_storage_state.mode = storage_mode
+    runtime, client, _ = _configure_openai_runtime(
+        fixture,
+        _base64_response(_synthetic_png()),
+    )
+
+    response = _request(fixture, token=fixture.token_for("owner", False), body=_body())
+
+    assert response.status_code == 200, response.text
+    task_id = response.json()["task_id"]
+    assert len(client.calls) == 1
+    assert len(fixture.inline_storage_state.calls) == 1
+    assert fixture.inline_storage_state.stored_media == []
+    with fixture.engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(
+            select(user_credits.c.credits).where(user_credits.c.user_id == "owner")
+        ).scalar_one()
+        logs = connection.execute(
+            select(CreditLogRow.__table__).where(CreditLogRow.user_id == "owner")
+        ).mappings().all()
+    assert task["status"] == "processing"
+    assert task["claim_token"]
+    assert task["recovery_status"] == "provider_result_unknown"
+    assert task["result"] == "图片已返回，媒体保存结果待核对"
+    assert task["progress_message"] == "图片已返回，保存结果待核对"
+    assert assets == []
+    assert wallet == 16
+    assert [(row["amount"], row["type"]) for row in logs] == [(-4, "usage")]
+
+    duplicate = _prepared_for_duplicate_execution(task_id, task["message_id"])
+    asyncio.run(
+        FusedGenerationExecution(
+            runtime,
+            fused_generation_uow_factory(fixture.business_factory),
+            inline_image_storage=fixture.inline_image_storage,
+        ).execute(duplicate)
+    )
+    assert len(client.calls) == 1
+    assert len(fixture.inline_storage_state.calls) == 1
+
+
+def test_cancellation_during_real_owned_media_write_drains_and_retains_task(
+    fused_app: AppFixture,
+):
+    fixture = fused_app
+    fixture.inline_storage_state.mode = "storage_block"
+    runtime, client, _ = _configure_openai_runtime(
+        fixture,
+        _base64_response(_synthetic_png()),
+    )
+
+    async def send_and_cancel() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=fixture.app, raise_app_exceptions=False),
+            base_url="http://fused-generation.test",
+        ) as client_session:
+            request = asyncio.create_task(
+                client_session.post(
+                    "/api/fused-assets/generate",
+                    headers={
+                        "Authorization": f"Bearer {fixture.token_for('owner', False)}"
+                    },
+                    json=_body(),
+                )
+            )
+            assert await asyncio.to_thread(fixture.inline_storage_state.started.wait, 3)
+            request.cancel()
+            await asyncio.sleep(0)
+            assert not request.done()
+            fixture.inline_storage_state.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+    asyncio.run(send_and_cancel())
+
+    assert len(client.calls) == 1
+    assert len(fixture.inline_storage_state.calls) == 1
+    assert len(fixture.inline_storage_state.stored_media) == 1
+    with fixture.engine.connect() as connection:
+        task = connection.execute(select(AITaskRow.__table__)).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(
+            select(user_credits.c.credits).where(user_credits.c.user_id == "owner")
+        ).scalar_one()
+        logs = connection.execute(
+            select(CreditLogRow.__table__).where(CreditLogRow.user_id == "owner")
+        ).mappings().all()
+    assert task["status"] == "processing"
+    assert task["claim_token"]
+    assert task["recovery_status"] == "provider_result_unknown"
+    assert task["result"] == "图片已返回，媒体保存结果待核对"
+    assert assets == []
+    assert wallet == 16
+    assert [(row["amount"], row["type"]) for row in logs] == [(-4, "usage")]
+
+    duplicate = _prepared_for_duplicate_execution(task["id"], task["message_id"])
+    asyncio.run(
+        FusedGenerationExecution(
+            runtime,
+            fused_generation_uow_factory(fixture.business_factory),
+            inline_image_storage=fixture.inline_image_storage,
+        ).execute(duplicate)
+    )
+    assert len(client.calls) == 1
+    assert len(fixture.inline_storage_state.calls) == 1
 
 
 def test_real_openai_runtime_unknown_is_retained_and_generic_writes_are_guarded(
