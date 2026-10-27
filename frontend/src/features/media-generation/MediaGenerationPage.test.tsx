@@ -230,6 +230,19 @@ function storyboardFixture(): StoryboardAsset {
 }
 
 describe("MediaGenerationPage", () => {
+  it("offers a user-visible batch storyboard video workflow", async () => {
+    const user = userEvent.setup();
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-batch-video-entry" sessionGeneration={1}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "批量分镜视频" }));
+    expect(await screen.findByRole("heading", { name: "批量分镜视频" })).toBeInTheDocument();
+  });
+
   it("isolates local single-media selections by account, API, mode, and target category", () => {
     const storage = window.localStorage;
     const scope = { apiBaseUrl: "https://api.example.test/api", userId: "actor-media-pref" };
