@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 import threading
+import time
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import Any
@@ -41,6 +42,7 @@ from haoai_backend.generation_providers.video.haoai_provider import (
     HaoaiVideoProvider,
     _safe_response_candidate,
 )
+from haoai_backend.generation_providers.video import haoai_provider as haoai_provider_module
 
 SECRET = "s3cr3t+/value"
 ENDPOINT = "https://cpa.haoai.icu/v1"
@@ -368,22 +370,146 @@ def test_construction_is_inert_and_unsupported_methods_do_not_create_resources()
 
     assert counts["resolver"] == 0
     assert counts["factory"] == 0
-    assert (
-        provider.resolve_original_credential(
-            make_credential_binding(), "content"
-        )
-        == "unavailable"
-    )
 
     stream = provider.stream_text(make_snapshot(), object())
     assert asyncio.run(anext(stream)).kind == "text_error"
     assert isinstance(provider.optimize_frame(make_snapshot(), "frame", make_intent()), ProviderFailure)
     assert isinstance(provider.generate_sync_image(make_snapshot(), (), make_intent()), Failure)
-    with pytest.raises(NotImplementedError, match="unsupported"):
-        provider.fetch_provider_content(make_snapshot(), submitted_ref())
-
     assert counts["resolver"] == 0
     assert counts["factory"] == 0
+
+
+def test_bound_content_fetch_uses_original_id_path_and_credential() -> None:
+    body = b"synthetic video bytes"
+    response = FakeResponse(
+        body=body,
+        headers={
+            "Content-Type": "video/mp4; charset=binary",
+            "Content-Length": str(len(body)),
+        },
+    )
+    provider, counts = make_provider(response)
+
+    fetched = provider.fetch_provider_content(
+        make_snapshot(), submitted_ref(external_id="video/one")
+    )
+
+    request = counts["client"].calls[0]
+    assert fetched == ReferenceInput(
+        kind="bytes", locator=None, content=body, media_type="video/mp4"
+    )
+    assert request["method"] == "GET"
+    assert request["url"] == (
+        "https://cpa.haoai.icu/openai/v1/videos/video%2Fone/content"
+    )
+    assert request["headers"] == {
+        "Authorization": f"Bearer {SECRET}",
+        "Accept": "video/*",
+    }
+    assert request["follow_redirects"] is False
+    assert request["timeout_seconds"] == 600.0
+    assert counts["credential_calls"][0][1] == "content"
+    assert response.stream.close_calls == 1
+    assert response.close_calls == 1
+    assert counts["manager"].exit_calls == 1
+
+
+@pytest.mark.parametrize(
+    "slow_stage", ["body", "cleanup", "enter", "combined"]
+)
+def test_bound_content_deadline_covers_body_and_resource_lifecycle(
+    monkeypatch, slow_stage: str
+) -> None:
+    budget = 0.02 if slow_stage == "combined" else 0.005
+    monkeypatch.setattr(haoai_provider_module, "MAX_BOUND_CONTENT_SECONDS", budget)
+    response = FakeResponse(
+        body=b"synthetic video bytes",
+        headers={"Content-Type": "video/mp4"},
+    )
+
+    class SlowBody(FakeStream):
+        async def __anext__(self) -> object:
+            if self.chunks:
+                await asyncio.sleep(0.012 if slow_stage == "combined" else 0.02)
+            return await super().__anext__()
+
+    class SlowCleanup(FakeStream):
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0.012 if slow_stage == "combined" else 0.02)
+
+    class SlowBodyAndCleanup(SlowBody):
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await asyncio.sleep(0.012)
+
+    if slow_stage == "body":
+        response.stream = SlowBody([b"synthetic video bytes"])
+    elif slow_stage == "cleanup":
+        response.stream = SlowCleanup([b"synthetic video bytes"])
+    elif slow_stage == "combined":
+        response.stream = SlowBodyAndCleanup([b"synthetic video bytes"])
+
+    original_enter = FakeClientManager.__aenter__
+    if slow_stage == "enter":
+        async def slow_enter(manager: FakeClientManager) -> FakeClient:
+            await asyncio.sleep(0.02)
+            return await original_enter(manager)
+
+        monkeypatch.setattr(FakeClientManager, "__aenter__", slow_enter)
+
+    provider, counts = make_provider(response)
+    started = time.monotonic()
+    with pytest.raises(ValueError, match="provider content is unavailable"):
+        provider.fetch_provider_content(make_snapshot(), submitted_ref())
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.1
+    assert counts["factory"] == 1
+    if slow_stage == "enter":
+        assert counts["client"].calls == []
+        assert counts["manager"].exit_calls == 0
+    else:
+        assert len(counts["client"].calls) == 1
+        assert response.stream.close_calls == 1
+        assert response.close_calls == 1
+        assert counts["manager"].exit_calls == 1
+
+
+def test_bound_content_external_cancellation_still_propagates() -> None:
+    cancellation = asyncio.CancelledError("external cancellation")
+    provider, counts = make_provider(request_error=cancellation)
+
+    with pytest.raises(asyncio.CancelledError) as raised:
+        provider.fetch_provider_content(make_snapshot(), submitted_ref())
+
+    assert raised.value is cancellation
+    assert len(counts["client"].calls) == 1
+    assert counts["manager"].exit_calls == 1
+
+
+@pytest.mark.parametrize(
+    "status_code,headers",
+    [
+        (302, {"Content-Type": "video/mp4"}),
+        (200, {"Content-Type": "application/json"}),
+        (200, {"Content-Type": "video/mp4", "Content-Length": "52428801"}),
+    ],
+)
+def test_bound_content_rejects_redirect_wrong_type_and_oversize(
+    status_code: int, headers: dict[str, str]
+) -> None:
+    response = FakeResponse(status_code, b"not-a-video", headers=headers)
+    provider, counts = make_provider(response)
+
+    with pytest.raises(ValueError, match="provider content is unavailable"):
+        provider.fetch_provider_content(make_snapshot(), submitted_ref())
+
+    assert len(counts["client"].calls) == 1
+    assert counts["client"].calls[0]["follow_redirects"] is False
+    assert response.stream.close_calls == 1
+    assert response.close_calls == 1
+    assert counts["manager"].exit_calls == 1
 
 
 def test_running_loop_rejects_create_and_query_before_credential_or_client() -> None:
