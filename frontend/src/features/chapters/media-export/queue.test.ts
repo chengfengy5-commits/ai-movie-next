@@ -169,6 +169,55 @@ describe("media export queue projection", () => {
     expect(fetcher.mock.calls.filter(([input]) => String(input).includes("shared.mp4"))).toHaveLength(2);
   });
 
+  it("emits a persistence receipt only for an actual saved sink result", async () => {
+    const items = [readyItem(0), readyItem(1), readyItem(2), readyItem(3)];
+    const queue: MediaExportQueue = {
+      runId: "run-receipts",
+      sourceKind: "chapter",
+      chapterId: "chapter-a",
+      seriesId: "series-a",
+      chapterName: "章节",
+      seriesName: "剧集",
+      sourceRevision: "chapter-4",
+      items,
+    };
+    const fetcher = vi.fn<typeof fetch>(async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/api/sign-download-urls")) {
+        const body = JSON.parse(String(init?.body)) as { items: Array<{ url: string; filename: string }> };
+        return Response.json({ items: body.items.map((item) => ({ ...item, signed: false })) });
+      }
+      const response = new Response("clip", { headers: { "Content-Type": "video/mp4" } });
+      Object.defineProperty(response, "url", { value: url });
+      return response;
+    });
+    const onSaved = vi.fn((_item: MediaExportQueueItem) => {
+      throw new Error("local storage write failed");
+    });
+    const result = await startMediaExport(queue, {
+      transport: createTransport(fetcher),
+      sink: {
+        async save(item) {
+          if (item.assetId === "asset-1") return { kind: "download-started" };
+          if (item.assetId === "asset-2") {
+            throw new MediaExportSinkError("unknown", "close", "close unknown");
+          }
+          if (item.assetId === "asset-3") {
+            throw new MediaExportSinkError("failed", "write", "write failed");
+          }
+          return { kind: "saved" };
+        },
+      },
+      onSaved,
+    }).done;
+
+    expect(result.items.map((item) => item.state)).toEqual([
+      "saved", "download-started", "unknown", "failed",
+    ]);
+    expect(onSaved).toHaveBeenCalledOnce();
+    expect(onSaved.mock.calls[0]?.[0]).toMatchObject({ assetId: "asset-0", state: "saved" });
+  });
+
   it("marks a post-close uncertainty unknown and never repeats its download", async () => {
     const queue = {
       runId: "run-a",
@@ -512,10 +561,12 @@ describe("media export queue projection", () => {
       releaseSave = resolve;
     }));
     const onItem = vi.fn();
+    const onSaved = vi.fn((_item: MediaExportQueueItem) => undefined);
     const run = startMediaExport(queue, {
       transport: createTransport(fetcher, () => current),
       sink: { save },
       onItem,
+      onSaved,
     });
     await vi.waitFor(() => expect(save).toHaveBeenCalledOnce());
     current = false;
@@ -530,5 +581,7 @@ describe("media export queue projection", () => {
       "https://cdn.example.invalid/0.mp4",
     ]);
     expect(onItem).not.toHaveBeenCalled();
+    expect(onSaved).toHaveBeenCalledOnce();
+    expect(onSaved.mock.calls[0]?.[0]).toMatchObject({ assetId: "asset-0", state: "saved" });
   });
 });

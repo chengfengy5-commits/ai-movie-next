@@ -20,6 +20,25 @@ import {
   type MediaExportRun,
 } from "./queue";
 import {
+  clearSavedMediaExportRecords,
+  countStaleMediaExportRecords,
+  findMatchingSavedMediaExportRecord,
+  fingerprintMediaExportCandidate,
+  getMediaExportStorage,
+  mediaExportPreferencesStorageKey,
+  mediaExportRecordIdentity,
+  mediaExportRecordsStorageKey,
+  readSavedMediaExportRecords,
+  readSkipSavedPreference,
+  toSavedMediaExportRecord,
+  writeSavedMediaExportRecord,
+  writeSkipSavedPreference,
+  type MediaExportPreferenceScope,
+  type MediaExportRecordCandidate,
+  type MediaExportRecordScope,
+  type SavedMediaExportRecord,
+} from "./exportRecords";
+import {
   createBrowserMediaExportSink,
   createDirectoryMediaExportSink,
   type DirectoryHandleLike,
@@ -57,6 +76,59 @@ interface CapturedPageScope {
   readonly sourceRevision: string | null;
   readonly sourceMode: ExportSourceMode;
   readonly roughCutSnapshot: PersonalRoughCutSnapshot | null | undefined;
+}
+
+interface RecordCandidateEntry {
+  readonly identity: string;
+  readonly candidate: MediaExportRecordCandidate;
+}
+
+interface LoadedRecordState {
+  readonly scopeKey: string;
+  readonly preferenceScopeKey: string;
+  readonly generation: number;
+  readonly records: readonly SavedMediaExportRecord[];
+  readonly skipConfirmedSaved: boolean;
+  readonly recordsAvailable: boolean;
+  readonly preferenceAvailable: boolean;
+}
+
+interface FingerprintState {
+  readonly scopeKey: string;
+  readonly candidates: readonly RecordCandidateEntry[];
+  readonly fingerprints: ReadonlyMap<string, string>;
+  readonly unavailableCount: number;
+}
+
+function sourceTextForItem(
+  sourceKind: ExportSourceMode,
+  item: MediaExportQueueItem,
+  chapter: Chapter,
+  roughCutSnapshot: PersonalRoughCutSnapshot | null | undefined,
+): string {
+  const value = sourceKind === "chapter"
+    ? chapter.content?.[item.frameIndex]?.text
+    : roughCutSnapshot?.frames[item.sourceIndex]?.text;
+  return typeof value === "string" ? value : "";
+}
+
+function reviewStatus(
+  item: MediaExportQueueItem,
+  selected: boolean,
+  hasSavedRecord: boolean,
+  skipSaved: boolean,
+): string {
+  if (item.eligibility === "ready" && item.assetId === null) {
+    return selected
+      ? "已选，可导出；缺少稳定镜头身份，不记本机记录"
+      : "已排除；缺少稳定镜头身份，不记本机记录";
+  }
+  if (hasSavedRecord) {
+    return skipSaved
+      ? "本机记录确认已保存，已跳过；文件仍需自行核对"
+      : "本机记录确认已保存，可重新导出";
+  }
+  return statusForEligibility(item.eligibility, selected);
 }
 
 let fallbackRunSequence = 0;
@@ -162,6 +234,25 @@ export function MediaExportDialog({
 }: MediaExportDialogProps) {
   const { services, state, sessionGeneration } = useAuth();
   const userId = state.status === "authenticated" ? state.user.id : null;
+  const recordScope = useMemo<MediaExportRecordScope | null>(() => (
+    userId === null || services.apiBaseUrl === null
+      ? null
+      : {
+        actorId: userId,
+        apiBaseUrl: services.apiBaseUrl,
+        seriesId: chapter.series_id,
+        chapterId: chapter.id,
+      }
+  ), [chapter.id, chapter.series_id, services.apiBaseUrl, userId]);
+  const preferenceScope = useMemo<MediaExportPreferenceScope | null>(() => (
+    userId === null || services.apiBaseUrl === null
+      ? null
+      : { actorId: userId, apiBaseUrl: services.apiBaseUrl }
+  ), [services.apiBaseUrl, userId]);
+  const recordScopeKey = recordScope === null ? null : mediaExportRecordsStorageKey(recordScope);
+  const preferenceScopeKey = preferenceScope === null
+    ? null
+    : mediaExportPreferencesStorageKey(preferenceScope);
   const dialogProps: MediaExportDialogProps = {
     chapter,
     seriesName,
@@ -197,6 +288,13 @@ export function MediaExportDialog({
   const [retryConfirmed, setRetryConfirmed] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [runNotice, setRunNotice] = useState<string | null>(null);
+  const [loadedRecordState, setLoadedRecordState] = useState<LoadedRecordState | null>(null);
+  const [fingerprintState, setFingerprintState] = useState<FingerprintState | null>(null);
+  const [recordWriteFailureScopeKey, setRecordWriteFailureScopeKey] = useState<string | null>(null);
+  const [preferenceWriteFailureScopeKey, setPreferenceWriteFailureScopeKey] = useState<string | null>(null);
+  const [recordActionNotice, setRecordActionNotice] = useState<{ scopeKey: string; message: string } | null>(null);
+  const [frozenSavedSkipIds, setFrozenSavedSkipIds] = useState<ReadonlySet<string>>(new Set());
+  const recordGenerationRef = useRef(new Map<string, number>());
 
   const focus = useSeriesDialogFocus({
     active: true,
@@ -221,6 +319,7 @@ export function MediaExportDialog({
     identityInvalidatedRef.current = true;
     setFrozenQueue(null);
     setResultQueue(null);
+    setFrozenSavedSkipIds(new Set());
     setPhase("review");
     setErrorMessage("登录凭据已变化，当前媒体导出已停止。请核对登录状态后重新开始。");
     propsRef.current.onClose();
@@ -296,6 +395,7 @@ export function MediaExportDialog({
     setDraftRunId(createRunId());
     setFrozenQueue(null);
     setResultQueue(null);
+    setFrozenSavedSkipIds(new Set());
     setPhase("review");
     setConfirmationChecked(false);
     setRetrySelectedIds(new Set());
@@ -316,22 +416,11 @@ export function MediaExportDialog({
     userId,
   ]);
 
-  const selectedIndexes = useMemo(
-    () => Array.from(selectedFrameIndexes).sort((left, right) => left - right),
-    [selectedFrameIndexes],
-  );
   const chapterAllQueue = buildChapterMediaExportQueue({
     runId: draftRunId,
     chapter,
     seriesName,
     selectedFrameIndexes: allFrameIndexes(chapter),
-    sourceRevision: currentSourceRevision(propsRef.current),
-  });
-  const chapterProjection = buildChapterMediaExportQueue({
-    runId: draftRunId,
-    chapter,
-    seriesName,
-    selectedFrameIndexes: selectedIndexes,
     sourceRevision: currentSourceRevision(propsRef.current),
   });
   let roughCutProjection: MediaExportQueue | null = null;
@@ -348,9 +437,222 @@ export function MediaExportDialog({
       roughCutMessage = "当前粗剪未保存或不属于本章，不能创建导出队列。";
     }
   }
-  const activeProjection = sourceMode === "chapter" ? chapterProjection : roughCutProjection;
+
+  useEffect(() => {
+    if (recordScope === null || recordScopeKey === null || preferenceScope === null || preferenceScopeKey === null) {
+      setLoadedRecordState(null);
+      setFingerprintState(null);
+      return;
+    }
+    const storage = getMediaExportStorage();
+    const savedRecords = readSavedMediaExportRecords(storage, recordScope);
+    const preference = readSkipSavedPreference(storage, preferenceScope);
+    setLoadedRecordState({
+      scopeKey: recordScopeKey,
+      preferenceScopeKey,
+      generation: savedRecords.status === "ready" ? savedRecords.value.generation : 0,
+      records: savedRecords.status === "ready" ? savedRecords.value.records : [],
+      skipConfirmedSaved: preference.status === "ready" ? preference.value : false,
+      recordsAvailable: savedRecords.status === "ready",
+      preferenceAvailable: preference.status === "ready",
+    });
+    setRecordWriteFailureScopeKey(null);
+    setPreferenceWriteFailureScopeKey(null);
+    setRecordActionNotice(null);
+  }, [preferenceScope, preferenceScopeKey, recordScope, recordScopeKey]);
+
+  const recordSourceSignature = JSON.stringify([
+    sourceMode,
+    chapter.id,
+    chapter.series_id,
+    chapter.title,
+    seriesName,
+    currentSourceRevision(propsRef.current),
+    sourceMode === "chapter"
+      ? chapter.content?.map((frame) => [
+        Array.isArray(frame.storyboard) && typeof frame.storyboard[0] === "string"
+          ? frame.storyboard[0]
+          : null,
+        typeof frame.preview === "string" ? frame.preview : null,
+        typeof frame.text === "string" ? frame.text : null,
+      ]) ?? []
+      : null,
+    sourceMode === "rough-cut" && roughCutSnapshot !== null && roughCutSnapshot !== undefined
+      ? [
+        roughCutSnapshot.saved,
+        roughCutSnapshot.chapter_id,
+        roughCutSnapshot.revision,
+        roughCutSnapshot.frames.map((frame) => [
+          frame.asset_id,
+          frame.frame_index,
+          frame.preview_url,
+          frame.text,
+          frame.included,
+          frame.pending,
+        ]),
+      ]
+      : null,
+  ]);
+  const recordCandidates = useMemo<readonly RecordCandidateEntry[]>(() => {
+    let queue: MediaExportQueue | null = null;
+    if (sourceMode === "chapter") {
+      queue = buildChapterMediaExportQueue({
+        runId: "media-export-record-preview",
+        chapter,
+        seriesName,
+        selectedFrameIndexes: allFrameIndexes(chapter),
+        sourceRevision: currentSourceRevision(propsRef.current),
+      });
+    } else if (roughCutSnapshot !== null && roughCutSnapshot !== undefined) {
+      try {
+        queue = buildSavedRoughCutMediaExportQueue({
+          runId: "media-export-record-preview",
+          chapter,
+          seriesName,
+          snapshot: roughCutSnapshot,
+        });
+      } catch {
+        queue = null;
+      }
+    }
+    if (queue === null) return [];
+    return queue.items.flatMap((item) => {
+      if (item.eligibility !== "ready" || item.assetId === null || item.sourceUrl === null) {
+        return [];
+      }
+      const identity = mediaExportRecordIdentity(item.sourceKind, item.assetId);
+      return [{
+        identity,
+        candidate: {
+          sourceKind: item.sourceKind,
+          assetId: item.assetId,
+          sourceRevision: queue.sourceRevision,
+          sourceUrl: item.sourceUrl,
+          sourceText: sourceTextForItem(sourceMode, item, chapter, roughCutSnapshot),
+          filename: item.filename,
+        },
+      }];
+    });
+  }, [
+    chapter.content,
+    chapter.id,
+    chapter.series_id,
+    chapter.title,
+    chapter.updated_at,
+    roughCutSnapshot,
+    seriesName,
+    sourceMode,
+    recordSourceSignature,
+    sourceRevision,
+  ]);
+
+  useEffect(() => {
+    if (recordScopeKey === null) {
+      setFingerprintState(null);
+      return;
+    }
+    let current = true;
+    setFingerprintState(null);
+    void Promise.all(recordCandidates.map(async (entry) => ({
+      identity: entry.identity,
+      fingerprint: await fingerprintMediaExportCandidate(entry.candidate),
+    }))).then((results) => {
+      if (!current) return;
+      const fingerprints = new Map<string, string>();
+      let unavailableCount = 0;
+      for (const result of results) {
+        if (result.fingerprint === null) unavailableCount += 1;
+        else fingerprints.set(result.identity, result.fingerprint);
+      }
+      setFingerprintState({
+        scopeKey: recordScopeKey,
+        candidates: recordCandidates,
+        fingerprints,
+        unavailableCount,
+      });
+    });
+    return () => {
+      current = false;
+    };
+  }, [recordCandidates, recordScopeKey]);
+
+  const currentRecordState = loadedRecordState?.scopeKey === recordScopeKey
+    && loadedRecordState.preferenceScopeKey === preferenceScopeKey
+    ? loadedRecordState
+    : null;
+  const currentFingerprintState = fingerprintState?.scopeKey === recordScopeKey
+    && fingerprintState.candidates === recordCandidates
+    ? fingerprintState
+    : null;
+  const fingerprintsByIdentity = currentFingerprintState?.fingerprints ?? new Map<string, string>();
+  const savedRecordIdentities = new Set<string>();
+  if (currentRecordState?.recordsAvailable && currentFingerprintState !== null) {
+    for (const entry of recordCandidates) {
+      if (findMatchingSavedMediaExportRecord(
+        currentRecordState.records,
+        entry.candidate,
+        fingerprintsByIdentity.get(entry.identity) ?? null,
+      ) !== null) {
+        savedRecordIdentities.add(entry.identity);
+      }
+    }
+  }
+  const skipConfirmedSaved = currentRecordState?.skipConfirmedSaved ?? false;
+  const selectedIndexes = Array.from(selectedFrameIndexes).filter((frameIndex) => {
+    if (!skipConfirmedSaved) return true;
+    const item = chapterAllQueue.items.find((candidate) => candidate.frameIndex === frameIndex);
+    return item?.assetId === null || item?.assetId === undefined
+      || !savedRecordIdentities.has(mediaExportRecordIdentity(item.sourceKind, item.assetId));
+  }).sort((left, right) => left - right);
+  const chapterProjection = buildChapterMediaExportQueue({
+    runId: draftRunId,
+    chapter,
+    seriesName,
+    selectedFrameIndexes: selectedIndexes,
+    sourceRevision: currentSourceRevision(propsRef.current),
+  });
+  const skippedSavedIdentities = skipConfirmedSaved ? savedRecordIdentities : new Set<string>();
+  const roughCutProjectionForDisplay = roughCutProjection === null
+    ? null
+    : {
+      ...roughCutProjection,
+      items: Object.freeze(roughCutProjection.items.map((item) => (
+        item.eligibility === "ready"
+        && item.assetId !== null
+        && skippedSavedIdentities.has(mediaExportRecordIdentity(item.sourceKind, item.assetId))
+          ? Object.freeze({ ...item, eligibility: "excluded" as const })
+          : item
+      ))),
+    };
+  const activeProjection = sourceMode === "chapter" ? chapterProjection : roughCutProjectionForDisplay;
+  const recordCheckReady = recordScopeKey === null
+    || currentRecordState !== null && currentFingerprintState !== null;
+  const staleRecordCount = currentRecordState?.recordsAvailable && currentFingerprintState !== null
+    ? countStaleMediaExportRecords(
+      currentRecordState.records,
+      recordCandidates.map((entry) => entry.candidate),
+      fingerprintsByIdentity,
+    )
+    : 0;
+  const localRecordNotice = recordScopeKey === null
+    ? null
+    : currentRecordState === null
+      ? "正在读取本机导出记录与偏好…"
+      : !currentRecordState.recordsAvailable || !currentRecordState.preferenceAvailable
+        ? "本机导出记录或偏好不可用；本次仍可手动导出，系统不会假报已记住。"
+        : currentFingerprintState === null
+          ? "正在安全核对当前来源与本机导出记录…"
+          : currentFingerprintState.unavailableCount > 0
+            ? "部分来源无法安全核对，本次不会为这些项目应用或写入本机记录。"
+            : recordWriteFailureScopeKey === recordScopeKey
+              ? "本机导出记录未能保存；本次文件状态仍按实际导出结果显示。"
+              : preferenceWriteFailureScopeKey === preferenceScopeKey
+                ? "跳过偏好未能持久化；当前勾选仅在本次打开期间生效。"
+              : staleRecordCount > 0
+                ? `${staleRecordCount} 条本机记录与当前镜头或版本不符，已失效。`
+                : null;
   const queueForDisplay = resultQueue ?? frozenQueue ?? (
-    sourceMode === "chapter" ? chapterAllQueue : roughCutProjection
+    sourceMode === "chapter" ? chapterAllQueue : roughCutProjectionForDisplay
   );
   const failedItems = (resultQueue?.items ?? []).filter((item) => (
     item.eligibility === "ready" && item.state === "failed"
@@ -359,8 +661,59 @@ export function MediaExportDialog({
   const chapterMissingCount = chapterAllQueue.items.filter((item) => item.eligibility === "missing").length;
   const chapterDuplicateCount = chapterAllQueue.items.filter((item) => item.eligibility === "duplicate").length;
   const chapterExcludedCount = chapterAllQueue.items.filter((item) => (
-    item.eligibility === "ready" && !selectedFrameIndexes.has(item.frameIndex)
+    item.eligibility === "ready" && !selectedIndexes.includes(item.frameIndex)
   )).length;
+  const chapterSkippedSavedCount = skipConfirmedSaved
+    ? chapterAllQueue.items.filter((item) => (
+      item.eligibility === "ready"
+      && item.assetId !== null
+      && savedRecordIdentities.has(mediaExportRecordIdentity(item.sourceKind, item.assetId))
+    )).length
+    : 0;
+
+  function changeSkipSavedPreference(skip: boolean): void {
+    if (currentRecordState === null || preferenceScope === null || preferenceScopeKey === null) return;
+    setLoadedRecordState((current) => current?.scopeKey === recordScopeKey
+      ? { ...current, skipConfirmedSaved: skip }
+      : current);
+    const written = writeSkipSavedPreference(getMediaExportStorage(), preferenceScope, skip);
+    if (written) {
+      setLoadedRecordState((current) => current?.scopeKey === recordScopeKey
+        ? { ...current, preferenceAvailable: true }
+        : current);
+      setPreferenceWriteFailureScopeKey(null);
+      setRecordActionNotice(null);
+    } else {
+      setPreferenceWriteFailureScopeKey(preferenceScopeKey);
+      setRecordActionNotice({
+        scopeKey: recordScopeKey ?? "",
+        message: "跳过偏好只在本次打开期间生效，未能写入本机存储。",
+      });
+    }
+  }
+
+  function clearCurrentChapterRecords(): void {
+    if (currentRecordState === null || recordScope === null || recordScopeKey === null) return;
+    const generation = clearSavedMediaExportRecords(getMediaExportStorage(), recordScope);
+    if (generation === null) {
+      setRecordWriteFailureScopeKey(recordScopeKey);
+      setRecordActionNotice({
+        scopeKey: recordScopeKey,
+        message: "本章记录未能清除；已有记录状态没有改变。",
+      });
+      return;
+    }
+    setLoadedRecordState((current) => current?.scopeKey === recordScopeKey
+      ? { ...current, generation, records: [], recordsAvailable: true }
+      : current);
+    recordGenerationRef.current.set(recordScopeKey, generation);
+    setRecordWriteFailureScopeKey(null);
+    setFrozenSavedSkipIds(new Set());
+    setRecordActionNotice({
+      scopeKey: recordScopeKey,
+      message: "本章本机导出记录已清除；较早开始的写入不会恢复这些记录。",
+    });
+  }
 
   function createTransport(capturedMode: ExportSourceMode): MediaExportSessionTransport {
     const auth = authRef.current;
@@ -439,6 +792,16 @@ export function MediaExportDialog({
     transport: MediaExportSessionTransport,
     controller: AbortController,
   ): void {
+    const recordScopeAtStart = recordScope;
+    const recordScopeKeyAtStart = recordScopeKey;
+    const expectedRecordGeneration = currentRecordState?.generation ?? 0;
+    const candidatesAtStart = new Map(recordCandidates.map((entry) => [entry.identity, entry.candidate]));
+    const fingerprintsAtStart = new Map(fingerprintsByIdentity);
+    const canRecordQueue = recordScopeAtStart !== null
+      && recordScopeKeyAtStart !== null
+      && queue.chapterId === recordScopeAtStart.chapterId
+      && queue.seriesId === recordScopeAtStart.seriesId
+      && queue.sourceKind === sourceModeRef.current;
     setFrozenQueue(queue);
     setResultQueue(queue);
     setPhase("running");
@@ -448,6 +811,75 @@ export function MediaExportDialog({
       sink,
       signal: controller.signal,
       onItem: (item) => updateQueueItem(item, transport),
+      onSaved: (item) => {
+        if (
+          !canRecordQueue
+          || recordScopeAtStart === null
+          || recordScopeKeyAtStart === null
+          || item.assetId === null
+          || !transport.isCurrent()
+          || (recordGenerationRef.current.get(recordScopeKeyAtStart) ?? expectedRecordGeneration)
+            !== expectedRecordGeneration
+        ) {
+          return;
+        }
+        const identity = mediaExportRecordIdentity(item.sourceKind, item.assetId);
+        const candidate = candidatesAtStart.get(identity);
+        const fingerprint = fingerprintsAtStart.get(identity);
+        if (candidate === undefined || candidate.sourceRevision !== queue.sourceRevision || fingerprint === undefined) {
+          return;
+        }
+        const record = toSavedMediaExportRecord(candidate, fingerprint);
+        if (record === null) return;
+        const written = writeSavedMediaExportRecord(
+          getMediaExportStorage(),
+          recordScopeAtStart,
+          record,
+          expectedRecordGeneration,
+        );
+        if (!written) {
+          const latestRecords = readSavedMediaExportRecords(getMediaExportStorage(), recordScopeAtStart);
+          if (
+            latestRecords.status === "ready"
+            && latestRecords.value.generation !== expectedRecordGeneration
+          ) {
+            setLoadedRecordState((current) => current?.scopeKey === recordScopeKeyAtStart
+              ? {
+                ...current,
+                generation: latestRecords.value.generation,
+                records: latestRecords.value.records,
+                recordsAvailable: true,
+              }
+              : current);
+            return;
+          }
+          setRecordWriteFailureScopeKey(recordScopeKeyAtStart);
+          setRecordActionNotice({
+            scopeKey: recordScopeKeyAtStart,
+            message: "文件已确认保存到目标目录，但本机记录写入失败。",
+          });
+          return;
+        }
+        setRecordWriteFailureScopeKey(null);
+        setRecordActionNotice({
+          scopeKey: recordScopeKeyAtStart,
+          message: "本机已记下已保存的来源；这不代表文件目前仍存在。",
+        });
+        setLoadedRecordState((current) => {
+          if (current?.scopeKey !== recordScopeKeyAtStart) return current;
+          const savedIdentity = mediaExportRecordIdentity(record.sourceKind, record.assetId);
+          return {
+            ...current,
+            records: [
+              ...current.records.filter((saved) => (
+                mediaExportRecordIdentity(saved.sourceKind, saved.assetId) !== savedIdentity
+              )),
+              record,
+            ],
+            recordsAvailable: true,
+          };
+        });
+      },
       onUnauthorized: (error) => {
         if (!transport.isCurrent()) return;
         setErrorMessage("登录状态已失效，媒体导出已停止，请重新登录。");
@@ -538,8 +970,20 @@ export function MediaExportDialog({
 
   function confirmProjection(): void {
     if (invalidateIfSessionChanged()) return;
-    if (activeProjection === null || !hasReadyItems(activeProjection)) return;
+    if (
+      !recordCheckReady
+      || activeProjection === null
+      || !hasReadyItems(activeProjection)
+    ) return;
+    const skippedIds = skipConfirmedSaved
+      ? activeProjection.items.filter((item) => (
+        item.eligibility === "excluded"
+        && item.assetId !== null
+        && savedRecordIdentities.has(mediaExportRecordIdentity(item.sourceKind, item.assetId))
+      )).map((item) => item.id)
+      : [];
     setFrozenQueue(activeProjection);
+    setFrozenSavedSkipIds(new Set(skippedIds));
     setResultQueue(null);
     setConfirmationChecked(false);
     setPhase("confirmed");
@@ -640,6 +1084,10 @@ export function MediaExportDialog({
         )}
         {errorMessage !== null && <p className="media-export-error" role="alert">{errorMessage}</p>}
         {runNotice !== null && <p className="media-export-notice" role="status">{runNotice}</p>}
+        {localRecordNotice !== null && <p className="media-export-notice" role="status">{localRecordNotice}</p>}
+        {recordActionNotice?.scopeKey === recordScopeKey && (
+          <p className="media-export-notice" role="status">{recordActionNotice.message}</p>
+        )}
 
         {isReviewing && state.status === "authenticated" && services.apiBaseUrl !== null && (
           <>
@@ -651,6 +1099,27 @@ export function MediaExportDialog({
                 : null}
             </div>
 
+            <div className="media-export-record-controls">
+              <label className="media-export-confirmation">
+                <input
+                  checked={skipConfirmedSaved}
+                  disabled={currentRecordState === null || !currentRecordState.recordsAvailable}
+                  onChange={(event) => changeSkipSavedPreference(event.currentTarget.checked)}
+                  type="checkbox"
+                />
+                跳过本机记录中已确认保存到目标目录的项目
+              </label>
+              <button
+                className="text-button"
+                disabled={currentRecordState === null || !currentRecordState.recordsAvailable || currentRecordState.records.length === 0}
+                onClick={clearCurrentChapterRecords}
+                type="button"
+              >
+                清除本章本机导出记录（{currentRecordState?.records.length ?? 0}）
+              </button>
+              <span>仅在目标目录文件已成功写入并关闭后记录；浏览器下载“已发起”不算已保存。记录不证明文件仍存在。</span>
+            </div>
+
             {sourceMode === "chapter" && (
               <div className="media-export-summary" aria-live="polite">
                 <span>可导出 {selectedIndexes.filter((index) => (
@@ -659,15 +1128,17 @@ export function MediaExportDialog({
                 <span>缺少视频 {chapterMissingCount}</span>
                 <span>身份重复 {chapterDuplicateCount}</span>
                 <span>已排除 {chapterExcludedCount}</span>
+                {skipConfirmedSaved && <span>已跳过本机确认保存 {chapterSkippedSavedCount}</span>}
               </div>
             )}
             {sourceMode === "rough-cut" && roughCutProjection !== null && (
               <div className="media-export-summary" aria-live="polite">
-                <span>可导出 {roughCutProjection.items.filter((item) => item.eligibility === "ready").length}</span>
-                <span>缺少视频 {roughCutProjection.items.filter((item) => item.eligibility === "missing").length}</span>
-                <span>仍在等待 {roughCutProjection.items.filter((item) => item.eligibility === "pending").length}</span>
-                <span>身份重复 {roughCutProjection.items.filter((item) => item.eligibility === "duplicate").length}</span>
-                <span>已排除 {roughCutProjection.items.filter((item) => item.eligibility === "excluded").length}</span>
+                <span>可导出 {roughCutProjectionForDisplay?.items.filter((item) => item.eligibility === "ready").length ?? 0}</span>
+                <span>缺少视频 {roughCutProjectionForDisplay?.items.filter((item) => item.eligibility === "missing").length ?? 0}</span>
+                <span>仍在等待 {roughCutProjectionForDisplay?.items.filter((item) => item.eligibility === "pending").length ?? 0}</span>
+                <span>身份重复 {roughCutProjectionForDisplay?.items.filter((item) => item.eligibility === "duplicate").length ?? 0}</span>
+                <span>已排除 {roughCutProjectionForDisplay?.items.filter((item) => item.eligibility === "excluded").length ?? 0}</span>
+                {skipConfirmedSaved && <span>本机确认保存 {savedRecordIdentities.size} 项已跳过</span>}
               </div>
             )}
 
@@ -678,8 +1149,11 @@ export function MediaExportDialog({
               ? <p>请先保存粗剪，再按本次保存的顺序确认导出清单。</p>
               : null}
             <ol aria-label="媒体导出预览" className="media-export-items">
-              {(sourceMode === "chapter" ? chapterAllQueue.items : roughCutProjection?.items ?? []).map((item) => {
-                const selected = sourceMode === "chapter" && selectedFrameIndexes.has(item.frameIndex);
+              {(sourceMode === "chapter" ? chapterAllQueue.items : roughCutProjectionForDisplay?.items ?? []).map((item) => {
+                const hasSavedRecord = item.assetId !== null
+                  && savedRecordIdentities.has(mediaExportRecordIdentity(item.sourceKind, item.assetId));
+                const skippedByPreference = skipConfirmedSaved && hasSavedRecord;
+                const selected = sourceMode === "chapter" && selectedIndexes.includes(item.frameIndex);
                 return (
                   <li className="media-export-item" data-export-item-id={item.id} key={item.id}>
                     {sourceMode === "chapter" && item.eligibility === "ready" && (
@@ -687,6 +1161,7 @@ export function MediaExportDialog({
                         <input
                           aria-label={`选择分镜 ${item.frameIndex + 1}`}
                           checked={selected}
+                          disabled={skippedByPreference}
                           onChange={(event) => selectFrame(item.frameIndex, event.currentTarget.checked)}
                           type="checkbox"
                         />
@@ -697,7 +1172,7 @@ export function MediaExportDialog({
                       <span>{frameDescription(item, chapter, roughCutSnapshot, sourceMode)}</span>
                     </div>
                     <span className={`media-export-status media-export-status-${item.eligibility}`}>
-                      {statusForEligibility(item.eligibility, selected || sourceMode === "rough-cut")}
+                      {reviewStatus(item, selected || sourceMode === "rough-cut", hasSavedRecord, skipConfirmedSaved)}
                     </span>
                   </li>
                 );
@@ -706,7 +1181,7 @@ export function MediaExportDialog({
             <div className="media-export-actions">
               <button
                 className="primary-button"
-                disabled={activeProjection === null || !hasReadyItems(activeProjection)}
+                disabled={!recordCheckReady || activeProjection === null || !hasReadyItems(activeProjection)}
                 onClick={confirmProjection}
                 type="button"
               >
@@ -737,7 +1212,9 @@ export function MediaExportDialog({
                     <span>{frameDescription(item, chapter, roughCutSnapshot, sourceMode)}</span>
                   </div>
                   <span className={`media-export-status media-export-status-${item.eligibility}`}>
-                    {statusForEligibility(item.eligibility, item.eligibility === "ready")}
+                    {frozenSavedSkipIds.has(item.id)
+                      ? "本机记录确认已保存，已跳过；文件仍需自行核对"
+                      : statusForEligibility(item.eligibility, item.eligibility === "ready")}
                   </span>
                 </li>
               ))}
