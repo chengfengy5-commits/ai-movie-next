@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset } from "../../shared/api/contracts";
@@ -949,6 +949,21 @@ describe("ChatAssistantPage", () => {
     expect(screen.getByText("仍未取得终态回执；可稍后手动刷新，系统不会重发。")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "刷新原任务状态" })).toBeEnabled();
     expect(window.sessionStorage.getItem("haoai.chat-assistant.pending.v1:actor-952:series-952")).not.toBeNull();
+  });
+
+  it("places the real chat history and composer in the adjustable split pane", async () => {
+    const user = userEvent.setup();
+    const fixture = setupFixture();
+    renderPage(fixture.services);
+
+    const separator = await screen.findByRole("separator", { name: "调整聊天记录与输入区域比例" });
+    expect(screen.getByLabelText("聊天记录")).toBeInTheDocument();
+    expect(screen.getByLabelText("发送给 AI 助手")).toBeInTheDocument();
+    expect(separator).toHaveAttribute("aria-valuenow", "62");
+
+    await user.click(separator);
+    fireEvent.keyDown(separator, { key: "ArrowDown" });
+    expect(separator).toHaveAttribute("aria-valuenow", "57");
   });
 
   it("keeps a newer pending refresh busy when an invalidated refresh finishes late", async () => {
