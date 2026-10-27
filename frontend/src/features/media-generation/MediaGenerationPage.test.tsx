@@ -524,7 +524,11 @@ describe("MediaGenerationPage", () => {
     let finishSubmission: ((value: Awaited<ReturnType<MediaGenerationRun["submitBatch"]>>) => void) | undefined;
     const submitBatch = vi.fn<MediaGenerationRun["submitBatch"]>(() => new Promise((resolve) => { finishSubmission = resolve; }));
     const preferencesA: UserPreferencesPort = {
-      get: vi.fn(() => ++preferenceRead === 1 ? latePreferences : stalePreferences),
+      get: vi.fn(() => {
+        preferenceRead += 1;
+        if (preferenceRead === 1) return Promise.resolve({});
+        return preferenceRead === 2 ? latePreferences : stalePreferences;
+      }),
       update: vi.fn(async () => ({ updatedKeys: ["batch_gen_prefs"] })),
     };
     const preferencesB = userPreferencesPort({
@@ -583,7 +587,7 @@ describe("MediaGenerationPage", () => {
 
     await user.click(screen.getByRole("button", { name: "普通视频" }));
     await user.click(screen.getByRole("button", { name: "批量素材生图" }));
-    await waitFor(() => expect(preferencesA.get).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(preferencesA.get).toHaveBeenCalledTimes(3));
     rerender(<MediaGenerationPage {...props} userId="actor-927" services={{ ...services, userPreferences: preferencesB.port }} />);
     await screen.findByText("已读取账户中保存的批量选项。修改后可点击“记住批量选项”。");
     expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-926");
@@ -691,7 +695,226 @@ describe("MediaGenerationPage", () => {
       checks: { character: false, keep_unknown: "preserve", scene: false },
       extension: { nested: true },
     } });
-    expect(get).toHaveBeenCalledTimes(3);
+    expect(get).toHaveBeenCalledTimes(4);
     expect(screen.getByLabelText("检查场景图片")).not.toBeChecked();
+  });
+
+  it("only applies quick references after confirmation and submits protected chapter images explicitly", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const referenceUrl = "/uploads/storyboard/reference.png";
+    const characterUrl = "https://cdn.example.test/character.png";
+    const chapter = {
+      ...chapterFixture(),
+      content: [{ storyboard: ["storyboard-926"], character: ["character-926"], text: "镜头一：5.2 秒" }],
+    };
+    const storyboard = { ...storyboardFixture(), image_url: referenceUrl };
+    const character = { ...characterFixture(), image_url: characterUrl };
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => ({
+      operation: "image.single",
+      submissionId: "quick-reference-submission",
+      taskId: "quick-reference-task",
+      messageId: "quick-reference-message",
+      status: "queued",
+      quotedAmount: 2,
+      billingStatus: "charged",
+    }));
+    const base = createDemoServices(window.localStorage);
+    const readImage = vi.fn(async () => new Blob(["synthetic PNG bytes"], { type: "image/png" }));
+    const preferences = userPreferencesPort({
+      batch_gen_prefs: { extension: "preserved" },
+      quick_ref_settings: { scene: false, characterVoice: false, custom_setting: "preserved" },
+    });
+    const services: WorkspaceServices = {
+      ...base,
+      mode: "api",
+      apiBaseUrl: "http://127.0.0.1:4175/api",
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+      userPreferences: preferences.port,
+      canvasData: { ...base.canvasData!, readImage } as NonNullable<WorkspaceServices["canvasData"]>,
+      listSeries: vi.fn(async () => [seriesFixture()]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [storyboard]),
+      listCharacters: vi.fn(async () => [character]),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByText("快速引用设置"));
+    await screen.findByText("已读取当前账号的快速引用设置。");
+    const imageQuickReferenceSettings = within(screen.getByRole("group", { name: "普通图片" }));
+    expect(imageQuickReferenceSettings.getByLabelText("场景图片")).not.toBeChecked();
+    await user.click(imageQuickReferenceSettings.getByLabelText("场景图片"));
+    await user.click(screen.getByRole("button", { name: "保存快速引用设置" }));
+    await screen.findByText("快速引用设置已保存到当前账号。");
+    expect(preferences.update).toHaveBeenCalledOnce();
+    expect(preferences.update.mock.calls[0]![0]).toMatchObject({ quick_ref_settings: {
+      scene: false,
+      characterVoice: false,
+      custom_setting: "preserved",
+      image: { scene: true },
+      video: { scene: false, characterVoice: false },
+    } });
+    expect(preferences.current().batch_gen_prefs).toEqual({ extension: "preserved" });
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(screen.getByLabelText("图片模型"), "image-model-926");
+    await user.selectOptions(screen.getByLabelText("图片目标"), "frame_message");
+    await user.selectOptions(screen.getByLabelText("剧集"), "series-926");
+    await user.selectOptions(await screen.findByLabelText("章节"), "chapter-926");
+    await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
+    await user.selectOptions(screen.getByLabelText("提示词目录"), "image-prompt-926");
+    await waitFor(() => expect(screen.getByLabelText("图片提示词")).toHaveValue("保持设定一致\n\n细节清晰"));
+    await user.type(screen.getByLabelText("参考图片 URL（每行一项）"), "https://manual.example.test/keep.png");
+
+    await user.click(screen.getByRole("button", { name: "快速引用当前章节" }));
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("保持设定一致\n\n细节清晰");
+    expect(screen.getByLabelText("提示词目录")).toHaveValue("image-prompt-926");
+    expect(screen.getByLabelText("参考图片 URL（每行一项）")).toHaveValue("https://manual.example.test/keep.png");
+    expect(submitImage).not.toHaveBeenCalled();
+
+    confirm.mockReturnValue(true);
+    await user.click(screen.getByRole("button", { name: "快速引用当前章节" }));
+    await screen.findByText("已填入当前章节快速引用；尚未提交生成。");
+    expect(readImage).toHaveBeenCalledOnce();
+    expect(readImage).toHaveBeenCalledWith(referenceUrl, expect.any(AbortSignal));
+    expect((screen.getByLabelText("图片提示词") as HTMLTextAreaElement).value).toContain("镜头一：5.2 秒");
+    expect(screen.getByLabelText("提示词目录")).toHaveValue("");
+    expect(screen.getByLabelText("参考图片 URL（每行一项）")).toHaveValue("");
+    expect(screen.getByText(/已准备 2 张章节参考图/)).toBeInTheDocument();
+    expect(screen.queryByText(referenceUrl)).not.toBeInTheDocument();
+    expect(submitImage).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+    await screen.findByText(/图片任务已受理/);
+    expect(submitImage).toHaveBeenCalledOnce();
+    expect(submitImage.mock.calls[0]![0]).toMatchObject({
+      target: { kind: "frame_message", chapter_id: "chapter-926", storyboard_asset_id: "storyboard-926" },
+      referenceImages: [expect.stringMatching(/^data:image\/png;base64,/u), characterUrl],
+    });
+    expect(submitImage.mock.calls[0]![0].prompt).toContain("图片1 = 雨巷转场镜头");
+    confirm.mockRestore();
+  });
+
+  it("cancels an in-progress quick reference without partially replacing the form", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const resolveReads: Array<(blob: Blob) => void> = [];
+    const chapter = {
+      ...chapterFixture(),
+      content: [{ storyboard: ["storyboard-926"], text: "章节描述" }],
+    };
+    const base = createDemoServices(window.localStorage);
+    const readImage = vi.fn((_url: string, _signal: AbortSignal) => new Promise<Blob>((resolve) => {
+      resolveReads.push(resolve);
+    }));
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => ({
+      operation: "image.single",
+      submissionId: "cancelled-quick-reference-submission",
+      taskId: "cancelled-quick-reference-task",
+      messageId: "cancelled-quick-reference-message",
+      status: "queued",
+      quotedAmount: 1,
+      billingStatus: "charged",
+    }));
+    const services: WorkspaceServices = {
+      ...base,
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+      userPreferences: userPreferencesPort({ quick_ref_settings: {} }).port,
+      canvasData: { ...base.canvasData!, readImage } as NonNullable<WorkspaceServices["canvasData"]>,
+      listSeries: vi.fn(async () => [seriesFixture()]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [{ ...storyboardFixture(), image_url: "/uploads/storyboard/reference.png" }]),
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+    await user.click(screen.getByText("快速引用设置"));
+    await screen.findByText("已读取当前账号的快速引用设置。");
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(screen.getByLabelText("图片目标"), "frame_message");
+    await user.selectOptions(screen.getByLabelText("剧集"), "series-926");
+    await user.selectOptions(await screen.findByLabelText("章节"), "chapter-926");
+    await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
+    await user.type(screen.getByLabelText("图片提示词"), "保留这段描述");
+
+    await user.click(screen.getByRole("button", { name: "快速引用当前章节" }));
+    await waitFor(() => expect(readImage).toHaveBeenCalledOnce());
+    await user.click(screen.getByRole("button", { name: "取消准备" }));
+    await screen.findByText("准备已取消；当前提示词和参考列表未更改。");
+    expect(screen.getByLabelText("图片模型")).toBeEnabled();
+    expect(screen.getByRole("button", { name: "快速引用当前章节" })).toBeEnabled();
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("保留这段描述");
+    expect(screen.queryByText(/已准备 \d+ 张章节参考图/u)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("参考图片 URL（每行一项）")).toHaveValue("");
+
+    await user.click(screen.getByRole("button", { name: "快速引用当前章节" }));
+    await waitFor(() => expect(readImage).toHaveBeenCalledTimes(2));
+    resolveReads[0]?.(new Blob(["late canceled PNG"], { type: "image/png" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByRole("button", { name: "取消准备" })).toBeInTheDocument();
+    expect(screen.getByLabelText("图片模型")).toBeDisabled();
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("保留这段描述");
+
+    await user.click(screen.getByRole("button", { name: "取消准备" }));
+    await screen.findByText("准备已取消；当前提示词和参考列表未更改。");
+    resolveReads[1]?.(new Blob(["late synthetic PNG"], { type: "image/png" }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(screen.getByLabelText("图片模型")).toBeEnabled();
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("保留这段描述");
+    expect(screen.queryByText(/已准备 \d+ 张章节参考图/u)).not.toBeInTheDocument();
+    expect(submitImage).not.toHaveBeenCalled();
+    confirm.mockRestore();
+  });
+
+  it("requires an explicit choice when account quick reference settings cannot be read", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const chapter = {
+      ...chapterFixture(),
+      content: [{ storyboard: ["storyboard-926"], text: "当前章节描述" }],
+    };
+    const preferences = userPreferencesPort({});
+    preferences.get.mockRejectedValueOnce(new Error("offline"));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      userPreferences: preferences.port,
+      listSeries: vi.fn(async () => [seriesFixture()]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [{
+        ...storyboardFixture(),
+        image_url: "https://cdn.example.test/storyboard-reference.png",
+      }]),
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+    await screen.findByText("无法读取账号快速引用设置。填入前会请你确认是否按本页当前开关继续。");
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.selectOptions(screen.getByLabelText("图片目标"), "frame_message");
+    await user.selectOptions(screen.getByLabelText("剧集"), "series-926");
+    await user.selectOptions(await screen.findByLabelText("章节"), "chapter-926");
+    await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
+
+    await user.click(screen.getByRole("button", { name: "快速引用当前章节" }));
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("本页开关可能仍是默认值"));
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("");
+    expect(screen.getByLabelText("参考图片 URL（每行一项）")).toHaveValue("");
+
+    confirm.mockReturnValueOnce(true);
+    await user.click(screen.getByRole("button", { name: "快速引用当前章节" }));
+    await screen.findByText("已填入当前章节快速引用；尚未提交生成。");
+    expect((screen.getByLabelText("图片提示词") as HTMLTextAreaElement).value).toContain("当前章节描述");
+    expect(screen.getByLabelText("参考图片 URL（每行一项）")).toHaveValue("");
+    confirm.mockRestore();
   });
 });

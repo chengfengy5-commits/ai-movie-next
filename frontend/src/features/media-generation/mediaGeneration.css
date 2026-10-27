@@ -66,6 +66,12 @@
   gap: 1.25rem;
 }
 
+.media-generation-preferences > summary {
+  color: var(--ink);
+  cursor: pointer;
+  font-weight: 700;
+}
+
 .media-generation-section-heading .eyebrow {
   margin-bottom: 0.35rem;
 }

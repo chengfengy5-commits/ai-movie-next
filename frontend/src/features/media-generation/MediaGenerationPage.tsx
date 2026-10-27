@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset } from "../../shared/api/contracts";
+import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, StoryboardFrame } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
+import { CanvasDataError } from "../../shared/api/canvasData";
+import { isValidCanvasImageReference } from "../../shared/api/canvasImageGeneration";
 import {
   MediaGenerationError,
   type MediaGenerationImageInput,
@@ -29,8 +31,27 @@ import {
   MediaReferenceUploadError,
   type MediaReferenceKind,
 } from "../../shared/api/mediaReferenceUpload";
+import { isSafeCanvasUploadPath, readCanvasImageBlobAsDataUrl } from "../canvas/image-generation/canvasImageReferences";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import type { CreatorModel, CreatorPrompt } from "../../shared/api/creatorSettings";
+import {
+  buildQuickReferencePlan,
+  defaultQuickReferenceSettings,
+  findQuickReferenceFrame,
+  formatQuickReferenceDescription,
+  matchQuickReferenceDuration,
+  mergeQuickReferencePreferences,
+  quickReferenceEditsMatch,
+  QUICK_REFERENCE_FIELDS,
+  requiresQuickReferenceFusedRead,
+  restoreQuickReferenceSettings,
+  type QuickReferenceField,
+  type QuickReferenceMode,
+  type QuickReferencePreferenceKey,
+  type QuickReferenceSettings,
+  type QuickReferenceTarget,
+} from "./quickReference";
+import { QuickReferenceSettingsPanel } from "./QuickReferenceSettingsPanel";
 import "./mediaGeneration.css";
 
 type MediaMode = "image" | "video" | "batch";
@@ -325,7 +346,12 @@ function libraryChoices(
 function isUnauthorized(error: unknown): boolean {
   return (error instanceof MediaReferenceUploadError && error.kind === "unauthorized")
     || (error instanceof MediaGenerationError && error.kind === "unauthorized")
+    || (error instanceof CanvasDataError && error.kind === "unauthorized")
     || (error instanceof ApiError && error.status === 401);
+}
+
+function isSafeHttpMediaReference(value: string): boolean {
+  return /^https?:\/\//iu.test(value) && isValidCanvasImageReference(value);
 }
 
 function receiptMessage(receipt: MediaGenerationReceipt): string {
@@ -383,6 +409,21 @@ export function MediaGenerationPage({
   const savingBatchPreferencesRef = useRef(false);
   const batchPreferenceControllerRef = useRef<AbortController | null>(null);
   const batchPreferenceRestoreGenerationRef = useRef(0);
+  const quickReferenceSettingsRef = useRef<QuickReferenceSettings>(defaultQuickReferenceSettings());
+  const [quickReferenceSettings, setQuickReferenceSettings] = useState(quickReferenceSettingsRef.current);
+  const quickReferenceEditsRef = useRef(new Set<QuickReferencePreferenceKey>());
+  const [quickReferenceEdits, setQuickReferenceEdits] = useState<ReadonlySet<QuickReferencePreferenceKey>>(new Set());
+  const [quickReferencePreferenceMessage, setQuickReferencePreferenceMessage] = useState<string | null>(null);
+  const [quickReferencePreferenceLoading, setQuickReferencePreferenceLoading] = useState(false);
+  const [quickReferencePreferenceReadFailed, setQuickReferencePreferenceReadFailed] = useState(false);
+  const [savingQuickReferencePreferences, setSavingQuickReferencePreferences] = useState(false);
+  const savingQuickReferencePreferencesRef = useRef(false);
+  const quickReferencePreferenceControllerRef = useRef<AbortController | null>(null);
+  const quickReferenceRestoreGenerationRef = useRef(0);
+  const quickReferenceActionControllerRef = useRef<AbortController | null>(null);
+  const quickReferenceActionRef = useRef(false);
+  const [preparingQuickReference, setPreparingQuickReference] = useState(false);
+  const [quickReferenceActionMessage, setQuickReferenceActionMessage] = useState<string | null>(null);
   const catalogReadyRef = useRef(false);
   const [imagePrompt, setImagePrompt] = useState("");
   const [videoPrompt, setVideoPrompt] = useState("");
@@ -399,6 +440,9 @@ export function MediaGenerationPage({
   const [videoReferenceImages, setVideoReferenceImages] = useState("");
   const [videoReferenceAudios, setVideoReferenceAudios] = useState("");
   const [videoReferenceVideos, setVideoReferenceVideos] = useState("");
+  const [imageQuickReferenceImages, setImageQuickReferenceImages] = useState<string[]>([]);
+  const [videoQuickReferenceImages, setVideoQuickReferenceImages] = useState<string[]>([]);
+  const [videoQuickReferenceAudios, setVideoQuickReferenceAudios] = useState<string[]>([]);
   const [batchReferenceImages, setBatchReferenceImages] = useState("");
   const [referenceFiles, setReferenceFiles] = useState<Partial<Record<MediaReferenceKind, File>>>({});
   const [referenceUploadStatus, setReferenceUploadStatus] = useState<ReferenceUploadStatus | null>(null);
@@ -498,6 +542,9 @@ export function MediaGenerationPage({
     videoReferenceImages,
     videoReferenceAudios,
     videoReferenceVideos,
+    imageQuickReferenceImages,
+    videoQuickReferenceImages,
+    videoQuickReferenceAudios,
     batchReferenceImages,
   });
   identityRef.current = { userId, services, sessionGeneration, signature: formSignature };
@@ -545,6 +592,22 @@ export function MediaGenerationPage({
     setBatchPreferenceMessage(null);
   }
 
+  function updateQuickReferenceSetting(modeName: QuickReferenceMode, field: QuickReferenceField, checked: boolean) {
+    if (savingQuickReferencePreferencesRef.current || quickReferenceActionRef.current) return;
+    const next = {
+      ...quickReferenceSettingsRef.current,
+      [modeName]: { ...quickReferenceSettingsRef.current[modeName], [field]: checked },
+    };
+    const key = `${modeName}:${field}` as QuickReferencePreferenceKey;
+    const edits = new Set(quickReferenceEditsRef.current);
+    edits.add(key);
+    quickReferenceSettingsRef.current = next;
+    quickReferenceEditsRef.current = edits;
+    setQuickReferenceSettings(next);
+    setQuickReferenceEdits(edits);
+    setQuickReferencePreferenceMessage(null);
+  }
+
   function preferenceScopeIsCurrent(
     capturedServices: WorkspaceServices,
     capturedUserId: string,
@@ -560,6 +623,10 @@ export function MediaGenerationPage({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      const actionController = quickReferenceActionControllerRef.current;
+      quickReferenceActionControllerRef.current = null;
+      quickReferenceActionRef.current = false;
+      actionController?.abort();
     };
   }, []);
 
@@ -580,8 +647,92 @@ export function MediaGenerationPage({
   }, [services, sessionGeneration, userId]);
 
   useEffect(() => {
+    quickReferenceRestoreGenerationRef.current += 1;
+    quickReferencePreferenceControllerRef.current?.abort();
+    quickReferencePreferenceControllerRef.current = null;
+    const actionController = quickReferenceActionControllerRef.current;
+    quickReferenceActionControllerRef.current = null;
+    quickReferenceActionRef.current = false;
+    actionController?.abort();
+    savingQuickReferencePreferencesRef.current = false;
+    quickReferenceSettingsRef.current = defaultQuickReferenceSettings();
+    setQuickReferenceSettings(quickReferenceSettingsRef.current);
+    quickReferenceEditsRef.current = new Set();
+    setQuickReferenceEdits(quickReferenceEditsRef.current);
+    setQuickReferencePreferenceMessage(null);
+    setQuickReferencePreferenceLoading(false);
+    setQuickReferencePreferenceReadFailed(false);
+    setSavingQuickReferencePreferences(false);
+    setPreparingQuickReference(false);
+    setQuickReferenceActionMessage(null);
+  }, [services, sessionGeneration, userId]);
+
+  useEffect(() => {
+    const port = services.userPreferences;
+    if (port === undefined) {
+      setQuickReferencePreferenceMessage("当前服务尚未接入账户快速引用设置。");
+      return;
+    }
+    const controller = new AbortController();
+    let current = true;
+    const capturedServices = services;
+    const capturedUserId = userId;
+    const capturedSessionGeneration = sessionGeneration;
+    const restoreGeneration = quickReferenceRestoreGenerationRef.current;
+    quickReferencePreferenceControllerRef.current = controller;
+    setQuickReferencePreferenceLoading(true);
+    setQuickReferencePreferenceMessage(null);
+    void port.get(controller.signal).then((preferences) => {
+      if (!current || controller.signal.aborted
+        || !preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)
+        || restoreGeneration !== quickReferenceRestoreGenerationRef.current) return;
+      const restored = restoreQuickReferenceSettings(preferences.quick_ref_settings);
+      const next = { ...quickReferenceSettingsRef.current };
+      for (const modeName of ["image", "video"] as const) {
+        const modeSettings = { ...next[modeName] };
+        for (const field of QUICK_REFERENCE_FIELDS[modeName]) {
+          if (!quickReferenceEditsRef.current.has(`${modeName}:${field}`)) {
+            modeSettings[field] = restored[modeName][field];
+          }
+        }
+        next[modeName] = modeSettings;
+      }
+      quickReferenceSettingsRef.current = next;
+      setQuickReferenceSettings(next);
+      setQuickReferencePreferenceReadFailed(false);
+      setQuickReferencePreferenceMessage("已读取当前账号的快速引用设置。");
+    }).catch((error: unknown) => {
+      if (!current || controller.signal.aborted
+        || !preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)
+        || restoreGeneration !== quickReferenceRestoreGenerationRef.current) return;
+      setQuickReferencePreferenceReadFailed(true);
+      if (isUnauthorized(error)) onUnauthorizedRef.current();
+      else setQuickReferencePreferenceMessage(`快速引用设置读取失败：${describeFailure(error)}`);
+    }).finally(() => {
+      if (current && !controller.signal.aborted
+        && preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)
+        && restoreGeneration === quickReferenceRestoreGenerationRef.current) {
+        setQuickReferencePreferenceLoading(false);
+      }
+      if (quickReferencePreferenceControllerRef.current === controller) {
+        quickReferencePreferenceControllerRef.current = null;
+      }
+    });
+    return () => {
+      current = false;
+      controller.abort();
+      if (quickReferencePreferenceControllerRef.current === controller) {
+        quickReferencePreferenceControllerRef.current = null;
+      }
+    };
+  }, [services, sessionGeneration, userId]);
+
+  useEffect(() => {
     setReferenceFiles({});
     setReferenceUploadStatus(null);
+    setImageQuickReferenceImages([]);
+    setVideoQuickReferenceImages([]);
+    setVideoQuickReferenceAudios([]);
     Object.values(referenceFileInputs.current).forEach((input) => {
       if (input !== null && input !== undefined) input.value = "";
     });
@@ -647,7 +798,8 @@ export function MediaGenerationPage({
       if (!current || controller.signal.aborted
         || !preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)
         || restoreGeneration !== batchPreferenceRestoreGenerationRef.current) return;
-      if (requestingRef.current || pendingRef.current !== null || savingBatchPreferencesRef.current) {
+      if (requestingRef.current || pendingRef.current !== null || savingBatchPreferencesRef.current
+        || quickReferenceActionRef.current) {
         setBatchPreferenceMessage("账户偏好读取晚于本次操作，已保留当前选项；提交内容不会被更改。");
         return;
       }
@@ -877,7 +1029,9 @@ export function MediaGenerationPage({
   }, [singleAssetChoices, singleAssetId, singleStoryboardAssetId, storyboardAssets]);
 
   const setModeSafely = (value: MediaMode) => {
-    if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current) return;
+    if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
+      || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
+      || savingBatchPreferencesRef.current) return;
     setMode(value);
     setOutcome(null);
     setReferenceUploadStatus(null);
@@ -963,14 +1117,23 @@ export function MediaGenerationPage({
   };
 
   const referenceCount = (kind: MediaReferenceKind) => {
-    const value = kind === "image"
-      ? mode === "image" ? imageReferenceImages : mode === "video" ? videoReferenceImages : batchReferenceImages
-      : kind === "audio" ? videoReferenceAudios : videoReferenceVideos;
+    if (kind === "image" && mode === "image") {
+      return new Set([...imageQuickReferenceImages, ...splitReferences(imageReferenceImages)]).size;
+    }
+    if (kind === "image" && mode === "video") {
+      return new Set([...videoQuickReferenceImages, ...splitReferences(videoReferenceImages)]).size;
+    }
+    if (kind === "audio" && mode === "video") {
+      return new Set([...videoQuickReferenceAudios, ...splitReferences(videoReferenceAudios)]).size;
+    }
+    const value = kind === "image" ? batchReferenceImages : videoReferenceVideos;
     return splitReferences(value).length;
   };
 
   const uploadReference = async (kind: MediaReferenceKind) => {
-    if (uploadInProgressRef.current || pendingRef.current !== null || requestingRef.current) return;
+    if (uploadInProgressRef.current || pendingRef.current !== null || requestingRef.current
+      || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
+      || savingBatchPreferencesRef.current) return;
     const file = referenceFiles[kind];
     if (file === undefined) return;
     if (referenceCount(kind) >= REFERENCE_COUNT_LIMIT[kind]) {
@@ -1037,7 +1200,9 @@ export function MediaGenerationPage({
   };
 
   const submitImage = async () => {
-    if (pendingRef.current !== null || requestingRef.current || selectedImageModel === null || imagePrompt.trim() === "") return;
+    if (pendingRef.current !== null || requestingRef.current || quickReferenceActionRef.current
+      || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
+      || selectedImageModel === null || imagePrompt.trim() === "") return;
     const rawKey = crypto.randomUUID();
     const signature = formSignature;
     let run: MediaGenerationRun;
@@ -1052,7 +1217,7 @@ export function MediaGenerationPage({
       prompt: imagePrompt,
       target: singleTarget(),
       ...(imageSize === "" ? {} : { size: imageSize }),
-      referenceImages: Object.freeze(splitReferences(imageReferenceImages)),
+      referenceImages: Object.freeze([...new Set([...imageQuickReferenceImages, ...splitReferences(imageReferenceImages)])]),
       idempotencyKey: rawKey,
     });
     const controller = new AbortController();
@@ -1088,7 +1253,9 @@ export function MediaGenerationPage({
   };
 
   const submitVideo = async () => {
-    if (pendingRef.current !== null || requestingRef.current || selectedVideoModel === null || videoPrompt.trim() === "") return;
+    if (pendingRef.current !== null || requestingRef.current || quickReferenceActionRef.current
+      || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
+      || selectedVideoModel === null || videoPrompt.trim() === "") return;
     const target = singleTarget();
     const rawKey = crypto.randomUUID();
     const signature = formSignature;
@@ -1106,8 +1273,8 @@ export function MediaGenerationPage({
       ...(videoSize === "" ? {} : { size: videoSize }),
       ...(videoDuration === "" ? {} : { duration: Number(videoDuration) }),
       ...(videoResolution === "" ? {} : { resolution: videoResolution }),
-      referenceImages: Object.freeze(splitReferences(videoReferenceImages)),
-      referenceAudios: Object.freeze(splitReferences(videoReferenceAudios)),
+      referenceImages: Object.freeze([...new Set([...videoQuickReferenceImages, ...splitReferences(videoReferenceImages)])]),
+      referenceAudios: Object.freeze([...new Set([...videoQuickReferenceAudios, ...splitReferences(videoReferenceAudios)])]),
       referenceVideos: Object.freeze(splitReferences(videoReferenceVideos)),
       idempotencyKey: rawKey,
     });
@@ -1145,6 +1312,7 @@ export function MediaGenerationPage({
 
   const submitBatch = async () => {
     if (pendingRef.current !== null || requestingRef.current || savingBatchPreferencesRef.current
+      || savingQuickReferencePreferencesRef.current || quickReferenceActionRef.current
       || selectedSeries === null || selectedChapter === null || selectedChapterId === ""
       || directoryLoading || directoryError !== null || batchReferenceIssues.length > 0
       || selectedBatchAssets.length < 1 || selectedBatchAssets.length > 64
@@ -1226,7 +1394,8 @@ export function MediaGenerationPage({
 
   const saveBatchPreferences = async () => {
     const port: UserPreferencesPort | undefined = services.userPreferences;
-    if (port === undefined || savingBatchPreferencesRef.current || requestingRef.current || pendingRef.current !== null) return;
+    if (port === undefined || savingBatchPreferencesRef.current || savingQuickReferencePreferencesRef.current
+      || quickReferenceActionRef.current || requestingRef.current || pendingRef.current !== null) return;
     const edits = emptyBatchEdits();
     for (const type of BATCH_ASSET_TYPES) {
       edits[type] = new Set(batchPreferenceEditsRef.current[type]);
@@ -1335,6 +1504,328 @@ export function MediaGenerationPage({
     }
   };
 
+  const saveQuickReferencePreferences = async () => {
+    const port: UserPreferencesPort | undefined = services.userPreferences;
+    if (port === undefined || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
+      || requestingRef.current || pendingRef.current !== null || quickReferenceActionRef.current) return;
+    const edits = new Set(quickReferenceEditsRef.current);
+    if (edits.size === 0) {
+      setQuickReferencePreferenceMessage("没有需要保存的快速引用设置修改。");
+      return;
+    }
+
+    quickReferenceRestoreGenerationRef.current += 1;
+    quickReferencePreferenceControllerRef.current?.abort();
+    const settings = quickReferenceSettingsRef.current;
+    const capturedServices = services;
+    const capturedUserId = userId;
+    const capturedSessionGeneration = sessionGeneration;
+    const controller = new AbortController();
+    quickReferencePreferenceControllerRef.current = controller;
+    savingQuickReferencePreferencesRef.current = true;
+    setSavingQuickReferencePreferences(true);
+    setQuickReferencePreferenceLoading(false);
+    setQuickReferencePreferenceMessage("正在读取当前账户偏好并合并本次修改…");
+
+    const isCurrentSave = () => preferenceScopeIsCurrent(
+      capturedServices,
+      capturedUserId,
+      capturedSessionGeneration,
+    ) && quickReferencePreferenceControllerRef.current === controller;
+    const clearSavedEdits = () => {
+      const current = quickReferenceEditsRef.current;
+      const remaining = new Set(current);
+      for (const key of edits) {
+        const separator = key.indexOf(":");
+        const modeName = key.slice(0, separator) as QuickReferenceMode;
+        const field = key.slice(separator + 1) as QuickReferenceField;
+        if (quickReferenceSettingsRef.current[modeName][field] === settings[modeName][field]) remaining.delete(key);
+      }
+      quickReferenceEditsRef.current = remaining;
+      setQuickReferenceEdits(remaining);
+    };
+
+    const verifyUnknown = async (message: string) => {
+      setQuickReferencePreferenceMessage(`${message} 正在只读核对账户偏好；不会自动重复保存。`);
+      try {
+        const latest = await port.get(controller.signal);
+        if (!isCurrentSave()) return;
+        if (quickReferenceEditsMatch(latest, settings, edits)) {
+          clearSavedEdits();
+          setQuickReferencePreferenceMessage("保存请求没有直接回执；只读核对发现账户偏好已包含本次修改。");
+        } else {
+          setQuickReferencePreferenceMessage("保存结果仍未确认；已只读核对账户偏好，本页保留修改且不会自动重试。");
+        }
+      } catch (error) {
+        if (!isCurrentSave()) return;
+        if (isUnauthorized(error)) onUnauthorized();
+        else setQuickReferencePreferenceMessage(`保存结果仍未确认；只读核对也失败：${describeFailure(error)}`);
+      }
+    };
+
+    try {
+      let latestPreferences: UserPreferences;
+      try {
+        latestPreferences = await port.get(controller.signal);
+      } catch (error) {
+        if (!isCurrentSave()) return;
+        if (isUnauthorized(error)) onUnauthorized();
+        else setQuickReferencePreferenceMessage(`读取账户偏好失败，未保存任何内容：${describeFailure(error)}`);
+        return;
+      }
+      if (!isCurrentSave()) return;
+
+      const update = mergeQuickReferencePreferences(latestPreferences, settings, edits);
+      try {
+        const receipt = await port.update(update, controller.signal);
+        if (!isCurrentSave()) return;
+        if (!receipt.updatedKeys.includes("quick_ref_settings")) {
+          await verifyUnknown("服务器没有确认快速引用设置已保存。");
+          return;
+        }
+        clearSavedEdits();
+        setQuickReferencePreferenceMessage("快速引用设置已保存到当前账号。");
+      } catch (error) {
+        if (!isCurrentSave()) return;
+        if (isUnauthorized(error)) {
+          onUnauthorized();
+          return;
+        }
+        const definiteClientRejection = error instanceof ApiError
+          && error.kind === "http"
+          && error.status !== null
+          && error.status >= 400
+          && error.status < 500
+          && error.status !== 408;
+        if (definiteClientRejection) {
+          setQuickReferencePreferenceMessage(`快速引用设置未保存：${describeFailure(error)}`);
+          return;
+        }
+        await verifyUnknown("保存结果尚未确认。");
+      }
+    } finally {
+      if (quickReferencePreferenceControllerRef.current === controller) {
+        quickReferencePreferenceControllerRef.current = null;
+        savingQuickReferencePreferencesRef.current = false;
+        if (preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)) {
+          setSavingQuickReferencePreferences(false);
+        }
+      }
+    }
+  };
+
+  const applyQuickReference = async () => {
+    if (quickReferenceActionRef.current || isFrozen || quickReferencePreferenceLoading
+      || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
+      || services.userPreferences === undefined || mode === "batch"
+      || singleTargetMode === "standalone" || selectedSeries === null || selectedChapter === null
+      || selectedChapterId === "" || selectedChapter.series_id !== selectedSeriesId
+      || directoryLoading || directoryError !== null) return;
+
+    if (quickReferencePreferenceReadFailed
+      && !window.confirm("无法确认账号保存的快速引用设置。本页开关可能仍是默认值；仍按当前开关填入吗？")) return;
+
+    let target: QuickReferenceTarget;
+    if (singleTargetMode === "frame_message") {
+      if (singleStoryboardAssetId === "") return;
+      target = { kind: "frame_message", storyboardAssetId: singleStoryboardAssetId };
+    } else {
+      if (singleAssetId === "") return;
+      target = { kind: "asset_message", assetType: singleAssetType, assetId: singleAssetId };
+    }
+
+    const isImage = mode === "image";
+    const currentPrompt = isImage ? imagePrompt : videoPrompt;
+    const hasCurrentPrompt = currentPrompt.trim() !== "";
+    const hasCurrentReferences = (isImage
+      ? imageQuickReferenceImages.length + splitReferences(imageReferenceImages).length
+      : videoQuickReferenceImages.length + splitReferences(videoReferenceImages).length) > 0
+      || (!isImage && (videoQuickReferenceAudios.length + splitReferences(videoReferenceAudios).length > 0
+        || splitReferences(videoReferenceVideos).length > 0));
+    if ((hasCurrentPrompt || hasCurrentReferences)
+      && !window.confirm("快速引用会替换当前提示词和参考素材列表。要继续吗？")) return;
+
+    const capturedServices = services;
+    const capturedUserId = userId;
+    const capturedSessionGeneration = sessionGeneration;
+    const capturedSignature = identityRef.current.signature;
+    const capturedMode: QuickReferenceMode = isImage ? "image" : "video";
+    const capturedSettings = Object.freeze({ ...quickReferenceSettingsRef.current[capturedMode] });
+    const controller = new AbortController();
+    quickReferenceActionControllerRef.current = controller;
+    quickReferenceActionRef.current = true;
+    setPreparingQuickReference(true);
+    setQuickReferenceActionMessage("正在准备当前章节的快速引用…");
+
+    const isCurrentAction = () => mountedRef.current
+      && !controller.signal.aborted
+      && quickReferenceActionControllerRef.current === controller
+      && identityRef.current.services === capturedServices
+      && identityRef.current.userId === capturedUserId
+      && identityRef.current.sessionGeneration === capturedSessionGeneration
+      && identityRef.current.signature === capturedSignature;
+
+    try {
+      const frameStoryboardId = target.kind === "frame_message"
+        ? target.storyboardAssetId
+        : target.assetType === "storyboard" ? target.assetId : null;
+      const frame: StoryboardFrame | null = frameStoryboardId === null
+        ? null
+        : findQuickReferenceFrame(selectedChapter.content, frameStoryboardId);
+      if (target.kind === "frame_message" && frame === null) {
+        setQuickReferenceActionMessage("当前章节没有找到该分镜的原始引用关系，未更改提示词或参考素材。");
+        return;
+      }
+
+      let fusedAssets = [] as Awaited<ReturnType<NonNullable<WorkspaceServices["listFusedAssets"]>>>;
+      if (requiresQuickReferenceFusedRead(frame, capturedSettings)) {
+        const listFusedAssets = capturedServices.listFusedAssets;
+        if (listFusedAssets === undefined) {
+          setQuickReferenceActionMessage("当前服务尚未接入融合素材目录，无法确认快速引用；当前输入未更改。");
+          return;
+        }
+        try {
+          fusedAssets = (await listFusedAssets(selectedSeriesId, controller.signal))
+            .filter((asset) => asset.series_id === selectedSeriesId);
+        } catch (error) {
+          if (!isCurrentAction()) return;
+          if (isUnauthorized(error)) onUnauthorizedRef.current();
+          else setQuickReferenceActionMessage("读取融合素材目录失败，快速引用未应用；请稍后重试。");
+          return;
+        }
+        if (!isCurrentAction()) return;
+      }
+
+      const plan = buildQuickReferencePlan({
+        mode: capturedMode,
+        target,
+        settings: capturedSettings,
+        chapterContent: selectedChapter.content,
+        storyboardAssets,
+        characters: characterAssets,
+        scenes: sceneAssets,
+        props: propAssets,
+        fusedAssets,
+      });
+      if (plan === null) {
+        setQuickReferenceActionMessage("当前目标没有可用的章节上下文，快速引用未应用。");
+        return;
+      }
+      if (plan.baseDescription.trim() === "" && plan.imageReferences.length === 0
+        && plan.audioReferences.length === 0 && plan.voiceNotes.length === 0) {
+        setQuickReferenceActionMessage("当前上下文没有可引用的描述或素材，输入未更改。");
+        return;
+      }
+      if (plan.imageReferences.length > REFERENCE_COUNT_LIMIT.image
+        || plan.audioReferences.length > REFERENCE_COUNT_LIMIT.audio) {
+        setQuickReferenceActionMessage("当前上下文的参考素材超过可提交上限；输入未更改，请先缩小引用范围。");
+        return;
+      }
+      if (!isImage && (!plan.imageReferences.every(isSafeHttpMediaReference)
+        || !plan.audioReferences.every(isSafeHttpMediaReference))) {
+        setQuickReferenceActionMessage("当前视频服务只接受安全的公开 HTTP(S) 参考素材；受保护上传地址或内嵌图片暂未接通，输入未更改。");
+        return;
+      }
+
+      const preparedImages: string[] = [];
+      const finalImageIndexes = new Map<string, number>();
+      const indexByPreparedImage = new Map<string, number>();
+      let totalImageBytes = 0;
+      for (const source of plan.imageReferences) {
+        let prepared = source;
+        if (capturedMode === "image" && isSafeCanvasUploadPath(source)) {
+          if (capturedServices.canvasData === undefined) {
+            setQuickReferenceActionMessage("当前服务未接入受保护图片读取，快速引用未应用；当前输入未更改。");
+            return;
+          }
+          try {
+            const blob = await capturedServices.canvasData.readImage(source, controller.signal);
+            prepared = await readCanvasImageBlobAsDataUrl(blob, controller.signal);
+          } catch (error) {
+            if (!isCurrentAction()) return;
+            if (isUnauthorized(error)) onUnauthorizedRef.current();
+            else setQuickReferenceActionMessage("读取章节关联图片失败，快速引用未应用；当前输入未更改。");
+            return;
+          }
+          if (!isCurrentAction()) return;
+        } else if (capturedMode === "video" ? !isSafeHttpMediaReference(source) : !isValidCanvasImageReference(source)) {
+          setQuickReferenceActionMessage("章节包含无法安全提交的图片地址，快速引用未应用；当前输入未更改。");
+          return;
+        }
+        if (!isValidCanvasImageReference(prepared)) {
+          setQuickReferenceActionMessage("关联图片未能转换为可提交的参考图，快速引用未应用；当前输入未更改。");
+          return;
+        }
+        let index = indexByPreparedImage.get(prepared);
+        if (index === undefined) {
+          const bytes = new TextEncoder().encode(prepared).byteLength;
+          totalImageBytes += bytes;
+          if (bytes > 8 * 1024 * 1024 || totalImageBytes > 32 * 1024 * 1024) {
+            setQuickReferenceActionMessage("准备后的参考图片超过当前服务的单图或总量限制，快速引用未应用。");
+            return;
+          }
+          preparedImages.push(prepared);
+          index = preparedImages.length;
+          indexByPreparedImage.set(prepared, index);
+        }
+        finalImageIndexes.set(source, index);
+      }
+      if (!isCurrentAction()) return;
+
+      const finalAudioIndexes = new Map(plan.audioReferences.map((url, index) => [url, index + 1] as const));
+      const description = formatQuickReferenceDescription(plan, finalImageIndexes, finalAudioIndexes);
+      let matchedDuration: ReturnType<typeof matchQuickReferenceDuration> | null = null;
+      if (!isImage && capturedSettings.matchDuration) {
+        matchedDuration = matchQuickReferenceDuration(description, videoOptions.durations);
+      }
+      if (!isCurrentAction()) return;
+
+      if (isImage) {
+        setSelectedImagePromptId("");
+        setImagePrompt(description);
+        setImageReferenceImages("");
+        setImageQuickReferenceImages(preparedImages);
+      } else {
+        setSelectedVideoPromptId("");
+        setVideoPrompt(description);
+        setVideoReferenceImages("");
+        setVideoQuickReferenceImages(preparedImages);
+        setVideoReferenceAudios("");
+        setVideoQuickReferenceAudios([...plan.audioReferences]);
+        setVideoReferenceVideos("");
+        if (matchedDuration?.duration !== null && matchedDuration?.duration !== undefined) {
+          setVideoDuration(String(matchedDuration.duration));
+        }
+      }
+      const durationMessage = matchedDuration?.message ?? null;
+      setQuickReferenceActionMessage(durationMessage === null
+        ? "已填入当前章节快速引用；尚未提交生成。"
+        : `已填入当前章节快速引用；尚未提交生成。${durationMessage}`);
+    } catch (error) {
+      if (!isCurrentAction()) return;
+      if (isUnauthorized(error)) onUnauthorizedRef.current();
+      else setQuickReferenceActionMessage("快速引用准备失败，当前提示词和参考列表未更改。");
+    } finally {
+      if (quickReferenceActionControllerRef.current === controller) {
+        quickReferenceActionControllerRef.current = null;
+        quickReferenceActionRef.current = false;
+        if (preferenceScopeIsCurrent(capturedServices, capturedUserId, capturedSessionGeneration)) {
+          setPreparingQuickReference(false);
+        }
+      }
+    }
+  };
+
+  const cancelQuickReferencePreparation = () => {
+    const controller = quickReferenceActionControllerRef.current;
+    if (controller === null) return;
+    quickReferenceActionControllerRef.current = null;
+    quickReferenceActionRef.current = false;
+    setPreparingQuickReference(false);
+    setQuickReferenceActionMessage("准备已取消；当前提示词和参考列表未更改。");
+    controller.abort();
+  };
+
   const selectImagePrompt = (id: string) => {
     setSelectedImagePromptId(id);
     if (id === "") setImagePrompt("");
@@ -1366,6 +1857,7 @@ export function MediaGenerationPage({
   ) !== null || batchPreferenceWarningBlocksSubmission(type, batchSelections[type], batchPreferenceWarnings, imageModels));
   const hasBatchPreferenceEdits = batchCheckEditsRef.current.size > 0
     || BATCH_ASSET_TYPES.some((type) => batchPreferenceEditsRef.current[type].size > 0);
+  const hasQuickReferenceEdits = quickReferenceEdits.size > 0;
   const currentImagePromptOptions = prompts.filter((prompt) => IMAGE_PROMPT_CATEGORIES.has(prompt.category));
   const currentVideoPromptOptions = prompts.filter((prompt) => prompt.category === "video-design");
   const isImageMode = mode === "image";
@@ -1376,7 +1868,21 @@ export function MediaGenerationPage({
   const singlePromptOptions = isImageMode ? currentImagePromptOptions : currentVideoPromptOptions;
   const singleReferences = isImageMode ? imageReferenceImages : videoReferenceImages;
   const singleReferenceSetter = isImageMode ? setImageReferenceImages : setVideoReferenceImages;
-  const isFrozen = pending !== null || requesting || uploadingReference || savingBatchPreferences;
+  const singleImageReferences = [...new Set([
+    ...(isImageMode ? imageQuickReferenceImages : videoQuickReferenceImages),
+    ...splitReferences(singleReferences),
+  ])];
+  const singleAudioReferences = [...new Set([...videoQuickReferenceAudios, ...splitReferences(videoReferenceAudios)])];
+  const singleVideoReferences = splitReferences(videoReferenceVideos);
+  const singleReferenceLimitMessage = singleImageReferences.length > REFERENCE_COUNT_LIMIT.image
+    ? "参考图片超过64项上限，请先减少引用。"
+    : !isImageMode && singleAudioReferences.length > REFERENCE_COUNT_LIMIT.audio
+      ? "参考音频超过5项上限，请先减少引用。"
+      : !isImageMode && singleVideoReferences.length > REFERENCE_COUNT_LIMIT.video
+        ? "参考视频超过5项上限，请先减少引用。"
+        : null;
+  const isFrozen = pending !== null || requesting || uploadingReference || savingBatchPreferences
+    || savingQuickReferencePreferences || preparingQuickReference;
 
   const renderReferenceUploader = (kind: MediaReferenceKind) => {
     const label = REFERENCE_KIND_LABELS[kind];
@@ -1435,6 +1941,23 @@ export function MediaGenerationPage({
         <button aria-pressed={mode === "video"} disabled={isFrozen} onClick={() => setModeSafely("video")} type="button">普通视频</button>
         <button aria-pressed={mode === "batch"} disabled={isFrozen} onClick={() => setModeSafely("batch")} type="button">批量素材生图</button>
       </nav>
+
+      <QuickReferenceSettingsPanel
+        disabled={isFrozen}
+        hasEdits={hasQuickReferenceEdits}
+        loading={quickReferencePreferenceLoading}
+        message={quickReferencePreferenceMessage}
+        onChange={updateQuickReferenceSetting}
+        onSave={() => void saveQuickReferencePreferences()}
+        saving={savingQuickReferencePreferences}
+        serviceAvailable={services.userPreferences !== undefined}
+        settings={quickReferenceSettings}
+      />
+      {quickReferencePreferenceReadFailed && (
+        <p className="media-generation-alert" role="alert">
+          无法读取账号快速引用设置。填入前会请你确认是否按本页当前开关继续。
+        </p>
+      )}
 
       {catalogError !== null && <p className="media-generation-alert" role="alert">配置目录读取失败：{catalogError}</p>}
       {loading && <p role="status">正在读取剧集、模型和提示词目录…</p>}
@@ -1535,16 +2058,41 @@ export function MediaGenerationPage({
                 {selectedAssetForSingle !== undefined && <p className="media-generation-wide media-generation-target-detail">{selectedAssetForSingle.description || "该素材没有描述。"}</p>}
               </>
             )}
+            {singleTargetMode !== "standalone" && (
+              <div className="media-generation-actions media-generation-wide">
+                <button className="secondary-button" disabled={isFrozen || loading || directoryLoading
+                  || quickReferencePreferenceLoading
+                  || services.userPreferences === undefined
+                  || (singleTargetMode === "frame_message"
+                    ? selectedChapterId === "" || singleStoryboardAssetId === ""
+                    : selectedChapterId === "" || singleAssetId === "")}
+                  onClick={() => void applyQuickReference()} type="button">
+                  {preparingQuickReference ? "正在准备快速引用…" : "快速引用当前章节"}
+                </button>
+                {preparingQuickReference && <button className="secondary-button" onClick={cancelQuickReferencePreparation} type="button">取消准备</button>}
+              </div>
+            )}
+            {quickReferenceActionMessage !== null && <p className="media-generation-note media-generation-wide" role="status">{quickReferenceActionMessage}</p>}
             <label><span>参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
               singleReferenceSetter(event.target.value);
               setReferenceUploadStatus((current) => current?.kind === "image" ? null : current);
             }} rows={3} value={singleReferences} /></label>
+            {(isImageMode ? imageQuickReferenceImages : videoQuickReferenceImages).length > 0 && (
+              <p className="media-generation-note media-generation-wide" role="status">
+                已准备 {(isImageMode ? imageQuickReferenceImages : videoQuickReferenceImages).length} 张章节参考图；图片地址不会显示在页面，提交时会与下面的手动列表一起发送。
+              </p>
+            )}
             {renderReferenceUploader("image")}
             {!isImageMode && <>
               <label><span>参考音频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
                 setVideoReferenceAudios(event.target.value);
                 setReferenceUploadStatus((current) => current?.kind === "audio" ? null : current);
               }} rows={3} value={videoReferenceAudios} /></label>
+              {videoQuickReferenceAudios.length > 0 && (
+                <p className="media-generation-note media-generation-wide" role="status">
+                  已准备 {videoQuickReferenceAudios.length} 项章节角色音频参考；地址不会显示在页面。
+                </p>
+              )}
               {renderReferenceUploader("audio")}
               <label className="media-generation-wide"><span>参考视频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
                 setVideoReferenceVideos(event.target.value);
@@ -1556,8 +2104,10 @@ export function MediaGenerationPage({
           {chapterError !== null && <p className="media-generation-alert" role="alert">章节读取失败：{chapterError}</p>}
           {directoryError !== null && <p className="media-generation-alert" role="alert">章节素材读取失败：{directoryError}</p>}
           {singleTargetMode !== "standalone" && directoryLoading && <p role="status">正在读取章节分镜和素材目录…</p>}
+          {singleReferenceLimitMessage !== null && <p className="media-generation-alert" role="alert">{singleReferenceLimitMessage}</p>}
           <div className="media-generation-actions">
             <button className="primary-button" disabled={loading || isFrozen || singleModel === null || singlePrompt.trim() === ""
+              || singleReferenceLimitMessage !== null
               || (singleTargetMode === "frame_message" && (selectedChapterId === "" || singleStoryboardAssetId === ""))
               || (singleTargetMode === "asset_message" && (selectedChapterId === "" || singleAssetId === ""))}
               onClick={() => void (isImageMode ? submitImage() : submitVideo())} type="button">
