@@ -1627,3 +1627,268 @@ describe("admin SMTP account integration", () => {
     expect(smtpCalls.map((call) => call[1]?.method ?? "GET")).toEqual(["GET", "POST", "GET", "GET", "PUT", "GET"]);
   });
 });
+
+describe("AIStarsLab quick configuration", () => {
+  it("loads saved-credential capabilities and explicitly fills the current image draft without replacing its name or secrets", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const starting = model({
+      id: "image-aistarslab-1",
+      category: "image",
+      name: "原图片模型",
+      provider: "aistarslab",
+      model: "old-line:old-model",
+      api_key: "decrypted-but-hidden",
+      base_url: "https://saved.example.test",
+      params: JSON.stringify({ billing_mode: "fixed", fixed_by_quality: { standard: 2 }, resolution: { options: ["1K"] } }),
+    });
+    const params = JSON.stringify({
+      billing_mode: "fixed",
+      fixed_by_quality: { high: 7, standard: 4 },
+      resolution: { enabled: true, default: "1K", options: ["1K", "2K"] },
+      aistarslab: { channel: "image-line", model: "image-model" },
+    });
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models" && url.search) return jsonResponse({ data: [starting], total: 1 });
+      if (url.pathname === "/api/admin/system-models/image-aistarslab-1" && method === "GET") return jsonResponse(starting);
+      if (url.pathname === "/api/aistarslab/config" && method === "GET") {
+        return jsonResponse({
+          imageConfig: [{ channel: "image-line", title: "图片主线", defaultOption: true, models: [{ model: "image-model", label: "图像模型" }] }],
+          videoConfig: [],
+          credits: null,
+        });
+      }
+      if (url.pathname === "/api/aistarslab/build-image-params" && method === "POST") {
+        return jsonResponse({ channel: "image-line", model: "image-model", label: "图像模型", lineTitle: "图片主线", params });
+      }
+      throw new Error("Unexpected request: " + method + " " + url.pathname);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await user.click(await screen.findByRole("button", { name: "原图片模型" }));
+    expect(await screen.findByLabelText("API Key")).toHaveValue("");
+    expect(screen.getByLabelText("提供商")).toHaveValue("aistarslab");
+
+    await user.clear(screen.getByLabelText("模型名称"));
+    await user.type(screen.getByLabelText("模型名称"), "模型 123");
+    await user.type(screen.getByLabelText("API Key"), "unsaved-draft-key");
+    await user.clear(screen.getByLabelText("Base URL（可选）"));
+    await user.type(screen.getByLabelText("Base URL（可选）"), "https://draft.example.test/custom");
+
+    await user.click(screen.getByRole("button", { name: "拉取线路/模型" }));
+    await user.selectOptions(await screen.findByLabelText("AIStarsLab 线路"), "image-line");
+    await user.selectOptions(await screen.findByLabelText("AIStarsLab 模型"), "image-model");
+    await user.click(await screen.findByRole("button", { name: "填入当前草稿" }));
+
+    expect(screen.getByLabelText("模型名称")).toHaveValue("模型 123");
+    expect(screen.getByLabelText("模型名")).toHaveValue("image-line:image-model");
+    expect(screen.getByLabelText("Base URL（可选）")).toHaveValue("https://draft.example.test/custom");
+    expect(screen.getByLabelText("API Key")).toHaveValue("unsaved-draft-key");
+    expect(screen.getByDisplayValue(params)).toBeInTheDocument();
+    expect(screen.getByDisplayValue("high")).toBeInTheDocument();
+    expect(screen.getByDisplayValue("7")).toBeInTheDocument();
+    expect(fetcher.mock.calls.filter((call) => new URL(String(call[0]), window.location.href).pathname.startsWith("/api/aistarslab/"))).toHaveLength(2);
+    const aistarslabCalls = fetcher.mock.calls.filter((call) => new URL(String(call[0]), window.location.href).pathname.startsWith("/api/aistarslab/"));
+    expect(new Headers(aistarslabCalls[0]?.[1]?.headers).get("Authorization")).toBe("Bearer admin-token");
+    expect(aistarslabCalls[0]?.[1]?.body).toBeUndefined();
+    expect(JSON.parse(String(aistarslabCalls[1]?.[1]?.body))).toEqual({ channel: "image-line", model: "image-model" });
+    expect(fetcher.mock.calls.some((call) => call[1]?.method === "PUT")).toBe(false);
+    expect(document.body.textContent).not.toContain("decrypted-but-hidden");
+  });
+
+  it("requires confirmation, creates the shared default model once, reads its exact ID back and refreshes the list", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const createdModel = {
+      id: "aistarslab-system-created-1",
+      category: "image",
+      name: "AIS-默认图片线路",
+      provider: "aistarslab",
+      model: "default-line:image-model",
+      api_key: "encrypted-response-secret",
+      user_id: "system",
+      is_system: true,
+      base_url: "https://provider.example.test",
+      params: "{}",
+      cost_per_call: 9,
+    };
+    const readback = model({
+      id: createdModel.id,
+      category: "image",
+      name: createdModel.name,
+      provider: "aistarslab",
+      model: createdModel.model,
+      api_key: "decrypted-readback-secret",
+      base_url: createdModel.base_url,
+    });
+    let didCreate = false;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models" && url.search) {
+        return jsonResponse({ data: didCreate ? [readback] : [], total: didCreate ? 1 : 0 });
+      }
+      if (url.pathname === "/api/aistarslab/add-image-default" && method === "POST") {
+        didCreate = true;
+        return jsonResponse(createdModel);
+      }
+      if (url.pathname === `/api/admin/system-models/${createdModel.id}` && method === "GET") return jsonResponse(readback);
+      throw new Error("Unexpected request: " + method + " " + url.pathname);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await user.click(await screen.findByRole("button", { name: "新建模型" }));
+    await user.selectOptions(screen.getByLabelText("分类"), "image");
+    await user.selectOptions(screen.getByLabelText("提供商"), "aistarslab");
+    await user.type(screen.getByLabelText("API Key"), "explicit-draft-key");
+    await user.clear(screen.getByLabelText("Base URL（可选）"));
+    await user.type(screen.getByLabelText("Base URL（可选）"), "https://custom-draft.example.test");
+    const createButton = screen.getByRole("button", { name: "从默认线路创建系统模型" });
+
+    await user.click(createButton);
+    expect(confirm).toHaveBeenNthCalledWith(1, expect.stringContaining("全站共享"));
+    expect(fetcher.mock.calls.some((call) => new URL(String(call[0]), window.location.href).pathname === "/api/aistarslab/add-image-default")).toBe(false);
+    await user.click(createButton);
+
+    expect(await screen.findByRole("heading", { name: "系统模型" })).toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: createdModel.name })).toBeInTheDocument();
+    const createCall = fetcher.mock.calls.find((call) => new URL(String(call[0]), window.location.href).pathname === "/api/aistarslab/add-image-default");
+    expect(createCall?.[1]?.method).toBe("POST");
+    expect(JSON.parse(String(createCall?.[1]?.body))).toEqual({ api_key: "explicit-draft-key" });
+    expect(createCall?.[1]?.body).not.toContain("custom-draft.example.test");
+    expect(fetcher.mock.calls.some((call) => new URL(String(call[0]), window.location.href).pathname === `/api/admin/system-models/${createdModel.id}`)).toBe(true);
+    expect(document.body.textContent).not.toContain("encrypted-response-secret");
+    expect(document.body.textContent).not.toContain("decrypted-readback-secret");
+    expect(fetcher.mock.calls.filter((call) => new URL(String(call[0]), window.location.href).pathname === "/api/aistarslab/add-image-default")).toHaveLength(1);
+    confirm.mockRestore();
+  });
+
+  it("keeps an uncertain create guarded and offers only explicit stop-and-refresh without resubmitting", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(true);
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models" && url.search) return jsonResponse({ data: [], total: 0 });
+      if (url.pathname === "/api/aistarslab/add-default" && method === "POST") throw new TypeError("private upstream credential");
+      throw new Error("Unexpected request: " + method + " " + url.pathname);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await user.click(await screen.findByRole("button", { name: "新建模型" }));
+    await user.selectOptions(screen.getByLabelText("分类"), "video");
+    await user.selectOptions(screen.getByLabelText("提供商"), "aistarslab");
+    await user.click(screen.getByRole("button", { name: "从默认线路创建系统模型" }));
+
+    expect(await screen.findByText(/创建结果未知；服务端可能已创建共享系统模型/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "从默认线路创建系统模型" })).toBeDisabled();
+    expect(document.body.textContent).not.toContain("private upstream credential");
+    expect(fetcher.mock.calls.filter((call) => new URL(String(call[0]), window.location.href).pathname === "/api/aistarslab/add-default")).toHaveLength(1);
+
+    confirm.mockReturnValueOnce(false);
+    await user.click(screen.getByRole("button", { name: "运营概览" }));
+    expect(screen.getByRole("heading", { name: "新建系统模型" })).toBeInTheDocument();
+
+    confirm.mockReturnValueOnce(true);
+    await user.click(screen.getByRole("button", { name: "停止本地跟踪并刷新模型目录" }));
+    expect(await screen.findByRole("heading", { name: "系统模型" })).toBeInTheDocument();
+    expect(fetcher.mock.calls.filter((call) => new URL(String(call[0]), window.location.href).pathname === "/api/aistarslab/add-default")).toHaveLength(1);
+    confirm.mockRestore();
+  });
+
+  it("drops a late saved-credential config response after the model provider changes", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const configReply = deferred<Response>();
+    const fetcher = vi.fn<AdminFetcher>(async (input) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models" && url.search) return jsonResponse({ data: [], total: 0 });
+      if (url.pathname === "/api/aistarslab/config") return configReply.promise;
+      throw new Error("Unexpected request: " + url.pathname);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await user.click(await screen.findByRole("button", { name: "新建模型" }));
+    await user.selectOptions(screen.getByLabelText("分类"), "image");
+    await user.selectOptions(screen.getByLabelText("提供商"), "aistarslab");
+    await user.click(screen.getByRole("button", { name: "拉取线路/模型" }));
+    await waitFor(() => expect(fetcher.mock.calls.some((call) => new URL(String(call[0]), window.location.href).pathname === "/api/aistarslab/config")).toBe(true));
+
+    await user.selectOptions(screen.getByLabelText("提供商"), "openai");
+    configReply.resolve(jsonResponse({
+      imageConfig: [{ channel: "late-line", title: "迟到线路", defaultOption: true, models: [{ model: "late-model" }] }],
+      videoConfig: [],
+      credits: null,
+    }));
+
+    await waitFor(() => expect(screen.getByLabelText("提供商")).toHaveValue("openai"));
+    expect(screen.queryByLabelText("AIStarsLab 线路")).not.toBeInTheDocument();
+    expect(document.body.textContent).not.toContain("迟到线路");
+    expect(fetcher.mock.calls.some((call) => new URL(String(call[0]), window.location.href).pathname.includes("build-image-params"))).toBe(false);
+  });
+
+  it("invalidates a pending build when a quality-row edit cannot be serialized into malformed draft params", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const starting = model({
+      id: "image-aistarslab-invalid-params",
+      category: "image",
+      name: "参数待修复",
+      provider: "aistarslab",
+      model: "old-line:old-model",
+      params: "{invalid-json",
+    });
+    const buildReply = deferred<Response>();
+    let buildStarted = false;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      const method = init?.method ?? "GET";
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models" && url.search) return jsonResponse({ data: [starting], total: 1 });
+      if (url.pathname === `/api/admin/system-models/${starting.id}` && method === "GET") return jsonResponse(starting);
+      if (url.pathname === "/api/aistarslab/config" && method === "GET") {
+        return jsonResponse({
+          imageConfig: [{ channel: "image-line", title: "图片主线", defaultOption: true, models: [{ model: "image-model" }] }],
+          videoConfig: [],
+        });
+      }
+      if (url.pathname === "/api/aistarslab/build-image-params" && method === "POST") {
+        buildStarted = true;
+        return buildReply.promise;
+      }
+      throw new Error("Unexpected request: " + method + " " + url.pathname);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await user.click(await screen.findByRole("button", { name: "参数待修复" }));
+    await user.click(screen.getByRole("button", { name: "拉取线路/模型" }));
+    await user.selectOptions(await screen.findByLabelText("AIStarsLab 线路"), "image-line");
+    await user.selectOptions(screen.getByLabelText("AIStarsLab 模型"), "image-model");
+    await waitFor(() => expect(buildStarted).toBe(true));
+
+    await user.click(screen.getByRole("button", { name: "+ 添加档位" }));
+    buildReply.resolve(jsonResponse({
+      channel: "image-line",
+      model: "image-model",
+      label: "图像模型",
+      params: JSON.stringify({ billing_mode: "fixed", fixed_by_quality: { high: 2 } }),
+    }));
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "填入当前草稿" })).not.toBeInTheDocument());
+    expect(screen.getByDisplayValue("{invalid-json")).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("模型草稿已变化");
+  });
+});

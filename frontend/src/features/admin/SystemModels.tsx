@@ -1,5 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../shared/api/errors";
+import { AistarslabQuickConfig, type AistarslabQuickConfigExitNotice } from "./AistarslabQuickConfig";
+import type { AistarslabApi, AistarslabBuiltParams } from "./aistarslabApi";
 import type {
   AdminApi,
   AdminModel,
@@ -30,6 +32,7 @@ const PROVIDERS_BY_CATEGORY: Record<ModelCategory, ProviderChoice[]> = {
   image: [
     { value: "openai", label: "OpenAI (DALL-E)" },
     { value: "gpt-image", label: "GPT-Image (谷Club)" },
+    { value: "aistarslab", label: "AIStarsLab" },
     { value: "zhangyuge", label: "章鱼哥AI" },
     { value: "museai", label: "MuseAI" },
     { value: "manxueapi", label: "满血API" },
@@ -83,6 +86,9 @@ type ModelMode = "list" | "create" | "edit";
 
 interface SystemModelsProps {
   api: AdminApi;
+  aistarslabApi: AistarslabApi;
+  adminActorId: string;
+  adminSessionGeneration: number;
   onUnauthorized(): void;
   mode: ModelMode;
   modelId: string | undefined;
@@ -91,6 +97,7 @@ interface SystemModelsProps {
   onEdit?(id: string): void;
   onCancel?(): void;
   onSaved?(): void;
+  onAistarslabExitStateChange?(owner: symbol, notice: AistarslabQuickConfigExitNotice | null): void;
 }
 
 interface QualityRateRow {
@@ -506,20 +513,28 @@ function ModelList({
 
 interface ModelFormProps {
   api: AdminApi;
+  aistarslabApi: AistarslabApi;
+  adminActorId: string;
+  adminSessionGeneration: number;
   onUnauthorized(): void;
   mode: "create" | "edit";
   modelId: string | undefined;
   onCancel: (() => void) | undefined;
   onSaved: (() => void) | undefined;
+  onAistarslabExitStateChange: ((owner: symbol, notice: AistarslabQuickConfigExitNotice | null) => void) | undefined;
 }
 
 function ModelForm({
   api,
+  aistarslabApi,
+  adminActorId,
+  adminSessionGeneration,
   onUnauthorized,
   mode,
   modelId,
   onCancel,
   onSaved,
+  onAistarslabExitStateChange,
 }: ModelFormProps) {
   const [draft, setDraft] = useState<ModelDraft>(emptyDraft);
   const [qualityRows, setQualityRows] = useState<QualityRateRow[]>([]);
@@ -530,6 +545,10 @@ function ModelForm({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
+  const [aistarslabWriteLocked, setAistarslabWriteLocked] = useState(false);
+  const aistarslabWriteLockedRef = useRef(false);
+  const [draftGeneration, setDraftGeneration] = useState(0);
+  const draftGenerationRef = useRef(0);
   const [retry, setRetry] = useState(0);
   const mounted = useRef(true);
   const saveController = useRef<AbortController | null>(null);
@@ -585,11 +604,19 @@ function ModelForm({
   }, [api, mode, modelId, onUnauthorized, retry]);
 
   function change<K extends keyof ModelDraft>(field: K, value: ModelDraft[K]) {
+    markDraftEdited();
     setDraft((current) => ({ ...current, [field]: value }));
+  }
+
+  function markDraftEdited() {
+    draftGenerationRef.current += 1;
+    setDraftGeneration(draftGenerationRef.current);
   }
 
   function changeCategory(category: string) {
     const availableProviders = providersForCategory(category);
+    draftGenerationRef.current += 1;
+    setDraftGeneration(draftGenerationRef.current);
     setDraft((current) => ({
       ...current,
       category,
@@ -615,8 +642,9 @@ function ModelForm({
   }
 
   function commitQualityRows(nextRows: QualityRateRow[]) {
+    markDraftEdited();
     const nextParams = writeQualityRows(draft.params, billingMode, nextRows);
-    if (nextParams !== null) change("params", nextParams);
+    if (nextParams !== null) setDraft((current) => ({ ...current, params: nextParams }));
   }
 
   function updateQualityRow(index: number, field: keyof QualityRateRow, value: string) {
@@ -691,7 +719,7 @@ function ModelForm({
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (saving) return;
+    if (saving || aistarslabWriteLockedRef.current) return;
     const controller = new AbortController();
     saveController.current = controller;
     setSaving(true);
@@ -743,6 +771,27 @@ function ModelForm({
     : [];
   const providerOptions = providerOptionsForDraft(draft.category, draft.provider);
 
+  function applyAistarslabParams(result: AistarslabBuiltParams) {
+    if (aistarslabWriteLockedRef.current) return;
+    const nextName = draft.name || `AIS-${result.lineTitle || result.label}`;
+    draftGenerationRef.current += 1;
+    setDraftGeneration(draftGenerationRef.current);
+    setDraft((current) => ({
+      ...current,
+      name: current.name || nextName,
+      model: `${result.channel}:${result.model}`,
+      params: result.params,
+    }));
+    const nextParams = asObject(result.params);
+    const nextBillingMode: BillingMode = nextParams?.billing_mode === "per_second" ? "per_second" : "fixed";
+    setQualityRows(readQualityRows(result.params, nextBillingMode));
+  }
+
+  function updateAistarslabWriteActivity(active: boolean) {
+    aistarslabWriteLockedRef.current = active;
+    setAistarslabWriteLocked(active);
+  }
+
   if (loading) {
     return <section className="admin-state-card" role="status">正在读取模型详情…</section>;
   }
@@ -774,193 +823,219 @@ function ModelForm({
       </header>
 
       <form className="admin-model-form" onSubmit={(event) => { void submit(event); }}>
-        <div className="admin-form-grid">
-          <label className="admin-field">
-            <span>模型名称</span>
-            <input required value={draft.name} onChange={(event) => change("name", event.target.value)} />
-          </label>
-          <label className="admin-field">
-            <span>分类</span>
-            <select value={draft.category} onChange={(event) => changeCategory(event.target.value)}>
-              {CATEGORIES.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
-            </select>
-          </label>
-          <label className="admin-field">
-            <span>提供商</span>
-            <select value={draft.provider} onChange={(event) => change("provider", event.target.value)}>
-              {providerOptions.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
-            </select>
-          </label>
-          <label className="admin-field">
-            <span>模型名</span>
-            <input value={draft.model ?? ""} onChange={(event) => change("model", event.target.value)} placeholder="例如 gpt-4" />
-          </label>
+        <fieldset className="admin-model-fields" disabled={saving || aistarslabWriteLocked}>
+          <div className="admin-form-grid">
+            <label className="admin-field">
+              <span>模型名称</span>
+              <input required value={draft.name} onChange={(event) => change("name", event.target.value)} />
+            </label>
+            <label className="admin-field">
+              <span>分类</span>
+              <select value={draft.category} onChange={(event) => changeCategory(event.target.value)}>
+                {CATEGORIES.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
+              </select>
+            </label>
+            <label className="admin-field">
+              <span>提供商</span>
+              <select value={draft.provider} onChange={(event) => change("provider", event.target.value)}>
+                {providerOptions.map((choice) => <option key={choice.value} value={choice.value}>{choice.label}</option>)}
+              </select>
+            </label>
+            <label className="admin-field">
+              <span>模型名</span>
+              <input value={draft.model ?? ""} onChange={(event) => change("model", event.target.value)} placeholder="例如 gpt-4" />
+            </label>
 
-          <div className="admin-field admin-field-span">
-            <label className="admin-field-label" htmlFor="admin-system-model-api-key">API Key</label>
-            <span className="admin-secret-control">
-              <input
-                id="admin-system-model-api-key"
-                type={showApiKey ? "text" : "password"}
-                autoComplete="new-password"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder={mode === "edit" && hasStoredApiKey ? "留空会保留当前 API Key" : "请输入 API Key"}
-                aria-describedby={mode === "edit" && hasStoredApiKey ? "admin-system-model-api-key-help" : undefined}
-              />
-              <button className="admin-button admin-button-secondary" type="button" onClick={() => setShowApiKey((value) => !value)}>
-                {showApiKey ? "隐藏" : "显示"}
-              </button>
-            </span>
-            {mode === "edit" && hasStoredApiKey
-              ? <small id="admin-system-model-api-key-help">已配置密钥；只有输入新值时才会提交 API Key。</small>
-              : null}
-          </div>
-
-          <label className="admin-field admin-field-span">
-            <span>Base URL（可选）</span>
-            <input value={draft.base_url ?? ""} onChange={(event) => change("base_url", event.target.value)} />
-          </label>
-
-          <label className="admin-field">
-            <span>每次调用消耗积分</span>
-            <input
-              type="number"
-              min="0"
-              step="1"
-              value={draft.cost_per_call}
-              onChange={(event) => change("cost_per_call", Number.parseInt(event.target.value, 10) || 0)}
-            />
-          </label>
-          <label className="admin-field">
-            <span>排序（越小越前）</span>
-            <input
-              type="number"
-              step="1"
-              value={draft.sort_order}
-              onChange={(event) => change("sort_order", Number.parseInt(event.target.value, 10) || 0)}
-            />
-          </label>
-
-          {mode === "edit" ? (
-            <fieldset className="admin-field admin-field-span admin-billing-fields">
-              <legend>计费方式</legend>
-              <label>
-                <span>计费模式</span>
-                <select
-                  value={billingMode}
-                  disabled={paramsObject === null}
-                  onChange={(event) => updateBilling(event.target.value === "per_second" ? "per_second" : "fixed", billingCost)}
-                >
-                  <option value="fixed">按次计费</option>
-                  <option value="per_second">按秒计费</option>
-                </select>
-              </label>
-              <label>
-                <span>{billingMode === "per_second" ? "每秒消耗积分" : "每次消耗积分"}</span>
+            <div className="admin-field admin-field-span">
+              <label className="admin-field-label" htmlFor="admin-system-model-api-key">API Key</label>
+              <span className="admin-secret-control">
                 <input
-                  type="number"
-                  min="0"
-                  step="1"
-                  value={billingCost}
-                  disabled={paramsObject === null}
-                  onChange={(event) => updateBilling(billingMode, Number.parseInt(event.target.value, 10) || 0)}
+                  id="admin-system-model-api-key"
+                  type={showApiKey ? "text" : "password"}
+                  autoComplete="new-password"
+                  value={apiKey}
+                  onChange={(event) => {
+                    draftGenerationRef.current += 1;
+                    setDraftGeneration(draftGenerationRef.current);
+                    setApiKey(event.target.value);
+                  }}
+                  placeholder={mode === "edit" && hasStoredApiKey ? "留空会保留当前 API Key" : "请输入 API Key"}
+                  aria-describedby={mode === "edit" && hasStoredApiKey ? "admin-system-model-api-key-help" : undefined}
                 />
-              </label>
-              <p className="admin-field-help">
-                {billingMode === "per_second"
-                  ? "按秒计费：每秒积分 × 实际秒数。"
-                  : "按次计费：每次调用消耗固定积分。"}
-                {qualityRates.length > 0
-                  ? " 当前已配置 " + qualityRates.length + " 个清晰度档位。"
-                  : " 可以按清晰度设置不同积分。"}
-              </p>
-              <div className="admin-quality-editor">
-                <div className="admin-quality-heading">
-                  <span>{billingMode === "per_second" ? "每档每秒积分" : "每档每次积分"}</span>
-                  <div>
-                    {resolutionOptions(paramsObject).length > 0 ? (
-                      <button className="admin-text-button" type="button" onClick={generateQualityRows}>
-                        按清晰度选项生成
+                <button className="admin-button admin-button-secondary" type="button" onClick={() => setShowApiKey((value) => !value)}>
+                  {showApiKey ? "隐藏" : "显示"}
+                </button>
+              </span>
+              {mode === "edit" && hasStoredApiKey
+                ? <small id="admin-system-model-api-key-help">已配置密钥；只有输入新值时才会提交 API Key。</small>
+                : null}
+            </div>
+
+            <label className="admin-field admin-field-span">
+              <span>Base URL（可选）</span>
+              <input value={draft.base_url ?? ""} onChange={(event) => change("base_url", event.target.value)} />
+            </label>
+
+            <label className="admin-field">
+              <span>每次调用消耗积分</span>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                value={draft.cost_per_call}
+                onChange={(event) => change("cost_per_call", Number.parseInt(event.target.value, 10) || 0)}
+              />
+            </label>
+            <label className="admin-field">
+              <span>排序（越小越前）</span>
+              <input
+                type="number"
+                step="1"
+                value={draft.sort_order}
+                onChange={(event) => change("sort_order", Number.parseInt(event.target.value, 10) || 0)}
+              />
+            </label>
+
+            {mode === "edit" ? (
+              <fieldset className="admin-field admin-field-span admin-billing-fields">
+                <legend>计费方式</legend>
+                <label>
+                  <span>计费模式</span>
+                  <select
+                    value={billingMode}
+                    disabled={paramsObject === null}
+                    onChange={(event) => updateBilling(event.target.value === "per_second" ? "per_second" : "fixed", billingCost)}
+                  >
+                    <option value="fixed">按次计费</option>
+                    <option value="per_second">按秒计费</option>
+                  </select>
+                </label>
+                <label>
+                  <span>{billingMode === "per_second" ? "每秒消耗积分" : "每次消耗积分"}</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    value={billingCost}
+                    disabled={paramsObject === null}
+                    onChange={(event) => updateBilling(billingMode, Number.parseInt(event.target.value, 10) || 0)}
+                  />
+                </label>
+                <p className="admin-field-help">
+                  {billingMode === "per_second"
+                    ? "按秒计费：每秒积分 × 实际秒数。"
+                    : "按次计费：每次调用消耗固定积分。"}
+                  {qualityRates.length > 0
+                    ? " 当前已配置 " + qualityRates.length + " 个清晰度档位。"
+                    : " 可以按清晰度设置不同积分。"}
+                </p>
+                <div className="admin-quality-editor">
+                  <div className="admin-quality-heading">
+                    <span>{billingMode === "per_second" ? "每档每秒积分" : "每档每次积分"}</span>
+                    <div>
+                      {resolutionOptions(paramsObject).length > 0 ? (
+                        <button className="admin-text-button" type="button" onClick={generateQualityRows}>
+                          按清晰度选项生成
+                        </button>
+                      ) : null}
+                      <button className="admin-text-button" type="button" onClick={addQualityRow}>
+                        + 添加档位
                       </button>
-                    ) : null}
-                    <button className="admin-text-button" type="button" onClick={addQualityRow}>
-                      + 添加档位
-                    </button>
+                    </div>
                   </div>
+                  {qualityRows.length === 0 ? (
+                    <p className="admin-field-help">未设置分档积分；未配置的清晰度使用上方默认值。</p>
+                  ) : null}
+                  {qualityRows.map((row, index) => (
+                    <div className="admin-quality-row" key={index}>
+                      <label>
+                        <span>档位名</span>
+                        <input
+                          value={row.quality}
+                          placeholder="如 480p / 高清 / 标准"
+                          onChange={(event) => updateQualityRow(index, "quality", event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        <span>{billingMode === "per_second" ? "每秒积分" : "每次积分"}</span>
+                        <input
+                          type="number"
+                          min="0"
+                          step="1"
+                          value={row.cost}
+                          onChange={(event) => updateQualityRow(index, "cost", event.target.value)}
+                        />
+                      </label>
+                      <button
+                        className="admin-text-button is-danger"
+                        type="button"
+                        onClick={() => removeQualityRow(index)}
+                      >
+                        删除
+                      </button>
+                    </div>
+                  ))}
                 </div>
-                {qualityRows.length === 0 ? (
-                  <p className="admin-field-help">未设置分档积分；未配置的清晰度使用上方默认值。</p>
-                ) : null}
-                {qualityRows.map((row, index) => (
-                  <div className="admin-quality-row" key={index}>
-                    <label>
-                      <span>档位名</span>
-                      <input
-                        value={row.quality}
-                        placeholder="如 480p / 高清 / 标准"
-                        onChange={(event) => updateQualityRow(index, "quality", event.target.value)}
-                      />
-                    </label>
-                    <label>
-                      <span>{billingMode === "per_second" ? "每秒积分" : "每次积分"}</span>
-                      <input
-                        type="number"
-                        min="0"
-                        step="1"
-                        value={row.cost}
-                        onChange={(event) => updateQualityRow(index, "cost", event.target.value)}
-                      />
-                    </label>
-                    <button
-                      className="admin-text-button is-danger"
-                      type="button"
-                      onClick={() => removeQualityRow(index)}
-                    >
-                      删除
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </fieldset>
-          ) : null}
+              </fieldset>
+            ) : null}
 
-          <label className="admin-field admin-field-span">
-            <span>模型介绍</span>
-            <textarea rows={3} value={draft.description ?? ""} onChange={(event) => change("description", event.target.value)} />
-          </label>
+            <label className="admin-field admin-field-span">
+              <span>模型介绍</span>
+              <textarea rows={3} value={draft.description ?? ""} onChange={(event) => change("description", event.target.value)} />
+            </label>
 
-          <label className="admin-checkbox-field">
-            <input type="checkbox" checked={draft.is_active} onChange={(event) => change("is_active", event.target.checked)} />
-            <span>是否启用</span>
-          </label>
+            <label className="admin-checkbox-field">
+              <input type="checkbox" checked={draft.is_active} onChange={(event) => change("is_active", event.target.checked)} />
+              <span>是否启用</span>
+            </label>
 
-          <label className="admin-field admin-field-span">
-            <span>模型参数配置（JSON）</span>
-            <textarea
-              className="admin-json-field"
-              rows={9}
-              spellCheck={false}
-              value={draft.params ?? ""}
-              onChange={(event) => {
-                const nextParams = event.target.value;
-                change("params", nextParams);
-                const nextObject = asObject(nextParams);
-                const nextMode: BillingMode = nextObject?.billing_mode === "per_second" ? "per_second" : "fixed";
-                setQualityRows(readQualityRows(nextParams, nextMode));
-              }}
-              placeholder="{}"
-            />
-            <small>可填写模型支持的参数；按次与按秒的清晰度分档也保存在这里。</small>
-          </label>
-        </div>
+            <label className="admin-field admin-field-span">
+              <span>模型参数配置（JSON）</span>
+              <textarea
+                className="admin-json-field"
+                rows={9}
+                spellCheck={false}
+                value={draft.params ?? ""}
+                onChange={(event) => {
+                  const nextParams = event.target.value;
+                  change("params", nextParams);
+                  const nextObject = asObject(nextParams);
+                  const nextMode: BillingMode = nextObject?.billing_mode === "per_second" ? "per_second" : "fixed";
+                  setQualityRows(readQualityRows(nextParams, nextMode));
+                }}
+                placeholder="{}"
+              />
+              <small>可填写模型支持的参数；按次与按秒的清晰度分档也保存在这里。</small>
+            </label>
+          </div>
+        </fieldset>
+
+        {draft.provider === "aistarslab" && (draft.category === "image" || draft.category === "video") ? (
+          <AistarslabQuickConfig
+            api={aistarslabApi}
+            adminApi={api}
+            actorId={adminActorId}
+            sessionGeneration={adminSessionGeneration}
+            mode={mode}
+            modelId={modelId}
+            category={draft.category}
+            provider={draft.provider}
+            apiKey={apiKey}
+            draftGeneration={draftGeneration}
+            onUnauthorized={onUnauthorized}
+            onApply={applyAistarslabParams}
+            onCreated={() => onSaved?.()}
+            onWriteActivityChange={updateAistarslabWriteActivity}
+            onExitStateChange={(owner, notice) => onAistarslabExitStateChange?.(owner, notice)}
+          />
+        ) : null}
 
         {saveError ? <p className="admin-form-error" role="alert">{saveError}</p> : null}
         <div className="admin-form-actions">
           <button className="admin-button admin-button-secondary" type="button" onClick={onCancel} disabled={saving}>
             取消
           </button>
-          <button className="admin-button admin-button-primary" type="submit" disabled={saving || !draft.name || !draft.provider}>
+          <button className="admin-button admin-button-primary" type="submit" disabled={saving || aistarslabWriteLocked || !draft.name || !draft.provider}>
             {saving ? "保存中…" : "保存"}
           </button>
         </div>
@@ -985,11 +1060,15 @@ export function SystemModels(props: SystemModelsProps) {
   return (
     <ModelForm
       api={props.api}
+      aistarslabApi={props.aistarslabApi}
+      adminActorId={props.adminActorId}
+      adminSessionGeneration={props.adminSessionGeneration}
       onUnauthorized={props.onUnauthorized}
       mode={props.mode}
       modelId={props.modelId}
       onCancel={props.onCancel}
       onSaved={props.onSaved}
+      onAistarslabExitStateChange={props.onAistarslabExitStateChange}
     />
   );
 }
