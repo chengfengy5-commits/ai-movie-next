@@ -2,7 +2,7 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { InvalidResponseError } from "./contracts";
+import { InvalidResponseError, type ChapterEditGuard } from "./contracts";
 import { createApiServices } from "./services";
 import { API_TOKEN_KEY, type StorageLike } from "./storage";
 import { projectStoryboardFrames } from "../../features/chapters/storyboardProjection";
@@ -153,6 +153,86 @@ const malformedCases = [
 ] as const;
 
 describe("chapter and storyboard API services over real HTTP", () => {
+  it("negotiates the guarded chapter capability through the authenticated current API session", async () => {
+    const requests: Array<{ method: string; url: string; authorization: string | null; body: string | null }> = [];
+    const seriesId = "series-a";
+    const chapterId = "chapter-a";
+    const guard: ChapterEditGuard = {
+      version: 1,
+      expected_chapter_id: chapterId,
+      expected_series_id: seriesId,
+      expected_order: 1,
+      expected_content: [{ text: "原文", storyboard: ["shot-a"] }],
+      expected_storyboards: [{ id: "shot-a", series_id: seriesId, chapter_id: chapterId, frame_index: 0 }],
+      expected_lock_identity: null,
+      frame_sources: [{ kind: "retained", source_index: 0, storyboard_id: "shot-a" }],
+      deleted_source_indexes: [],
+    };
+    const update = { content: [{ text: "新正文", storyboard: ["shot-a"] }], chapter_edit_guard: guard };
+    const { services } = createServices("http://127.0.0.1/api", {
+      fetcher: async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        requests.push({
+          method,
+          url,
+          authorization: new Headers(init?.headers).get("Authorization"),
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        const response = method === "GET"
+          ? { features: { chapter_edit_guard: 1 } }
+          : {
+              id: chapterId,
+              series_id: seriesId,
+              title: "第一章",
+              content: update.content,
+              order: 1,
+              created_at: "2026-10-01T00:00:00Z",
+              updated_at: "2026-10-02T00:00:00Z",
+              lock: null,
+            };
+        return new Response(JSON.stringify(response), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+    const getCapabilities = requireServiceMethod(
+      services.getContinuousChapterEditCapabilities,
+      "getContinuousChapterEditCapabilities",
+    );
+
+    await expect(getCapabilities(new AbortController().signal)).resolves.toEqual({ chapterEditGuard: 1 });
+    const updateChapter = requireServiceMethod(services.updateChapter, "updateChapter");
+    await expect(updateChapter(seriesId, chapterId, update, new AbortController().signal))
+      .resolves.toMatchObject({ id: chapterId, content: update.content });
+    expect(requests).toEqual([{
+      method: "GET",
+      url: "http://127.0.0.1/api/chapters/continuous-edit/capabilities",
+      authorization: "Bearer fixture-demo-token",
+      body: null,
+    }, {
+      method: "PUT",
+      url: "http://127.0.0.1/api/chapters/chapter-a",
+      authorization: "Bearer fixture-demo-token",
+      body: JSON.stringify(update),
+    }]);
+  });
+
+  it("fails closed when chapter guard capability is missing or malformed", async () => {
+    const { services } = createServices("http://127.0.0.1/api", {
+      fetcher: async () => new Response(JSON.stringify({ features: { chapter_edit_guard: "1" } }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    });
+    const getCapabilities = requireServiceMethod(
+      services.getContinuousChapterEditCapabilities,
+      "getContinuousChapterEditCapabilities",
+    );
+    await expect(getCapabilities(new AbortController().signal)).rejects.toMatchObject({ name: "InvalidResponseError" });
+  });
+
   afterEach(() => vi.restoreAllMocks());
 
   it("sends one full content PUT, then confirms a committed 500 result through fresh chapter and asset reads", async () => {

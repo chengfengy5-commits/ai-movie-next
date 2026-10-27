@@ -9,7 +9,7 @@ export interface SeriesWorkbenchPreferenceScope {
 
 export interface SeriesWorkbenchPreferences {
   readonly route: SeriesWorkbenchRoute;
-  readonly leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">;
+  readonly leftView: SeriesWorkbenchLeftView;
   readonly leftWidths: Readonly<Record<SeriesWorkbenchLeftView, number>>;
 }
 
@@ -62,7 +62,9 @@ function parsePreferences(value: string | null): SeriesWorkbenchPreferences {
       : {};
     return {
       route: record.route === "media" ? "media" : "chat",
-      leftView: record.leftView === "assets" ? "assets" : "storyboard",
+      leftView: record.leftView === "assets" || record.leftView === "continuous-preview"
+        ? record.leftView
+        : "storyboard",
       leftWidths: {
         storyboard: clampLeftWidth(widths.storyboard ?? widths.chat ?? oldWidth),
         assets: clampLeftWidth(widths.assets ?? oldWidth),

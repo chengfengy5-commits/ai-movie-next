@@ -79,6 +79,12 @@ def build_series_data_router(
             raise HTTPException(status_code=exc.status_code, detail=exc.detail) from exc
         return JSONResponse(content=payload)
 
+    @router.get("/chapters/continuous-edit/capabilities")
+    def continuous_chapter_edit_capabilities(
+        _actor: TrustedActor = Depends(trusted_actor),
+    ) -> dict[str, dict[str, int]]:
+        return {"features": {"chapter_edit_guard": 1}}
+
     @router.get("/series", response_model=list[SeriesResponse])
     def list_series(actor: TrustedActor = Depends(trusted_actor)) -> list[dict[str, Any]]:
         return invoke(application.get_series_list, actor)
@@ -116,6 +122,15 @@ def build_series_data_router(
     def edit_chapter(chapter_id: str, request: ChapterUpdate, actor: TrustedActor = Depends(trusted_actor)) -> Any:
         if request.generation_application is not None:
             return apply_generation(request.generation_application, chapter_id, actor)
+        if request.chapter_edit_guard is not None:
+            assert request.content is not None
+            return invoke(
+                application.update_chapter_guarded,
+                actor,
+                chapter_id,
+                request.content,
+                request.chapter_edit_guard,
+            )
         return invoke(application.update_chapter, actor, chapter_id, request)
 
     @router.put("/chapters/{chapter_id}/delete-frame", response_model=ChapterResponse)

@@ -18,7 +18,11 @@ import { ApiError } from "../shared/api/errors";
 import { MediaGenerationError, type MediaGenerationPort, type MediaGenerationRun } from "../shared/api/mediaGeneration";
 import { parsePersonalProductionSnapshot } from "../shared/api/personalProductionNotes";
 import { digestPersonalProductionMediaIdentity } from "../features/chapters/personal-production/mediaIdentity";
-import { readSeriesWorkbenchPreferences } from "../features/series-workbench/preferences";
+import {
+  defaultSeriesWorkbenchPreferences,
+  readSeriesWorkbenchPreferences,
+  writeSeriesWorkbenchPreferences,
+} from "../features/series-workbench/preferences";
 import type { FusedSourceEntrySelection } from "../features/series-workbench/fusedSourceEntry";
 import type { PersonalRoughCutSnapshot } from "../shared/api/personalRoughCut";
 import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../shared/api/myTasks";
@@ -1409,6 +1413,12 @@ describe("read-only workspace", () => {
     for (const category of ["故事板", "角色", "场景", "道具", "融合素材"]) {
       expect(within(resourceColumn).getByRole("heading", { name: category })).toBeInTheDocument();
     }
+    fireEvent.click(screen.getByRole("button", { name: "整章连续编辑" }));
+    expect(await screen.findByRole("region", { name: "选中镜头原文" })).toBeInTheDocument();
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
+    fireEvent.click(screen.getByRole("button", { name: "分镜" }));
+    expect(await screen.findByRole("region", { name: "镜头 1 的五类关联素材" })).toBeInTheDocument();
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
     const characterSourceId = `${demoSeries[0]!.id}-character-linlan`;
     const preferenceScope = { userId: "demo-user", apiBaseUrl, seriesId: demoSeries[0]!.id };
     const separator = screen.getByRole("separator", { name: "调整剧集内容与创作区宽度" });
@@ -1610,7 +1620,14 @@ describe("read-only workspace", () => {
       can_enter: true,
     };
     const characterId = "workbench-team-b-character-1117";
-    const hostAChapter = chapterSnapshot(hostA.id, "workbench-a-chapter-1117", "A 章节", "A 正文");
+    const hostAChapter: Chapter = {
+      ...chapterSnapshot(hostA.id, "workbench-a-chapter-1117", "A 章节", null),
+      content: [{
+        text: "A 正文",
+        original_text: "A 剧集打开时的原文",
+        storyboard: ["workbench-a-chapter-1117-frame"],
+      }],
+    };
     const hostBChapter = chapterWithAssetReference(
       hostB.id,
       "workbench-b-chapter-1117",
@@ -1636,6 +1653,10 @@ describe("read-only workspace", () => {
       chapter_count: 1,
       asset_counts: { characters: 1, scenes: 0, props: 0, storyboard: 1 },
     };
+    expect(writeSeriesWorkbenchPreferences(
+      { userId: "fixture-user", apiBaseUrl, seriesId: hostB.id },
+      { ...defaultSeriesWorkbenchPreferences, leftView: "continuous-preview" },
+    )).toBe(true);
     const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
     const managementPort = apiServices.teamManagement as TeamManagementServicePort;
     vi.spyOn(managementPort, "listTeams").mockResolvedValue([{
@@ -1677,6 +1698,7 @@ describe("read-only workspace", () => {
       listCharacters,
       listScenes: vi.fn(async () => []),
       listProps: vi.fn(async () => []),
+      getContinuousChapterEditCapabilities: vi.fn(async () => ({ chapterEditGuard: 1 as const })),
     };
     window.localStorage.setItem(API_TOKEN_KEY, "workbench-team-host-session");
     window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
@@ -1705,6 +1727,27 @@ describe("read-only workspace", () => {
     await screen.findByText("A 正文");
     expect(container.querySelector(".chapter-browser")).toHaveTextContent("A 章节");
 
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+    await screen.findByRole("heading", { name: "创作区" });
+    fireEvent.click(screen.getByRole("button", { name: "整章连续编辑" }));
+    await screen.findByRole("region", { name: "选中镜头原文" });
+    const openContinuousEditor = screen.getByRole("button", { name: "开启整章连续编辑" });
+    expect(openContinuousEditor).toBeEnabled();
+    await user.click(openContinuousEditor);
+    await screen.findByRole("region", { name: "整章连续编辑" });
+    const aOriginalPanel = screen.getByRole("region", { name: "选中镜头原文" });
+    await user.click(screen.getByRole("button", { name: "第 1 段 · 原镜头 1" }));
+    expect(await within(aOriginalPanel).findByText("A 剧集打开时的原文")).toBeInTheDocument();
+
+    await user.click(within(topbar).getByRole("button", { name: "AI 助手", hidden: true }));
+    await screen.findByRole("heading", { name: "AI 聊天助手" });
+    await user.click(screen.getByRole("button", { name: "返回剧集工作台" }));
+    await screen.findByRole("heading", { name: "创作区" });
+    const returnedAOriginalPanel = screen.getByRole("region", { name: "选中镜头原文" });
+    expect(within(returnedAOriginalPanel).getByText("A 剧集打开时的原文")).toBeInTheDocument();
+
     await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
     const reopenedTeamDirectory = await screen.findByRole("region", { name: "我的团队目录" });
     await user.click(await within(reopenedTeamDirectory).findByRole("button", { name: /工作台团队/ }));
@@ -1719,10 +1762,10 @@ describe("read-only workspace", () => {
     expect(listCharacters).toHaveBeenCalledWith(hostB.id, expect.any(AbortSignal));
     expect(listCharacters.mock.calls.at(-1)?.[0]).toBe(hostB.id);
 
-    const topbar = container.querySelector(".topbar");
-    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
     await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
     await screen.findByRole("heading", { name: "创作区" });
+    const bOriginalPanel = screen.getByRole("region", { name: "选中镜头原文" });
+    expect(within(bOriginalPanel).queryByText("A 剧集打开时的原文")).not.toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "素材库" }));
     const workbenchLibrary = await screen.findByRole("region", { name: `${hostB.name} · 素材库` });
     const characterCard = within(workbenchLibrary).getByRole("heading", { name: teamCharacter.name }).closest("article");
@@ -1743,6 +1786,19 @@ describe("read-only workspace", () => {
     expect(media.getByLabelText("章节")).toHaveValue(hostBChapter.id);
     expect(media.getByLabelText("目标素材")).toHaveValue(characterId);
     expect(listChapters.mock.calls.some(([seriesId]) => seriesId === hostB.id)).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "分镜" }));
+    await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+    const returnedSeriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const returnedHostACard = within(returnedSeriesRegion).getByRole("heading", { name: hostA.name }).closest("article");
+    if (!(returnedHostACard instanceof HTMLElement)) throw new Error("The A series was not restored in the directory.");
+    await user.click(within(returnedHostACard).getByRole("button", { name: /只读查看章节/ }));
+    await screen.findByText("A 正文");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+    await screen.findByRole("heading", { name: "创作区" });
+    const returnedAWithoutEditor = screen.getByRole("region", { name: "选中镜头原文" });
+    expect(within(returnedAWithoutEditor).queryByText("A 剧集打开时的原文")).not.toBeInTheDocument();
   }, 20_000);
 
   it("uses a verified asset chapter to update idle chat from the workbench asset view", async () => {

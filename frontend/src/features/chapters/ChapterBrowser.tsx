@@ -11,6 +11,7 @@ import type {
   StoryboardAsset,
   StoryboardFrame,
 } from "../../shared/api/contracts";
+import type { AssetOrphanCandidate } from "../../shared/api/assetMaintenance";
 import type { FusedGenerationMemberType } from "../../shared/api/fusedGeneration";
 import type { PersonalProductionSnapshot } from "../../shared/api/personalProductionNotes";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
@@ -126,6 +127,16 @@ import {
 } from "./chapterEditing";
 import "./chapterEditing.css";
 import "./storyboardBrowsePreferences.css";
+import {
+  createContinuousChapterDraft,
+  buildGuardedChapterUpdate,
+  removedContinuousAssetCandidates,
+  continuousWriteReadbackMatches,
+  type ContinuousAssetCatalog,
+  type ContinuousChapterDraftSnapshot,
+  type ContinuousDraftFrame,
+} from "./continuousChapterEditing";
+import { ContinuousChapterEditor, type ContinuousAssetKind } from "./ContinuousChapterEditor";
 
 interface ChapterBrowserProps {
   series: Series;
@@ -139,6 +150,12 @@ interface ChapterBrowserProps {
   onNavigationAbandoned?(navigationEpoch: number): void;
   onNavigateToAsset?(target: FrameAssetReferenceAssetTarget): void;
   workbenchActive?: boolean;
+  continuousPreviewActive?: boolean;
+  onContinuousOriginalChange?(selection: {
+    readonly position: number;
+    readonly text: string | null;
+    readonly status: "text" | "missing" | "unrecognized";
+  } | null): void;
   onWorkbenchSource?(selection: WorkbenchSourceSelection): void;
   onFusedSource?(selection: FusedSourceEntrySelection): void;
 }
@@ -225,6 +242,25 @@ interface FrameTextEditorContext extends ChapterEditLockOwner {
   cursorEpoch: number;
   referenceOwnerEpoch: number;
   referenceOwner: FrameAssetReferenceOwner;
+}
+
+interface ContinuousChapterEditorContext extends ChapterEditLockOwner {
+  readonly sessionId: string;
+  readonly snapshot: ContinuousChapterDraftSnapshot;
+  readonly draft: readonly ContinuousDraftFrame[];
+  readonly undoStack: readonly (readonly ContinuousDraftFrame[])[];
+  readonly redoStack: readonly (readonly ContinuousDraftFrame[])[];
+  readonly catalogs: ContinuousAssetCatalog;
+  readonly selectedIndex: number;
+  readonly dirty: boolean;
+  readonly busy: boolean;
+  readonly pendingUpdate: ReturnType<typeof buildGuardedChapterUpdate> | null;
+  readonly pendingAssetCreate: {
+    readonly kind: ContinuousAssetKind;
+    readonly name: string;
+    readonly draftId: string;
+  } | null;
+  readonly notice: string | null;
 }
 
 interface FrameReviewDialogOwner {
@@ -849,6 +885,8 @@ export function ChapterBrowser({
   onNavigationAbandoned,
   onNavigateToAsset,
   workbenchActive = false,
+  continuousPreviewActive = false,
+  onContinuousOriginalChange,
   onWorkbenchSource,
   onFusedSource,
 }: ChapterBrowserProps) {
@@ -863,6 +901,9 @@ export function ChapterBrowser({
   const [frameTextEditor, setFrameTextEditor] = useState<FrameTextEditorContext | null>(null);
   const frameTextEditorRef = useRef<FrameTextEditorContext | null>(null);
   frameTextEditorRef.current = frameTextEditor;
+  const [continuousChapterEditor, setContinuousChapterEditor] = useState<ContinuousChapterEditorContext | null>(null);
+  const continuousChapterEditorRef = useRef<ContinuousChapterEditorContext | null>(null);
+  continuousChapterEditorRef.current = continuousChapterEditor;
   const [frameReviewDialog, setFrameReviewDialog] = useState<FrameReviewDialogOwner | null>(null);
   const frameReviewDialogRef = useRef<FrameReviewDialogOwner | null>(null);
   frameReviewDialogRef.current = frameReviewDialog;
@@ -2425,6 +2466,10 @@ export function ChapterBrowser({
 
   function selectChapter(chapterId: string, expectedRequestGeneration: number) {
     const directory = chapterDirectoryRef.current;
+    if (continuousChapterEditorRef.current !== null) {
+      setChapterMutationNotice("请先保存并结束连续编辑，或明确放弃草稿后再切换章节。");
+      return;
+    }
     if (
       expectedRequestGeneration !== chapterRequestGeneration.current
       || expectedRequestGeneration !== directory.requestGeneration
@@ -2440,6 +2485,7 @@ export function ChapterBrowser({
 
   function selectChapterNow(chapterId: string, expectedRequestGeneration: number): void {
     const directory = chapterDirectoryRef.current;
+    if (continuousChapterEditorRef.current !== null) return;
     if (
       expectedRequestGeneration !== chapterRequestGeneration.current
       || expectedRequestGeneration !== directory.requestGeneration
@@ -2867,20 +2913,23 @@ export function ChapterBrowser({
 
     const owner = frameTextEditorRef.current;
     const structureOwner = frameStructureEditorRef.current;
+    const continuousOwner = continuousChapterEditorRef.current;
     const pendingOwner = pendingFrameLockReleaseRef.current;
     frameTextEditorRef.current = null;
     frameStructureEditorRef.current = null;
+    continuousChapterEditorRef.current = null;
     pendingFrameLockReleaseRef.current = null;
     owner?.lifecycleController.abort();
     structureOwner?.lifecycleController.abort();
-    const cleanupOwner = owner ?? structureOwner ?? pendingOwner;
+    continuousOwner?.lifecycleController.abort();
+    const cleanupOwner = owner ?? structureOwner ?? continuousOwner ?? pendingOwner;
     frameStructureDraftDirtyRef.current = false;
     frameStructureDiscardRequestRef.current = null;
     guardedNavigationSequence.current += 1;
     if (cleanupOwner !== null) {
       const hasProvenLease = cleanupOwner.newlyAcquiredLock && cleanupOwner.lockLease !== null;
       const refreshLockSnapshot = options.refreshLockSnapshot === true
-        && (owner === cleanupOwner || structureOwner === cleanupOwner);
+        && (owner === cleanupOwner || structureOwner === cleanupOwner || continuousOwner === cleanupOwner);
       if (options.deferLockRelease && hasProvenLease) {
         pendingFrameLockReleaseRef.current = cleanupOwner;
       } else if (hasProvenLease || (refreshLockSnapshot && cleanupOwner.refreshLockOnClose)) {
@@ -2891,7 +2940,9 @@ export function ChapterBrowser({
     if (options.updateState !== false) {
       setFrameTextEditor(null);
       setFrameStructureEditor(null);
+      setContinuousChapterEditor(null);
       setFrameEditOpening(false);
+      onContinuousOriginalChange?.(null);
     }
   }
 
@@ -2900,9 +2951,11 @@ export function ChapterBrowser({
   useLayoutEffect(() => {
     const owner = frameTextEditorRef.current;
     const structureOwner = frameStructureEditorRef.current;
+    const continuousOwner = continuousChapterEditorRef.current;
     const openingChapterId = frameEditOpeningChapterIdRef.current;
     if ((owner !== null && owner.chapter.id !== selectedChapterId)
       || (structureOwner !== null && structureOwner.chapter.id !== selectedChapterId)
+      || (continuousOwner !== null && continuousOwner.chapter.id !== selectedChapterId)
       || (openingChapterId !== null && openingChapterId !== selectedChapterId)) {
       invalidateFrameEditingWorkflowRef.current();
     }
@@ -3177,7 +3230,7 @@ export function ChapterBrowser({
   async function openFrameTextEditor(position: number): Promise<void> {
     const directory = chapterDirectoryRef.current;
     if (!canEditStoryboard || chapterManagement !== null || chapterManagementBlocked || chapterOrderEditorRef.current !== null
-      || frameTextEditorRef.current !== null || frameEditOpening || chaptersLoading
+      || frameTextEditorRef.current !== null || continuousChapterEditorRef.current !== null || frameEditOpening || chaptersLoading
       || chapters === null || chaptersError !== null || selectedChapter === null
       || !sameChapterBrowserScope(directory.scope, currentScope)
       || directory.requestGeneration !== chapterRequestGeneration.current || directory.chapters !== chapters
@@ -3301,11 +3354,667 @@ export function ChapterBrowser({
     }
   }
 
+  function updateContinuousChapterEditor(
+    sessionId: string,
+    update: (current: ContinuousChapterEditorContext) => ContinuousChapterEditorContext,
+  ): ContinuousChapterEditorContext | null {
+    const current = continuousChapterEditorRef.current;
+    if (current === null || current.sessionId !== sessionId) return null;
+    const next = update(current);
+    continuousChapterEditorRef.current = next;
+    setContinuousChapterEditor(next);
+    return next;
+  }
+
+  function isContinuousChapterEditorCurrent(
+    sessionId: string,
+    scope: ChapterBrowserScope,
+    chapterId: string,
+    requestGeneration: number,
+    signal?: AbortSignal,
+  ): boolean {
+    const owner = continuousChapterEditorRef.current;
+    const directory = chapterDirectoryRef.current;
+    const matching = directory.chapters?.filter((chapter) => chapter.id === chapterId) ?? [];
+    return (signal === undefined || !signal.aborted)
+      && owner !== null
+      && owner.sessionId === sessionId
+      && !owner.lifecycleController.signal.aborted
+      && sameChapterBrowserScope(owner.scope, scope)
+      && sameChapterBrowserScope(scope, activeScopeRef.current)
+      && owner.chapter.id === chapterId
+      && owner.requestGeneration === requestGeneration
+      && requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === chapterId
+      && sameChapterBrowserScope(directory.scope, scope)
+      && directory.requestGeneration === requestGeneration
+      && matching.length === 1
+      && matching[0]?.series_id === scope.seriesId;
+  }
+
+  function publishContinuousOriginal(owner: ContinuousChapterEditorContext, index: number): void {
+    const frame = owner.draft[index];
+    if (frame === undefined) {
+      onContinuousOriginalChange?.(null);
+      return;
+    }
+    const original: unknown = frame.originalFrame?.original_text;
+    const hasOriginal = frame.originalFrame !== null
+      && Object.prototype.hasOwnProperty.call(frame.originalFrame, "original_text");
+    onContinuousOriginalChange?.({
+      position: index + 1,
+      status: !hasOriginal ? "missing" : typeof original === "string" ? "text" : "unrecognized",
+      text: typeof original === "string" ? original : null,
+    });
+  }
+
+  async function openContinuousChapterEditor(): Promise<void> {
+    const directory = chapterDirectoryRef.current;
+    const chapter = selectedChapter;
+    if (!canEditStoryboard || !continuousPreviewActive || chapter === null || chapters === null
+      || chaptersLoading || chaptersError !== null || chapterManagementBlocked
+      || chapterOrderEditorRef.current !== null || frameTextEditorRef.current !== null
+      || frameStructureEditorRef.current !== null || continuousChapterEditorRef.current !== null
+      || frameEditOpening || !sameChapterBrowserScope(directory.scope, currentScope)
+      || directory.requestGeneration !== chapterRequestGeneration.current || directory.chapters !== chapters
+      || !isChapterSelectableFromDirectory(directory.chapters, chapter.id, series.id)) return;
+
+    const capabilityReader = services.getContinuousChapterEditCapabilities;
+    if (capabilityReader === undefined || services.updateChapter === undefined) {
+      setChapterMutationNotice("当前服务未确认整章条件保存能力；连续编辑保持只读。");
+      return;
+    }
+
+    const controller = new AbortController();
+    const workflowEpoch = frameEditWorkflowEpoch.current;
+    const base = {
+      scope: currentScope,
+      chapter,
+      requestGeneration: directory.requestGeneration,
+    };
+    frameEditOpeningController.current = controller;
+    frameEditOpeningChapterIdRef.current = chapter.id;
+    setFrameEditOpening(true);
+    setChapterMutationNotice(null);
+    let newlyAcquiredLock = false;
+    let refreshLockOnClose = false;
+    let lockLease: ChapterEditLockLeaseHandle | null = null;
+    let lockIdentity: ChapterEditLockIdentity = null;
+    const isCurrent = () => frameEditOpeningController.current === controller
+      && frameEditOpeningChapterIdRef.current === chapter.id
+      && workflowEpoch === frameEditWorkflowEpoch.current
+      && !controller.signal.aborted
+      && sameChapterBrowserScope(base.scope, activeScopeRef.current)
+      && base.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === chapter.id;
+
+    try {
+      const capability = await capabilityReader(controller.signal);
+      if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+      if (capability.chapterEditGuard !== 1) {
+        throw new ApiError("invalid-response", "服务未声明整章条件保存协议；已停止编辑。", null);
+      }
+      const freshDirectory = await services.listChapters(series.id, controller.signal);
+      if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+      const matches = freshDirectory.filter((item) => item.id === chapter.id);
+      if (matches.length !== 1 || matches[0]?.series_id !== series.id) {
+        throw new ApiError("http", "最新目录无法唯一核对当前章节。", 409);
+      }
+      const freshChapter = matches[0];
+      const [storyboards, characters, scenes, props] = await Promise.all([
+        services.listStoryboardAssets(series.id, chapter.id, controller.signal),
+        services.listCharacters(series.id, controller.signal),
+        services.listScenes(series.id, controller.signal),
+        services.listProps(series.id, controller.signal),
+      ]);
+      if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+      applyFreshChapterDirectory(freshDirectory, base.scope);
+      const catalogs = { characters, scenes, props };
+      validateContinuousCatalogReferences(freshChapter, catalogs);
+
+      let lockNotice: string | null = null;
+      if (typeof series.team_id === "string" && series.team_id !== "") {
+        const { getChapterEditLock, acquireChapterEditLock } = services;
+        if (getChapterEditLock === undefined || acquireChapterEditLock === undefined
+          || services.releaseChapterEditLock === undefined) {
+          throw new ApiError("invalid-response", "团队章节锁能力未就绪，已停止编辑。", null);
+        }
+        const existing = await getChapterEditLock(freshChapter.id, controller.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        if (existing.locked) {
+          if (!validOwnedChapterLock(existing, userId)) {
+            throw new ApiError("http", existing.username
+              ? `当前章节由 ${existing.username} 编辑，暂不能修改。`
+              : "当前章节由其他创作者编辑，暂不能修改。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(existing);
+          refreshLockOnClose = true;
+          lockNotice = "当前账号已持有有效编辑锁。";
+        } else {
+          const acquisition = await acquireChapterEditLock(freshChapter.id, controller.signal);
+          lockLease = acquisition.lease;
+          if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+          if (!validOwnedChapterLock(acquisition.state, userId)) {
+            throw new ApiError("http", acquisition.state.message ?? "未能取得有效章节编辑锁。", 409);
+          }
+          newlyAcquiredLock = lockLease !== null;
+          refreshLockOnClose = lockLease === null;
+          const verified = lockLease === null
+            ? await getChapterEditLock(freshChapter.id, controller.signal)
+            : await getChapterEditLock(freshChapter.id, controller.signal, lockLease);
+          if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+          if (!validOwnedChapterLock(verified, userId)) {
+            throw new ApiError("http", "取得锁后无法核对当前所有权和有效期限。", 409);
+          }
+          lockIdentity = chapterEditLockIdentity(verified);
+          lockNotice = lockLease === null
+            ? "当前账号持有有效章节编辑锁；取得来源无法确认，关闭后保留至服务器过期。"
+            : `已取得章节编辑锁，有效期至 ${verified.expires_at}`;
+        }
+      }
+      if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+      const snapshot = createContinuousChapterDraft(
+        freshChapter,
+        storyboards,
+        lockIdentity === null ? null : { user_id: lockIdentity.userId, acquired_at: lockIdentity.acquiredAt },
+      );
+      const sessionId = `${chapter.id}:${workflowEpoch}:${Date.now()}`;
+      const owner: ContinuousChapterEditorContext = {
+        ...base,
+        chapter: freshChapter,
+        lifecycleController: controller,
+        newlyAcquiredLock,
+        refreshLockOnClose,
+        lockLease,
+        lockIdentity,
+        lockNotice,
+        sessionId,
+        snapshot,
+        draft: snapshot.frames,
+        undoStack: [],
+        redoStack: [],
+        catalogs,
+        selectedIndex: 0,
+        dirty: false,
+        busy: false,
+        pendingUpdate: null,
+        pendingAssetCreate: null,
+        notice: null,
+      };
+      continuousChapterEditorRef.current = owner;
+      setContinuousChapterEditor(owner);
+      publishContinuousOriginal(owner, 0);
+    } catch (cause) {
+      if (isCurrent()) {
+        const error = normalizeApiError(cause);
+        if (error.status === 401) unauthorizedHandlerRef.current();
+        else if (error.kind !== "aborted") setChapterMutationNotice(error.detail ?? error.message);
+      }
+      if (newlyAcquiredLock || refreshLockOnClose) {
+        await releaseOrRefreshChapterEditLock({
+          ...base,
+          lifecycleController: controller,
+          newlyAcquiredLock,
+          refreshLockOnClose,
+          lockNotice: null,
+          lockLease,
+          lockIdentity,
+        }, { refreshLockSnapshot: refreshLockOnClose });
+      }
+    } finally {
+      if (frameEditOpeningController.current === controller) {
+        frameEditOpeningController.current = null;
+        frameEditOpeningChapterIdRef.current = null;
+        setFrameEditOpening(false);
+      }
+    }
+  }
+
+  function changeContinuousDraft(sessionId: string, frames: ContinuousDraftFrame[]): void {
+    const next = updateContinuousChapterEditor(sessionId, (owner) => ({
+      ...owner,
+      draft: frames,
+      undoStack: [...owner.undoStack, owner.draft].slice(-100),
+      redoStack: [],
+      selectedIndex: Math.max(0, Math.min(owner.selectedIndex, frames.length - 1)),
+      dirty: frames !== owner.snapshot.frames,
+    }));
+    if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
+  }
+
+  function undoContinuousDraft(sessionId: string): void {
+    const owner = continuousChapterEditorRef.current;
+    if (owner === null || owner.sessionId !== sessionId || owner.busy || owner.pendingUpdate !== null
+      || owner.pendingAssetCreate !== null || owner.undoStack.length === 0) return;
+    const frames = owner.undoStack[owner.undoStack.length - 1]!;
+    const next = updateContinuousChapterEditor(sessionId, (current) => ({
+      ...current,
+      draft: frames,
+      undoStack: current.undoStack.slice(0, -1),
+      redoStack: [...current.redoStack, current.draft].slice(-100),
+      selectedIndex: Math.max(0, Math.min(current.selectedIndex, frames.length - 1)),
+      dirty: frames !== current.snapshot.frames,
+    }));
+    if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
+  }
+
+  function redoContinuousDraft(sessionId: string): void {
+    const owner = continuousChapterEditorRef.current;
+    if (owner === null || owner.sessionId !== sessionId || owner.busy || owner.pendingUpdate !== null
+      || owner.pendingAssetCreate !== null || owner.redoStack.length === 0) return;
+    const frames = owner.redoStack[owner.redoStack.length - 1]!;
+    const next = updateContinuousChapterEditor(sessionId, (current) => ({
+      ...current,
+      draft: frames,
+      undoStack: [...current.undoStack, current.draft].slice(-100),
+      redoStack: current.redoStack.slice(0, -1),
+      selectedIndex: Math.max(0, Math.min(current.selectedIndex, frames.length - 1)),
+      dirty: frames !== current.snapshot.frames,
+    }));
+    if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
+  }
+
+  function selectContinuousDraftFrame(sessionId: string, index: number): void {
+    const next = updateContinuousChapterEditor(sessionId, (owner) => ({
+      ...owner,
+      selectedIndex: Math.max(0, Math.min(index, owner.draft.length - 1)),
+    }));
+    if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
+  }
+
+  function finishContinuousChapterEditor(discard: boolean): void {
+    const owner = continuousChapterEditorRef.current;
+    if (owner === null) return;
+    if (owner.pendingUpdate !== null || owner.pendingAssetCreate !== null || owner.busy) {
+      setChapterMutationNotice("操作结果尚未确认，连续编辑会话仍保留。");
+      return;
+    }
+    if (owner.dirty && !discard) {
+      setChapterMutationNotice("请先保存，或明确放弃未保存草稿。");
+      return;
+    }
+    continuousChapterEditorRef.current = null;
+    setContinuousChapterEditor(null);
+    owner.lifecycleController.abort();
+    onContinuousOriginalChange?.(null);
+    void releaseOrRefreshChapterEditLock(owner, { refreshLockSnapshot: true });
+  }
+
+  async function readContinuousCatalogs(
+    scope: ChapterBrowserScope,
+    signal: AbortSignal,
+  ): Promise<ContinuousAssetCatalog> {
+    const [characters, scenes, props] = await Promise.all([
+      scope.services.listCharacters(scope.seriesId, signal),
+      scope.services.listScenes(scope.seriesId, signal),
+      scope.services.listProps(scope.seriesId, signal),
+    ]);
+    return { characters, scenes, props };
+  }
+
+  function continuousAssetExists(
+    kind: ContinuousAssetKind,
+    id: string,
+    catalog: ContinuousAssetCatalog,
+    seriesId: string,
+  ): boolean {
+    const items = kind === "character" ? catalog.characters : kind === "scene" ? catalog.scenes : catalog.props;
+    return items.filter((item) => item.id === id && item.series_id === seriesId).length === 1;
+  }
+
+  function validateContinuousCatalogReferences(chapter: Chapter, catalogs: ContinuousAssetCatalog): void {
+    for (const frame of chapter.content ?? []) {
+      const entries: Array<[ContinuousAssetKind, unknown]> = [
+        ["character", frame.character],
+        ["scene", frame.scene],
+        ["prop", frame.prop],
+      ];
+      for (const [kind, value] of entries) {
+        if (value === undefined) continue;
+        if (!Array.isArray(value) || value.some((id) => typeof id !== "string")) {
+          throw new ApiError("invalid-response", "章节素材引用结构无法核对，未打开连续编辑。", null);
+        }
+        for (const id of value) {
+          if (!continuousAssetExists(kind, id, catalogs, chapter.series_id)) {
+            throw new ApiError("http", "章节引用了目录中缺失或重复的素材，未打开连续编辑。", 409);
+          }
+        }
+      }
+    }
+  }
+
+  function attachContinuousAsset(
+    owner: ContinuousChapterEditorContext,
+    draftId: string,
+    kind: ContinuousAssetKind,
+    id: string,
+    catalogs: ContinuousAssetCatalog,
+  ): void {
+    const currentOwner = continuousChapterEditorRef.current;
+    if (currentOwner === null || currentOwner.sessionId !== owner.sessionId
+      || !continuousAssetExists(kind, id, catalogs, owner.scope.seriesId)) return;
+    const targetIndex = currentOwner.draft.findIndex((frame) => frame.draftId === draftId);
+    const frame = currentOwner.draft[targetIndex];
+    if (frame === undefined) {
+      updateContinuousChapterEditor(owner.sessionId, (current) => ({
+        ...current,
+        busy: false,
+        notice: "素材已在目录中确认，但原目标段已不存在；不会把素材关联到其他段。",
+      }));
+      return;
+    }
+    const ids = kind === "character" ? frame.characterIds : kind === "scene" ? frame.sceneIds : frame.propIds;
+    const update = kind === "character" ? { characterIds: [...new Set([...ids, id])] }
+      : kind === "scene" ? { sceneIds: [...new Set([...ids, id])] }
+        : { propIds: [...new Set([...ids, id])] };
+    const next = updateContinuousChapterEditor(owner.sessionId, (current) => ({
+      ...current,
+      catalogs,
+      draft: current.draft.map((item) => item.draftId === draftId ? { ...item, ...update } : item),
+      undoStack: [...current.undoStack, current.draft].slice(-100),
+      redoStack: [],
+      dirty: true,
+      busy: false,
+      pendingAssetCreate: null,
+      notice: `已核对并关联${kind === "character" ? "角色" : kind === "scene" ? "场景" : "道具"}素材。`,
+    }));
+    if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
+  }
+
+  async function verifyContinuousUnknown(sessionId: string): Promise<void> {
+    const owner = continuousChapterEditorRef.current;
+    if (owner === null || owner.sessionId !== sessionId || owner.busy) return;
+    const controller = owner.lifecycleController;
+    updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: true, notice: "正在重新读取确认结果…" }));
+    try {
+      if (owner.pendingAssetCreate !== null) {
+        const catalogs = await readContinuousCatalogs(owner.scope, controller.signal);
+        if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, controller.signal)) return;
+        const { kind, name, draftId } = owner.pendingAssetCreate;
+        const items = kind === "character" ? catalogs.characters : kind === "scene" ? catalogs.scenes : catalogs.props;
+        const matches = items.filter((item) => item.series_id === owner.scope.seriesId && assetLibraryName(item) === name);
+        if (matches.length === 1) {
+          attachContinuousAsset(owner, draftId, kind, matches[0]!.id, catalogs);
+        } else {
+          updateContinuousChapterEditor(sessionId, (current) => ({
+            ...current,
+            busy: false,
+            notice: matches.length === 0
+              ? "目录中仍未找到该素材；创建结果未确认，不会再次创建。"
+              : "目录中出现多个同名素材，无法唯一确认；请人工核对。",
+          }));
+        }
+        return;
+      }
+      if (owner.pendingUpdate === null) {
+        updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: false, notice: "没有待确认的写入。" }));
+        return;
+      }
+      const [directory, assets] = await Promise.all([
+        owner.scope.services.listChapters(owner.scope.seriesId, controller.signal),
+        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, controller.signal),
+      ]);
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, controller.signal)) return;
+      const matching = directory.filter((item) => item.id === owner.chapter.id && item.series_id === owner.scope.seriesId);
+      const fresh = matching.length === 1 ? matching[0] : undefined;
+      const content = owner.pendingUpdate.content;
+      const confirmed = fresh !== undefined && content !== undefined
+        && continuousWriteReadbackMatches(content, fresh, assets, owner.scope.seriesId);
+      if (confirmed) {
+        const orphanCandidates = removedContinuousAssetCandidates(owner.snapshot, content);
+        applyFreshChapterDirectory(directory, owner.scope);
+        refreshAssetsAfterFrameRead(owner.chapter.id, assets);
+        const nextSnapshot = createContinuousChapterDraft(fresh, assets, owner.snapshot.lockIdentity);
+        const next = updateContinuousChapterEditor(sessionId, (current) => ({
+          ...current,
+          chapter: fresh,
+          snapshot: nextSnapshot,
+          draft: nextSnapshot.frames,
+          undoStack: [],
+          redoStack: [],
+          selectedIndex: Math.min(current.selectedIndex, Math.max(0, nextSnapshot.frames.length - 1)),
+          dirty: false,
+          busy: false,
+          pendingUpdate: null,
+          pendingAssetCreate: null,
+          notice: "已从服务器重新读取并确认整章保存。",
+        }));
+        if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
+        await checkContinuousRemovedAssets(sessionId, owner, fresh, orphanCandidates);
+      } else {
+        updateContinuousChapterEditor(sessionId, (current) => ({
+          ...current,
+          busy: false,
+          notice: "重新读取后仍无法确认原写入结果。草稿与原请求保持冻结，不会自动重发。",
+        }));
+      }
+    } catch (cause) {
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, controller.signal)) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      updateContinuousChapterEditor(sessionId, (current) => ({
+        ...current,
+        busy: false,
+        notice: error.status === 401 ? "登录状态已失效，当前请求结果仍待确认。" : "重新读取失败；草稿和原请求仍保留。",
+      }));
+    }
+  }
+
+  async function checkContinuousRemovedAssets(
+    sessionId: string,
+    requestOwner: ContinuousChapterEditorContext,
+    confirmedChapter: Chapter,
+    candidates: readonly AssetOrphanCandidate[],
+  ): Promise<void> {
+    if (candidates.length === 0) return;
+    const port = requestOwner.scope.services.assetMaintenance;
+    const signal = requestOwner.lifecycleController.signal;
+    if (port === undefined) {
+      updateContinuousChapterEditor(sessionId, (current) => current.chapter === confirmedChapter && !current.dirty && !current.busy
+        ? { ...current, notice: "整章保存已确认；当前服务未提供全剧集素材使用核对，素材未删除。" }
+        : current);
+      return;
+    }
+    try {
+      const result = await port.checkOrphans(requestOwner.scope.seriesId, { items: [...candidates] }, signal);
+      if (!isContinuousChapterEditorCurrent(
+        sessionId,
+        requestOwner.scope,
+        confirmedChapter.id,
+        requestOwner.requestGeneration,
+        signal,
+      )) return;
+      const expected = new Set(candidates.map((item) => `${item.type}:${item.id}`));
+      const counts = new Map<string, number>();
+      for (const orphan of result.orphans) {
+        const key = `${orphan.type}:${orphan.id}`;
+        if (expected.has(key)) counts.set(key, (counts.get(key) ?? 0) + 1);
+      }
+      const confirmedOrphans = candidates.filter((item) => counts.get(`${item.type}:${item.id}`) === 1);
+      updateContinuousChapterEditor(sessionId, (current) => current.chapter === confirmedChapter && !current.dirty && !current.busy
+        ? {
+            ...current,
+            notice: confirmedOrphans.length === 0
+              ? "整章保存已确认；全剧集素材使用情况已核对，没有发现可确认的孤立素材。未自动删除素材。"
+              : `整章保存已确认；全剧集核对发现 ${confirmedOrphans.length} 项可能孤立素材。未自动删除，可在素材库中人工检查。`,
+          }
+        : current);
+    } catch (cause) {
+      if (!isContinuousChapterEditorCurrent(
+        sessionId,
+        requestOwner.scope,
+        confirmedChapter.id,
+        requestOwner.requestGeneration,
+        signal,
+      )) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      updateContinuousChapterEditor(sessionId, (current) => current.chapter === confirmedChapter && !current.dirty && !current.busy
+        ? {
+            ...current,
+            notice: error.status === 401
+              ? "整章保存已确认；登录状态已变化，素材使用情况未核对，未删除素材。"
+              : "整章保存已确认；素材使用情况暂未核对，可稍后在素材库重新检查。未删除素材。",
+          }
+        : current);
+    }
+  }
+
+  async function saveContinuousChapterEditor(sessionId: string): Promise<void> {
+    const owner = continuousChapterEditorRef.current;
+    if (owner === null || owner.sessionId !== sessionId || !owner.dirty || owner.busy
+      || owner.pendingUpdate !== null || owner.pendingAssetCreate !== null || services.updateChapter === undefined) return;
+    let update: ReturnType<typeof buildGuardedChapterUpdate>;
+    try {
+      update = buildGuardedChapterUpdate(owner.snapshot, owner.draft);
+    } catch (cause) {
+      updateContinuousChapterEditor(sessionId, (current) => ({
+        ...current,
+        notice: cause instanceof Error ? cause.message : "整章草稿无法安全构造。",
+      }));
+      return;
+    }
+    const signal = owner.lifecycleController.signal;
+    const updateChapter = owner.scope.services.updateChapter;
+    if (updateChapter === undefined) {
+      updateContinuousChapterEditor(sessionId, (current) => ({ ...current, notice: "当前服务未接入整章保存。" }));
+      return;
+    }
+    updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: true, pendingUpdate: update, notice: "正在核对章节、分镜素材和编辑锁…" }));
+    let writeStarted = false;
+    try {
+      const [directory, assets, catalogs] = await Promise.all([
+        owner.scope.services.listChapters(owner.scope.seriesId, signal),
+        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+        readContinuousCatalogs(owner.scope, signal),
+      ]);
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      const matching = directory.filter((item) => item.id === owner.chapter.id && item.series_id === owner.scope.seriesId);
+      const fresh = matching.length === 1 ? matching[0] : undefined;
+      if (fresh === undefined || fresh.order !== owner.snapshot.chapter.order
+        || !sameChapterContent(fresh.content, owner.snapshot.chapter.content)
+        || !sameStoryboardAssetPositions(owner.snapshot.expectedStoryboards.map((item) => ({ ...item })), assets)) {
+        updateContinuousChapterEditor(sessionId, (current) => ({
+          ...current,
+          busy: false,
+          pendingUpdate: null,
+          notice: "章节或分镜目录已变化；草稿保留，未发送写入。请重新读取核对后再开新会话。",
+        }));
+        return;
+      }
+      validateContinuousCatalogReferences({ ...owner.chapter, content: update.content ?? [] }, catalogs);
+      if (owner.lockIdentity !== null) {
+        const readLock = owner.scope.services.getChapterEditLock;
+        if (readLock === undefined) throw new ApiError("invalid-response", "无法重新核对章节编辑锁。", null);
+        const lock = owner.lockLease === null
+          ? await readLock(owner.chapter.id, signal)
+          : await readLock(owner.chapter.id, signal, owner.lockLease);
+        if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+        if (!validOwnedChapterLock(lock, owner.scope.userId) || !sameChapterEditLockIdentity(owner.lockIdentity, lock)) {
+          throw new ApiError("http", "章节编辑锁身份或有效期已变化，未发送整章写入。", 409);
+        }
+      }
+      updateContinuousChapterEditor(sessionId, (current) => ({ ...current, catalogs, notice: "目录与编辑锁已核对，正在保存…" }));
+      writeStarted = true;
+      await updateChapter(owner.scope.seriesId, owner.chapter.id, update, signal);
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      updateContinuousChapterEditor(sessionId, (current) => ({
+        ...current,
+        busy: false,
+        notice: "写入已返回，正在重新读取核对…",
+      }));
+      await verifyContinuousUnknown(sessionId);
+    } catch (cause) {
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      const uncertain = writeStarted && (error.status === 408 || error.status === null || error.status >= 500 || error.kind === "network" || error.kind === "timeout");
+      if (uncertain) {
+        updateContinuousChapterEditor(sessionId, (current) => ({
+          ...current,
+          busy: false,
+          pendingUpdate: update,
+          notice: "保存请求已发出，但结果未确认；不会自动再次发送。",
+        }));
+        await verifyContinuousUnknown(sessionId);
+      } else {
+        updateContinuousChapterEditor(sessionId, (current) => ({
+          ...current,
+          busy: false,
+          pendingUpdate: null,
+          notice: writeStarted
+            ? error.detail ?? error.message
+            : error.detail ?? error.message ?? "保存前核对失败，草稿保留且未发送写入。",
+        }));
+      }
+    }
+  }
+
+  async function createContinuousAsset(
+    sessionId: string,
+    kind: ContinuousAssetKind,
+    name: string,
+  ): Promise<void> {
+    const owner = continuousChapterEditorRef.current;
+    if (owner === null || owner.sessionId !== sessionId || owner.busy || owner.pendingUpdate !== null
+      || owner.pendingAssetCreate !== null) return;
+    const draftId = owner.draft[owner.selectedIndex]?.draftId;
+    if (draftId === undefined) return;
+    const signal = owner.lifecycleController.signal;
+    const existingCatalog = owner.catalogs;
+    const existing = (kind === "character" ? existingCatalog.characters : kind === "scene" ? existingCatalog.scenes : existingCatalog.props)
+      .filter((asset) => asset.series_id === owner.scope.seriesId && assetLibraryName(asset) === name);
+    if (existing.length > 0) {
+      if (existing.length === 1) attachContinuousAsset(owner, draftId, kind, existing[0]!.id, existingCatalog);
+      else updateContinuousChapterEditor(sessionId, (current) => ({ ...current, notice: "素材目录中存在同名项目，无法唯一确认。" }));
+      return;
+    }
+    const create = kind === "character" ? owner.scope.services.createCharacter
+      : kind === "scene" ? owner.scope.services.createScene
+        : owner.scope.services.createProp;
+    if (create === undefined) {
+      updateContinuousChapterEditor(sessionId, (current) => ({ ...current, notice: "当前服务没有接入该类素材创建。" }));
+      return;
+    }
+    updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: true, notice: "正在创建素材并核对目录…" }));
+    let createStarted = false;
+    try {
+      createStarted = true;
+      if (kind === "character") await owner.scope.services.createCharacter!(owner.scope.seriesId, { name, description: "" }, signal);
+      else if (kind === "scene") await owner.scope.services.createScene!(owner.scope.seriesId, { title: name, description: "" }, signal);
+      else await owner.scope.services.createProp!(owner.scope.seriesId, { name, description: "" }, signal);
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      const catalogs = await readContinuousCatalogs(owner.scope, signal);
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      const items = kind === "character" ? catalogs.characters : kind === "scene" ? catalogs.scenes : catalogs.props;
+      const matches = items.filter((asset) => asset.series_id === owner.scope.seriesId && assetLibraryName(asset) === name);
+      if (matches.length === 1) attachContinuousAsset(owner, draftId, kind, matches[0]!.id, catalogs);
+      else updateContinuousChapterEditor(sessionId, (current) => ({
+        ...current,
+        busy: false,
+        pendingAssetCreate: { kind, name, draftId },
+        notice: matches.length === 0 ? "创建已返回，但目录暂未确认素材；不会自动重建。" : "目录出现多个同名素材，创建结果无法唯一确认。",
+      }));
+    } catch (cause) {
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      const uncertain = createStarted && (error.status === 408 || error.status === null || error.status >= 500 || error.kind === "network" || error.kind === "timeout");
+      updateContinuousChapterEditor(sessionId, (current) => ({
+        ...current,
+        busy: false,
+        pendingAssetCreate: uncertain ? { kind, name, draftId } : null,
+        notice: uncertain ? "素材创建结果未确认；不会自动再次创建，请重新读取目录。" : error.detail ?? error.message,
+      }));
+      if (uncertain) await verifyContinuousUnknown(sessionId);
+    }
+  }
+
   async function openFrameStructureEditor(mode: FrameStructureMode): Promise<void> {
     const directoryAtOpen = chapterDirectoryRef.current;
     if (!canEditFrameStructure || chapterManagement !== null || chapterManagementBlocked
       || chapterOrderEditorRef.current !== null || frameTextEditorRef.current !== null
-      || frameStructureEditorRef.current !== null || frameEditOpening || chaptersLoading
+      || frameStructureEditorRef.current !== null || continuousChapterEditorRef.current !== null || frameEditOpening || chaptersLoading
       || chapters === null || chaptersError !== null || selectedChapter === null
       || directoryAtOpen.chapters !== chapters
       || !sameChapterBrowserScope(directoryAtOpen.scope, currentScope)
@@ -4135,7 +4844,8 @@ export function ChapterBrowser({
   const selectedIndex = chapters?.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen || productionChecklistOpen;
   const chapterManagementBlocked = chapterPanelsOpen
-    || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null || frameEditOpening
+    || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null
+    || continuousChapterEditor !== null || frameEditOpening
     || storyboardGenerationDialog !== null || frameReviewDialog !== null
     || frameOptimizeDialog !== null || frameOptimizeOpening
     || storyboardAssetExtractionDialog !== null || storyboardAssetExtractionOpening;
@@ -5378,7 +6088,9 @@ export function ChapterBrowser({
     : null;
 
   return (
-    <section className="chapter-browser" aria-labelledby="chapter-browser-heading">
+    <section className={continuousPreviewActive && continuousChapterEditor !== null
+      ? "chapter-browser continuous-chapter-browser-active"
+      : "chapter-browser"} aria-labelledby="chapter-browser-heading">
       <div className="chapter-browser-heading">
         <div>
           <p className="eyebrow">{canEditStoryboard ? "章节与分镜" : "只读浏览"}</p>
@@ -5391,7 +6103,7 @@ export function ChapterBrowser({
       </div>
 
       <div className="chapter-browser-layout">
-        <aside className="chapter-list-panel" aria-label="章节列表">
+        <aside className="chapter-list-panel" aria-label="章节列表" hidden={continuousPreviewActive && continuousChapterEditor !== null}>
           <div className="chapter-list-heading">
             <div>
               <p className="eyebrow">剧集章节</p>
@@ -5526,7 +6238,8 @@ export function ChapterBrowser({
             </div>
           )}
 
-          {!chaptersLoading && chaptersError === null && selectedChapter !== null && (
+          {!chaptersLoading && chaptersError === null && selectedChapter !== null
+            && !(continuousPreviewActive && continuousChapterEditor !== null) && (
             <>
               <header className="selected-chapter-header">
                 <div>
@@ -6195,6 +6908,45 @@ export function ChapterBrowser({
                 </>
               )}
             </>
+          )}
+          {continuousPreviewActive && selectedChapter !== null && continuousChapterEditor === null && (
+            <section className="continuous-chapter-launch" aria-label="整章连续编辑入口">
+              <p className="eyebrow">整章连续编辑</p>
+              <h2>{displayChapterTitle(selectedChapter)}</h2>
+              <p>先确认当前服务支持条件保存，再重新读取本章、分镜素材和编辑锁。</p>
+              {chapterMutationNotice !== null && <p role="status">{chapterMutationNotice}</p>}
+              <button
+                className="primary-button"
+                disabled={!canEditStoryboard || chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                onClick={() => void openContinuousChapterEditor()}
+                type="button"
+              >{frameEditOpening ? "正在核对章节与编辑锁…" : "开启整章连续编辑"}</button>
+            </section>
+          )}
+          {continuousPreviewActive && continuousChapterEditor !== null
+            && sameChapterBrowserScope(continuousChapterEditor.scope, currentScope)
+            && continuousChapterEditor.chapter.id === selectedChapterId && (
+            <ContinuousChapterEditor
+              busy={continuousChapterEditor.busy}
+              catalogs={continuousChapterEditor.catalogs}
+              canRedo={continuousChapterEditor.redoStack.length > 0}
+              canUndo={continuousChapterEditor.undoStack.length > 0}
+              dirty={continuousChapterEditor.dirty}
+              frames={continuousChapterEditor.draft}
+              notice={continuousChapterEditor.notice}
+              onCreateAsset={(kind, name) => void createContinuousAsset(continuousChapterEditor.sessionId, kind, name)}
+              onDiscard={() => finishContinuousChapterEditor(true)}
+              onExit={() => finishContinuousChapterEditor(false)}
+              onFramesChange={(frames) => changeContinuousDraft(continuousChapterEditor.sessionId, frames)}
+              onSave={() => void saveContinuousChapterEditor(continuousChapterEditor.sessionId)}
+              onRedo={() => redoContinuousDraft(continuousChapterEditor.sessionId)}
+              onSelectFrame={(index) => selectContinuousDraftFrame(continuousChapterEditor.sessionId, index)}
+              onUndo={() => undoContinuousDraft(continuousChapterEditor.sessionId)}
+              onVerifyUnknown={() => void verifyContinuousUnknown(continuousChapterEditor.sessionId)}
+              selectedIndex={continuousChapterEditor.selectedIndex}
+              snapshot={continuousChapterEditor.snapshot}
+              unknownWrite={continuousChapterEditor.pendingUpdate !== null || continuousChapterEditor.pendingAssetCreate !== null}
+            />
           )}
         </div>
       </div>
