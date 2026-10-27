@@ -237,6 +237,7 @@ export function CreatorSettingsPage({
   const [listError, setListError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [providerQuotaOpen, setProviderQuotaOpen] = useState(false);
+  const providerQuotaCloseGuard = useRef<() => boolean>(() => true);
   const [draft, setDraft] = useState<SettingsDraft | null>(null);
   const [modelDraftGeneration, setModelDraftGeneration] = useState(0);
   const [orderDraft, setOrderDraft] = useState<{ tab: SettingsTab; category: string; baseline: string[]; ids: string[] } | null>(null);
@@ -471,6 +472,7 @@ export function CreatorSettingsPage({
 
   function changeTab(nextTab: SettingsTab): boolean {
     if (nextTab === tab) return true;
+    if (providerQuotaOpen && !providerQuotaCloseGuard.current()) return false;
     if (pendingLock.current || verification !== null || !confirmDiscard()) return false;
     invalidateCurrentView();
     discardDrafts();
@@ -478,6 +480,14 @@ export function CreatorSettingsPage({
     setTab(nextTab);
     setNotice(null);
     return true;
+  }
+
+  function toggleProviderQuota(): void {
+    if (!providerQuotaOpen) {
+      setProviderQuotaOpen(true);
+      return;
+    }
+    if (providerQuotaCloseGuard.current()) setProviderQuotaOpen(false);
   }
 
   function handleTabKeyDown(event: ReactKeyboardEvent<HTMLButtonElement>, currentTabValue: SettingsTab): void {
@@ -1264,6 +1274,7 @@ export function CreatorSettingsPage({
   }
 
   function requestBack(): void {
+    if (providerQuotaOpen && !providerQuotaCloseGuard.current()) return;
     if (pending || verification !== null) {
       if (!window.confirm("当前有操作正在保存或只读核对，离开后将中断页面核对。继续吗？")) return;
     } else if (!confirmDiscard()) {
@@ -1341,7 +1352,7 @@ export function CreatorSettingsPage({
             <button
               aria-controls="creator-provider-quota-panel"
               aria-expanded={providerQuotaOpen}
-              onClick={() => setProviderQuotaOpen((open) => !open)}
+              onClick={toggleProviderQuota}
               type="button"
             >
               {providerQuotaOpen ? "收起额度监控" : "供应商额度监控"}
@@ -1359,6 +1370,7 @@ export function CreatorSettingsPage({
           actorId={userId}
           isSuperuser={isSuperuser}
           onClose={() => setProviderQuotaOpen(false)}
+          onCloseGuardChange={(guard) => { providerQuotaCloseGuard.current = guard; }}
           onUnauthorized={onUnauthorized}
           service={providerQuotaService}
         />

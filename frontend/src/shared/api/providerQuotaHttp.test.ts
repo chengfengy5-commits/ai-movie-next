@@ -23,7 +23,7 @@ function jsonResponse(payload: unknown): Response {
 }
 
 describe("provider quota HTTP projection", () => {
-  it("uses authenticated read routes, safe DTOs, and a narrow balance timeout", async () => {
+  it("uses authenticated quota routes and keeps account credentials out of read projections", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "admin-session-token");
     const accountPayload = [
@@ -88,16 +88,28 @@ describe("provider quota HTTP projection", () => {
       }
 
       const path = new URL(String(input)).pathname;
-      return jsonResponse(path.endsWith("/provider-quota/accounts") ? accountPayload : balancePayload);
+      const method = init?.method ?? "GET";
+      if (path.endsWith("/provider-quota/accounts") && method === "GET") return jsonResponse(accountPayload);
+      if (path.endsWith("/provider-quota/accounts") && method === "POST") {
+        return jsonResponse({ ...accountPayload[0], id: "quota-created", name: "新增账号", is_active: true });
+      }
+      if (path.endsWith("/provider-quota/accounts/quota-a") && method === "PUT") {
+        return jsonResponse({ ...accountPayload[1], name: "更新账号" });
+      }
+      if (path.endsWith("/provider-quota/accounts/quota-a") && method === "DELETE") return jsonResponse({ ok: true });
+      if (path.endsWith("/provider-quota/probe")) {
+        return jsonResponse({ id: "", ok: true, errors: [], balance: 0, unit: "$" });
+      }
+      return jsonResponse(balancePayload);
     });
     const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
     const service = services.providerQuota;
     if (service === undefined) throw new Error("Expected the provider quota service.");
 
     const controller = new AbortController();
-    const accounts = await service.listAccounts(controller.signal);
-    expect(accounts.map(({ id }) => id)).toEqual(["quota-a", "quota-b"]);
-    expect(accounts[0]).toEqual({
+    const directory = await service.listAccountDirectory(controller.signal);
+    expect(directory.accounts.map(({ id }) => id)).toEqual(["quota-a", "quota-b"]);
+    expect(directory.accounts[0]).toEqual({
       id: "quota-a",
       name: "新 API",
       providerType: "new_api",
@@ -105,7 +117,14 @@ describe("provider quota HTTP projection", () => {
       sortOrder: 10,
       consoleUrl: "https://console.example/account",
     });
-    expect(accounts[1]?.consoleUrl).toBeNull();
+    expect(directory.accounts[1]?.consoleUrl).toBeNull();
+    expect(directory.editableAccounts[0]).toMatchObject({
+      id: "quota-a",
+      baseUrl: "https://gateway.example",
+      hasUsername: true,
+    });
+    expect(directory.editableAccounts[0]).not.toHaveProperty("username");
+    expect(directory.editableAccounts[0]).not.toHaveProperty("password");
 
     const balance = await service.getBalance("quota-a", controller.signal);
     expect(balance).toMatchObject({
@@ -125,11 +144,39 @@ describe("provider quota HTTP projection", () => {
     expect("username" in balance).toBe(false);
     expect("password" in balance).toBe(false);
     expect("errors" in balance).toBe(false);
-    expect(JSON.stringify({ accounts, balance })).not.toContain("do-not-render");
-    expect(JSON.stringify({ accounts, balance })).not.toContain("must-not-project");
-    expect(fetcher).toHaveBeenCalledTimes(2);
-    expect(fetcher.mock.calls.map(([input, init]) => ({
-      url: String(input),
+    expect(JSON.stringify({ directory, balance })).not.toContain("do-not-render");
+    expect(JSON.stringify({ directory, balance })).not.toContain("must-not-project");
+
+    const input = {
+      name: "新增账号",
+      providerType: "deepseek" as const,
+      baseUrl: "https://gateway.example/v1/",
+      username: "fresh-user",
+      password: "fresh-secret",
+      isActive: true,
+    };
+    const created = await service.createAccount(input, controller.signal);
+    expect(created).toMatchObject({
+      id: "quota-created",
+      name: "新增账号",
+      baseUrl: "https://gateway.example",
+      hasUsername: true,
+    });
+    expect(JSON.stringify(created)).not.toContain("fresh-secret");
+    const updated = await service.updateAccount("quota-a", { ...input, name: "更新账号", username: "", password: "" }, controller.signal);
+    expect(updated).toMatchObject({ id: "quota-a", name: "更新账号" });
+    await service.deleteAccount("quota-a", controller.signal);
+    await expect(service.probeConnection({
+      providerType: input.providerType,
+      baseUrl: input.baseUrl,
+      username: input.username,
+      password: input.password,
+    }, controller.signal))
+      .resolves.toMatchObject({ ok: true, balance: 0, unit: "$" });
+
+    expect(fetcher).toHaveBeenCalledTimes(6);
+    expect(fetcher.mock.calls.map(([requestInput, init]) => ({
+      url: String(requestInput),
       method: init?.method,
       authorization: new Headers(init?.headers).get("Authorization"),
       body: init?.body,
@@ -146,12 +193,55 @@ describe("provider quota HTTP projection", () => {
         authorization: "Bearer admin-session-token",
         body: undefined,
       },
+      {
+        url: "http://127.0.0.1:4175/api/provider-quota/accounts",
+        method: "POST",
+        authorization: "Bearer admin-session-token",
+        body: JSON.stringify({
+          name: input.name,
+          provider_type: input.providerType,
+          base_url: input.baseUrl,
+          username: input.username,
+          password: input.password,
+          is_active: input.isActive,
+        }),
+      },
+      {
+        url: "http://127.0.0.1:4175/api/provider-quota/accounts/quota-a",
+        method: "PUT",
+        authorization: "Bearer admin-session-token",
+        body: JSON.stringify({
+          name: "更新账号",
+          provider_type: input.providerType,
+          base_url: input.baseUrl,
+          username: "",
+          password: "",
+          is_active: input.isActive,
+        }),
+      },
+      {
+        url: "http://127.0.0.1:4175/api/provider-quota/accounts/quota-a",
+        method: "DELETE",
+        authorization: "Bearer admin-session-token",
+        body: undefined,
+      },
+      {
+        url: "http://127.0.0.1:4175/api/provider-quota/probe",
+        method: "POST",
+        authorization: "Bearer admin-session-token",
+        body: JSON.stringify({
+          provider_type: "deepseek",
+          base_url: "https://gateway.example/v1/",
+          username: "fresh-user",
+          password: "fresh-secret",
+        }),
+      },
     ]);
 
     vi.useFakeTimers();
     try {
       hangRequests = true;
-      const listRequest = service.listAccounts(new AbortController().signal);
+      const listRequest = service.listAccountDirectory(new AbortController().signal);
       const listTimeout = expect(listRequest).rejects.toMatchObject({ kind: "timeout" });
       await vi.advanceTimersByTimeAsync(15_000);
       await listTimeout;
@@ -165,6 +255,19 @@ describe("provider quota HTTP projection", () => {
       expect(balanceSignal?.aborted).toBe(false);
       await vi.advanceTimersByTimeAsync(1);
       await balanceTimeout;
+
+      const probeRequest = service.probeConnection({
+        providerType: "deepseek",
+        baseUrl: "https://gateway.example/v1/",
+        username: "fresh-user",
+        password: "fresh-secret",
+      }, new AbortController().signal);
+      const probeTimeout = expect(probeRequest).rejects.toMatchObject({ kind: "timeout" });
+      const probeSignal = fetcher.mock.calls.at(-1)?.[1]?.signal;
+      await vi.advanceTimersByTimeAsync(59_999);
+      expect(probeSignal?.aborted).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await probeTimeout;
     } finally {
       vi.useRealTimers();
     }

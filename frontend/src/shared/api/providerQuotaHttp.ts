@@ -1,8 +1,13 @@
 import { ApiError } from "./errors";
 import type {
   ProviderQuotaAccount,
+  ProviderQuotaAccountDirectory,
+  ProviderQuotaAccountEditor,
+  ProviderQuotaAccountInput,
   ProviderQuotaBalance,
   ProviderQuotaExtraMeta,
+  ProviderQuotaProbeInput,
+  ProviderQuotaProbeResult,
   ProviderQuotaJsonRequester,
   ProviderQuotaServicePort,
 } from "./providerQuota";
@@ -77,10 +82,10 @@ function parseExtraMeta(value: unknown): ProviderQuotaExtraMeta[] {
   return result;
 }
 
-export function parseProviderQuotaAccounts(payload: unknown): ProviderQuotaAccount[] {
+function parseAccountRows(payload: unknown): ProviderQuotaAccountDirectory {
   if (!Array.isArray(payload)) throw invalidResponse();
   const ids = new Set<string>();
-  return payload.map((item) => {
+  const rows = payload.map((item): { account: ProviderQuotaAccount; editor: ProviderQuotaAccountEditor } => {
     const source = record(item);
     const id = requiredString(source, "id");
     if (ids.has(id)) throw invalidResponse();
@@ -88,21 +93,53 @@ export function parseProviderQuotaAccounts(payload: unknown): ProviderQuotaAccou
 
     const name = source.name;
     const providerType = source.provider_type;
+    const baseUrl = source.base_url;
+    const username = source.username;
     const isActive = source.is_active;
     const sortOrder = source.sort_order;
     if (typeof name !== "string" || typeof providerType !== "string"
+      || typeof baseUrl !== "string" || typeof username !== "string"
       || typeof isActive !== "boolean" || typeof sortOrder !== "number"
       || !Number.isSafeInteger(sortOrder)) throw invalidResponse();
 
+    const safeName = displayString(name);
+    const safeProviderType = displayString(providerType, "new_api", 80);
     return {
-      id,
-      name: displayString(name),
-      providerType: displayString(providerType, "new_api", 80),
-      isActive,
-      sortOrder,
-      consoleUrl: safeConsoleUrl(source.console_url),
+      account: {
+        id,
+        name: safeName,
+        providerType: safeProviderType,
+        isActive,
+        sortOrder,
+        consoleUrl: safeConsoleUrl(source.console_url),
+      },
+      editor: {
+        id,
+        name: safeName,
+        providerType: safeProviderType,
+        baseUrl: displayString(baseUrl, "", 500),
+        hasUsername: username.trim() !== "",
+        isActive,
+        sortOrder,
+        consoleUrl: safeConsoleUrl(source.console_url),
+      },
     };
-  }).sort((left, right) => left.sortOrder - right.sortOrder);
+  }).sort((left, right) => left.account.sortOrder - right.account.sortOrder);
+  return {
+    accounts: rows.map(({ account }) => account),
+    editableAccounts: rows.map(({ editor }) => editor),
+  };
+}
+
+export function parseProviderQuotaAccountDirectory(payload: unknown): ProviderQuotaAccountDirectory {
+  return parseAccountRows(payload);
+}
+
+export function parseProviderQuotaAccountReceipt(payload: unknown, expectedId?: string): ProviderQuotaAccountEditor {
+  const directory = parseAccountRows([payload]);
+  const account = directory.editableAccounts[0];
+  if (account === undefined || (expectedId !== undefined && account.id !== expectedId)) throw invalidResponse();
+  return account;
 }
 
 export function parseProviderQuotaBalance(payload: unknown, expectedAccountId: string): ProviderQuotaBalance {
@@ -158,20 +195,58 @@ export function parseProviderQuotaBalance(payload: unknown, expectedAccountId: s
   };
 }
 
+export function parseProviderQuotaDeleteReceipt(payload: unknown): void {
+  const source = record(payload);
+  if (source.ok !== true) throw invalidResponse();
+}
+
+export function parseProviderQuotaProbeResult(payload: unknown): ProviderQuotaProbeResult {
+  const source = record(payload);
+  if (source.id !== "" || typeof source.ok !== "boolean" || !Array.isArray(source.errors)) {
+    throw invalidResponse();
+  }
+  const balance = optionalAmount(source, "balance");
+  const unit = source.unit;
+  if (unit !== undefined && unit !== null && typeof unit !== "string") throw invalidResponse();
+  return {
+    ok: source.ok && source.errors.length === 0 && balance !== null,
+    balance,
+    unit: displayString(unit, "$", 12),
+  };
+}
+
 /**
  * Adapts the application's authenticated JSON requester into a strict quota
  * projection. The requester owns token, session-generation, and HTTP handling.
  */
 export function createProviderQuotaHttp(requestJson: ProviderQuotaJsonRequester): ProviderQuotaServicePort {
   return {
-    async listAccounts(signal) {
+    async listAccountDirectory(signal) {
       const payload = await requestJson({ endpoint: "providerQuotaAccounts" }, signal);
-      return parseProviderQuotaAccounts(payload);
+      return parseProviderQuotaAccountDirectory(payload);
     },
     async getBalance(accountId, signal) {
       if (accountId.trim() === "") throw invalidResponse();
       const payload = await requestJson({ endpoint: "providerQuotaAccountBalance", accountId }, signal);
       return parseProviderQuotaBalance(payload, accountId);
+    },
+    async createAccount(input: ProviderQuotaAccountInput, signal) {
+      const payload = await requestJson({ endpoint: "providerQuotaCreateAccount", input }, signal);
+      return parseProviderQuotaAccountReceipt(payload);
+    },
+    async updateAccount(accountId: string, input: ProviderQuotaAccountInput, signal) {
+      if (accountId.trim() === "") throw invalidResponse();
+      const payload = await requestJson({ endpoint: "providerQuotaUpdateAccount", accountId, input }, signal);
+      return parseProviderQuotaAccountReceipt(payload, accountId);
+    },
+    async deleteAccount(accountId: string, signal) {
+      if (accountId.trim() === "") throw invalidResponse();
+      const payload = await requestJson({ endpoint: "providerQuotaDeleteAccount", accountId }, signal);
+      parseProviderQuotaDeleteReceipt(payload);
+    },
+    async probeConnection(input: ProviderQuotaProbeInput, signal) {
+      const payload = await requestJson({ endpoint: "providerQuotaProbe", input }, signal);
+      return parseProviderQuotaProbeResult(payload);
     },
   };
 }

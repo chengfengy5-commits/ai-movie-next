@@ -8,6 +8,93 @@
   color: #26313d;
 }
 
+.provider-quota-editor {
+  display: grid;
+  gap: 12px;
+  padding: 15px;
+  border: 1px solid #cad7e8;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.provider-quota-editor-heading,
+.provider-quota-editor-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.provider-quota-editor-heading h3 {
+  margin: 0;
+  color: #1d2732;
+  font-size: 16px;
+}
+
+.provider-quota-editor-heading p,
+.provider-quota-editor-hint {
+  margin: 5px 0 0;
+  color: #647080;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.provider-quota-editor-fields {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 10px;
+}
+
+.provider-quota-editor-fields label {
+  display: grid;
+  gap: 5px;
+  color: #455261;
+  font-size: 12px;
+}
+
+.provider-quota-editor-fields input:not([type="checkbox"]),
+.provider-quota-editor-fields select {
+  width: 100%;
+  min-height: 36px;
+  box-sizing: border-box;
+  padding: 7px 9px;
+  border: 1px solid #cbd3de;
+  border-radius: 7px;
+  color: #26313d;
+  font: inherit;
+}
+
+.provider-quota-editor-active {
+  display: flex !important;
+  align-items: center;
+  align-self: end;
+  min-height: 36px;
+}
+
+.provider-quota-editor-error {
+  margin: 0;
+  color: #8a3025;
+  font-size: 12px;
+}
+
+.provider-quota-editor-message {
+  margin: 0;
+  color: #304e7f;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.provider-quota-editor-actions {
+  justify-content: flex-start;
+}
+
+.provider-quota-editor-actions .is-primary {
+  border-color: #315f9e;
+  background: #315f9e;
+  color: #fff;
+}
+
 .provider-quota-panel button {
   min-height: 36px;
   padding: 7px 11px;
@@ -58,6 +145,49 @@
 
 .provider-quota-panel-actions {
   flex: 0 0 auto;
+}
+
+.provider-quota-panel-account-actions,
+.provider-quota-panel-unknown > div,
+.provider-quota-panel-delete-confirm,
+.provider-quota-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.provider-quota-panel-account-actions > span {
+  color: #647080;
+  font-size: 12px;
+}
+
+.provider-quota-panel-unknown,
+.provider-quota-panel-delete-confirm {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px solid #e5cc88;
+  border-radius: 8px;
+  background: #fff7df;
+  color: #624b19;
+}
+
+.provider-quota-panel-unknown p,
+.provider-quota-panel-delete-confirm p {
+  margin: 0;
+  line-height: 1.5;
+}
+
+.provider-quota-card-actions {
+  padding-top: 4px;
+  border-top: 1px solid #edf0f4;
+}
+
+.provider-quota-card-actions button {
+  min-height: 30px;
+  padding: 4px 8px;
+  font-size: 12px;
 }
 
 .provider-quota-panel-summary {

@@ -16,7 +16,7 @@ import type {
 } from "../../shared/api/creatorSettings";
 import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { CreatorSettingsPage } from "./CreatorSettingsPage";
-import type { ProviderQuotaAccount, ProviderQuotaBalance, ProviderQuotaServicePort } from "../../shared/api/providerQuota";
+import type { ProviderQuotaAccount, ProviderQuotaAccountEditor, ProviderQuotaBalance, ProviderQuotaServicePort } from "../../shared/api/providerQuota";
 
 afterEach(() => {
   cleanup();
@@ -1058,19 +1058,48 @@ describe("creator settings", () => {
       ...overrides,
     });
     const quotaService: ProviderQuotaServicePort = {
-      listAccounts: vi.fn(async () => accounts),
+      listAccountDirectory: vi.fn(async () => ({
+        accounts,
+        editableAccounts: accounts.map((account): ProviderQuotaAccountEditor => ({
+          ...account,
+          baseUrl: "https://gateway.example",
+          hasUsername: false,
+        })),
+      })),
       getBalance: vi.fn(async (accountId: string) => {
         if (accountId === "quota-zero") return makeBalance(accountId, { balance: 0, total: 0 });
         if (accountId === "quota-error") return makeBalance(accountId, { balance: null, hasErrors: true });
         if (accountId === "quota-slow") return lateBalance.promise;
         throw new Error("inactive account must not be queried");
       }),
+      createAccount: vi.fn(async (input) => ({
+        id: "created-account",
+        name: input.name,
+        providerType: input.providerType,
+        baseUrl: input.baseUrl,
+        hasUsername: input.username !== "",
+        isActive: input.isActive,
+        sortOrder: 10,
+        consoleUrl: null,
+      })),
+      updateAccount: vi.fn(async (accountId, input) => ({
+        id: accountId,
+        name: input.name,
+        providerType: input.providerType,
+        baseUrl: input.baseUrl,
+        hasUsername: input.username !== "",
+        isActive: input.isActive,
+        sortOrder: 10,
+        consoleUrl: null,
+      })),
+      deleteAccount: vi.fn(async () => undefined),
+      probeConnection: vi.fn(async () => ({ ok: true, balance: 0, unit: "$" })),
     };
 
     const regularUser = renderPage(settingsService, ownerId, false, quotaService);
     await screen.findByText("我的文本模型");
     expect(screen.queryByRole("button", { name: "供应商额度监控" })).not.toBeInTheDocument();
-    expect(quotaService.listAccounts).not.toHaveBeenCalled();
+    expect(quotaService.listAccountDirectory).not.toHaveBeenCalled();
     expect(quotaService.getBalance).not.toHaveBeenCalled();
     cleanup();
 
@@ -1092,7 +1121,12 @@ describe("creator settings", () => {
       .toBeInTheDocument();
     expect(screen.getByText("该监控账号已停用。")).toBeInTheDocument();
     expect(screen.queryByText(/总剩余额度/)).not.toBeInTheDocument();
-    expect(quotaService.listAccounts).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("button", { name: "添加账号" })).toBeDisabled();
+    const pendingCard = screen.getByText("迟到账户").closest("article");
+    expect(pendingCard).not.toBeNull();
+    expect(within(pendingCard!).getByRole("button", { name: "编辑" })).toBeDisabled();
+    expect(within(pendingCard!).getByRole("button", { name: "停用" })).toBeDisabled();
+    expect(quotaService.listAccountDirectory).toHaveBeenCalledTimes(1);
     expect(quotaService.getBalance).toHaveBeenCalledTimes(3);
     expect(quotaService.getBalance).not.toHaveBeenCalledWith("quota-disabled", expect.anything());
 
@@ -1113,9 +1147,166 @@ describe("creator settings", () => {
     expect(screen.queryByRole("region", { name: "供应商额度监控" })).not.toBeInTheDocument();
     expect(screen.queryByText("不可显示的迟到余额")).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "供应商额度监控" })).not.toBeInTheDocument();
-    expect(quotaService.listAccounts).toHaveBeenCalledTimes(1);
+    expect(quotaService.listAccountDirectory).toHaveBeenCalledTimes(1);
     expect(onUnauthorized).not.toHaveBeenCalled();
     expect(regularUser.onUnauthorized).not.toHaveBeenCalled();
+  });
+
+  it("creates, tests, edits without credential readback, and requires a second delete action", async () => {
+    const user = userEvent.setup();
+    const { service: settingsService } = makeService();
+    let directoryRows: ProviderQuotaAccountEditor[] = [];
+    const toAccount = (item: ProviderQuotaAccountEditor): ProviderQuotaAccount => ({
+      id: item.id,
+      name: item.name,
+      providerType: item.providerType,
+      isActive: item.isActive,
+      sortOrder: item.sortOrder,
+      consoleUrl: item.consoleUrl,
+    });
+    const quotaService: ProviderQuotaServicePort = {
+      listAccountDirectory: vi.fn(async () => ({
+        accounts: directoryRows.map(toAccount),
+        editableAccounts: [...directoryRows],
+      })),
+      getBalance: vi.fn(async () => { throw new Error("quota balance should wait for manual refresh"); }),
+      createAccount: vi.fn(async (input) => {
+        const created: ProviderQuotaAccountEditor = {
+          id: "created-quota",
+          name: input.name,
+          providerType: input.providerType,
+          baseUrl: "https://gateway.example/custom",
+          hasUsername: input.username !== "",
+          isActive: input.isActive,
+          sortOrder: 1,
+          consoleUrl: null,
+        };
+        directoryRows = [created];
+        return created;
+      }),
+      updateAccount: vi.fn(async (accountId, input) => {
+        const updated: ProviderQuotaAccountEditor = {
+          ...directoryRows.find((item) => item.id === accountId)!,
+          name: input.name,
+          providerType: input.providerType,
+          baseUrl: "https://gateway.example/custom",
+          hasUsername: input.username !== "" || directoryRows.find((item) => item.id === accountId)?.hasUsername === true,
+          isActive: input.isActive,
+        };
+        directoryRows = [updated];
+        return updated;
+      }),
+      deleteAccount: vi.fn(async (accountId) => {
+        directoryRows = directoryRows.filter((item) => item.id !== accountId);
+      }),
+      probeConnection: vi.fn(async () => ({ ok: true, balance: 0, unit: "$" })),
+    };
+    const { onBack, view } = renderPage(settingsService, ownerId, true, quotaService);
+    await screen.findByText("我的文本模型");
+    await user.click(await screen.findByRole("button", { name: "供应商额度监控" }));
+    const addAccountButton = await screen.findByRole("button", { name: "添加账号" });
+    await waitFor(() => expect(addAccountButton).toBeEnabled());
+    await user.click(addAccountButton);
+
+    await user.type(screen.getByLabelText("账号名称"), "测试额度账号");
+    await user.type(screen.getByLabelText("网关地址"), "https://gateway.example/custom/v1/");
+    await user.type(screen.getByLabelText("登录账号"), "fresh-user");
+    await user.type(screen.getByLabelText("登录密码"), "fresh-secret");
+    await user.click(screen.getByRole("button", { name: "测试连接" }));
+    expect(await screen.findByText("连接成功，可用余额 $0.00。")).toBeInTheDocument();
+    expect(quotaService.probeConnection).toHaveBeenCalledWith({
+      providerType: "new_api",
+      baseUrl: "https://gateway.example/custom/v1/",
+      username: "fresh-user",
+      password: "fresh-secret",
+    }, expect.any(AbortSignal));
+    expect(document.body.textContent).not.toContain("fresh-secret");
+
+    await user.click(screen.getByRole("button", { name: "创建账号" }));
+    expect(await screen.findByText("测试额度账号")).toBeInTheDocument();
+    expect(quotaService.createAccount).toHaveBeenCalledWith({
+      name: "测试额度账号",
+      providerType: "new_api",
+      baseUrl: "https://gateway.example/custom/v1/",
+      username: "fresh-user",
+      password: "fresh-secret",
+      isActive: true,
+    }, expect.any(AbortSignal));
+    expect(quotaService.getBalance).not.toHaveBeenCalled();
+
+    const card = screen.getByText("测试额度账号").closest("article");
+    expect(card).not.toBeNull();
+    await user.click(within(card!).getByRole("button", { name: "编辑" }));
+    expect(screen.getByLabelText("登录账号")).toHaveValue("");
+    expect(screen.getByLabelText("登录密码")).toHaveValue("");
+    await user.clear(screen.getByLabelText("账号名称"));
+    await user.type(screen.getByLabelText("账号名称"), "更新后的账号");
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(false);
+    await user.click(screen.getByRole("button", { name: "收起额度监控" }));
+    expect(confirmSpy).toHaveBeenCalledOnce();
+    expect(screen.getByRole("region", { name: "供应商额度监控" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "返回工作空间" }));
+    expect(confirmSpy).toHaveBeenCalledTimes(2);
+    expect(onBack).not.toHaveBeenCalled();
+    expect(screen.getByLabelText("账号名称")).toHaveValue("更新后的账号");
+
+    await user.click(screen.getByRole("button", { name: "保存账号" }));
+    expect(await screen.findByText("更新后的账号")).toBeInTheDocument();
+    expect(quotaService.updateAccount).toHaveBeenCalledWith("created-quota", {
+      name: "更新后的账号",
+      providerType: "new_api",
+      baseUrl: "https://gateway.example/custom",
+      username: "",
+      password: "",
+      isActive: true,
+    }, expect.any(AbortSignal));
+
+    const updatedCard = screen.getByText("更新后的账号").closest("article");
+    expect(updatedCard).not.toBeNull();
+    await user.click(within(updatedCard!).getByRole("button", { name: "删除" }));
+    expect(screen.getByRole("alertdialog", { name: "确认删除监控账号" })).toBeInTheDocument();
+    expect(quotaService.deleteAccount).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "确认删除" }));
+    await waitFor(() => expect(quotaService.deleteAccount).toHaveBeenCalledWith("created-quota", expect.any(AbortSignal)));
+    expect(screen.queryByText("更新后的账号")).not.toBeInTheDocument();
+    expect(quotaService.getBalance).not.toHaveBeenCalled();
+    view.unmount();
+  });
+
+  it("does not repeat an unknown quota-account create and requires a directory review before local stop", async () => {
+    const user = userEvent.setup();
+    const { service: settingsService } = makeService();
+    const quotaService: ProviderQuotaServicePort = {
+      listAccountDirectory: vi.fn(async () => ({ accounts: [], editableAccounts: [] })),
+      getBalance: vi.fn(async () => { throw new Error("no accounts to query"); }),
+      createAccount: vi.fn(async () => { throw new ApiError("network", "offline"); }),
+      updateAccount: vi.fn(async () => { throw new Error("unexpected update"); }),
+      deleteAccount: vi.fn(async () => undefined),
+      probeConnection: vi.fn(async () => ({ ok: false, balance: null, unit: "$" })),
+    };
+    renderPage(settingsService, ownerId, true, quotaService);
+    await screen.findByText("我的文本模型");
+    await user.click(await screen.findByRole("button", { name: "供应商额度监控" }));
+    const addAccountButton = await screen.findByRole("button", { name: "添加账号" });
+    await waitFor(() => expect(addAccountButton).toBeEnabled());
+    await user.click(addAccountButton);
+    await user.type(screen.getByLabelText("账号名称"), "结果未知账号");
+    await user.type(screen.getByLabelText("网关地址"), "https://gateway.example/v1/");
+    await user.type(screen.getByLabelText("登录账号"), "fresh-user");
+    await user.type(screen.getByLabelText("登录密码"), "fresh-secret");
+    await user.click(screen.getByRole("button", { name: "创建账号" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent(/创建结果未能确认/);
+    expect(quotaService.createAccount).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "添加账号" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "重新只读核对" }));
+    await waitFor(() => expect(quotaService.listAccountDirectory).toHaveBeenCalledTimes(2));
+    await screen.findByText("目录已刷新；创建结果仍无法按名称或参数关联，请人工核对账号记录。不会自动重试。");
+    await user.click(screen.getByRole("button", { name: "停止本地跟踪" }));
+    expect(await screen.findByText(/本次创建可能已生效/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "添加账号" })).toBeEnabled();
+    expect(quotaService.createAccount).toHaveBeenCalledOnce();
+    expect(quotaService.getBalance).not.toHaveBeenCalled();
   });
 
   it("drops api_key values from model response projections", () => {
