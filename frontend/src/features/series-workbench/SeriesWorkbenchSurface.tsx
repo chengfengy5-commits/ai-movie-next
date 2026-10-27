@@ -7,24 +7,25 @@ interface SeriesWorkbenchSurfaceProps {
   readonly ownerKey: string;
   readonly mode: SeriesWorkbenchSurfaceMode;
   readonly route: SeriesWorkbenchRoute;
-  readonly leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">;
+  readonly leftView: SeriesWorkbenchLeftView;
   readonly leftWidth: number;
   readonly preferenceNotice: string | null;
   readonly storyboard: ReactNode;
+  readonly continuousOriginal?: ReactNode;
   readonly assets: ReactNode;
   readonly chat: ReactNode;
   readonly media: ReactNode;
   onRouteChange(route: SeriesWorkbenchRoute): void;
-  onLeftViewChange(view: Exclude<SeriesWorkbenchLeftView, "continuous-preview">): void;
-  onWidthChange(leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">, width: number, ownerKey: string): void;
-  onWidthCommit(leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">, width: number, ownerKey: string): void;
+  onLeftViewChange(view: SeriesWorkbenchLeftView): void;
+  onWidthChange(leftView: SeriesWorkbenchLeftView, width: number, ownerKey: string): void;
+  onWidthCommit(leftView: SeriesWorkbenchLeftView, width: number, ownerKey: string): void;
 }
 
 interface ActiveDrag {
   readonly pointerId: number;
   readonly captureTarget: HTMLButtonElement;
   readonly ownerKey: string;
-  readonly leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">;
+  readonly leftView: SeriesWorkbenchLeftView;
   readonly interactionEpoch: number;
   readonly originX: number;
   readonly originWidth: number;
@@ -43,6 +44,7 @@ export function SeriesWorkbenchSurface({
   leftWidth,
   preferenceNotice,
   storyboard,
+  continuousOriginal,
   assets,
   chat,
   media,
@@ -186,9 +188,13 @@ export function SeriesWorkbenchSurface({
               cancelActiveDrag(true);
               onLeftViewChange("assets");
             }} type="button">素材库</button>
+            <button aria-pressed={leftView === "continuous-preview"} onClick={() => {
+              cancelActiveDrag(true);
+              onLeftViewChange("continuous-preview");
+            }} type="button">整章连续编辑</button>
           </nav>
         )}
-        <div className="series-workbench-left-pane storyboard-pane" hidden={mode !== "chapters" && !(mode === "workbench" && leftView === "storyboard")}>
+        <div className="series-workbench-left-pane storyboard-pane" hidden={mode !== "chapters" && !(mode === "workbench" && (leftView === "storyboard" || leftView === "continuous-preview"))}>
           {storyboard}
         </div>
         <div className="series-workbench-left-pane assets-pane" hidden={mode !== "assets" && !(mode === "workbench" && leftView === "assets")}>
@@ -235,10 +241,16 @@ export function SeriesWorkbenchSurface({
           </header>
         )}
         {preferenceNotice !== null && mode === "workbench" && <p className="series-workbench-notice" role="status">{preferenceNotice}</p>}
-        <div className="series-workbench-consumer" hidden={mode !== "chat" && !(mode === "workbench" && route === "chat")}>
+        {mode === "workbench" && leftView === "continuous-preview" && (
+          <section className="series-workbench-original" aria-label="选中镜头原文">
+            <header><h2>选中镜头原文</h2><p>对照打开时保存的原文快照</p></header>
+            {continuousOriginal}
+          </section>
+        )}
+        <div className="series-workbench-consumer" hidden={mode !== "chat" && !(mode === "workbench" && leftView !== "continuous-preview" && route === "chat")}>
           {chat}
         </div>
-        <div className="series-workbench-consumer" hidden={mode !== "media" && !(mode === "workbench" && route === "media")}>
+        <div className="series-workbench-consumer" hidden={mode !== "media" && !(mode === "workbench" && leftView !== "continuous-preview" && route === "media")}>
           {media}
         </div>
       </div>

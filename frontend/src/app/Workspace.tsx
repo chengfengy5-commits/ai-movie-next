@@ -65,6 +65,40 @@ interface FusedPageHost {
   readonly openIntent: FusedGenerationOpenIntent | null;
 }
 
+interface ContinuousOriginalSelection {
+  readonly position: number;
+  readonly text: string | null;
+  readonly status: "text" | "missing" | "unrecognized";
+}
+
+interface ContinuousOriginalOwner {
+  readonly userId: string;
+  readonly apiBaseUrl: string | null;
+  readonly services: object;
+  readonly sessionGeneration: number;
+  readonly scopeEpoch: number;
+  readonly seriesId: string;
+}
+
+interface OwnedContinuousOriginal {
+  readonly owner: ContinuousOriginalOwner;
+  readonly callbackEpoch: number;
+  readonly selection: ContinuousOriginalSelection;
+}
+
+function sameContinuousOriginalOwner(
+  left: ContinuousOriginalOwner | null,
+  right: ContinuousOriginalOwner | null,
+): boolean {
+  return left === right || (left !== null && right !== null
+    && left.userId === right.userId
+    && left.apiBaseUrl === right.apiBaseUrl
+    && left.services === right.services
+    && left.sessionGeneration === right.sessionGeneration
+    && left.scopeEpoch === right.scopeEpoch
+    && left.seriesId === right.seriesId);
+}
+
 function Dashboard() {
   const { services, state, logout, refreshCurrentUser, sessionGeneration } = useAuth();
   const collaborationActorId = state.status === "authenticated" ? state.user.id : null;
@@ -88,10 +122,13 @@ function Dashboard() {
   const [workbenchSeries, setWorkbenchSeries] = useState<Series | null>(null);
   const [selectedView, setSelectedView] = useState<WorkspaceView>("series");
   const [workbenchRoute, setWorkbenchRoute] = useState<SeriesWorkbenchRoute>(defaultSeriesWorkbenchPreferences.route);
-  const [workbenchLeftView, setWorkbenchLeftView] = useState<Exclude<SeriesWorkbenchLeftView, "continuous-preview">>(defaultSeriesWorkbenchPreferences.leftView);
+  const [workbenchLeftView, setWorkbenchLeftView] = useState<SeriesWorkbenchLeftView>(defaultSeriesWorkbenchPreferences.leftView);
   const [workbenchLeftWidths, setWorkbenchLeftWidths] = useState<SeriesWorkbenchPreferences["leftWidths"]>(defaultSeriesWorkbenchPreferences.leftWidths);
   const workbenchCommittedLeftWidthsRef = useRef<SeriesWorkbenchPreferences["leftWidths"]>(defaultSeriesWorkbenchPreferences.leftWidths);
   const [workbenchPreferenceNotice, setWorkbenchPreferenceNotice] = useState<string | null>(null);
+  const [continuousOriginalFrame, setContinuousOriginalFrame] = useState<OwnedContinuousOriginal | null>(null);
+  const continuousOriginalOwnerRef = useRef<ContinuousOriginalOwner | null>(null);
+  const continuousOriginalCallbackEpochRef = useRef(0);
   const [chatWorkbenchIntent, setChatWorkbenchIntent] = useState<WorkbenchSourceIntent | null>(null);
   const [mediaWorkbenchIntent, setMediaWorkbenchIntent] = useState<WorkbenchSourceIntent | null>(null);
   const [mediaGenerationVisited, setMediaGenerationVisited] = useState(false);
@@ -203,6 +240,7 @@ function Dashboard() {
     workbenchCommittedLeftWidthsRef.current = defaultSeriesWorkbenchPreferences.leftWidths;
     setWorkbenchLeftWidths(defaultSeriesWorkbenchPreferences.leftWidths);
     setWorkbenchPreferenceNotice(null);
+    setContinuousOriginalFrame(null);
     workbenchNavigationEpoch.current += 1;
     workbenchSourceIntentRef.current = null;
     setChatWorkbenchIntent(null);
@@ -232,6 +270,46 @@ function Dashboard() {
     seriesShareGuardRef.current = { scopeKey: seriesShareGuardScopeKey, dirty: false, inFlight: false };
   }
   currentNavigationContext.current = renderNavigationContext;
+
+  const continuousOriginalOwner: ContinuousOriginalOwner | null = scopeChanged || workbenchSeries === null
+    ? null
+    : {
+      userId: currentUserId,
+      apiBaseUrl: services.apiBaseUrl,
+      services,
+      sessionGeneration,
+      scopeEpoch: dashboardScopeEpoch.current,
+      seriesId: workbenchSeries.id,
+    };
+  if (!sameContinuousOriginalOwner(continuousOriginalOwnerRef.current, continuousOriginalOwner)) {
+    continuousOriginalOwnerRef.current = continuousOriginalOwner;
+    continuousOriginalCallbackEpochRef.current += 1;
+  }
+  const continuousOriginalCallbackEpoch = continuousOriginalCallbackEpochRef.current;
+  const displayedContinuousOriginal = continuousOriginalFrame !== null
+    && continuousOriginalFrame.callbackEpoch === continuousOriginalCallbackEpoch
+    && sameContinuousOriginalOwner(continuousOriginalFrame.owner, continuousOriginalOwner)
+    ? continuousOriginalFrame.selection
+    : null;
+
+  function updateContinuousOriginal(
+    owner: ContinuousOriginalOwner | null,
+    callbackEpoch: number,
+    selection: ContinuousOriginalSelection | null,
+  ) {
+    if (owner === null) return;
+    const isCurrentOwner = () => callbackEpoch === continuousOriginalCallbackEpochRef.current
+      && sameContinuousOriginalOwner(owner, continuousOriginalOwnerRef.current);
+    if (!isCurrentOwner()) return;
+
+    setContinuousOriginalFrame((current) => {
+      if (!isCurrentOwner()) return current;
+      if (selection === null) {
+        return current !== null && sameContinuousOriginalOwner(current.owner, owner) ? null : current;
+      }
+      return { owner, callbackEpoch, selection };
+    });
+  }
 
   function clearChapterNavigationIntent(expectedEpoch?: number) {
     const current = navigationIntentRef.current;
@@ -368,7 +446,7 @@ function Dashboard() {
 
   function persistWorkbenchPreferences(
     route: SeriesWorkbenchRoute,
-    leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">,
+    leftView: SeriesWorkbenchLeftView,
     leftWidths: SeriesWorkbenchPreferences["leftWidths"],
   ) {
     if (selectedSeries === null || services.apiBaseUrl === null) {
@@ -451,13 +529,13 @@ function Dashboard() {
     persistWorkbenchPreferences(route, workbenchLeftView, workbenchCommittedLeftWidthsRef.current);
   }
 
-  function changeWorkbenchLeftView(view: Exclude<SeriesWorkbenchLeftView, "continuous-preview">) {
+  function changeWorkbenchLeftView(view: SeriesWorkbenchLeftView) {
     setWorkbenchLeftView(view);
     persistWorkbenchPreferences(workbenchRoute, view, workbenchCommittedLeftWidthsRef.current);
   }
 
   function changeWorkbenchWidth(
-    leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">,
+    leftView: SeriesWorkbenchLeftView,
     width: number,
     commit: boolean,
     ownerKey: string,
@@ -1117,12 +1195,31 @@ function Dashboard() {
                 onNavigationConsumed={(epoch) => clearChapterNavigationIntent(epoch)}
                 onWorkbenchSource={acceptWorkbenchSource}
                 onFusedSource={acceptFusedSourceEntry}
-                workbenchActive={selectedView === "series-workbench" && workbenchLeftView === "storyboard"}
+                workbenchActive={selectedView === "series-workbench"
+                  && (workbenchLeftView === "storyboard" || workbenchLeftView === "continuous-preview")}
+                continuousPreviewActive={selectedView === "series-workbench" && workbenchLeftView === "continuous-preview"}
+                onContinuousOriginalChange={(selection) => updateContinuousOriginal(
+                  continuousOriginalOwner,
+                  continuousOriginalCallbackEpoch,
+                  selection,
+                )}
                 series={workbenchSeries}
                 services={services}
                 userId={state.user.id}
               />
             ) : null}
+            continuousOriginal={displayedContinuousOriginal === null ? (
+              <p role="status">选择镜头后显示其打开时的原文字段；不会以草稿替代原文。</p>
+            ) : displayedContinuousOriginal.status === "text" ? (
+              <div className="series-workbench-original-text">
+                <span>镜头 {displayedContinuousOriginal.position}</span>
+                <p>{displayedContinuousOriginal.text}</p>
+              </div>
+            ) : (
+              <p role="status">
+                {displayedContinuousOriginal.status === "missing" ? "该镜头没有原文字段。" : "原文字段无法识别。"}
+              </p>
+            )}
             assets={workbenchSeries !== null ? (
               <AssetLibrary
                 key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + sessionGeneration + ":" + workbenchSeries.id}

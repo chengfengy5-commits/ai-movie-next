@@ -53,6 +53,29 @@ export interface Chapter {
   lock: Record<string, unknown> | null;
 }
 
+export type ChapterEditFrameSource =
+  | { readonly kind: "retained"; readonly source_index: number; readonly storyboard_id: string | null }
+  | { readonly kind: "new" };
+
+export interface ChapterEditStoryboardBaseline {
+  readonly id: string;
+  readonly series_id: string;
+  readonly chapter_id: string;
+  readonly frame_index: number;
+}
+
+export interface ChapterEditGuard {
+  readonly version: 1;
+  readonly expected_chapter_id: string;
+  readonly expected_series_id: string;
+  readonly expected_order: number;
+  readonly expected_content: StoryboardFrame[] | null;
+  readonly expected_storyboards: ChapterEditStoryboardBaseline[];
+  readonly expected_lock_identity: { readonly user_id: string; readonly acquired_at: string } | null;
+  readonly frame_sources: ChapterEditFrameSource[];
+  readonly deleted_source_indexes: number[];
+}
+
 export interface CreateChapterInput {
   title: string;
   content: StoryboardFrame[];
@@ -62,6 +85,7 @@ export interface CreateChapterInput {
 export interface UpdateChapterInput {
   title?: string;
   content?: StoryboardFrame[];
+  chapter_edit_guard?: ChapterEditGuard;
 }
 
 export interface ReorderChaptersInput {

@@ -1,0 +1,147 @@
+.continuous-chapter-editor {
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  min-height: 0;
+  padding: 1.25rem;
+}
+
+.continuous-chapter-editor-heading,
+.continuous-chapter-block > header,
+.continuous-chapter-create-asset {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.continuous-chapter-editor-heading h2,
+.continuous-chapter-editor-heading p,
+.series-workbench-original h2,
+.series-workbench-original p {
+  margin: 0.25rem 0;
+}
+
+.continuous-chapter-editor-actions,
+.continuous-chapter-toolbar,
+.continuous-chapter-block > header > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}
+
+.continuous-chapter-summary {
+  margin: 0;
+  color: var(--muted, #69777a);
+  font-size: 0.85rem;
+}
+
+.continuous-chapter-blocks {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  min-height: 0;
+  overflow: auto;
+}
+
+.continuous-chapter-block {
+  border: 1px solid var(--border-subtle, #d9dce3);
+  border-inline-start: 4px solid var(--frame-accent, #7a8b9a);
+  border-radius: 0.75rem;
+  padding: 0.9rem;
+  background: var(--frame-surface, var(--surface-raised, #fff));
+}
+
+.continuous-chapter-block.is-selected {
+  border-color: var(--accent, #6c5ce7);
+  border-inline-start-color: var(--frame-accent, var(--accent, #6c5ce7));
+  box-shadow: 0 0 0 1px var(--accent, #6c5ce7);
+}
+
+.continuous-chapter-block.tone-0 { --frame-accent: #357a6b; --frame-surface: #f2f9f6; }
+.continuous-chapter-block.tone-1 { --frame-accent: #4774a5; --frame-surface: #f1f6fb; }
+.continuous-chapter-block.tone-2 { --frame-accent: #8a6b32; --frame-surface: #fbf8ef; }
+.continuous-chapter-block.tone-3 { --frame-accent: #8d5c72; --frame-surface: #fbf4f7; }
+.continuous-chapter-block.tone-4 { --frame-accent: #5b7580; --frame-surface: #f3f8f9; }
+.continuous-chapter-block.tone-5 { --frame-accent: #7a6a9c; --frame-surface: #f7f5fb; }
+.continuous-chapter-block.tone-6 { --frame-accent: #a05f43; --frame-surface: #fcf5f1; }
+.continuous-chapter-block.tone-7 { --frame-accent: #5e8251; --frame-surface: #f5f9f1; }
+
+.continuous-chapter-block-select {
+  border: 0;
+  padding: 0;
+  color: inherit;
+  background: transparent;
+  font-weight: 650;
+  cursor: pointer;
+}
+
+.continuous-chapter-block textarea {
+  width: 100%;
+  min-height: 6rem;
+  margin-top: 0.75rem;
+  resize: vertical;
+}
+
+.continuous-chapter-asset-lines {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.75rem;
+  margin-top: 0.75rem;
+}
+
+.continuous-chapter-asset-lines label,
+.continuous-chapter-create-asset label {
+  display: grid;
+  gap: 0.35rem;
+}
+
+.continuous-chapter-asset-lines select {
+  min-height: 4.5rem;
+  width: 100%;
+}
+
+.continuous-chapter-original,
+.continuous-chapter-lock,
+.continuous-chapter-notice,
+.continuous-chapter-unknown-help {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.continuous-chapter-create-asset {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+
+.continuous-chapter-create-asset input {
+  min-width: 10rem;
+}
+
+.series-workbench-original {
+  min-height: 0;
+  height: 100%;
+  overflow: auto;
+  padding: 1rem;
+}
+
+.series-workbench-original-text p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.chapter-browser.continuous-chapter-browser-active .chapter-browser-layout {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+@media (max-width: 768px) {
+  .continuous-chapter-editor-heading,
+  .continuous-chapter-create-asset {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .continuous-chapter-asset-lines {
+    grid-template-columns: 1fr;
+  }
+}
