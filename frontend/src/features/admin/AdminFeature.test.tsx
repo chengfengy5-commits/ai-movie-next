@@ -1892,3 +1892,184 @@ describe("AIStarsLab quick configuration", () => {
     expect(screen.getByRole("alert")).toHaveTextContent("模型草稿已变化");
   });
 });
+
+describe("AIStarsLab channel synchronization", () => {
+  it("requires confirmation and refreshes the same filtered page with strict counts", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const listQueries: URL[] = [];
+    let syncRequests = 0;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models") {
+        listQueries.push(url);
+        const skip = Number(url.searchParams.get("skip") ?? 0);
+        return jsonResponse({
+          data: [model({ id: `aistarslab-page-${skip}`, name: skip === 10 ? "AIStarsLab 第二页模型" : "AIStarsLab 首页模型", category: "video", provider: "aistarslab" })],
+          total: 11,
+        });
+      }
+      if (url.pathname === "/api/aistarslab/sync-all" && init?.method === "POST") {
+        syncRequests += 1;
+        return jsonResponse({ created: 2, updated: 3, total: 5 });
+      }
+      throw new Error("Unexpected request: " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await screen.findByRole("heading", { name: "系统模型" });
+    await user.selectOptions(screen.getByLabelText("提供商"), "aistarslab");
+    await user.click(await screen.findByRole("button", { name: "下一页" }));
+    expect(await screen.findByRole("button", { name: "AIStarsLab 第二页模型" })).toBeInTheDocument();
+
+    const syncButton = screen.getByRole("button", { name: "同步 AIStarsLab 渠道" });
+    await user.click(syncButton);
+    expect(confirm).toHaveBeenNthCalledWith(1, expect.stringContaining("图片和视频渠道配置"));
+    expect(confirm).toHaveBeenNthCalledWith(1, expect.stringContaining("保留启用状态"));
+    expect(syncRequests).toBe(0);
+
+    await user.click(syncButton);
+    expect(await screen.findByText("同步完成：新增 2 个，更新 3 个，共 5 个。")).toBeInTheDocument();
+    await waitFor(() => expect(listQueries.length).toBeGreaterThanOrEqual(4));
+    const refreshed = listQueries[listQueries.length - 1];
+    expect(refreshed?.searchParams.get("provider")).toBe("aistarslab");
+    expect(refreshed?.searchParams.get("skip")).toBe("10");
+    expect(screen.getByText("第 2 / 2 页")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "AIStarsLab 第二页模型" })).toBeInTheDocument();
+
+    const syncCall = fetcher.mock.calls.find(([input]) => requestPath(input).endsWith("/api/aistarslab/sync-all"));
+    expect(syncRequests).toBe(1);
+    expect(syncCall?.[1]?.method).toBe("POST");
+    expect(syncCall?.[1]?.body).toBeUndefined();
+    expect(new Headers(syncCall?.[1]?.headers).get("Authorization")).toBe("Bearer admin-token");
+    confirm.mockRestore();
+  });
+
+  it("keeps invalid and HTTP 408 results unknown until explicitly stopped, without automatic replay", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    let listReads = 0;
+    let syncRequests = 0;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models") {
+        listReads += 1;
+        return jsonResponse({ data: [], total: 0 });
+      }
+      if (url.pathname === "/api/aistarslab/sync-all" && init?.method === "POST") {
+        syncRequests += 1;
+        return syncRequests === 1
+          ? jsonResponse({ created: 1, updated: 2, total: 99 })
+          : jsonResponse({ detail: "raw upstream error" }, 408);
+      }
+      throw new Error("Unexpected request: " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await screen.findByRole("heading", { name: "系统模型" });
+    await user.click(screen.getByRole("button", { name: "同步 AIStarsLab 渠道" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("同步结果未知");
+    expect(screen.getByRole("button", { name: "同步 AIStarsLab 渠道" })).toBeDisabled();
+    expect(syncRequests).toBe(1);
+    expect(document.body.textContent).not.toContain("raw upstream error");
+
+    await user.click(screen.getByRole("button", { name: "停止本地跟踪并刷新目录" }));
+    expect(await screen.findByText("已停止本地跟踪并刷新模型目录；目录内容不能证明刚才的同步已成功。若仍需同步，请重新发起并确认。")).toBeInTheDocument();
+    await waitFor(() => expect(listReads).toBeGreaterThanOrEqual(2));
+    expect(syncRequests).toBe(1);
+
+    await user.click(screen.getByRole("button", { name: "同步 AIStarsLab 渠道" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("同步结果未知");
+    expect(syncRequests).toBe(2);
+    expect(screen.getByRole("button", { name: "停止本地跟踪并刷新目录" })).toBeInTheDocument();
+    confirm.mockRestore();
+  });
+});
+
+describe("AIStarsLab synchronization ownership", () => {
+  it("asks before leaving an in-flight sync and ignores completion after confirmed exit", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValueOnce(true).mockReturnValueOnce(false).mockReturnValueOnce(true);
+    const syncReply = deferred<Response>();
+    let syncRequests = 0;
+    const fetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models") return jsonResponse({ data: [], total: 0 });
+      if (url.pathname === "/api/aistarslab/sync-all" && init?.method === "POST") {
+        syncRequests += 1;
+        return syncReply.promise;
+      }
+      throw new Error("Unexpected request: " + url.pathname + url.search);
+    });
+
+    render(<AdminFeature apiBaseUrl="/api" fetcher={fetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await screen.findByRole("heading", { name: "系统模型" });
+    await user.click(screen.getByRole("button", { name: "同步 AIStarsLab 渠道" }));
+    await waitFor(() => expect(syncRequests).toBe(1));
+
+    await user.click(screen.getByRole("button", { name: "运营概览" }));
+    expect(confirm).toHaveBeenNthCalledWith(2, expect.stringContaining("同步请求已发出"));
+    expect(screen.getByRole("heading", { name: "系统模型" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "运营概览" }));
+    expect(await screen.findByRole("heading", { name: "运营概览" })).toBeInTheDocument();
+
+    await act(async () => {
+      syncReply.resolve(jsonResponse({ created: 4, updated: 0, total: 4 }));
+      await Promise.resolve();
+    });
+    expect(syncRequests).toBe(1);
+    expect(screen.queryByText(/同步完成：新增 4 个/)).not.toBeInTheDocument();
+    confirm.mockRestore();
+  });
+
+  it("aborts and ignores a dispatched sync when the authenticated API service changes", async () => {
+    const user = userEvent.setup();
+    const storage = adminStorage();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const oldSyncReply = deferred<Response>();
+    let oldSignal: AbortSignal | undefined;
+    const oldFetcher = vi.fn<AdminFetcher>(async (input, init) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models") return jsonResponse({ data: [], total: 0 });
+      if (url.pathname === "/api/aistarslab/sync-all" && init?.method === "POST") {
+        oldSignal = init.signal ?? undefined;
+        return oldSyncReply.promise;
+      }
+      throw new Error("Unexpected old request: " + url.pathname + url.search);
+    });
+    const nextFetcher = vi.fn<AdminFetcher>(async (input) => {
+      const url = new URL(String(input), window.location.href);
+      if (url.pathname === "/api/admin/stats") return jsonResponse(stats());
+      if (url.pathname === "/api/admin/system-models") return jsonResponse({ data: [], total: 0 });
+      throw new Error("Unexpected new request: " + url.pathname + url.search);
+    });
+
+    const view = render(<AdminFeature apiBaseUrl="/api" fetcher={oldFetcher} storage={storage} />);
+    await user.click(screen.getByRole("button", { name: "系统模型" }));
+    await screen.findByRole("heading", { name: "系统模型" });
+    await user.click(screen.getByRole("button", { name: "同步 AIStarsLab 渠道" }));
+    await waitFor(() => expect(oldSignal).toBeDefined());
+
+    view.rerender(<AdminFeature apiBaseUrl="/api" fetcher={nextFetcher} storage={storage} />);
+    await waitFor(() => expect(oldSignal?.aborted).toBe(true));
+    await act(async () => {
+      oldSyncReply.resolve(jsonResponse({ created: 1, updated: 1, total: 2 }));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByRole("button", { name: "同步 AIStarsLab 渠道" })).toBeEnabled();
+    expect(screen.queryByText(/同步完成/)).not.toBeInTheDocument();
+    expect(nextFetcher.mock.calls.some(([input]) => requestPath(input).endsWith("/api/aistarslab/sync-all"))).toBe(false);
+    confirm.mockRestore();
+  });
+});

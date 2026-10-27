@@ -31,6 +31,7 @@ import { createAdminSmtpAccountsApi } from "../admin-smtp-accounts/adminSmtpAcco
 import type { AdminSmtpAccountExitSnapshot, AdminSmtpAccountMode, AdminSmtpAccountsApi, PendingAdminSmtpAccountExit } from "../admin-smtp-accounts/adminSmtpAccountsTypes";
 import { createAistarslabApi } from "./aistarslabApi";
 import type { AistarslabQuickConfigExitNotice } from "./AistarslabQuickConfig";
+import type { AistarslabChannelSyncExitNotice } from "./AistarslabChannelSync";
 import type { AistarslabApi } from "./aistarslabApi";
 import "./Admin.css";
 
@@ -114,6 +115,14 @@ interface ActiveSmtpAccountExit {
 interface ActiveAistarslabQuickConfigExit {
   owner: symbol;
   notice: AistarslabQuickConfigExitNotice;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AistarslabApi;
+}
+
+interface ActiveAistarslabSyncExit {
+  owner: symbol;
+  notice: AistarslabChannelSyncExitNotice;
   viewIdentity: number;
   sessionGeneration: number;
   api: AistarslabApi;
@@ -261,6 +270,7 @@ export function AdminFeature({
   const smtpAccountsExit = useRef<ActiveSmtpAccountExit | null>(null);
   const smtpAccountsApiRef = useRef<AdminSmtpAccountsApi | null>(null);
   const aistarslabExit = useRef<ActiveAistarslabQuickConfigExit | null>(null);
+  const aistarslabSyncExit = useRef<ActiveAistarslabSyncExit | null>(null);
   const aistarslabApiRef = useRef<AistarslabApi | null>(null);
   const [seriesListState, setSeriesListState] = useState<AdminSeriesListState>(DEFAULT_ADMIN_SERIES_LIST_STATE);
   const [taskListState, setTaskListState] = useState<AdminTaskListState>(DEFAULT_ADMIN_TASK_LIST_STATE);
@@ -340,11 +350,22 @@ export function AdminFeature({
           : "AIStarsLab 系统模型创建结果未知；服务端可能已经新增了共享模型。离开会停止本地跟踪，不会自动重试或按名称认领。仍要离开吗？";
       if (!window.confirm(question)) return false;
     }
+    const aistarslabSyncPending = aistarslabSyncExit.current;
+    if (!options?.force && aistarslabSyncPending
+      && aistarslabSyncPending.viewIdentity === viewIdentity.current
+      && aistarslabSyncPending.sessionGeneration === sessionGeneration.current
+      && aistarslabSyncPending.api === aistarslabApiRef.current) {
+      const question = aistarslabSyncPending.notice.kind === "write-in-flight"
+        ? "AIStarsLab 图片和视频渠道同步请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : "AIStarsLab 渠道同步结果未知，服务端可能已经处理了图片和视频渠道。离开会停止本地跟踪，之后的目录刷新不能证明本次同步成功。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
     membershipExit.current = null;
     systemConfigExit.current = null;
     seriesExit.current = null;
     smtpAccountsExit.current = null;
     aistarslabExit.current = null;
+    aistarslabSyncExit.current = null;
     viewIdentity.current += 1;
     setView(nextView);
     return true;
@@ -404,6 +425,7 @@ export function AdminFeature({
     seriesExit.current = null;
     smtpAccountsExit.current = null;
     aistarslabExit.current = null;
+    aistarslabSyncExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -419,6 +441,7 @@ export function AdminFeature({
     seriesExit.current = null;
     smtpAccountsExit.current = null;
     aistarslabExit.current = null;
+    aistarslabSyncExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -436,6 +459,7 @@ export function AdminFeature({
     seriesExit.current = null;
     smtpAccountsExit.current = null;
     aistarslabExit.current = null;
+    aistarslabSyncExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -470,6 +494,21 @@ export function AdminFeature({
     } else if (aistarslabExit.current?.owner === owner) {
       aistarslabExit.current = null;
     }
+  }, [activeAistarslabApi, activeSessionGeneration, activeViewIdentity, view.kind]);
+  const handleAistarslabSyncExitStateChange = useCallback((owner: symbol, notice: AistarslabChannelSyncExitNotice | null) => {
+    if (!notice) {
+      if (aistarslabSyncExit.current?.owner === owner) aistarslabSyncExit.current = null;
+      return;
+    }
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || aistarslabApiRef.current !== activeAistarslabApi || view.kind !== "system-models") return;
+    aistarslabSyncExit.current = {
+      owner,
+      notice,
+      viewIdentity: activeViewIdentity,
+      sessionGeneration: activeSessionGeneration,
+      api: activeAistarslabApi,
+    };
   }, [activeAistarslabApi, activeSessionGeneration, activeViewIdentity, view.kind]);
   const membershipOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
   const membershipViewKey = view.kind === "redemption-codes" ? "redemption/list"
@@ -894,6 +933,7 @@ export function AdminFeature({
               aistarslabApi={aistarslabApi}
               adminActorId={session?.user.id ?? ""}
               adminSessionGeneration={activeSessionGeneration}
+              viewIdentity={activeViewIdentity}
               onUnauthorized={handleUnauthorized}
               mode="list"
               modelId={undefined}
@@ -901,6 +941,7 @@ export function AdminFeature({
               onEdit={(id) => navigate({ kind: "model-edit", id })}
               reloadVersion={modelListVersion}
               onAistarslabExitStateChange={handleAistarslabExitStateChange}
+              onAistarslabSyncExitStateChange={handleAistarslabSyncExitStateChange}
             />
           ) : view.kind === "model-create" || view.kind === "model-edit" ? (
             <SystemModels
@@ -908,6 +949,7 @@ export function AdminFeature({
               aistarslabApi={aistarslabApi}
               adminActorId={session?.user.id ?? ""}
               adminSessionGeneration={activeSessionGeneration}
+              viewIdentity={activeViewIdentity}
               onUnauthorized={handleUnauthorized}
               onCancel={() => navigate({ kind: "system-models" })}
               onSaved={handleModelsSaved}

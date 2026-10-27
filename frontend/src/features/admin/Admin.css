@@ -766,6 +766,31 @@
   background: #1d1c22;
 }
 
+.admin-aistarslab-sync {
+  display: grid;
+  gap: 8px;
+  margin: -10px 0 16px;
+}
+
+.admin-aistarslab-sync-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.admin-aistarslab-sync-message,
+.admin-aistarslab-sync-error {
+  margin: 0;
+  color: #aaa6b1;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.admin-aistarslab-sync-message[role="alert"],
+.admin-aistarslab-sync-error {
+  color: #f2a7a7;
+}
+
 .admin-aistarslab-heading,
 .admin-aistarslab-actions,
 .admin-aistarslab-built,
