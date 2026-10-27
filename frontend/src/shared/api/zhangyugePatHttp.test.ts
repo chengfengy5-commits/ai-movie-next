@@ -2,7 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "./errors";
 import { createApiServices } from "./services";
 import { API_TOKEN_KEY, type StorageLike } from "./storage";
-import { parseZhangyugePatSaveReceipt, parseZhangyugePatStatus } from "./zhangyugePatHttp";
+import {
+  parseZhangyugeBalanceSnapshot,
+  parseZhangyugePatSaveReceipt,
+  parseZhangyugePatStatus,
+} from "./zhangyugePatHttp";
 
 class MemoryStorage implements StorageLike {
   private readonly values = new Map<string, string>();
@@ -17,6 +21,77 @@ function jsonResponse(payload: unknown, status = 200): Response {
 }
 
 describe("Zhangyuge PAT HTTP adapter", () => {
+  it("reads saved balance through the authenticated route with a narrow timeout and safe fields", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "admin-session-token");
+    const payload = {
+      balance_usd: 0,
+      balance_cny: 0,
+      used_usd: null,
+      used_cny: null,
+      quota_per_unit: 500_000,
+      usd_exchange_rate: 7.2,
+      pat_configured: true,
+      api_key_configured: false,
+      errors: ["upstream detail containing a private credential"],
+      updated_at: "2026-10-27 09:10:11",
+      private_extra: "must-not-project",
+    };
+    const fetcher = vi.fn<typeof fetch>(async (input) => {
+      const url = new URL(String(input));
+      if (url.pathname === "/api/zhangyuge/balance") return jsonResponse(payload);
+      if (url.pathname === "/api/zhangyuge/pat") return jsonResponse({ configured: true });
+      throw new Error("Unexpected Zhangyuge route.");
+    });
+    const service = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher }).zhangyugePat;
+    if (service === undefined) throw new Error("Expected the Zhangyuge service.");
+
+    const timeoutSpy = vi.spyOn(globalThis, "setTimeout");
+    try {
+      const snapshot = await service.getBalance(new AbortController().signal);
+      const status = await service.getStatus(new AbortController().signal);
+
+      expect(snapshot).toEqual({
+        balanceUsd: 0,
+        balanceCny: 0,
+        usedUsd: null,
+        usedCny: null,
+        quotaPerUnit: 500_000,
+        usdExchangeRate: 7.2,
+        patConfigured: true,
+        apiKeyConfigured: false,
+        hasErrors: true,
+        updatedAt: "2026-10-27 09:10:11",
+      });
+      expect(status).toEqual({ configured: true });
+      expect(JSON.stringify(snapshot)).not.toContain("private credential");
+      expect(JSON.stringify(snapshot)).not.toContain("must-not-project");
+      expect(fetcher.mock.calls.map(([input, init]) => ({
+        url: String(input),
+        method: init?.method ?? "GET",
+        authorization: new Headers(init?.headers).get("Authorization"),
+        body: init?.body,
+      }))).toEqual([
+        {
+          url: "http://127.0.0.1:4175/api/zhangyuge/balance",
+          method: "GET",
+          authorization: "Bearer admin-session-token",
+          body: undefined,
+        },
+        {
+          url: "http://127.0.0.1:4175/api/zhangyuge/pat",
+          method: "GET",
+          authorization: "Bearer admin-session-token",
+          body: undefined,
+        },
+      ]);
+      expect(timeoutSpy.mock.calls.map(([, delay]) => delay)).toEqual([60_000, 15_000]);
+      expect(() => parseZhangyugeBalanceSnapshot({ ...payload, used_usd: Number.POSITIVE_INFINITY })).toThrow(ApiError);
+    } finally {
+      timeoutSpy.mockRestore();
+    }
+  });
+
   it("uses the authenticated status and write routes with strict receipts", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "admin-session-token");

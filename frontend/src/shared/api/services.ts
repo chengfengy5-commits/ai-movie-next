@@ -1994,6 +1994,7 @@ const STORYBOARD_STREAM_TOTAL_TIMEOUT_MS = 5 * 60_000;
 const STORYBOARD_STREAM_IDLE_TIMEOUT_MS = 45_000;
 const PROVIDER_QUOTA_BALANCE_TIMEOUT_MS = 60_000;
 const PROVIDER_QUOTA_PROBE_TIMEOUT_MS = 60_000;
+const ZHANGYUGE_BALANCE_TIMEOUT_MS = 60_000;
 
 function serializeProviderQuotaAccountInput(input: ProviderQuotaAccountInput): Record<string, unknown> {
   return {
@@ -2161,6 +2162,7 @@ type ApiEndpoint =
   | "providerQuotaDeleteAccount"
   | "providerQuotaProbe"
   | "zhangyugePatStatus"
+  | "zhangyugeBalance"
   | "zhangyugePatSave"
   | "creatorModel"
   | "promoteCreatorModelToSystem"
@@ -2362,6 +2364,9 @@ function apiRequestDefinition(
   }
   if (endpoint === "zhangyugePatStatus") {
     return { path: "/zhangyuge/pat", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "zhangyugeBalance") {
+    return { path: "/zhangyuge/balance", method: "GET", expectedStatus: 200 };
   }
   if (endpoint === "zhangyugePatSave") {
     return { path: "/zhangyuge/pat", method: "POST", expectedStatus: 200 };
@@ -3259,6 +3264,16 @@ export function createApiServices(
       const token = requireApiToken(storage);
       if (call.endpoint === "zhangyugePatSave") {
         return requestForCurrentApiSession(call.endpoint, token, signal, { pat: call.pat });
+      }
+      if (call.endpoint === "zhangyugeBalance") {
+        return requestForCurrentApiSession(
+          call.endpoint,
+          token,
+          signal,
+          undefined,
+          undefined,
+          ZHANGYUGE_BALANCE_TIMEOUT_MS,
+        );
       }
       return requestForCurrentApiSession(call.endpoint, token, signal);
     }),
