@@ -1,0 +1,23 @@
+.storyboard-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.65rem;
+  margin: 1rem 0;
+}
+
+.storyboard-pagination label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.45rem;
+}
+
+.storyboard-pagination-status {
+  color: var(--muted-foreground, #666);
+  font-size: 0.9rem;
+}
+
+.storyboard-browse-notice {
+  margin: 0.5rem 0;
+  color: var(--muted-foreground, #666);
+}

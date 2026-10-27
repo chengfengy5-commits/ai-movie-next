@@ -64,6 +64,18 @@ import {
   type ChapterFrameNavigationTarget,
 } from "./assetFrameNavigation";
 import { projectStoryboardFrames, type TextField } from "./storyboardProjection";
+import {
+  clampStoryboardPage,
+  defaultStoryboardPageSize,
+  readStoryboardBrowsePreferences,
+  storyboardPageCount,
+  storyboardPageForPosition,
+  storyboardChapterStorageKey,
+  storyboardPageSizeStorageKey,
+  writeStoryboardBrowsePreferences,
+  type StoryboardBrowsePreferenceScope,
+  type StoryboardPageSize,
+} from "./storyboardBrowsePreferences";
 import { findRoughCutFramePosition } from "./roughCutFrameNavigation";
 import { resolveProductionNoteFrameTarget } from "./productionNoteFrameNavigation";
 import { ChapterManagementDialog, type ChapterManagementAction } from "./ChapterManagementDialog";
@@ -101,6 +113,7 @@ import {
   updateStoryboardFrameText,
 } from "./chapterEditing";
 import "./chapterEditing.css";
+import "./storyboardBrowsePreferences.css";
 
 interface ChapterBrowserProps {
   series: Series;
@@ -267,6 +280,24 @@ interface PendingFrameNavigation {
   status: "awaiting-assets" | "unresolved";
   message?: string;
 }
+
+interface PendingPagedLocateBase {
+  id: number;
+  browseScopeKey: string;
+  chapter: Chapter;
+  chapterRequestGeneration: number;
+  sessionGeneration: number | undefined;
+  position: number;
+  resolve(result: boolean): void;
+}
+
+type PendingPagedLocateTarget =
+  | { kind: "production-note"; target: PersonalProductionNoteFrameTarget }
+  | { kind: "resume"; target: PersonalProductionResumeTarget }
+  | { kind: "rough-cut"; target: PersonalRoughCutFrameTarget }
+  | { kind: "checklist"; target: ChapterProductionChecklistFrameTarget };
+
+type PendingPagedLocate = PendingPagedLocateBase & PendingPagedLocateTarget;
 
 interface FrameNavigationFeedback {
   chapter: Chapter;
@@ -1349,6 +1380,363 @@ export function ChapterBrowser({
         ),
     [currentAssetResult, selectedChapter, services.apiBaseUrl],
   );
+  const browsePreferenceScope: StoryboardBrowsePreferenceScope | null = selectedChapter === null
+    ? null
+    : {
+      userId,
+      apiBaseUrl: services.apiBaseUrl ?? "",
+      seriesId: series.id,
+      chapterId: selectedChapter.id,
+    };
+  const browseOwnerKey = browsePreferenceScope === null
+    ? null
+    : storyboardChapterStorageKey(browsePreferenceScope);
+  const browsePageSizeOwnerKey = browsePreferenceScope === null
+    ? null
+    : storyboardPageSizeStorageKey(browsePreferenceScope);
+  const [savedBrowsePageSize, setSavedBrowsePageSize] = useState<{
+    ownerKey: string;
+    value: StoryboardPageSize;
+  } | null>(null);
+  const [savedBrowsePage, setSavedBrowsePage] = useState<{ ownerKey: string; value: number } | null>(null);
+  const [browseStorageNotice, setBrowseStorageNotice] = useState<string | null>(null);
+  const [pendingPagedLocate, setPendingPagedLocate] = useState<PendingPagedLocate | null>(null);
+  const pendingPagedLocateRef = useRef<PendingPagedLocate | null>(null);
+  const pendingPagedLocateId = useRef(0);
+  const browseLoadedOwnerKey = useRef<string | null>(null);
+  const browseRestoreGeneration = useRef(0);
+  const browseRestoreFrame = useRef<number | null>(null);
+  const browseActionFrame = useRef<number | null>(null);
+  const pendingBrowseScrollRestore = useRef<{ ownerKey: string; generation: number; scrollTop: number } | null>(null);
+  const expectedProgrammaticScrollTop = useRef<number | null>(null);
+  const manualBrowseOwner = useRef<string | null>(null);
+  const browseSaveTimer = useRef<number | null>(null);
+  const browseValues = useRef({ ownerKey: null as string | null, pageSize: defaultStoryboardPageSize, page: 1, scrollTop: 0 });
+  const browsePageSize = savedBrowsePageSize?.ownerKey === browsePageSizeOwnerKey
+    ? savedBrowsePageSize.value
+    : defaultStoryboardPageSize;
+  const pageCount = storyboardPageCount(frameViews.length, browsePageSize);
+  const browsePage = browseOwnerKey !== null && savedBrowsePage?.ownerKey === browseOwnerKey
+    ? clampStoryboardPage(savedBrowsePage.value, pageCount)
+    : 1;
+  const pageStartIndex = (browsePage - 1) * browsePageSize;
+  const visibleFrameViews = frameViews.slice(pageStartIndex, pageStartIndex + browsePageSize);
+
+  browseValues.current = {
+    ownerKey: browseOwnerKey,
+    pageSize: browsePageSize,
+    page: browsePage,
+    scrollTop: browseValues.current.ownerKey === browseOwnerKey ? browseValues.current.scrollTop : 0,
+  };
+
+  function cancelBrowseScrollRestore(): void {
+    pendingBrowseScrollRestore.current = null;
+    expectedProgrammaticScrollTop.current = null;
+    if (browseRestoreFrame.current !== null) {
+      window.cancelAnimationFrame(browseRestoreFrame.current);
+      browseRestoreFrame.current = null;
+    }
+    if (browseActionFrame.current !== null) {
+      window.cancelAnimationFrame(browseActionFrame.current);
+      browseActionFrame.current = null;
+    }
+  }
+
+  function finishPendingPagedLocate(result: boolean, updateState = true): void {
+    const pending = pendingPagedLocateRef.current;
+    if (pending === null) return;
+    pendingPagedLocateRef.current = null;
+    pending.resolve(result);
+    if (updateState) setPendingPagedLocate(null);
+  }
+
+  function cancelPendingPagedLocate(updateState = true): void {
+    finishPendingPagedLocate(false, updateState);
+  }
+
+  function beginExplicitStoryboardLocate(): void {
+    if (browseOwnerKey !== null) manualBrowseOwner.current = browseOwnerKey;
+    cancelBrowseScrollRestore();
+    cancelPendingPagedLocate();
+  }
+
+  function currentWindowScrollTop(): number {
+    const value = window.scrollY ?? window.pageYOffset ?? document.documentElement.scrollTop ?? 0;
+    return Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  }
+
+  function persistBrowseValues(values = browseValues.current): boolean {
+    const scope = browsePreferenceScope;
+    if (scope === null || values.ownerKey !== browseOwnerKey) return false;
+    const saved = writeStoryboardBrowsePreferences(scope, {
+      pageSize: values.pageSize,
+      page: values.page,
+      scrollTop: values.scrollTop,
+    });
+    setBrowseStorageNotice((current) => {
+      if (!saved) return "浏览状态未能保存；本次翻页和定位仍可继续使用。";
+      return current?.startsWith("无法读取浏览偏好") ? current : null;
+    });
+    return saved;
+  }
+
+  function setBrowsePage(nextPage: number, source: "user" | "reveal" | "external" | "clamp"): void {
+    if (browseOwnerKey === null || browsePageSizeOwnerKey === null) return;
+    const page = clampStoryboardPage(nextPage, pageCount);
+    if (source === "user" || source === "external") {
+      manualBrowseOwner.current = browseOwnerKey;
+      cancelBrowseScrollRestore();
+      cancelPendingPagedLocate();
+    } else if (source === "reveal") {
+      manualBrowseOwner.current = browseOwnerKey;
+      cancelBrowseScrollRestore();
+    }
+    const values = { ...browseValues.current, ownerKey: browseOwnerKey, page };
+    browseValues.current = values;
+    setSavedBrowsePage({ ownerKey: browseOwnerKey, value: page });
+    persistBrowseValues(values);
+  }
+
+  function changeBrowsePageSize(nextPageSize: StoryboardPageSize): void {
+    if (browseOwnerKey === null || browsePageSizeOwnerKey === null) return;
+    manualBrowseOwner.current = browseOwnerKey;
+    cancelBrowseScrollRestore();
+    cancelPendingPagedLocate();
+    const values = {
+      ...browseValues.current,
+      ownerKey: browseOwnerKey,
+      pageSize: nextPageSize,
+      page: 1,
+    };
+    browseValues.current = values;
+    setSavedBrowsePageSize({ ownerKey: browsePageSizeOwnerKey, value: nextPageSize });
+    setSavedBrowsePage({ ownerKey: browseOwnerKey, value: 1 });
+    persistBrowseValues(values);
+    const generation = browseRestoreGeneration.current;
+    browseActionFrame.current = window.requestAnimationFrame(() => {
+      browseActionFrame.current = null;
+      const list = storyboardListElement.current;
+      if (generation !== browseRestoreGeneration.current
+        || list === null || browseValues.current.ownerKey !== browseOwnerKey) return;
+      const nextTop = Math.max(0, Math.floor(window.scrollY + list.getBoundingClientRect().top));
+      expectedProgrammaticScrollTop.current = nextTop;
+      browseValues.current = { ...browseValues.current, scrollTop: nextTop };
+      if (Math.abs(currentWindowScrollTop() - nextTop) > 2) {
+        try {
+          window.scrollTo(0, nextTop);
+        } catch {
+          // The selected page remains usable when programmatic scrolling is unavailable.
+        }
+      }
+      persistBrowseValues(browseValues.current);
+    });
+  }
+
+  function scrollToStoryboardStart(): void {
+    const expectedOwner = browseOwnerKey;
+    const generation = browseRestoreGeneration.current;
+    cancelBrowseScrollRestore();
+    browseActionFrame.current = window.requestAnimationFrame(() => {
+      browseActionFrame.current = null;
+      const list = storyboardListElement.current;
+      if (generation !== browseRestoreGeneration.current
+        || list === null || expectedOwner === null || browseValues.current.ownerKey !== expectedOwner) return;
+      const nextTop = Math.max(0, Math.floor(currentWindowScrollTop() + list.getBoundingClientRect().top));
+      expectedProgrammaticScrollTop.current = nextTop;
+      browseValues.current = { ...browseValues.current, scrollTop: nextTop };
+      if (Math.abs(currentWindowScrollTop() - nextTop) > 2) {
+        try {
+          window.scrollTo(0, nextTop);
+        } catch {
+          // The current page remains usable if the browser cannot scroll programmatically.
+        }
+      }
+      persistBrowseValues(browseValues.current);
+    });
+  }
+
+  function requestPagedLocate(request: PendingPagedLocateTarget & { position: number }): Promise<boolean> {
+    const chapter = selectedChapter;
+    if (chapter === null || browseOwnerKey === null || !request.target.isCurrent()) {
+      return Promise.resolve(false);
+    }
+    const targetPage = storyboardPageForPosition(request.position, browsePageSize, pageCount);
+    if (targetPage === null || targetPage === browsePage) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const pending = {
+        ...request,
+        id: ++pendingPagedLocateId.current,
+        browseScopeKey: browseOwnerKey,
+        chapter,
+        chapterRequestGeneration: chapterRequestGeneration.current,
+        sessionGeneration,
+        resolve,
+      } as PendingPagedLocate;
+      pendingPagedLocateRef.current = pending;
+      setPendingPagedLocate(pending);
+      setBrowsePage(targetPage, "reveal");
+    });
+  }
+
+  const externalFrameNavigationPending = navigationIntent !== null
+    && navigationIntent.frameTarget !== undefined
+    && navigationIntent.userId === userId
+    && navigationIntent.services === services
+    && navigationIntent.seriesId === series.id
+    && !finalizedNavigationEpochsRef.current.has(navigationIntent.navigationEpoch);
+
+  useLayoutEffect(() => {
+    if (browsePreferenceScope === null || browseOwnerKey === null || browsePageSizeOwnerKey === null) {
+      browseLoadedOwnerKey.current = null;
+      cancelPendingPagedLocate(false);
+      setPendingPagedLocate(null);
+      cancelBrowseScrollRestore();
+      return undefined;
+    }
+    const ownerKey = browseOwnerKey;
+    const generation = ++browseRestoreGeneration.current;
+    cancelPendingPagedLocate(false);
+    setPendingPagedLocate(null);
+    const isNewOwner = browseLoadedOwnerKey.current !== ownerKey;
+    if (isNewOwner) {
+      browseLoadedOwnerKey.current = ownerKey;
+      manualBrowseOwner.current = null;
+      const restored = readStoryboardBrowsePreferences(browsePreferenceScope);
+      const restoredPage = clampStoryboardPage(
+        restored.preferences.page,
+        storyboardPageCount(frameViews.length, restored.preferences.pageSize),
+      );
+      const values = {
+        ownerKey,
+        pageSize: restored.preferences.pageSize,
+        page: restoredPage,
+        scrollTop: restored.preferences.scrollTop,
+      };
+      browseValues.current = values;
+      setSavedBrowsePageSize({ ownerKey: browsePageSizeOwnerKey, value: restored.preferences.pageSize });
+      setSavedBrowsePage({ ownerKey, value: restoredPage });
+      setBrowseStorageNotice(restored.available ? null : "无法读取浏览偏好；可继续手动翻页和滚动。");
+      if (externalFrameNavigationPending) {
+        manualBrowseOwner.current = ownerKey;
+        pendingBrowseScrollRestore.current = null;
+      } else {
+        pendingBrowseScrollRestore.current = {
+          ownerKey,
+          generation,
+          scrollTop: restored.preferences.scrollTop,
+        };
+      }
+    } else {
+      // A refreshed directory or session object invalidates old work, but does not
+      // reread storage over page choices already made in this mounted chapter.
+      pendingBrowseScrollRestore.current = null;
+    }
+
+    const persistScroll = () => {
+      if (browseSaveTimer.current !== null) {
+        window.clearTimeout(browseSaveTimer.current);
+      }
+      browseSaveTimer.current = window.setTimeout(() => {
+        browseSaveTimer.current = null;
+        if (browseRestoreGeneration.current !== generation || browseOwnerKey !== ownerKey) return;
+        browseValues.current = { ...browseValues.current, scrollTop: currentWindowScrollTop() };
+        persistBrowseValues(browseValues.current);
+      }, 160);
+    };
+    const onScroll = () => {
+      if (browseRestoreGeneration.current !== generation || browseOwnerKey !== ownerKey) return;
+      const scrollTop = currentWindowScrollTop();
+      const expected = expectedProgrammaticScrollTop.current;
+      if (expected !== null && Math.abs(scrollTop - expected) <= 2) {
+        expectedProgrammaticScrollTop.current = null;
+        browseValues.current = { ...browseValues.current, scrollTop };
+        return;
+      }
+      cancelBrowseScrollRestore();
+      manualBrowseOwner.current = ownerKey;
+      browseValues.current = { ...browseValues.current, scrollTop };
+      persistScroll();
+    };
+    const onManualScrollIntent = () => {
+      if (browseRestoreGeneration.current !== generation || browseOwnerKey !== ownerKey) return;
+      manualBrowseOwner.current = ownerKey;
+      cancelBrowseScrollRestore();
+    };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    window.addEventListener("wheel", onManualScrollIntent, { passive: true });
+    window.addEventListener("touchmove", onManualScrollIntent, { passive: true });
+    window.addEventListener("pointerdown", onManualScrollIntent, { passive: true });
+    return () => {
+      if (browseRestoreGeneration.current === generation) browseRestoreGeneration.current += 1;
+      if (browseSaveTimer.current !== null) {
+        window.clearTimeout(browseSaveTimer.current);
+        browseSaveTimer.current = null;
+      }
+      cancelBrowseScrollRestore();
+      cancelPendingPagedLocate(false);
+      window.removeEventListener("scroll", onScroll);
+      window.removeEventListener("wheel", onManualScrollIntent);
+      window.removeEventListener("touchmove", onManualScrollIntent);
+      window.removeEventListener("pointerdown", onManualScrollIntent);
+    };
+  }, [browseOwnerKey, browsePageSizeOwnerKey, services, sessionGeneration, selectedChapter]);
+
+  useLayoutEffect(() => {
+    if (browseOwnerKey === null || !externalFrameNavigationPending) return;
+    manualBrowseOwner.current = browseOwnerKey;
+    cancelBrowseScrollRestore();
+  }, [browseOwnerKey, externalFrameNavigationPending, navigationIntentEpoch, pendingFrameNavigation]);
+
+  useLayoutEffect(() => {
+    const pending = pendingBrowseScrollRestore.current;
+    if (
+      pending === null
+      || pending.ownerKey !== browseOwnerKey
+      || pending.generation !== browseRestoreGeneration.current
+      || browseOwnerKey === null
+      || externalFrameNavigationPending
+      || manualBrowseOwner.current === browseOwnerKey
+      || savedBrowsePage?.ownerKey !== browseOwnerKey
+      || savedBrowsePageSize?.ownerKey !== browsePageSizeOwnerKey
+    ) return undefined;
+    if (browseRestoreFrame.current !== null) window.cancelAnimationFrame(browseRestoreFrame.current);
+    browseRestoreFrame.current = window.requestAnimationFrame(() => {
+      browseRestoreFrame.current = null;
+      if (
+        pendingBrowseScrollRestore.current !== pending
+        || pending.generation !== browseRestoreGeneration.current
+        || manualBrowseOwner.current === browseOwnerKey
+        || browseValues.current.ownerKey !== browseOwnerKey
+      ) return;
+      pendingBrowseScrollRestore.current = null;
+      expectedProgrammaticScrollTop.current = pending.scrollTop;
+      browseValues.current = { ...browseValues.current, scrollTop: pending.scrollTop };
+      if (Math.abs(currentWindowScrollTop() - pending.scrollTop) > 2) {
+        try {
+          window.scrollTo(0, pending.scrollTop);
+        } catch {
+          // Manual scrolling remains available if the browser cannot restore the saved position.
+        }
+      } else {
+        expectedProgrammaticScrollTop.current = null;
+      }
+    });
+    return () => {
+      if (browseRestoreFrame.current !== null) {
+        window.cancelAnimationFrame(browseRestoreFrame.current);
+        browseRestoreFrame.current = null;
+      }
+    };
+  }, [browseOwnerKey, browsePageSizeOwnerKey, browsePage, savedBrowsePage, savedBrowsePageSize, visibleFrameViews.length, externalFrameNavigationPending]);
+
+  useEffect(() => {
+    if (browseOwnerKey === null || savedBrowsePage?.ownerKey !== browseOwnerKey) return;
+    const clamped = clampStoryboardPage(savedBrowsePage.value, pageCount);
+    if (clamped === savedBrowsePage.value) return;
+    setSavedBrowsePage({ ownerKey: browseOwnerKey, value: clamped });
+    browseValues.current = { ...browseValues.current, page: clamped };
+    persistBrowseValues(browseValues.current);
+  }, [browseOwnerKey, pageCount, savedBrowsePage]);
 
   useEffect(() => {
     const pending = pendingFrameNavigation;
@@ -1392,6 +1780,18 @@ export function ChapterBrowser({
 
     if (framePosition === null || matchedAsset === null) {
       markUnresolved("当前镜头快照与素材目录无法对应，目标镜头尚未定位。可重新核对目标镜头。");
+      return;
+    }
+
+    if (!visibleFrameViews.some((frame) => frame.position === framePosition)) {
+      const targetPage = storyboardPageForPosition(framePosition, browsePageSize, pageCount);
+      if (targetPage === null) {
+        markUnresolved("目标镜头所在分页无法核对，尚未完成定位。可重新核对目标镜头。");
+        return;
+      }
+      if (targetPage !== browsePage) {
+        setBrowsePage(targetPage, "external");
+      }
       return;
     }
 
@@ -1442,6 +1842,11 @@ export function ChapterBrowser({
     chapters,
     currentAssetResult,
     frameViews,
+    visibleFrameViews,
+    browsePage,
+    browsePageSize,
+    browseOwnerKey,
+    pageCount,
     pendingFrameNavigation,
     selectedChapter,
     selectedChapterId,
@@ -1553,7 +1958,7 @@ export function ChapterBrowser({
     ));
   }, [isCurrentPersonalNotesOwner, personalNotesContext]);
 
-  const onLocateProductionNoteFrame = useCallback((target: PersonalProductionNoteFrameTarget): boolean => {
+  const onLocateProductionNoteFrame = useCallback((target: PersonalProductionNoteFrameTarget): boolean | Promise<boolean> => {
     const owner = personalNotesContext;
     const registration = personalNotesReadRegistrationRef.current;
     if (
@@ -1601,6 +2006,10 @@ export function ChapterBrowser({
     if (!isCurrent() || !frameViews.some((frame) => frame.position === target.position)) {
       return false;
     }
+    beginExplicitStoryboardLocate();
+    if (!visibleFrameViews.some((frame) => frame.position === target.position)) {
+      return requestPagedLocate({ kind: "production-note", target, position: target.position });
+    }
 
     const storyboardList = storyboardListElement.current;
     const frameElement = storyboardFrameElements.current.get(target.position);
@@ -1637,7 +2046,7 @@ export function ChapterBrowser({
     }
     setPersonalNoteFrameFeedback({ owner, identity: target.readIdentity, target });
     return true;
-  }, [frameViews, isCurrentPersonalNotesOwner, personalNotesContext]);
+  }, [frameViews, visibleFrameViews, isCurrentPersonalNotesOwner, personalNotesContext, requestPagedLocate]);
 
   const onClosePersonalNotes = useCallback((identity: PersonalProductionNoteReadIdentity | null) => {
     const owner = personalNotesContext;
@@ -1646,7 +2055,7 @@ export function ChapterBrowser({
     }
   }, [closePersonalNotes, isCurrentPersonalNotesOwner, personalNotesContext]);
 
-  const onLocateResume = useCallback((target: PersonalProductionResumeTarget) => {
+  const onLocateResume = useCallback((target: PersonalProductionResumeTarget): boolean | Promise<boolean> => {
     const owner = personalNotesContext;
     if (
       owner === null
@@ -1656,7 +2065,11 @@ export function ChapterBrowser({
       || target.position < 1
       || !frameViews.some((frame) => frame.position === target.position)
     ) {
-      return;
+      return false;
+    }
+    beginExplicitStoryboardLocate();
+    if (!visibleFrameViews.some((frame) => frame.position === target.position)) {
+      return requestPagedLocate({ kind: "resume", target, position: target.position });
     }
 
     const storyboardList = storyboardListElement.current;
@@ -1668,16 +2081,32 @@ export function ChapterBrowser({
       || !storyboardList.contains(frameElement)
       || frameElement.closest("[hidden], [inert]") !== null
     ) {
-      return;
+      return false;
     }
 
-    frameElement.focus({ preventScroll: true });
-    if (!isCurrentPersonalNotesOwner(owner) || !target.isCurrent()) {
-      return;
+    try {
+      frameElement.focus({ preventScroll: true });
+    } catch {
+      return false;
     }
-    frameElement.scrollIntoView?.({ behavior: "auto", block: "center" });
+    if (
+      document.activeElement !== frameElement
+      || !isCurrentPersonalNotesOwner(owner)
+      || !target.isCurrent()
+      || storyboardFrameElements.current.get(target.position) !== frameElement
+      || !isVisibleStoryboardElement(frameElement)
+      || !storyboardList.contains(frameElement)
+    ) {
+      return false;
+    }
+    try {
+      frameElement.scrollIntoView?.({ behavior: "auto", block: "center" });
+    } catch {
+      return false;
+    }
     setResumeLocation({ owner, target });
-  }, [frameViews, isCurrentPersonalNotesOwner, personalNotesContext]);
+    return true;
+  }, [frameViews, visibleFrameViews, isCurrentPersonalNotesOwner, personalNotesContext, requestPagedLocate]);
 
   const onResumeInvalidated = useCallback(() => {
     const owner = personalNotesContext;
@@ -1701,7 +2130,7 @@ export function ChapterBrowser({
     ));
   }, [personalRoughCutContext]);
 
-  const onLocateRoughCutFrame = useCallback((target: PersonalRoughCutFrameTarget): boolean => {
+  const onLocateRoughCutFrame = useCallback((target: PersonalRoughCutFrameTarget): boolean | Promise<boolean> => {
     const owner = personalRoughCutContext;
     const assetSnapshot = currentAssetResult;
     const requestGeneration = assetRequestGeneration.current;
@@ -1750,6 +2179,10 @@ export function ChapterBrowser({
     if (!isCurrent()) {
       return false;
     }
+    beginExplicitStoryboardLocate();
+    if (!visibleFrameViews.some((frame) => frame.position === target.position)) {
+      return requestPagedLocate({ kind: "rough-cut", target, position: target.position });
+    }
 
     const storyboardList = storyboardListElement.current;
     const frameElement = storyboardFrameElements.current.get(target.position);
@@ -1784,7 +2217,7 @@ export function ChapterBrowser({
     frameElement.scrollIntoView?.({ behavior: "auto", block: "center" });
     setRoughCutFrameFeedback({ owner, assetSnapshot, assetRequestGeneration: requestGeneration, target });
     return true;
-  }, [currentAssetResult, frameViews, personalRoughCutContext, selectedChapter, series.id, services, userId]);
+  }, [currentAssetResult, frameViews, visibleFrameViews, personalRoughCutContext, requestPagedLocate, selectedChapter, series.id, services, userId]);
 
   const currentResumeLocation = resumeLocation !== null
     && resumeLocation.owner === personalNotesContext
@@ -2082,7 +2515,7 @@ export function ChapterBrowser({
   function locateChapterProductionChecklistFrame(
     context: ChapterProductionChecklistContext,
     target: ChapterProductionChecklistFrameTarget,
-  ): boolean {
+  ): boolean | Promise<boolean> {
     if (!isCurrentChapterProductionChecklist(context) || !target.isCurrent()) return false;
     const storyboardAssetId = target.storyboardAssetId.trim();
     const content = context.owner.chapter.content;
@@ -2099,6 +2532,10 @@ export function ChapterBrowser({
     if (positions.length !== 1) return false;
     const position = positions[0];
     if (position === undefined || !frameViews.some((frame) => frame.position === position)) return false;
+    beginExplicitStoryboardLocate();
+    if (!visibleFrameViews.some((frame) => frame.position === position)) {
+      return requestPagedLocate({ kind: "checklist", target, position });
+    }
     const list = storyboardListElement.current;
     const element = storyboardFrameElements.current.get(position);
     if (list === null || element === undefined || !element.isConnected || !list.contains(element)
@@ -2118,6 +2555,67 @@ export function ChapterBrowser({
     }
     return true;
   }
+
+  const pagedLocateHandlersRef = useRef<{
+    "production-note": (target: PersonalProductionNoteFrameTarget) => boolean | Promise<boolean>;
+    resume: (target: PersonalProductionResumeTarget) => boolean | Promise<boolean>;
+    "rough-cut": (target: PersonalRoughCutFrameTarget) => boolean | Promise<boolean>;
+    checklist: (target: ChapterProductionChecklistFrameTarget) => boolean | Promise<boolean>;
+  }>({
+    "production-note": () => false,
+    resume: () => false,
+    "rough-cut": () => false,
+    checklist: () => false,
+  });
+  pagedLocateHandlersRef.current = {
+    "production-note": onLocateProductionNoteFrame,
+    resume: onLocateResume,
+    "rough-cut": onLocateRoughCutFrame,
+    checklist: (target) => productionChecklistContext === null
+      ? false
+      : locateChapterProductionChecklistFrame(productionChecklistContext, target),
+  };
+
+  useLayoutEffect(() => {
+    const pending = pendingPagedLocate;
+    if (pending === null || pendingPagedLocateRef.current !== pending) return;
+    const current = pending.browseScopeKey === browseOwnerKey
+      && pending.chapter === selectedChapter
+      && pending.chapterRequestGeneration === chapterRequestGeneration.current
+      && pending.sessionGeneration === sessionGenerationRef.current
+      && pending.target.isCurrent();
+    if (!current) {
+      finishPendingPagedLocate(false);
+      return;
+    }
+    if (!visibleFrameViews.some((frame) => frame.position === pending.position)) return;
+
+    pendingPagedLocateRef.current = null;
+    setPendingPagedLocate(null);
+    const performLocate = (): boolean | Promise<boolean> => {
+      switch (pending.kind) {
+        case "production-note":
+          return pagedLocateHandlersRef.current["production-note"](pending.target);
+        case "resume":
+          return pagedLocateHandlersRef.current.resume(pending.target);
+        case "rough-cut":
+          return pagedLocateHandlersRef.current["rough-cut"](pending.target);
+        case "checklist":
+          return pagedLocateHandlersRef.current.checklist(pending.target);
+      }
+    };
+    let result: boolean | Promise<boolean>;
+    try {
+      result = performLocate();
+    } catch {
+      pending.resolve(false);
+      return;
+    }
+    void Promise.resolve(result).then(
+      (located) => pending.resolve(located === true),
+      () => pending.resolve(false),
+    );
+  }, [browseOwnerKey, pendingPagedLocate, selectedChapter, visibleFrameViews, browsePage]);
 
   function openPersonalNotes() {
     if (
@@ -4858,6 +5356,14 @@ export function ChapterBrowser({
                   </button>
                 </div>
               )}
+              {browseStorageNotice !== null && (
+                <p className="storyboard-browse-notice" role="note">{browseStorageNotice}</p>
+              )}
+              {pendingPagedLocate !== null && pendingPagedLocate.browseScopeKey === browseOwnerKey && (
+                <p className="storyboard-browse-notice" role="status" aria-live="polite">
+                  正在打开目标分镜所在页并核对定位…
+                </p>
+              )}
 
               {personalNotesOpen && personalNotesContext !== null && selectedChapter !== null && currentAssetResult !== null && (
                 <PersonalProductionNotesPanel
@@ -4929,6 +5435,46 @@ export function ChapterBrowser({
                       </button>
                     </div>
                   )}
+                  <nav className="storyboard-pagination" aria-label="分镜分页">
+                    <label>
+                      每页
+                      <select
+                        aria-label="每页分镜"
+                        onChange={(event) => {
+                          const value = Number(event.currentTarget.value);
+                          if (value === 10 || value === 20 || value === 50 || value === 100) {
+                            changeBrowsePageSize(value);
+                          }
+                        }}
+                        value={browsePageSize}
+                      >
+                        {[10, 20, 50, 100].map((size) => (
+                          <option key={size} value={size}>{size} 条</option>
+                        ))}
+                      </select>
+                    </label>
+                    <button
+                      aria-label="上一页分镜"
+                      className="secondary-button"
+                      disabled={browsePage <= 1}
+                      onClick={() => {
+                        setBrowsePage(browsePage - 1, "user");
+                        scrollToStoryboardStart();
+                      }}
+                      type="button"
+                    >上一页</button>
+                    <span aria-live="polite" role="status">第 {browsePage} / {pageCount} 页 · 共 {frameViews.length} 个镜头</span>
+                    <button
+                      aria-label="下一页分镜"
+                      className="secondary-button"
+                      disabled={browsePage >= pageCount}
+                      onClick={() => {
+                        setBrowsePage(browsePage + 1, "user");
+                        scrollToStoryboardStart();
+                      }}
+                      type="button"
+                    >下一页</button>
+                  </nav>
                   <div className="storyboard-list" ref={storyboardListElement} aria-label="分镜内容">
                     {currentResumeLocation !== null && (
                       <p className="resume-location-feedback" role="status" aria-live="polite">
@@ -4950,7 +5496,7 @@ export function ChapterBrowser({
                         已定位到粗剪镜头 {currentRoughCutFrameFeedback.target.position}。
                       </p>
                     )}
-                    {frameViews.map((frame) => {
+                    {visibleFrameViews.map((frame) => {
                       const sourceFrame = frames[frame.position - 1];
                       const storyboardAssetId = storyboardFrameId(sourceFrame);
                       const reviewAssets = storyboardAssetId !== null && currentAssetResult?.status === "ready"

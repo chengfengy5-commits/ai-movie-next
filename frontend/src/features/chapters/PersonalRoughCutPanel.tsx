@@ -48,7 +48,7 @@ interface PersonalRoughCutPanelProps {
   assetSnapshotToken?: object | null;
   assetRequestGeneration?: number;
   assetDirectoryStatus?: "loading" | "ready" | "error";
-  onLocateFrame?(target: PersonalRoughCutFrameTarget): boolean;
+  onLocateFrame?(target: PersonalRoughCutFrameTarget): boolean | Promise<boolean>;
   onFrameNavigationInvalidated?(identity: PersonalRoughCutReadIdentity): void;
 }
 
@@ -250,6 +250,8 @@ export function PersonalRoughCutPanel({
   const renderedRequestGeneration = requestGeneration.current;
   const [reloadGeneration, setReloadGeneration] = useState(0);
   const [navigationNotice, setNavigationNotice] = useState<string | null>(null);
+  const [navigationPendingPosition, setNavigationPendingPosition] = useState<number | null>(null);
+  const navigationActionGeneration = useRef(0);
   const activeController = useRef<AbortController | null>(null);
   const stopPlaybackRef = useRef<(() => void) | null>(null);
   const registerPlaybackStop = useCallback((stop: (() => void) | null) => {
@@ -271,6 +273,13 @@ export function PersonalRoughCutPanel({
     && readState.requestGeneration === requestGeneration.current;
   const hasCurrentPlaybackRead = hasCurrentCanonicalRead
     && readState.directoryIdentity === directoryIdentity;
+
+  useLayoutEffect(() => {
+    if (scopeInvalidated) {
+      navigationActionGeneration.current += 1;
+      setNavigationPendingPosition(null);
+    }
+  }, [scopeInvalidated]);
 
   useLayoutEffect(() => {
     const activeReadIdentity = activeReadIdentityRef.current;
@@ -434,6 +443,7 @@ export function PersonalRoughCutPanel({
 
     return () => {
       mounted = false;
+      navigationActionGeneration.current += 1;
       requestGeneration.current += 1;
       controller.abort();
       if (activeController.current === controller) {
@@ -631,6 +641,30 @@ export function PersonalRoughCutPanel({
         && findRoughCutFramePosition(boundScope.chapter, boundScope.seriesId, currentSnapshot, row, currentAssets) === position
       ),
     };
+  }
+
+  async function locateRoughCutTarget(target: PersonalRoughCutFrameTarget): Promise<void> {
+    if (onLocateFrame === undefined || !target.isCurrent()) return;
+    const generation = ++navigationActionGeneration.current;
+    setNavigationPendingPosition(target.position);
+    setNavigationNotice(null);
+    try {
+      const located = await Promise.resolve(onLocateFrame(target));
+      if (generation !== navigationActionGeneration.current) return;
+      setNavigationPendingPosition(null);
+      if (target.isCurrent()) {
+        setNavigationNotice(located
+          ? null
+          : "暂时无法定位到对应镜头，请确认该镜头仍在当前章节中后重试。");
+      }
+    } catch {
+      if (generation === navigationActionGeneration.current) {
+        setNavigationPendingPosition(null);
+        if (target.isCurrent()) {
+          setNavigationNotice("暂时无法定位到对应镜头，请确认该镜头仍在当前章节中后重试。");
+        }
+      }
+    }
   }
 
   function closePanel() {
@@ -883,14 +917,14 @@ export function PersonalRoughCutPanel({
                               if (!target.isCurrent()) {
                                 return;
                               }
-                              const located = onLocateFrame(target);
-                              setNavigationNotice(located
-                                ? null
-                                : "暂时无法定位到对应镜头，请确认该镜头仍在当前章节中后重试。");
+                              void locateRoughCutTarget(target);
                             }}
+                            disabled={navigationPendingPosition === position}
                             type="button"
                           >
-                            定位到对应镜头 {position}
+                            {navigationPendingPosition === position
+                              ? "正在切换到对应镜头…"
+                              : `定位到对应镜头 ${position}`}
                           </button>
                         ) : onLocateFrame !== undefined && assets === null ? (
                           <p className="rough-cut-navigation-note" role="note">

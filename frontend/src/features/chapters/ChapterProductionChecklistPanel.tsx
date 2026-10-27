@@ -31,7 +31,7 @@ interface ChapterProductionChecklistPanelProps {
   isCurrent(): boolean;
   onClose(): void;
   onNavigateToAsset?(target: FrameAssetReferenceAssetTarget): void;
-  onLocateFrame?(target: ChapterProductionChecklistFrameTarget): boolean;
+  onLocateFrame?(target: ChapterProductionChecklistFrameTarget): boolean | Promise<boolean>;
   onUnauthorized(): void;
 }
 
@@ -88,6 +88,8 @@ export function ChapterProductionChecklistPanel({
 }: ChapterProductionChecklistPanelProps) {
   const [state, setState] = useState<PanelState>({ status: "loading" });
   const [feedback, setFeedback] = useState<string | null>(null);
+  const [locatingFrame, setLocatingFrame] = useState<string | null>(null);
+  const locateGeneration = useRef(0);
   const [manualCopyText, setManualCopyText] = useState("");
   const mounted = useRef(false);
   const stateRef = useRef(state);
@@ -149,6 +151,7 @@ export function ChapterProductionChecklistPanel({
     return () => {
       mounted.current = false;
       readGeneration.current += 1;
+      locateGeneration.current += 1;
       readController.current?.abort();
       readController.current = null;
       outputCleanup.current?.();
@@ -168,7 +171,7 @@ export function ChapterProductionChecklistPanel({
       && stateRef.current.result === result;
   }
 
-  function navigate(item: ChapterChecklistItem, result: ChapterChecklistResult) {
+  async function navigate(item: ChapterChecklistItem, result: ChapterChecklistResult): Promise<void> {
     if (!targetIsCurrent(result)) return;
     if (item.kind === "asset") {
       const navigation = item.navigation;
@@ -189,8 +192,25 @@ export function ChapterProductionChecklistPanel({
       storyboardAssetId: frame.storyboardAssetId,
       isCurrent: () => targetIsCurrent(result),
     };
-    if (target.isCurrent() && onLocateFrame(target)) {
-      setFeedback(`已定位到关联分镜 ${frame.frameIndex + 1}。`);
+    if (!target.isCurrent()) return;
+    const generation = ++locateGeneration.current;
+    setLocatingFrame(frame.storyboardAssetId);
+    setFeedback(null);
+    try {
+      const located = await Promise.resolve(onLocateFrame(target));
+      if (generation !== locateGeneration.current) return;
+      setLocatingFrame(null);
+      if (!target.isCurrent()) return;
+      setFeedback(located
+        ? `已定位到关联分镜 ${frame.frameIndex + 1}。`
+        : "暂时无法定位到关联分镜，请确认目标仍在当前章节中后重试。");
+    } catch {
+      if (generation === locateGeneration.current) {
+        setLocatingFrame(null);
+        if (target.isCurrent()) {
+          setFeedback("暂时无法定位到关联分镜，请确认目标仍在当前章节中后重试。");
+        }
+      }
     }
   }
 
@@ -268,12 +288,15 @@ export function ChapterProductionChecklistPanel({
             {item.kind === "asset" && item.navigation !== null && (
               <button
                 className="text-button"
-                onClick={() => navigate(item, result)}
+                onClick={() => { void navigate(item, result); }}
+                disabled={locatingFrame !== null}
                 type="button"
-              >{item.navigation.kind === "asset" ? "打开素材" : "定位分镜"}</button>
+              >{locatingFrame !== null ? "正在定位…" : item.navigation.kind === "asset" ? "打开素材" : "定位分镜"}</button>
             )}
             {(item.kind === "preview" || item.kind === "video") && item.frame.navigable && (
-              <button className="text-button" onClick={() => navigate(item, result)} type="button">定位分镜</button>
+              <button className="text-button" onClick={() => { void navigate(item, result); }} disabled={locatingFrame !== null} type="button">
+                {locatingFrame === item.frame.storyboardAssetId ? "正在定位…" : "定位分镜"}
+              </button>
             )}
           </li>
         ))}

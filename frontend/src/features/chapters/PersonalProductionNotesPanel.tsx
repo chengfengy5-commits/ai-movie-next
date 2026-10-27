@@ -79,11 +79,11 @@ interface PersonalProductionNotesPanelProps extends PersonalProductionNotesScope
   onClose(readIdentity: PersonalProductionNoteReadIdentity | null): void;
   onRetryChapter(): void;
   onUnauthorized(): void;
-  onLocateResume(target: PersonalProductionResumeTarget): void;
+  onLocateResume(target: PersonalProductionResumeTarget): boolean | void | Promise<boolean | void>;
   onResumeInvalidated(): void;
   onRegisterFrameRead(readIdentity: PersonalProductionNoteReadIdentity): void;
   onFrameReadInvalidated(readIdentity: PersonalProductionNoteReadIdentity): void;
-  onLocateProductionNoteFrame(target: PersonalProductionNoteFrameTarget): boolean;
+  onLocateProductionNoteFrame(target: PersonalProductionNoteFrameTarget): boolean | Promise<boolean>;
 }
 
 type ReadState =
@@ -314,6 +314,10 @@ export function PersonalProductionNotesPanel({
 }: PersonalProductionNotesPanelProps) {
   const [readState, setReadState] = useState<ReadState>({ status: "loading", ticket: null });
   const [frameNavigationNotice, setFrameNavigationNotice] = useState<number | null>(null);
+  const [frameNavigationPending, setFrameNavigationPending] = useState<number | null>(null);
+  const [resumeNavigationPending, setResumeNavigationPending] = useState(false);
+  const [resumeNavigationNotice, setResumeNavigationNotice] = useState(false);
+  const navigationActionGeneration = useRef(0);
   const [statusSelection, setStatusSelection] = useState<ProductionNoteStatusSelection | null>(null);
   const [resumeSelection, setResumeSelection] = useState<PersonalProductionResumeSelection | null>(null);
   const resumeSelectionRef = useRef(resumeSelection);
@@ -439,6 +443,10 @@ export function PersonalProductionNotesPanel({
     setEditingFrameId(null);
     setResumeSelection(null);
     setFrameNavigationNotice(null);
+    navigationActionGeneration.current += 1;
+    setFrameNavigationPending(null);
+    setResumeNavigationPending(false);
+    setResumeNavigationNotice(false);
     invalidatedCallback.current();
     return identity;
   }
@@ -448,6 +456,10 @@ export function PersonalProductionNotesPanel({
       return;
     }
     scopeInvalidated.current = true;
+    navigationActionGeneration.current += 1;
+    setFrameNavigationPending(null);
+    setResumeNavigationPending(false);
+    setResumeNavigationNotice(false);
     invalidateEditorSession();
     const identity = readIdentityForState(readStateRef.current);
     requestGeneration.current += 1;
@@ -594,6 +606,7 @@ export function PersonalProductionNotesPanel({
   ]);
 
   useEffect(() => () => {
+    navigationActionGeneration.current += 1;
     invalidateEditorSession();
     saveGeneration.current += 1;
     saveControllerRef.current?.abort();
@@ -617,6 +630,9 @@ export function PersonalProductionNotesPanel({
       frameReadInvalidatedCallback.current(identity);
     }
     scopeInvalidated.current = true;
+    navigationActionGeneration.current += 1;
+    setFrameNavigationPending(null);
+    setResumeNavigationPending(false);
     setReadState({ status: "loading", ticket: null });
   }
 
@@ -1268,7 +1284,7 @@ export function PersonalProductionNotesPanel({
       });
   }
 
-  function locateProductionNoteFrame(row: PersonalProductionFrameView) {
+  async function locateProductionNoteFrame(row: PersonalProductionFrameView) {
     const state = readStateRef.current;
     if (
       visibleReadState.status !== "ready"
@@ -1331,14 +1347,26 @@ export function PersonalProductionNotesPanel({
       return;
     }
 
-    const located = locateProductionNoteFrameCallback.current(target);
-    if (!target.isCurrent()) {
-      return;
+    const actionGeneration = ++navigationActionGeneration.current;
+    setFrameNavigationPending(row.position);
+    setFrameNavigationNotice(null);
+    setResumeNavigationPending(false);
+    setResumeNavigationNotice(false);
+    try {
+      const located = await Promise.resolve(locateProductionNoteFrameCallback.current(target));
+      if (actionGeneration !== navigationActionGeneration.current) return;
+      setFrameNavigationPending(null);
+      if (!target.isCurrent()) return;
+      setFrameNavigationNotice(located === true ? null : row.position);
+    } catch {
+      if (actionGeneration === navigationActionGeneration.current) {
+        setFrameNavigationPending(null);
+        if (target.isCurrent()) setFrameNavigationNotice(row.position);
+      }
     }
-    setFrameNavigationNotice(located ? null : row.position);
   }
 
-  function locateResume() {
+  async function locateResume() {
     if (
       visibleReadState.status !== "ready"
       || !ticketIsCurrent(visibleReadState.ticket)
@@ -1372,8 +1400,23 @@ export function PersonalProductionNotesPanel({
           && ticket.scope.mediaSnapshotAvailable;
       },
     };
-    if (target.isCurrent()) {
-      locateCallback.current(target);
+    if (!target.isCurrent()) return;
+    const actionGeneration = ++navigationActionGeneration.current;
+    setResumeNavigationPending(true);
+    setResumeNavigationNotice(false);
+    setFrameNavigationPending(null);
+    setFrameNavigationNotice(null);
+    try {
+      const located = await Promise.resolve(locateCallback.current(target));
+      if (actionGeneration !== navigationActionGeneration.current) return;
+      setResumeNavigationPending(false);
+      if (!target.isCurrent()) return;
+      setResumeNavigationNotice(located === false);
+    } catch {
+      if (actionGeneration === navigationActionGeneration.current) {
+        setResumeNavigationPending(false);
+        if (target.isCurrent()) setResumeNavigationNotice(true);
+      }
     }
   }
 
@@ -1661,11 +1704,17 @@ export function PersonalProductionNotesPanel({
                     && resolveProductionNoteFrameTarget(chapter, seriesId, assets, readout, frame) !== null && (
                     <button
                       className="text-button personal-production-locate-frame"
-                      onClick={() => locateProductionNoteFrame(frame)}
+                      onClick={() => { void locateProductionNoteFrame(frame); }}
+                      disabled={frameNavigationPending === frame.position}
                       type="button"
                     >
-                      定位到记录镜头 {frame.position}
+                      {frameNavigationPending === frame.position ? "正在切换到记录镜头…" : `定位到记录镜头 ${frame.position}`}
                     </button>
+                  )}
+                  {frameNavigationPending === frame.position && (
+                    <p className="personal-production-locate-frame-notice" role="status" aria-live="polite">
+                      正在打开目标镜头并核对其身份。
+                    </p>
                   )}
                   {frameNavigationNotice === frame.position && (
                     <p className="personal-production-locate-frame-notice" role="status" aria-live="polite">
@@ -1704,20 +1753,32 @@ export function PersonalProductionNotesPanel({
           <section className="personal-production-resume-panel" aria-labelledby="personal-production-resume-heading">
             <h4 id="personal-production-resume-heading">续作位置</h4>
             {readout.resumePosition !== null ? (
-              <div className="personal-production-resume-actions">
-                <p className="personal-production-resume" role="note">
-                  续作位置：镜头 {readout.resumePosition}。页面不会自动跳转。
-                </p>
-                {canLocateResume ? (
-                  <button className="secondary-button" onClick={locateResume} type="button">
-                    定位到续作镜头
-                  </button>
-                ) : (
-                  <p className="personal-production-resume-unavailable" role="note">
-                    续作位置已保存，但当前无法定位。
+              <>
+                <div className="personal-production-resume-actions">
+                  <p className="personal-production-resume" role="note">
+                    续作位置：镜头 {readout.resumePosition}。页面不会自动跳转。
+                  </p>
+                  {canLocateResume ? (
+                    <button className="secondary-button" onClick={() => { void locateResume(); }} disabled={resumeNavigationPending} type="button">
+                      {resumeNavigationPending ? "正在切换到续作镜头…" : "定位到续作镜头"}
+                    </button>
+                  ) : (
+                    <p className="personal-production-resume-unavailable" role="note">
+                      续作位置已保存，但当前无法定位。
+                    </p>
+                  )}
+                </div>
+                {resumeNavigationPending && (
+                  <p className="personal-production-resume-unavailable" role="status" aria-live="polite">
+                    正在打开续作镜头并核对其身份。
                   </p>
                 )}
-              </div>
+                {resumeNavigationNotice && !resumeNavigationPending && (
+                  <p className="personal-production-resume-unavailable" role="status" aria-live="polite">
+                    未能定位到当前续作镜头，请确认镜头仍在当前章节中后重试。
+                  </p>
+                )}
+              </>
             ) : savedResumeCandidate !== null ? (
               <div className="personal-production-resume-actions">
                 <p className="personal-production-resume" role="note">
