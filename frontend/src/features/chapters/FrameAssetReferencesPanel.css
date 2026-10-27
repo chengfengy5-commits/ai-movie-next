@@ -1,0 +1,26 @@
+.frame-asset-reference-scroll-viewport {
+  max-height: min(42vh, 420px);
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-radius: 7px;
+  scrollbar-gutter: stable;
+}
+
+.frame-asset-reference-scroll-viewport:focus-visible {
+  outline: 2px solid #8cb8a8;
+  outline-offset: 2px;
+}
+
+.frame-asset-reference-scroll-feedback {
+  margin: 0;
+  color: #8a7651;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+@media (max-height: 640px) {
+  .frame-asset-reference-scroll-viewport {
+    max-height: 36vh;
+  }
+}
