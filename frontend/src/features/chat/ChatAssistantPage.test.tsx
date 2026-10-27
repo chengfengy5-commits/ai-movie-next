@@ -1,7 +1,7 @@
 import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { Chapter, Series } from "../../shared/api/contracts";
+import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset } from "../../shared/api/contracts";
 import type { CreatorPrompt } from "../../shared/api/creatorSettings";
 import type { ChatAssistantMessage } from "../../shared/api/chatAssistant";
 import { createApiServices, type WorkspaceServices } from "../../shared/api/services";
@@ -12,6 +12,7 @@ import {
   readChatCategoryPreference,
   writeChatCategoryPreference,
 } from "./chatCategoryPreferences";
+import { writeChatContextPreference } from "./chatContextPreferences";
 
 const originalClipboardDescriptor = Object.getOwnPropertyDescriptor(navigator, "clipboard");
 
@@ -25,6 +26,35 @@ const chapter: Chapter = {
   updated_at: "2026-10-26T00:00:00Z",
   lock: null,
 };
+
+const alternateChapter: Chapter = {
+  ...chapter,
+  id: "chapter-952-alternate",
+  title: "第 2 集",
+  order: 2,
+};
+
+const chapterWithStableFrames: Chapter = {
+  ...chapter,
+  content: [
+    { description: "第一镜", storyboard: ["board-952-first"] },
+    { description: "第二镜", storyboard: ["board-952-target"] },
+  ],
+};
+
+function storyboardAsset(id: string, frameIndex: number, chapterId = chapter.id): StoryboardAsset {
+  return {
+    id,
+    series_id: series.id,
+    chapter_id: chapterId,
+    frame_index: frameIndex,
+    name: id,
+    description: null,
+    image_url: null,
+    created_at: "2026-10-26T00:00:00Z",
+    updated_at: "2026-10-26T00:00:00Z",
+  };
+}
 
 const series: Series = {
   id: "series-952",
@@ -150,6 +180,11 @@ function setupFixture(options: {
   readonly assistantCreateResponseLost?: boolean;
   readonly models?: readonly StoryboardModelChoice[];
   readonly prompts?: readonly CreatorPrompt[];
+  readonly chapters?: readonly Chapter[];
+  readonly storyboards?: readonly StoryboardAsset[];
+  readonly characters?: readonly Character[];
+  readonly scenes?: readonly Scene[];
+  readonly props?: readonly Prop[];
 } = {}) {
   let messages = [...(options.initialMessages ?? [])];
   const tasksByMessage = new Map((options.initialTasks ?? []).map((task) => [task.message_id, task]));
@@ -248,11 +283,11 @@ function setupFixture(options: {
   const api = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
   const services: WorkspaceServices = {
     ...api,
-    listChapters: vi.fn(async () => [chapter]),
-    listStoryboardAssets: vi.fn(async () => []),
-    listCharacters: vi.fn(async () => []),
-    listScenes: vi.fn(async () => []),
-    listProps: vi.fn(async () => []),
+    listChapters: vi.fn(async () => [...(options.chapters ?? [chapter])]),
+    listStoryboardAssets: vi.fn(async () => [...(options.storyboards ?? [])]),
+    listCharacters: vi.fn(async () => [...(options.characters ?? [])]),
+    listScenes: vi.fn(async () => [...(options.scenes ?? [])]),
+    listProps: vi.fn(async () => [...(options.props ?? [])]),
     storyboardGeneration: {
       ...api.storyboardGeneration!,
       listModels: vi.fn(async () => [...(options.models ?? [model])]),
@@ -262,7 +297,7 @@ function setupFixture(options: {
       listPrompts: vi.fn(async (category) => category === "chat-assistant" ? [...(options.prompts ?? [prompt])] : []),
     },
   };
-  return { services, calls, fetcher, get messages() { return messages; }, get streamBody() { return streamBody; } };
+  return { services, calls, fetcher, storage, get messages() { return messages; }, get streamBody() { return streamBody; } };
 }
 
 function toWireMessage(row: ChatAssistantMessage): Record<string, unknown> {
@@ -283,15 +318,19 @@ function toWireMessage(row: ChatAssistantMessage): Record<string, unknown> {
 function renderPage(
   services: WorkspaceServices,
   onNavigateSource = vi.fn<(target: ChatAssistantSourceIntent) => void>(),
+  identity: { readonly userId?: string; readonly sessionGeneration?: number; readonly series?: Series } = {},
 ) {
   const onUnauthorized = vi.fn();
   const onBack = vi.fn();
-  const renderWithServices = (nextServices: WorkspaceServices) => (
+  const renderWithServices = (
+    nextServices: WorkspaceServices,
+    nextIdentity = identity,
+  ) => (
     <ChatAssistantPage
       services={nextServices}
-      series={series}
-      userId="actor-952"
-      sessionGeneration={1}
+      series={nextIdentity.series ?? series}
+      userId={nextIdentity.userId ?? "actor-952"}
+      sessionGeneration={nextIdentity.sessionGeneration ?? 1}
       onUnauthorized={onUnauthorized}
       onBack={onBack}
       onNavigateSource={onNavigateSource}
@@ -303,8 +342,11 @@ function renderPage(
     onUnauthorized,
     onBack,
     onNavigateSource,
-    rerenderWithServices(nextServices: WorkspaceServices) {
-      rendered.rerender(renderWithServices(nextServices));
+    rerenderWithServices(
+      nextServices: WorkspaceServices,
+      nextIdentity = identity,
+    ) {
+      rendered.rerender(renderWithServices(nextServices, nextIdentity));
     },
   };
 }
@@ -337,6 +379,280 @@ describe("ChatAssistantPage", () => {
     };
     expect(readChatCategoryPreference(scope, "general", unavailable)).toBeNull();
     expect(writeChatCategoryPreference(scope, "general", preference, unavailable)).toBe(false);
+  });
+
+  it("restores a stable storyboard target into the history and chat stream after frame order changes", async () => {
+    const user = userEvent.setup();
+    const historicalMessage = message({
+      id: "stable-frame-history-952",
+      chapterId: chapter.id,
+      frameIndex: 1,
+      role: "user",
+      content: "目标镜头的历史消息",
+    });
+    const fixture = setupFixture({
+      chapters: [chapterWithStableFrames],
+      storyboards: [storyboardAsset("board-952-first", 0), storyboardAsset("board-952-target", 1)],
+      initialMessages: [historicalMessage],
+    });
+    expect(writeChatContextPreference({
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      userId: "actor-952",
+      seriesId: series.id,
+    }, { kind: "frame", chapterId: chapter.id, storyboardAssetId: "board-952-target" })).toBe("saved");
+
+    renderPage(fixture.services);
+
+    await screen.findByText("目标镜头的历史消息");
+    expect(screen.getByLabelText("会话目标")).toHaveValue("frame:1");
+    const historyRequest = fixture.calls.find((call) => call.method === "GET" && call.url.pathname.endsWith("/chat-messages"));
+    expect(historyRequest?.url.searchParams.get("frame_index")).toBe("1");
+
+    await user.selectOptions(await screen.findByLabelText("文本模型"), model.id);
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "继续目标镜头");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    await screen.findByText("聊天已完成，并已核对原任务回执与服务器消息。");
+    const framePosts = fixture.calls.filter((call) => call.method === "POST" && call.url.pathname.endsWith("/chat-messages"));
+    expect(framePosts.map((call) => (call.body as Record<string, unknown>).frame_index)).toEqual([1, 1]);
+    expect(fixture.streamBody?.messages).toMatchObject([
+      { role: "user", content: "继续目标镜头" },
+    ]);
+  });
+
+  it("does not restore another actor or API scope", async () => {
+    const fixture = setupFixture({ chapters: [chapter, alternateChapter] });
+    expect(writeChatContextPreference({
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      userId: "actor-952",
+      seriesId: series.id,
+    }, { kind: "chapter", chapterId: alternateChapter.id })).toBe("saved");
+
+    const actorScoped = renderPage(fixture.services, undefined, { userId: "actor-other" });
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(chapter.id));
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
+    actorScoped.rerenderWithServices({ ...fixture.services, apiBaseUrl: "https://other.example.test/api" });
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(chapter.id));
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
+    actorScoped.rerenderWithServices(
+      { ...fixture.services, apiBaseUrl: "https://other.example.test/api" },
+      { userId: "actor-952" },
+    );
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(chapter.id));
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
+  });
+
+  it("falls back safely when a saved storyboard ID no longer resolves in current chapter content", async () => {
+    const fixture = setupFixture({
+      chapters: [chapterWithStableFrames],
+      storyboards: [storyboardAsset("board-952-first", 0), storyboardAsset("board-952-target", 1)],
+    });
+    expect(writeChatContextPreference({
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      userId: "actor-952",
+      seriesId: series.id,
+    }, { kind: "frame", chapterId: chapter.id, storyboardAssetId: "removed-board-952" })).toBe("saved");
+
+    renderPage(fixture.services);
+
+    await screen.findByText("保存的分镜 ID 在当前章节内容中不存在，已回退到整章会话；请重新选择。");
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
+    expect(fixture.calls.some((call) => call.method === "GET" && call.url.searchParams.has("frame_index"))).toBe(false);
+  });
+
+  it("keeps an explicit chapter choice made while the saved target directory is still loading", async () => {
+    const user = userEvent.setup();
+    let resolveSavedDirectory!: (assets: StoryboardAsset[]) => void;
+    const savedDirectory = new Promise<StoryboardAsset[]>((resolve) => { resolveSavedDirectory = resolve; });
+    const fixture = setupFixture({ chapters: [chapterWithStableFrames, alternateChapter] });
+    fixture.services = {
+      ...fixture.services,
+      listStoryboardAssets: vi.fn(async (_seriesId, chapterId) => chapterId === chapter.id ? savedDirectory : []),
+    };
+    expect(writeChatContextPreference({
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      userId: "actor-952",
+      seriesId: series.id,
+    }, { kind: "frame", chapterId: chapter.id, storyboardAssetId: "board-952-target" })).toBe("saved");
+
+    renderPage(fixture.services);
+    const chapterSelect = await screen.findByLabelText("章节");
+    await waitFor(() => expect(chapterSelect).toBeEnabled());
+    await user.selectOptions(chapterSelect, alternateChapter.id);
+    expect(chapterSelect).toHaveValue(alternateChapter.id);
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
+
+    resolveSavedDirectory([storyboardAsset("board-952-target", 1)]);
+    await waitFor(() => expect(fixture.calls.some((call) => call.method === "GET"
+      && call.url.pathname.includes(`/chapters/${alternateChapter.id}/chat-messages`))).toBe(true));
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
+    expect(fixture.calls.some((call) => call.method === "GET" && call.url.searchParams.has("frame_index"))).toBe(false);
+  });
+
+  it("preserves the latest explicit chapter choice when services refresh in the same scope", async () => {
+    const user = userEvent.setup();
+    const fixture = setupFixture({ chapters: [chapter, alternateChapter] });
+    const rendered = renderPage(fixture.services);
+    const chapterSelect = await screen.findByLabelText("章节");
+    await waitFor(() => expect(chapterSelect).toBeEnabled());
+    await user.selectOptions(chapterSelect, alternateChapter.id);
+
+    const refreshedServices = {
+      ...fixture.services,
+      listChapters: vi.fn(async () => [chapter, alternateChapter]),
+    };
+    rendered.rerenderWithServices(refreshedServices);
+    await waitFor(() => expect(refreshedServices.listChapters).toHaveBeenCalled());
+    expect(screen.getByLabelText("章节")).toHaveValue(alternateChapter.id);
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
+  });
+
+  it("releases an invalidated stream on same-scope service refresh without discarding its pending locator", async () => {
+    const user = userEvent.setup();
+    const fixture = setupFixture();
+    const originalPort = fixture.services.chatAssistant;
+    if (originalPort === undefined) throw new Error("fixture chat service is unavailable");
+    let resolveStreamStarted!: () => void;
+    const streamStarted = new Promise<void>((resolve) => { resolveStreamStarted = resolve; });
+    let streamAborted = false;
+    const controlledPort: NonNullable<WorkspaceServices["chatAssistant"]> = {
+      beginRun(context) {
+        const run = originalPort.beginRun(context);
+        return {
+          ...run,
+          stream: async function* (_input, signal) {
+            resolveStreamStarted();
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) {
+                streamAborted = true;
+                resolve();
+                return;
+              }
+              signal.addEventListener("abort", () => {
+                streamAborted = true;
+                resolve();
+              }, { once: true });
+            });
+            yield { type: "done" };
+          },
+        };
+      },
+    };
+    const initialServices = { ...fixture.services, chatAssistant: controlledPort };
+    const rendered = renderPage(initialServices);
+    const modelSelect = await screen.findByLabelText("文本模型");
+    await waitFor(() => expect(modelSelect).toBeEnabled());
+    await user.selectOptions(modelSelect, model.id);
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "服务刷新中的原任务");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    await streamStarted;
+
+    const refreshedServices = {
+      ...initialServices,
+      listChapters: vi.fn(async () => [chapter]),
+    };
+    rendered.rerenderWithServices(refreshedServices);
+
+    await screen.findByText("聊天服务已更新；旧流已停止，可刷新原任务状态。");
+    await waitFor(() => expect(streamAborted).toBe(true));
+    expect(screen.getByRole("button", { name: "刷新原任务状态" })).toBeEnabled();
+    expect(window.sessionStorage.getItem("haoai.chat-assistant.pending.v1:actor-952:series-952")).not.toBeNull();
+    expect(fixture.calls.filter((call) => call.method === "POST" && call.url.pathname.endsWith("/chat-messages"))).toHaveLength(2);
+    expect(fixture.calls.filter((call) => call.method === "POST" && call.url.pathname === "/api/chat/stream")).toHaveLength(0);
+  });
+
+  it("preserves a draft and cancels target restoration when the user starts typing", async () => {
+    const user = userEvent.setup();
+    let resolveSavedDirectory!: (assets: StoryboardAsset[]) => void;
+    const savedDirectory = new Promise<StoryboardAsset[]>((resolve) => { resolveSavedDirectory = resolve; });
+    const fixture = setupFixture({ chapters: [chapterWithStableFrames] });
+    fixture.services = {
+      ...fixture.services,
+      listStoryboardAssets: vi.fn(async () => savedDirectory),
+    };
+    expect(writeChatContextPreference({
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      userId: "actor-952",
+      seriesId: series.id,
+    }, { kind: "frame", chapterId: chapter.id, storyboardAssetId: "board-952-target" })).toBe("saved");
+
+    renderPage(fixture.services);
+    const draft = await screen.findByLabelText("发送给 AI 助手");
+    await waitFor(() => expect(fixture.services.listStoryboardAssets).toHaveBeenCalled());
+    await user.type(draft, "写到一半的草稿");
+    resolveSavedDirectory([storyboardAsset("board-952-first", 0), storyboardAsset("board-952-target", 1)]);
+
+    await waitFor(() => expect(screen.getByLabelText("会话目标")).toHaveValue("chapter"));
+    expect(draft).toHaveValue("写到一半的草稿");
+    expect(fixture.calls.some((call) => call.method === "GET" && call.url.searchParams.has("frame_index"))).toBe(false);
+  });
+
+  it("keeps manual chat available when context storage reads fail", async () => {
+    const user = userEvent.setup();
+    const fixture = setupFixture();
+    const originalGetItem = Storage.prototype.getItem;
+    vi.spyOn(Storage.prototype, "getItem").mockImplementation(function getItem(this: Storage, key: string) {
+      if (key.startsWith("haoai:chat-assistant-context:v1:")) throw new Error("storage unavailable");
+      return originalGetItem.call(this, key);
+    });
+
+    renderPage(fixture.services);
+    await screen.findByText("浏览器存储不可用，未能读取上次聊天目标；当前会话仍可手动使用。");
+    await user.selectOptions(await screen.findByLabelText("文本模型"), model.id);
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "存储读取失败仍可聊天");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    await screen.findByText("助手回答：你好");
+    expect(fixture.calls.filter((call) => call.method === "POST" && call.url.pathname === "/api/chat/stream")).toHaveLength(1);
+  });
+
+  it("keeps manual chat available when saving the context preference fails", async () => {
+    const user = userEvent.setup();
+    const fixture = setupFixture({ chapters: [chapter, alternateChapter] });
+    const originalSetItem = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(function setItem(this: Storage, key: string, value: string) {
+      if (key.startsWith("haoai:chat-assistant-context:v1:")) throw new Error("storage unavailable");
+      originalSetItem.call(this, key, value);
+    });
+
+    renderPage(fixture.services);
+    const chapterSelect = await screen.findByLabelText("章节");
+    await waitFor(() => expect(chapterSelect).toBeEnabled());
+    await user.selectOptions(chapterSelect, alternateChapter.id);
+    await screen.findByText("浏览器存储不可用，当前聊天目标未持久化；当前会话仍可手动使用。");
+    await user.selectOptions(await screen.findByLabelText("文本模型"), model.id);
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "存储写入失败仍可聊天");
+    await user.click(screen.getByRole("button", { name: "发送消息" }));
+    await screen.findByText("助手回答：你好");
+    expect(fixture.streamBody?.messages).toMatchObject([
+      { role: "user", content: "存储写入失败仍可聊天" },
+    ]);
+  });
+
+  it("ignores a late history 401 after the actor and session change", async () => {
+    const fixture = setupFixture();
+    const originalImplementation = fixture.fetcher.getMockImplementation();
+    if (originalImplementation === undefined) throw new Error("fixture fetcher has no implementation");
+    let resolveOldHistory!: (response: Response) => void;
+    const oldHistory = new Promise<Response>((resolve) => { resolveOldHistory = resolve; });
+    let historyRequests = 0;
+    fixture.fetcher.mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/chat-messages") && (init?.method ?? "GET") === "GET") {
+        historyRequests += 1;
+        return historyRequests === 1 ? oldHistory : Response.json([]);
+      }
+      return originalImplementation(input, init);
+    });
+    const rendered = renderPage(fixture.services);
+    await waitFor(() => expect(historyRequests).toBe(1));
+
+    fixture.storage.setItem(API_USER_KEY, JSON.stringify({ id: "actor-next" }));
+    rendered.rerenderWithServices(fixture.services, { userId: "actor-next", sessionGeneration: 2 });
+    await waitFor(() => expect(historyRequests).toBe(2));
+    resolveOldHistory(Response.json({ detail: "expired old session" }, { status: 401 }));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(rendered.onUnauthorized).not.toHaveBeenCalled();
+    expect(screen.queryByText("expired old session")).not.toBeInTheDocument();
   });
 
   it("persists server messages once, streams with the selected template, and verifies the terminal task", async () => {
@@ -534,7 +850,9 @@ describe("ChatAssistantPage", () => {
     const onNavigateSource = vi.fn<(target: ChatAssistantSourceIntent) => void>();
     renderPage(fixture.services, onNavigateSource);
 
-    await user.selectOptions(await screen.findByLabelText("会话目标"), "frame:0");
+    const targetSelect = await screen.findByLabelText("会话目标");
+    await waitFor(() => expect(targetSelect).toBeEnabled());
+    await user.selectOptions(targetSelect, "frame:0");
     await screen.findByText(body);
     expect(screen.getByText("<script>alert('x')</script>")).toBeInTheDocument();
     expect(document.querySelector("img, script")).toBeNull();
@@ -570,9 +888,15 @@ describe("ChatAssistantPage", () => {
       assistantMessageId: missingAssistantId,
       taskId: null,
     }));
+    expect(writeChatContextPreference({
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      userId: "actor-952",
+      seriesId: series.id,
+    }, { kind: "frame", chapterId: chapter.id, storyboardAssetId: "stale-board-952" })).toBe("saved");
     renderPage(fixture.services);
 
     await screen.findByText("仍未取得终态回执；可稍后手动刷新，系统不会重发。");
+    expect(screen.getByLabelText("会话目标")).toHaveValue("chapter");
     const refreshButton = screen.getByRole("button", { name: "刷新原任务状态" });
     await user.click(refreshButton);
     await screen.findByText("仍未取得终态回执；可稍后手动刷新，系统不会重发。");
@@ -600,5 +924,102 @@ describe("ChatAssistantPage", () => {
     expect(newAssistant!.id).not.toBe(missingAssistantId);
     expect(fixture.streamBody?.message_id).toBe(newAssistant!.id);
     expect(fixture.calls.filter((call) => call.method === "POST" && call.url.pathname === "/api/chat/stream")).toHaveLength(1);
+  });
+
+  it("preserves the current pending locator through a same-scope services refresh", async () => {
+    const missingAssistantId = "pending-refresh-assistant-952";
+    const fixture = setupFixture({ initialMessages: [message({ id: missingAssistantId, role: "assistant", content: "..." })] });
+    window.sessionStorage.setItem("haoai.chat-assistant.pending.v1:actor-952:series-952", JSON.stringify({
+      actorId: "actor-952",
+      apiBaseUrl: "http://127.0.0.1:4175/api",
+      seriesId: series.id,
+      target: { kind: "chapter", chapterId: chapter.id },
+      assistantMessageId: missingAssistantId,
+      taskId: null,
+    }));
+    const rendered = renderPage(fixture.services);
+    await screen.findByText("仍未取得终态回执；可稍后手动刷新，系统不会重发。");
+
+    const refreshedServices = {
+      ...fixture.services,
+      listChapters: vi.fn(async () => [chapter]),
+    };
+    rendered.rerenderWithServices(refreshedServices);
+    await waitFor(() => expect(refreshedServices.listChapters).toHaveBeenCalled());
+    expect(screen.getByText("仍未取得终态回执；可稍后手动刷新，系统不会重发。")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "刷新原任务状态" })).toBeEnabled();
+    expect(window.sessionStorage.getItem("haoai.chat-assistant.pending.v1:actor-952:series-952")).not.toBeNull();
+  });
+
+  it("keeps a newer pending refresh busy when an invalidated refresh finishes late", async () => {
+    const user = userEvent.setup();
+    const missingAssistantId = "pending-refresh-owner-952";
+    const fixture = setupFixture({ initialMessages: [message({ id: missingAssistantId, role: "assistant", content: "..." })] });
+    window.sessionStorage.setItem("haoai.chat-assistant.pending.v1:actor-952:series-952", JSON.stringify({
+      actorId: "actor-952",
+      apiBaseUrl: "http://127.0.0.1:4175/api",
+      seriesId: series.id,
+      target: { kind: "chapter", chapterId: chapter.id },
+      assistantMessageId: missingAssistantId,
+      taskId: null,
+    }));
+    const rendered = renderPage(fixture.services);
+    await screen.findByText("仍未取得终态回执；可稍后手动刷新，系统不会重发。");
+
+    let releaseOldLookup!: () => void;
+    let releaseNewLookup!: () => void;
+    let markOldLookupStarted!: () => void;
+    let markNewLookupStarted!: () => void;
+    let markOldLookupReturned!: () => void;
+    const oldGate = new Promise<void>((resolve) => { releaseOldLookup = resolve; });
+    const newGate = new Promise<void>((resolve) => { releaseNewLookup = resolve; });
+    const oldLookupStarted = new Promise<void>((resolve) => { markOldLookupStarted = resolve; });
+    const newLookupStarted = new Promise<void>((resolve) => { markNewLookupStarted = resolve; });
+    const oldLookupReturned = new Promise<void>((resolve) => { markOldLookupReturned = resolve; });
+    const baseFetcher = fixture.fetcher.getMockImplementation();
+    if (baseFetcher === undefined) throw new Error("Fixture fetcher implementation is unavailable.");
+    let heldLookups = 0;
+    fixture.fetcher.mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      let heldLookup = 0;
+      if (url.pathname === "/api/chat/tasks" && url.searchParams.get("message_id") === missingAssistantId) {
+        heldLookup = ++heldLookups;
+        if (heldLookup === 1) {
+          markOldLookupStarted();
+          await oldGate;
+        } else if (heldLookup === 2) {
+          markNewLookupStarted();
+          await newGate;
+        }
+      }
+      const response = await baseFetcher(input, init);
+      if (heldLookup === 1) markOldLookupReturned();
+      return response;
+    });
+
+    await user.click(screen.getByRole("button", { name: "刷新原任务状态" }));
+    await oldLookupStarted;
+
+    const refreshedServices = {
+      ...fixture.services,
+      listChapters: vi.fn(async () => [chapter]),
+    };
+    rendered.rerenderWithServices(refreshedServices);
+    await waitFor(() => expect(refreshedServices.listChapters).toHaveBeenCalled());
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新原任务状态" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "刷新原任务状态" }));
+    await newLookupStarted;
+    expect(screen.getByRole("button", { name: "刷新原任务状态" })).toBeDisabled();
+
+    releaseOldLookup();
+    await oldLookupReturned;
+    await new Promise<void>((resolve) => setTimeout(resolve, 0));
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "x");
+    expect(screen.getByRole("button", { name: "刷新原任务状态" })).toBeDisabled();
+
+    releaseNewLookup();
+    await screen.findByText("仍未取得终态回执；可稍后手动刷新，系统不会重发。");
+    await waitFor(() => expect(screen.getByRole("button", { name: "刷新原任务状态" })).toBeEnabled());
+    expect(fixture.calls.filter((call) => call.method === "POST")).toHaveLength(0);
   });
 });

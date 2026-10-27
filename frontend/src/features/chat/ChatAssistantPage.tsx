@@ -18,6 +18,15 @@ import {
   readChatCategoryPreference,
   writeChatCategoryPreference,
 } from "./chatCategoryPreferences";
+import {
+  clearChatContextPreference,
+  preferenceForChatTarget,
+  readChatContextPreference,
+  resolveChatContextPreference,
+  writeChatContextPreference,
+  type ChatContextPreference,
+  type ChatContextPreferenceFailure,
+} from "./chatContextPreferences";
 import "./chatAssistant.css";
 
 const PENDING_LOCATOR_PREFIX = "haoai.chat-assistant.pending.v1";
@@ -47,6 +56,18 @@ interface HistorySnapshot {
   readonly scopeKey: string;
   readonly messages: ChatAssistantMessage[];
   readonly taskStates: ReadonlyMap<string, MessageTaskState>;
+}
+
+interface PendingContextRestore {
+  readonly contextKey: string;
+  readonly generation: number;
+  readonly interactionVersion: number;
+  readonly preference: ChatContextPreference;
+}
+
+interface DirectoryReadiness {
+  readonly key: string;
+  readonly services: WorkspaceServices;
 }
 
 interface ChatAssistantPageProps {
@@ -198,6 +219,22 @@ function assetLabel(type: ChatAssistantAssetType): string {
   }
 }
 
+function contextPreferenceFailureMessage(reason: ChatContextPreferenceFailure, restoring: boolean): string {
+  const action = restoring ? "已回退到整章会话" : "无法记住此目标";
+  switch (reason) {
+    case "chapter-missing": return `保存的章节已不存在，${action}；请重新选择。`;
+    case "chapter-ambiguous": return `当前章节编号不唯一，${action}；请重新选择。`;
+    case "frame-id-missing": return `此分镜没有稳定素材 ID，${action}；当前聊天仍可用。`;
+    case "frame-id-ambiguous": return `此分镜 ID 在章节内容中重复，${action}；当前聊天仍可用。`;
+    case "frame-target-missing": return `保存的分镜 ID 在当前章节内容中不存在，${action}；请重新选择。`;
+    case "storyboard-missing": return `此分镜 ID 未在当前章节素材目录中找到，${action}；当前聊天仍可用。`;
+    case "storyboard-ambiguous": return `此分镜 ID 在当前章节素材目录中重复，${action}；当前聊天仍可用。`;
+    case "storyboard-mismatch": return `当前章节内容与分镜素材目录不一致，${action}；当前聊天仍可用。`;
+    case "asset-missing": return `此类型素材不在当前剧集或章节目录中，${action}；当前聊天仍可用。`;
+    case "asset-ambiguous": return `此类型素材 ID 在当前目录中重复，${action}；当前聊天仍可用。`;
+  }
+}
+
 function sourceText(message: ChatAssistantMessage, assets: readonly AssetChoice[]): string {
   if (message.frameIndex !== null) return `打开原章节（历史第 ${message.frameIndex + 1} 镜）`;
   if (message.assetType !== null && message.assetId !== null) {
@@ -280,12 +317,23 @@ export function ChatAssistantPage({
   const [messageNotice, setMessageNotice] = useState<string | null>(null);
   const [selectionPreferenceReadyFor, setSelectionPreferenceReadyFor] = useState<string | null>(null);
   const [selectionPreferenceNotice, setSelectionPreferenceNotice] = useState<string | null>(null);
+  const [contextPreferenceReadyFor, setContextPreferenceReadyFor] = useState<string | null>(null);
+  const [contextPreferenceNotice, setContextPreferenceNotice] = useState<string | null>(null);
+  const [directoryReadyFor, setDirectoryReadyFor] = useState<DirectoryReadiness | null>(null);
   const [deletingMessageId, setDeletingMessageId] = useState<string | null>(null);
   const streamControllerRef = useRef<AbortController | null>(null);
   const recoveryWaitControllerRef = useRef<AbortController | null>(null);
   const mountedRef = useRef(false);
   const operationBusyRef = useRef(false);
+  const operationGenerationRef = useRef(0);
   const restoredLocatorRef = useRef<string | null>(null);
+  const contextRestoreGenerationRef = useRef(0);
+  const contextInteractionVersionRef = useRef(0);
+  const pendingContextRestoreRef = useRef<PendingContextRestore | null>(null);
+  const catalogScopeRef = useRef<{ readonly contextKey: string; readonly services: WorkspaceServices } | null>(null);
+  const selectedContextRef = useRef({ chapterId, targetKey });
+  const draftRef = useRef(draft);
+  const contextPreferenceReadyForRef = useRef<string | null>(null);
   const appliedSelectionPreferenceRef = useRef<{
     readonly contextKey: string;
     readonly models: StoryboardModelChoice[];
@@ -293,10 +341,17 @@ export function ChatAssistantPage({
   } | null>(null);
   const editedSelectionContextRef = useRef<string | null>(null);
   const renderIdentityRef = useRef<object>({});
+  const contextIdentityRef = useRef("");
   const unauthorizedHandlerRef = useRef(onUnauthorized);
   unauthorizedHandlerRef.current = onUnauthorized;
   const target = useMemo(() => parseTargetKey(targetKey, chapterId), [chapterId, targetKey]);
   const targetSignature = targetScopeKey(target);
+  const contextPreferenceContextKey = JSON.stringify([userId, services.apiBaseUrl, sessionGeneration, series.id]);
+  const directoryContextKey = JSON.stringify([contextPreferenceContextKey, chapterId]);
+  contextIdentityRef.current = contextPreferenceContextKey;
+  selectedContextRef.current = { chapterId, targetKey };
+  draftRef.current = draft;
+  contextPreferenceReadyForRef.current = contextPreferenceReadyFor;
   const selectionPreferenceCategory = chatPreferenceCategory(target);
   const selectionPreferenceContextKey = JSON.stringify([
     userId,
@@ -318,6 +373,8 @@ export function ChatAssistantPage({
   const selectedModel = models.find((model) => model.id === modelId) ?? null;
   const selectedPrompt = promptId === "" ? null : prompts.find((prompt) => prompt.id === promptId) ?? null;
   const historyScopeKey = targetSignature;
+  const contextPreferenceReady = contextPreferenceReadyFor === contextPreferenceContextKey;
+  const directoryReady = directoryReadyFor?.key === directoryContextKey && directoryReadyFor.services === services;
   const visibleMessages = snapshot?.scopeKey === historyScopeKey ? snapshot.messages : [];
   const taskStates = snapshot?.scopeKey === historyScopeKey ? snapshot.taskStates : new Map<string, MessageTaskState>();
   const canSend = series.can_enter === true
@@ -327,6 +384,7 @@ export function ChatAssistantPage({
     && draft.trim() !== ""
     && catalogError === null
     && !catalogLoading
+    && contextPreferenceReady
     && selectionPreferenceReadyFor === selectionPreferenceContextKey
     && !historyLoading
     && !directoryLoading
@@ -345,9 +403,57 @@ export function ChatAssistantPage({
 
   useEffect(() => {
     const controller = new AbortController();
+    const contextKey = contextPreferenceContextKey;
+    const generation = ++contextRestoreGenerationRef.current;
+    const previousCatalogScope = catalogScopeRef.current;
+    const contextChanged = previousCatalogScope === null || previousCatalogScope.contextKey !== contextKey;
+    const servicesChanged = previousCatalogScope !== null && previousCatalogScope.services !== services;
+    const shouldReadContextPreference = contextChanged
+      || contextPreferenceReadyForRef.current !== contextKey;
+    const interactionVersion = contextInteractionVersionRef.current;
+    const hasDraftAtStart = draftRef.current.trim() !== "";
     let current = true;
     const settings = chatSettings(services);
     const catalog = services.storyboardGeneration;
+    catalogScopeRef.current = { contextKey, services };
+    pendingContextRestoreRef.current = null;
+    if (contextChanged || servicesChanged) {
+      const operationWasActive = operationBusyRef.current;
+      operationGenerationRef.current += 1;
+      streamControllerRef.current?.abort();
+      streamControllerRef.current = null;
+      recoveryWaitControllerRef.current?.abort();
+      recoveryWaitControllerRef.current = null;
+      operationBusyRef.current = false;
+      setSending(false);
+      if (contextChanged) {
+        restoredLocatorRef.current = null;
+        setPending(null);
+      } else {
+        setPending((existing) => existing === null || existing.phase === "unknown"
+          ? existing
+          : { ...existing, phase: "unknown", detail: "聊天服务已更新；旧流已停止，可刷新原任务状态。", attempt: 0 });
+        if (operationWasActive) {
+          setMessageNotice("聊天服务已更新；旧操作不会自动重发，请先核对当前聊天记录。");
+        }
+      }
+    }
+    setContextPreferenceReadyFor(null);
+    setContextPreferenceNotice(null);
+    setDirectoryReadyFor(null);
+    setDirectoryLoading(false);
+    setHistoryLoading(false);
+    setSnapshot(null);
+    setHistoryError(null);
+    if (shouldReadContextPreference) {
+      setChapters([]);
+      setChapterId("");
+      setTargetKey("chapter");
+      setStoryboards([]);
+      setCharacters([]);
+      setScenes([]);
+      setProps([]);
+    }
     setCatalogLoading(true);
     setSelectionPreferenceReadyFor(null);
     setCatalogError(null);
@@ -357,6 +463,7 @@ export function ChatAssistantPage({
       setModels([]);
       setPrompts([]);
       setCatalogError("聊天服务或模型/提示词目录尚未接入。");
+      setContextPreferenceReadyFor(contextKey);
       return () => { current = false; controller.abort(); };
     }
 
@@ -365,7 +472,8 @@ export function ChatAssistantPage({
       catalog.listModels(controller.signal),
       settings.listPrompts("chat-assistant", controller.signal),
     ]).then(([nextChapters, nextModels, nextPrompts]) => {
-      if (!current || controller.signal.aborted) return;
+      if (!current || controller.signal.aborted || contextIdentityRef.current !== contextKey
+        || contextRestoreGenerationRef.current !== generation) return;
       const textModels = nextModels.filter((model) => model.category === "text" || model.category === "reasoning");
       const assistantPrompts = nextPrompts.filter((prompt) => prompt.category === "chat-assistant");
       setChapters(nextChapters);
@@ -373,25 +481,88 @@ export function ChatAssistantPage({
       setPrompts(assistantPrompts);
       const locator = readPendingLocator(userId, services.apiBaseUrl, series.id);
       if (locator !== null && nextChapters.some((chapter) => chapter.id === locator.target.chapterId)) {
+        pendingContextRestoreRef.current = null;
         setChapterId(locator.target.chapterId);
         setTargetKey(makeTargetKey(locator.target));
-        setPending({ ...locator, phase: "unknown", detail: "发现上次尚未确认的聊天操作，可刷新原任务。", attempt: 0 });
+        setPending((existing) => existing?.assistantMessageId === locator.assistantMessageId
+          ? existing
+          : { ...locator, phase: "unknown", detail: "发现上次尚未确认的聊天操作，可刷新原任务。", attempt: 0 });
+        setContextPreferenceReadyFor(contextKey);
+        setContextPreferenceNotice(null);
+      } else if (!shouldReadContextPreference) {
+        const selectedContext = selectedContextRef.current;
+        const selectedChapterIsCurrent = nextChapters.some((chapter) => chapter.id === selectedContext.chapterId);
+        if (selectedChapterIsCurrent) {
+          setChapterId(selectedContext.chapterId);
+          setTargetKey(selectedContext.targetKey);
+        } else {
+          const fallbackChapterId = nextChapters.find((chapter) => chapter.series_id === series.id)?.id ?? "";
+          setChapterId(fallbackChapterId);
+          setTargetKey("chapter");
+          setContextPreferenceNotice(selectedContext.chapterId === ""
+            ? null
+            : "当前章节已不在新目录中，已回退到可用章节。");
+        }
+        setContextPreferenceReadyFor(contextKey);
       } else {
-        setChapterId((currentId) => currentId !== "" && nextChapters.some((chapter) => chapter.id === currentId)
-          ? currentId
-          : nextChapters[0]?.id ?? "");
+        const read = readChatContextPreference({ apiBaseUrl: services.apiBaseUrl, userId, seriesId: series.id });
+        const fallbackChapterId = nextChapters.find((chapter) => chapter.series_id === series.id)?.id ?? "";
+        const hasUserChangedForm = hasDraftAtStart || interactionVersion !== contextInteractionVersionRef.current;
+        if (read.status === "unavailable") {
+          setChapterId(fallbackChapterId);
+          setTargetKey("chapter");
+          setContextPreferenceReadyFor(contextKey);
+          setContextPreferenceNotice(read.reason === "storage"
+            ? "浏览器存储不可用，未能读取上次聊天目标；当前会话仍可手动使用。"
+            : "当前 API 地址尚未确定，聊天目标无法持久化；当前会话仍可手动使用。");
+        } else if (read.malformed) {
+          setChapterId(fallbackChapterId);
+          setTargetKey("chapter");
+          setContextPreferenceReadyFor(contextKey);
+          setContextPreferenceNotice("上次保存的聊天目标格式无效，已回退到整章会话。");
+        } else if (read.preference === null) {
+          setChapterId(fallbackChapterId);
+          setTargetKey("chapter");
+          setContextPreferenceReadyFor(contextKey);
+          setContextPreferenceNotice(null);
+        } else if (hasUserChangedForm) {
+          setChapterId(fallbackChapterId);
+          setTargetKey("chapter");
+          setContextPreferenceReadyFor(contextKey);
+        } else {
+          const chapterMatches = nextChapters.filter((chapter) => chapter.id === read.preference!.chapterId
+            && chapter.series_id === series.id);
+          if (chapterMatches.length !== 1) {
+            const reason: ChatContextPreferenceFailure = chapterMatches.length === 0 ? "chapter-missing" : "chapter-ambiguous";
+            setChapterId(fallbackChapterId);
+            setTargetKey("chapter");
+            setContextPreferenceReadyFor(contextKey);
+            setContextPreferenceNotice(contextPreferenceFailureMessage(reason, true));
+          } else {
+            pendingContextRestoreRef.current = {
+              contextKey,
+              generation,
+              interactionVersion,
+              preference: read.preference,
+            };
+            setChapterId(read.preference.chapterId);
+            setTargetKey("chapter");
+          }
+        }
       }
       setCatalogLoading(false);
       setCatalogError(null);
     }).catch((error: unknown) => {
-      if (!current || controller.signal.aborted) return;
+      if (!current || controller.signal.aborted || contextIdentityRef.current !== contextKey
+        || contextRestoreGenerationRef.current !== generation) return;
       const normalized = normalizeApiError(error);
       if (normalized.status === 401) unauthorizedHandlerRef.current();
       else setCatalogError(normalized.detail ?? normalized.message);
       setCatalogLoading(false);
+      setContextPreferenceReadyFor(contextKey);
     });
     return () => { current = false; controller.abort(); };
-  }, [series.id, services, sessionGeneration, userId]);
+  }, [contextPreferenceContextKey, series.id, services, sessionGeneration, userId]);
 
   useEffect(() => {
     if (catalogLoading || catalogError !== null || pending !== null || sending) return;
@@ -455,10 +626,14 @@ export function ChatAssistantPage({
       setScenes([]);
       setProps([]);
       setDirectoryError(null);
+      setDirectoryLoading(false);
+      setDirectoryReadyFor(null);
       return;
     }
     const controller = new AbortController();
+    const contextKey = contextPreferenceContextKey;
     let current = true;
+    setDirectoryReadyFor(null);
     setDirectoryLoading(true);
     setDirectoryError(null);
     Promise.all([
@@ -467,24 +642,76 @@ export function ChatAssistantPage({
       services.listScenes(series.id, controller.signal),
       services.listProps(series.id, controller.signal),
     ]).then(([nextStoryboards, nextCharacters, nextScenes, nextProps]) => {
-      if (!current || controller.signal.aborted) return;
+      if (!current || controller.signal.aborted || contextIdentityRef.current !== contextKey) return;
       setStoryboards(nextStoryboards);
       setCharacters(nextCharacters);
       setScenes(nextScenes);
       setProps(nextProps);
       setDirectoryLoading(false);
+      setDirectoryReadyFor({ key: directoryContextKey, services });
     }).catch((error: unknown) => {
-      if (!current || controller.signal.aborted) return;
+      if (!current || controller.signal.aborted || contextIdentityRef.current !== contextKey) return;
       const normalized = normalizeApiError(error);
       if (normalized.status === 401) unauthorizedHandlerRef.current();
       else setDirectoryError(normalized.detail ?? normalized.message);
       setDirectoryLoading(false);
     });
     return () => { current = false; controller.abort(); };
-  }, [chapterId, series.id, services]);
+  }, [chapterId, contextPreferenceContextKey, directoryContextKey, series.id, services]);
 
   useEffect(() => {
-    if (target === null || services.chatAssistant === undefined || series.can_enter !== true) {
+    const restore = pendingContextRestoreRef.current;
+    if (restore === null || restore.contextKey !== contextPreferenceContextKey
+      || restore.generation !== contextRestoreGenerationRef.current) return;
+    if (restore.interactionVersion !== contextInteractionVersionRef.current) {
+      pendingContextRestoreRef.current = null;
+      setContextPreferenceReadyFor(contextPreferenceContextKey);
+      return;
+    }
+    if (chapterId !== restore.preference.chapterId) return;
+    if (directoryError !== null) {
+      pendingContextRestoreRef.current = null;
+      setTargetKey("chapter");
+      setContextPreferenceNotice("会话目标目录读取失败，无法验证上次目标；已回退到整章会话，请重新选择。");
+      setContextPreferenceReadyFor(contextPreferenceContextKey);
+      return;
+    }
+    if (directoryLoading || !directoryReady) return;
+
+    const result = resolveChatContextPreference(
+      restore.preference,
+      chapters,
+      series.id,
+      storyboards,
+      characters,
+      scenes,
+      props,
+    );
+    pendingContextRestoreRef.current = null;
+    if (result.status === "resolved") {
+      setTargetKey(result.targetKey);
+      setContextPreferenceNotice(null);
+    } else {
+      setTargetKey("chapter");
+      setContextPreferenceNotice(contextPreferenceFailureMessage(result.reason, true));
+    }
+    setContextPreferenceReadyFor(contextPreferenceContextKey);
+  }, [
+    chapterId,
+    characters,
+    contextPreferenceContextKey,
+    directoryError,
+    directoryLoading,
+    directoryReady,
+    chapters,
+    props,
+    series.id,
+    scenes,
+    storyboards,
+  ]);
+
+  useEffect(() => {
+    if (!contextPreferenceReady || target === null || services.chatAssistant === undefined || series.can_enter !== true) {
       setSnapshot(null);
       setHistoryLoading(false);
       return;
@@ -507,14 +734,14 @@ export function ChatAssistantPage({
       setSnapshot({ ...next, scopeKey });
       setHistoryLoading(false);
     }).catch((error: unknown) => {
-      if (!current || controller.signal.aborted) return;
+      if (!current || controller.signal.aborted || !run.isCurrent()) return;
       const normalized = normalizeApiError(error);
       if (normalized.status === 401) unauthorizedHandlerRef.current();
       else setHistoryError(normalized.detail ?? normalized.message);
       setHistoryLoading(false);
     });
     return () => { current = false; controller.abort(); };
-  }, [identitySignature, services, series.can_enter, target, targetSignature, userId]);
+  }, [contextPreferenceReady, identitySignature, services, series.can_enter, target, targetSignature, userId]);
 
   useEffect(() => {
     if (currentLocator === null || !chapters.some((chapter) => chapter.id === currentLocator.target.chapterId)) return;
@@ -541,7 +768,9 @@ export function ChatAssistantPage({
         isContextCurrent: () => mountedRef.current && renderIdentityRef.current === scopeSignature,
       });
     } catch (error) {
-      if (normalizeApiError(error).status === 401) unauthorizedHandlerRef.current();
+      if (normalizeApiError(error).status === 401 && renderIdentityRef.current === scopeSignature) {
+        unauthorizedHandlerRef.current();
+      }
       return null;
     }
   }
@@ -598,15 +827,70 @@ export function ChatAssistantPage({
 
   function onChapterChange(nextChapterId: string) {
     if (pending !== null || sending) return;
+    recordContextInteraction();
     setChapterId(nextChapterId);
     setTargetKey("chapter");
     setMessageNotice(null);
+    const selectedChapter = chapters.filter((chapter) => chapter.id === nextChapterId && chapter.series_id === series.id);
+    if (selectedChapter.length === 1) {
+      persistContextPreference({ kind: "chapter", chapterId: nextChapterId });
+    } else {
+      setContextPreferenceNotice("所选章节编号无法唯一确认；本次聊天目标未持久化。");
+    }
   }
 
   function onTargetChange(nextTargetKey: string) {
     if (pending !== null || sending) return;
+    recordContextInteraction();
     setTargetKey(nextTargetKey);
     setMessageNotice(null);
+    const selectedTarget = parseTargetKey(nextTargetKey, chapterId);
+    if (selectedTarget === null) {
+      clearContextPreference("当前聊天目标无效；请重新选择。");
+      return;
+    }
+    const selectedChapter = chapters.find((chapter) => chapter.id === chapterId) ?? null;
+    const result = preferenceForChatTarget(
+      selectedTarget,
+      selectedChapter,
+      series.id,
+      storyboards,
+      characters,
+      scenes,
+      props,
+    );
+    if (result.status === "invalid") {
+      clearContextPreference(contextPreferenceFailureMessage(result.reason, false));
+      return;
+    }
+    persistContextPreference(result.preference);
+  }
+
+  function recordContextInteraction() {
+    contextInteractionVersionRef.current += 1;
+    if (pendingContextRestoreRef.current !== null) {
+      pendingContextRestoreRef.current = null;
+      setContextPreferenceReadyFor(contextPreferenceContextKey);
+    }
+  }
+
+  function persistContextPreference(preference: ChatContextPreference) {
+    const result = writeChatContextPreference(
+      { apiBaseUrl: services.apiBaseUrl, userId, seriesId: series.id },
+      preference,
+    );
+    setContextPreferenceNotice(result === "saved"
+      ? null
+      : "浏览器存储不可用，当前聊天目标未持久化；当前会话仍可手动使用。");
+  }
+
+  function clearContextPreference(notice: string) {
+    const result = clearChatContextPreference(
+      { apiBaseUrl: services.apiBaseUrl, userId, seriesId: series.id },
+    );
+    setContextPreferenceNotice(result === "saved"
+      ? notice
+      : "浏览器存储不可用，当前聊天目标未持久化；当前会话仍可手动使用。");
   }
 
   function persistChatSelection(nextModelId: string, nextPromptId: string) {
@@ -622,12 +906,14 @@ export function ChatAssistantPage({
   }
 
   function onModelChange(nextModelId: string) {
+    recordContextInteraction();
     setModelId(nextModelId);
     editedSelectionContextRef.current = selectionPreferenceContextKey;
     persistChatSelection(nextModelId, promptId);
   }
 
   function onPromptChange(nextPromptId: string) {
+    recordContextInteraction();
     setPromptId(nextPromptId);
     editedSelectionContextRef.current = selectionPreferenceContextKey;
     persistChatSelection(modelId, nextPromptId);
@@ -666,6 +952,7 @@ export function ChatAssistantPage({
     if (!canSend || target === null || selectedModel === null || services.chatAssistant === undefined) return;
     if (operationBusyRef.current) return;
     operationBusyRef.current = true;
+    const operationGeneration = ++operationGenerationRef.current;
     setSending(true);
     setMessageNotice(null);
     setStreamNotice(null);
@@ -780,9 +1067,11 @@ export function ChatAssistantPage({
         else setMessageNotice(normalized.detail ?? normalized.message);
       }
     } finally {
-      setSending(false);
-      operationBusyRef.current = false;
-      streamControllerRef.current = null;
+      if (operationGenerationRef.current === operationGeneration) {
+        setSending(false);
+        operationBusyRef.current = false;
+        streamControllerRef.current = null;
+      }
     }
   }
 
@@ -878,6 +1167,7 @@ export function ChatAssistantPage({
   }
 
   async function refreshHistory(selectedTarget: ChatAssistantTarget, existingRun?: ChatAssistantRun) {
+    if (!contextPreferenceReady) return;
     const scope = identitySignature;
     const run = existingRun ?? createRun(scope);
     if (run === null) return;
@@ -900,12 +1190,15 @@ export function ChatAssistantPage({
 
   async function manualRefreshPending() {
     if (pending === null || operationBusyRef.current) return;
+    const operationGeneration = ++operationGenerationRef.current;
     operationBusyRef.current = true;
     setPending({ ...pending, phase: "recovering", detail: "正在刷新原消息任务，不会重新发送。", attempt: 1 });
     const run = createRun(identitySignature);
     if (run === null) {
-      setPending({ ...pending, phase: "unknown", detail: "当前登录会话无法确认。" });
-      operationBusyRef.current = false;
+      if (operationGenerationRef.current === operationGeneration) {
+        setPending({ ...pending, phase: "unknown", detail: "当前登录会话无法确认。" });
+        operationBusyRef.current = false;
+      }
       return;
     }
     try {
@@ -923,7 +1216,7 @@ export function ChatAssistantPage({
         setPending({ ...pending, taskId: outcome.taskId ?? pending.taskId, phase: "unknown", detail: "仍未取得终态回执；可稍后手动刷新，系统不会重发。" });
       }
     } finally {
-      operationBusyRef.current = false;
+      if (operationGenerationRef.current === operationGeneration) operationBusyRef.current = false;
     }
   }
 
@@ -1024,6 +1317,8 @@ export function ChatAssistantPage({
       {series.can_enter !== true && <p className="chat-assistant-alert" role="alert">当前账号没有进入该剧集的权限。</p>}
       {catalogError !== null && <p className="chat-assistant-alert" role="alert">模型/提示词目录：{catalogError}</p>}
       {selectionPreferenceNotice !== null && <p className="chat-assistant-note" role="status">{selectionPreferenceNotice}</p>}
+      {contextPreferenceNotice !== null && <p className="chat-assistant-note" role="status">{contextPreferenceNotice}</p>}
+      {!contextPreferenceReady && <p className="chat-assistant-note" role="status">正在读取章节目录并核对上次聊天目标…</p>}
       {directoryError !== null && <p className="chat-assistant-alert" role="alert">会话目标读取失败：{directoryError}</p>}
       {pageError !== null && <p className="chat-assistant-alert" role="alert">{pageError}</p>}
 
@@ -1056,7 +1351,10 @@ export function ChatAssistantPage({
           </select>
         </label>
         <label className="chat-assistant-thinking">
-          <input checked={enableThinking} disabled={pending !== null || sending} onChange={(event) => setEnableThinking(event.target.checked)} type="checkbox" />
+          <input checked={enableThinking} disabled={pending !== null || sending} onChange={(event) => {
+            recordContextInteraction();
+            setEnableThinking(event.target.checked);
+          }} type="checkbox" />
           <span>启用深度思考</span>
         </label>
       </div>
@@ -1064,7 +1362,7 @@ export function ChatAssistantPage({
       <div className="chat-assistant-history" aria-label="聊天记录" aria-live="polite">
         <div className="chat-assistant-history-heading">
           <h2>当前会话</h2>
-          <button className="text-button" disabled={historyLoading || target === null} onClick={() => target !== null && void refreshHistory(target)} type="button">
+          <button className="text-button" disabled={!contextPreferenceReady || historyLoading || target === null} onClick={() => target !== null && void refreshHistory(target)} type="button">
             刷新会话
           </button>
         </div>
@@ -1103,6 +1401,7 @@ export function ChatAssistantPage({
                   {message.role === "user" && (
                     <button className="text-button" onClick={() => {
                       const context = parseChatContent(message.content);
+                      recordContextInteraction();
                       setDraft(context.text);
                       if (context.metadata !== null) {
                         editedSelectionContextRef.current = selectionPreferenceContextKey;
@@ -1152,7 +1451,10 @@ export function ChatAssistantPage({
       <form className="chat-assistant-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage(); }}>
         <label>
           <span>发送给 AI 助手</span>
-          <textarea disabled={catalogError !== null || series.can_enter !== true} onChange={(event) => setDraft(event.target.value)} rows={5} value={draft} />
+          <textarea disabled={catalogError !== null || series.can_enter !== true} onChange={(event) => {
+            recordContextInteraction();
+            setDraft(event.target.value);
+          }} rows={5} value={draft} />
         </label>
         <div className="chat-assistant-composer-actions">
           <span>{selectedModel === null ? "请先选择实际可用的文本模型。" : `当前模型：${selectedModel.name}`}</span>
