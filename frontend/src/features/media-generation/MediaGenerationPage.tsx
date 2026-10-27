@@ -51,6 +51,15 @@ import {
   type QuickReferenceSettings,
   type QuickReferenceTarget,
 } from "./quickReference";
+import {
+  readSingleMediaPreference,
+  writeSingleMediaPreference,
+  type ImageSelectionPreference,
+  type SingleMediaPreferenceCategory,
+  type SingleMediaPreferenceMode,
+  type SingleMediaSelectionPreference,
+  type VideoSelectionPreference,
+} from "./mediaSelectionPreferences";
 import { QuickReferenceSettingsPanel } from "./QuickReferenceSettingsPanel";
 import "./mediaGeneration.css";
 
@@ -269,6 +278,33 @@ interface SubmissionOutcome {
   readonly pendingLookup?: boolean;
 }
 
+interface ResolvedSingleMediaPreference {
+  readonly modelId: string | null;
+  readonly promptId: string | null;
+  readonly size: string | null;
+  readonly duration: string | null;
+  readonly resolution: string | null;
+  readonly warnings: readonly string[];
+}
+
+interface SingleMediaPreferenceOffer {
+  readonly contextKey: string;
+  readonly mode: SingleMediaPreferenceMode;
+  readonly preference: SingleMediaSelectionPreference;
+  readonly resolved: ResolvedSingleMediaPreference;
+}
+
+interface SingleMediaPreferenceCatalogSnapshot {
+  readonly contextKey: string;
+  readonly models: readonly CreatorModel[];
+  readonly prompts: readonly CreatorPrompt[];
+}
+
+interface SingleMediaPreferenceFeedback {
+  readonly contextKey: string;
+  readonly message: string;
+}
+
 interface MediaGenerationPageProps {
   readonly services: WorkspaceServices;
   readonly userId: string;
@@ -317,6 +353,138 @@ function modelOptions(model: CreatorModel | null): ModelOptions {
       : null,
     defaultResolution: typeof resolution.defaultValue === "string" ? resolution.defaultValue : "",
   };
+}
+
+function singleMediaPreferenceCategory(
+  targetMode: SingleTargetMode,
+  assetType: MediaGenerationAssetType,
+): SingleMediaPreferenceCategory {
+  if (targetMode === "standalone") return "general";
+  if (targetMode === "frame_message") return "frame";
+  return assetType;
+}
+
+function resolveOption(
+  savedValue: string,
+  options: readonly string[],
+  defaultValue: string,
+  label: string,
+  warnings: string[],
+): string {
+  if (options.length === 0) {
+    if (savedValue !== "") warnings.push(`当前模型没有可用的${label}选项，已忽略记住的值。`);
+    return "";
+  }
+  if (savedValue !== "" && options.includes(savedValue)) return savedValue;
+  const fallback = options.includes(defaultValue) ? defaultValue : options[0] ?? "";
+  if (savedValue !== "") warnings.push(`记住的${label}已不受当前模型支持，已使用当前模型的可用默认值。`);
+  return fallback;
+}
+
+function resolveSingleMediaPreference(
+  mode: SingleMediaPreferenceMode,
+  preference: SingleMediaSelectionPreference,
+  models: readonly CreatorModel[],
+  modePrompts: readonly CreatorPrompt[],
+): ResolvedSingleMediaPreference {
+  const saved = mode === "image"
+    ? preference as ImageSelectionPreference
+    : preference as VideoSelectionPreference;
+  const warnings: string[] = [];
+  const model = saved.modelId === "" ? null : models.find((candidate) => (
+    candidate.id === saved.modelId && candidate.category === mode
+  )) ?? null;
+  let modelId: string | null = saved.modelId;
+  let size: string | null = "";
+  let duration: string | null = mode === "video" ? "" : null;
+  let resolution: string | null = mode === "video" ? "" : null;
+
+  if (saved.modelId !== "" && model === null) {
+    modelId = null;
+    size = null;
+    duration = null;
+    resolution = null;
+    warnings.push("记住的模型已不在当前图片/视频模型目录中；请重新选择可用模型。");
+  } else if (model !== null) {
+    const options = modelOptions(model);
+    size = resolveOption(saved.size, options.sizes, options.defaultSize, "尺寸", warnings);
+    if (mode === "video") {
+      const videoPreference = preference as VideoSelectionPreference;
+      duration = resolveOption(
+        videoPreference.duration,
+        options.durations.map(String),
+        options.defaultDuration === null ? "" : String(options.defaultDuration),
+        "时长",
+        warnings,
+      );
+      resolution = resolveOption(
+        videoPreference.resolution,
+        options.resolutions,
+        options.defaultResolution,
+        "分辨率",
+        warnings,
+      );
+    }
+  } else {
+    if (saved.size !== "" || (mode === "video"
+      && ((preference as VideoSelectionPreference).duration !== "" || (preference as VideoSelectionPreference).resolution !== ""))) {
+      warnings.push("记住的选项没有关联模型，已清除尺寸、时长和分辨率。");
+    }
+    if (mode === "video") {
+      duration = "";
+      resolution = "";
+    }
+  }
+
+  let promptId: string | null = saved.promptId;
+  if (saved.promptId !== "" && !modePrompts.some((prompt) => prompt.id === saved.promptId)) {
+    promptId = null;
+    warnings.push("记住的提示词不属于当前图片/视频提示词目录；请手动重新选择。");
+  }
+
+  return { modelId, promptId, size, duration, resolution, warnings };
+}
+
+function promptsForSingleMode(mode: SingleMediaPreferenceMode, prompts: readonly CreatorPrompt[]): CreatorPrompt[] {
+  return mode === "image"
+    ? prompts.filter((prompt) => IMAGE_PROMPT_CATEGORIES.has(prompt.category))
+    : prompts.filter((prompt) => prompt.category === "video-design");
+}
+
+function singleMediaSelectionIssue(input: {
+  readonly mode: SingleMediaPreferenceMode;
+  readonly modelId: string;
+  readonly promptId: string;
+  readonly size: string;
+  readonly duration: string;
+  readonly resolution: string;
+  readonly models: readonly CreatorModel[];
+  readonly prompts: readonly CreatorPrompt[];
+}): string | null {
+  const model = input.modelId === "" ? null : input.models.find((candidate) => (
+    candidate.id === input.modelId && candidate.category === input.mode
+  )) ?? null;
+  if (input.modelId !== "" && model === null) return "所选模型已不在当前目录中，请重新选择。";
+  if (input.promptId !== "" && !promptsForSingleMode(input.mode, input.prompts).some((prompt) => prompt.id === input.promptId)) {
+    return "所选提示词已不属于当前图片/视频提示词目录，请重新选择。";
+  }
+  if (model === null) return null;
+
+  const options = modelOptions(model);
+  if (input.size !== "" && !options.sizes.includes(input.size)) {
+    return input.mode === "image"
+      ? "所选图片尺寸已不受当前模型支持，请重新选择。"
+      : "所选画面比例已不受当前模型支持，请重新选择。";
+  }
+  if (input.mode === "video") {
+    if (input.duration !== "" && !options.durations.map(String).includes(input.duration)) {
+      return "所选时长已不受当前模型支持，请重新选择。";
+    }
+    if (input.resolution !== "" && !options.resolutions.includes(input.resolution)) {
+      return "所选分辨率已不受当前模型支持，请重新选择。";
+    }
+  }
+  return null;
 }
 
 function promptText(prompt: CreatorPrompt): string {
@@ -396,6 +564,10 @@ export function MediaGenerationPage({
   const [selectedImageModelId, setSelectedImageModelId] = useState("");
   const [selectedImagePromptId, setSelectedImagePromptId] = useState("");
   const [selectedVideoPromptId, setSelectedVideoPromptId] = useState("");
+  const [singlePreferenceFeedback, setSinglePreferenceFeedback] = useState<SingleMediaPreferenceFeedback | null>(null);
+  const [singlePreferenceOffer, setSinglePreferenceOffer] = useState<SingleMediaPreferenceOffer | null>(null);
+  const singlePreferenceCatalogRef = useRef<SingleMediaPreferenceCatalogSnapshot | null>(null);
+  const editedSinglePreferenceContextsRef = useRef(new Set<string>());
   const batchSelectionsRef = useRef<BatchGenerationSelections>(emptyBatchSelections());
   const [batchSelections, setBatchSelections] = useState<BatchGenerationSelections>(batchSelectionsRef.current);
   const batchPreferenceEditsRef = useRef<BatchPreferenceEdits>(emptyBatchEdits());
@@ -460,6 +632,12 @@ export function MediaGenerationPage({
   const [requesting, setRequesting] = useState(false);
   const requestingRef = useRef(false);
   const [outcome, setOutcome] = useState<SubmissionOutcome | null>(null);
+  const acceptedReceiptContextRef = useRef<{
+    readonly userId: string;
+    readonly services: WorkspaceServices;
+    readonly sessionGeneration: number;
+    readonly signature: string;
+  } | null>(null);
   const mountedRef = useRef(false);
   const identityRef = useRef({ userId, services, sessionGeneration, signature: "" });
   const onUnauthorizedRef = useRef(onUnauthorized);
@@ -467,6 +645,27 @@ export function MediaGenerationPage({
 
   const selectedVideoModel = videoModels.find((model) => model.id === selectedVideoModelId) ?? null;
   const selectedImageModel = imageModels.find((model) => model.id === selectedImageModelId) ?? null;
+  const singlePreferenceMode = mode === "image" || mode === "video" ? mode : null;
+  const currentImagePromptOptions = prompts.filter((prompt) => IMAGE_PROMPT_CATEGORIES.has(prompt.category));
+  const currentVideoPromptOptions = prompts.filter((prompt) => prompt.category === "video-design");
+  const singleSelectionIssue = singlePreferenceMode === null ? null : singleMediaSelectionIssue({
+    mode: singlePreferenceMode,
+    modelId: singlePreferenceMode === "image" ? selectedImageModelId : selectedVideoModelId,
+    promptId: singlePreferenceMode === "image" ? selectedImagePromptId : selectedVideoPromptId,
+    size: singlePreferenceMode === "image" ? imageSize : videoSize,
+    duration: videoDuration,
+    resolution: videoResolution,
+    models: singlePreferenceMode === "image" ? imageModels : videoModels,
+    prompts,
+  });
+  const singlePreferenceCategory = singleMediaPreferenceCategory(singleTargetMode, singleAssetType);
+  const singlePreferenceContextKey = JSON.stringify([
+    userId,
+    services.apiBaseUrl,
+    sessionGeneration,
+    singlePreferenceMode,
+    singlePreferenceCategory,
+  ]);
   const selectedSeries = series.find((item) => item.id === selectedSeriesId) ?? null;
   const selectedChapter = chapters.find((item) => (
     item.id === selectedChapterId && item.series_id === selectedSeriesId
@@ -558,6 +757,160 @@ export function MediaGenerationPage({
   function updateRequesting(value: boolean) {
     requestingRef.current = value;
     setRequesting(value);
+  }
+
+  function markSinglePreferenceEdited(contextKey = singlePreferenceContextKey) {
+    editedSinglePreferenceContextsRef.current.add(contextKey);
+    setSinglePreferenceOffer(null);
+  }
+
+  function setSinglePreferenceMessage(message: string | null, contextKey = singlePreferenceContextKey) {
+    setSinglePreferenceFeedback(message === null ? null : { contextKey, message });
+  }
+
+  function persistSinglePreference(
+    preferenceMode: SingleMediaPreferenceMode,
+    preference: ImageSelectionPreference | VideoSelectionPreference,
+  ) {
+    const scope = { apiBaseUrl: services.apiBaseUrl, userId };
+    const saved = preferenceMode === "image"
+      ? writeSingleMediaPreference(scope, "image", singlePreferenceCategory, preference as ImageSelectionPreference)
+      : writeSingleMediaPreference(scope, "video", singlePreferenceCategory, preference as VideoSelectionPreference);
+    setSinglePreferenceMessage(saved
+      ? "已记住当前分类的生成选项。"
+      : "浏览器未能保存此分类的生成选项；当前表单仍可继续使用。",
+    );
+  }
+
+  function applyResolvedSinglePreference(
+    offer: SingleMediaPreferenceOffer,
+    automatic: boolean,
+  ): boolean {
+    if (offer.contextKey !== singlePreferenceContextKey || offer.mode !== singlePreferenceMode
+      || pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
+      || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
+      || savingBatchPreferencesRef.current) return false;
+    const models = offer.mode === "image" ? imageModels : videoModels;
+    const promptsInMode = promptsForSingleMode(offer.mode, prompts);
+    const resolved = resolveSingleMediaPreference(offer.mode, offer.preference, models, promptsInMode);
+    const selectedPrompt = resolved.promptId === null || resolved.promptId === ""
+      ? null
+      : promptsInMode.find((prompt) => prompt.id === resolved.promptId) ?? null;
+    const nextPromptText = selectedPrompt === null ? null : promptText(selectedPrompt);
+    const currentPromptText = offer.mode === "image" ? imagePrompt : videoPrompt;
+    if (!automatic && nextPromptText !== null && currentPromptText.trim() !== "" && currentPromptText !== nextPromptText) {
+      if (!window.confirm("应用已记住的设置会替换当前提示词。是否继续？")) return false;
+    }
+
+    if (offer.mode === "image") {
+      if (resolved.modelId !== null) setSelectedImageModelId(resolved.modelId);
+      if (resolved.promptId !== null) {
+        setSelectedImagePromptId(resolved.promptId);
+        if (nextPromptText !== null) setImagePrompt(nextPromptText);
+      }
+      if (resolved.size !== null) setImageSize(resolved.size);
+    } else {
+      if (resolved.modelId !== null) setSelectedVideoModelId(resolved.modelId);
+      if (resolved.promptId !== null) {
+        setSelectedVideoPromptId(resolved.promptId);
+        if (nextPromptText !== null) setVideoPrompt(nextPromptText);
+      }
+      if (resolved.size !== null) setVideoSize(resolved.size);
+      if (resolved.duration !== null) setVideoDuration(resolved.duration);
+      if (resolved.resolution !== null) setVideoResolution(resolved.resolution);
+    }
+
+    editedSinglePreferenceContextsRef.current.add(offer.contextKey);
+    setSinglePreferenceOffer(null);
+    setSinglePreferenceMessage(resolved.warnings.length > 0
+      ? `已应用可用设置；${resolved.warnings.join(" ")}`
+      : `已应用此分类记住的${offer.mode === "image" ? "图片" : "视频"}选项。`, offer.contextKey);
+    return true;
+  }
+
+  function applyRememberedSinglePreference() {
+    if (singlePreferenceOffer === null || isFrozen) return;
+    applyResolvedSinglePreference(singlePreferenceOffer, false);
+  }
+
+  function changeSingleModel(preferenceMode: SingleMediaPreferenceMode, modelId: string) {
+    markSinglePreferenceEdited();
+    if (preferenceMode === "image") {
+      const model = imageModels.find((candidate) => candidate.id === modelId) ?? null;
+      const size = model === null ? "" : modelOptions(model).defaultSize;
+      setSelectedImageModelId(modelId);
+      setImageSize(size);
+      persistSinglePreference("image", { modelId, promptId: selectedImagePromptId, size });
+      return;
+    }
+    const model = videoModels.find((candidate) => candidate.id === modelId) ?? null;
+    const options = modelOptions(model);
+    const size = model === null ? "" : options.defaultSize;
+    const duration = model === null || options.defaultDuration === null ? "" : String(options.defaultDuration);
+    const resolution = model === null ? "" : options.defaultResolution;
+    setSelectedVideoModelId(modelId);
+    setVideoSize(size);
+    setVideoDuration(duration);
+    setVideoResolution(resolution);
+    persistSinglePreference("video", { modelId, promptId: selectedVideoPromptId, size, duration, resolution });
+  }
+
+  function changeSinglePrompt(preferenceMode: SingleMediaPreferenceMode, promptId: string) {
+    markSinglePreferenceEdited();
+    if (preferenceMode === "image") {
+      selectImagePrompt(promptId);
+      persistSinglePreference("image", { modelId: selectedImageModelId, promptId, size: imageSize });
+      return;
+    }
+    selectVideoPrompt(promptId);
+    persistSinglePreference("video", {
+      modelId: selectedVideoModelId,
+      promptId,
+      size: videoSize,
+      duration: videoDuration,
+      resolution: videoResolution,
+    });
+  }
+
+  function changeSingleSize(preferenceMode: SingleMediaPreferenceMode, size: string) {
+    markSinglePreferenceEdited();
+    if (preferenceMode === "image") {
+      setImageSize(size);
+      persistSinglePreference("image", { modelId: selectedImageModelId, promptId: selectedImagePromptId, size });
+      return;
+    }
+    setVideoSize(size);
+    persistSinglePreference("video", {
+      modelId: selectedVideoModelId,
+      promptId: selectedVideoPromptId,
+      size,
+      duration: videoDuration,
+      resolution: videoResolution,
+    });
+  }
+
+  function changeVideoDuration(duration: string) {
+    markSinglePreferenceEdited();
+    setVideoDuration(duration);
+    persistSinglePreference("video", {
+      modelId: selectedVideoModelId,
+      promptId: selectedVideoPromptId,
+      size: videoSize,
+      duration,
+      resolution: videoResolution,
+    });
+  }
+
+  function changeVideoResolution(resolution: string) {
+    markSinglePreferenceEdited();
+    setVideoResolution(resolution);
+    persistSinglePreference("video", {
+      modelId: selectedVideoModelId,
+      promptId: selectedVideoPromptId,
+      size: videoSize,
+      duration: videoDuration,
+      resolution,
+    });
   }
 
   function updateBatchSelection(
@@ -666,6 +1019,168 @@ export function MediaGenerationPage({
     setPreparingQuickReference(false);
     setQuickReferenceActionMessage(null);
   }, [services, sessionGeneration, userId]);
+
+  useEffect(() => {
+    if (singlePreferenceMode === null || loading || catalogError !== null || !catalogReadyRef.current
+      || pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
+      || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
+      || savingBatchPreferencesRef.current) return;
+
+    const contextKey = singlePreferenceContextKey;
+    const preferenceMode = singlePreferenceMode;
+    const models = preferenceMode === "image" ? imageModels : videoModels;
+    const acceptedReceipt = acceptedReceiptContextRef.current;
+    if (acceptedReceipt?.userId === userId && acceptedReceipt.services === services
+      && acceptedReceipt.sessionGeneration === sessionGeneration && acceptedReceipt.signature === formSignature) {
+      singlePreferenceCatalogRef.current = { contextKey, models, prompts };
+      return;
+    }
+    const previous = singlePreferenceCatalogRef.current;
+    if (previous?.contextKey === contextKey) {
+      if (previous.models === models && previous.prompts === prompts) return;
+      singlePreferenceCatalogRef.current = { contextKey, models, prompts };
+
+      const warnings: string[] = [];
+      const currentModelId = preferenceMode === "image" ? selectedImageModelId : selectedVideoModelId;
+      const selectedModel = models.find((candidate) => candidate.id === currentModelId && candidate.category === preferenceMode) ?? null;
+      if (currentModelId !== "" && selectedModel === null) {
+        warnings.push("所选模型已不在当前目录中，已清除该模型及其选项。");
+        if (preferenceMode === "image") {
+          setSelectedImageModelId("");
+          setImageSize("");
+        } else {
+          setSelectedVideoModelId("");
+          setVideoSize("");
+          setVideoDuration("");
+          setVideoResolution("");
+        }
+      } else if (selectedModel !== null) {
+        const options = modelOptions(selectedModel);
+        if (preferenceMode === "image") {
+          if (imageSize !== "" && !options.sizes.includes(imageSize)) {
+            setImageSize("");
+            warnings.push("所选图片尺寸已不受当前模型支持，已清除，请重新选择。");
+          }
+        } else {
+          if (videoSize !== "" && !options.sizes.includes(videoSize)) {
+            setVideoSize("");
+            warnings.push("所选画面比例已不受当前模型支持，已清除，请重新选择。");
+          }
+          if (videoDuration !== "" && !options.durations.map(String).includes(videoDuration)) {
+            setVideoDuration("");
+            warnings.push("所选时长已不受当前模型支持，已清除，请重新选择。");
+          }
+          if (videoResolution !== "" && !options.resolutions.includes(videoResolution)) {
+            setVideoResolution("");
+            warnings.push("所选分辨率已不受当前模型支持，已清除，请重新选择。");
+          }
+        }
+      }
+
+      const currentPromptId = preferenceMode === "image" ? selectedImagePromptId : selectedVideoPromptId;
+      const currentPromptOptions = promptsForSingleMode(preferenceMode, prompts);
+      if (currentPromptId !== "" && !currentPromptOptions.some((prompt) => prompt.id === currentPromptId)) {
+        if (preferenceMode === "image") setSelectedImagePromptId("");
+        else setSelectedVideoPromptId("");
+        warnings.push("所选提示词已不属于当前图片/视频提示词目录，已切回手动输入；正文保留。");
+      }
+
+      if (singlePreferenceOffer?.contextKey === contextKey) {
+        const resolved = resolveSingleMediaPreference(
+          preferenceMode,
+          singlePreferenceOffer.preference,
+          models,
+          currentPromptOptions,
+        );
+        setSinglePreferenceOffer({ ...singlePreferenceOffer, resolved });
+      }
+      if (warnings.length > 0) {
+        setSinglePreferenceMessage(warnings.join(" "), contextKey);
+      }
+      return;
+    }
+
+    singlePreferenceCatalogRef.current = { contextKey, models, prompts };
+    const read = preferenceMode === "image"
+      ? readSingleMediaPreference({ apiBaseUrl: services.apiBaseUrl, userId }, "image", singlePreferenceCategory)
+      : readSingleMediaPreference({ apiBaseUrl: services.apiBaseUrl, userId }, "video", singlePreferenceCategory);
+    setSinglePreferenceOffer(null);
+    if (read.kind === "missing") {
+      setSinglePreferenceMessage(null, contextKey);
+      return;
+    }
+    if (read.kind === "unavailable" || read.kind === "invalid") {
+      setSinglePreferenceMessage(read.kind === "unavailable"
+        ? "浏览器无法读取此分类的本地生成选项；请手动选择。"
+        : "此分类的本地生成选项无法读取；请手动选择。", contextKey);
+      return;
+    }
+
+    const modePrompts = promptsForSingleMode(preferenceMode, prompts);
+    const resolved = resolveSingleMediaPreference(preferenceMode, read.value, models, modePrompts);
+    const formHasInput = preferenceMode === "image"
+      ? selectedImageModelId !== "" || selectedImagePromptId !== "" || imagePrompt.trim() !== "" || imageSize !== ""
+        || imageReferenceImages.trim() !== "" || imageQuickReferenceImages.length > 0 || referenceFiles.image !== undefined
+      : selectedVideoModelId !== "" || selectedVideoPromptId !== "" || videoPrompt.trim() !== ""
+        || videoSize !== "" || videoDuration !== "" || videoResolution !== ""
+        || videoReferenceImages.trim() !== "" || videoReferenceAudios.trim() !== "" || videoReferenceVideos.trim() !== ""
+        || videoQuickReferenceImages.length > 0 || videoQuickReferenceAudios.length > 0
+        || referenceFiles.image !== undefined || referenceFiles.audio !== undefined || referenceFiles.video !== undefined;
+    const offer: SingleMediaPreferenceOffer = {
+      contextKey,
+      mode: preferenceMode,
+      preference: read.value,
+      resolved,
+    };
+    if (formHasInput || editedSinglePreferenceContextsRef.current.has(contextKey)) {
+      setSinglePreferenceOffer(offer);
+      setSinglePreferenceMessage(
+        `已找到当前分类记住的${preferenceMode === "image" ? "图片" : "视频"}选项；为保留现有表单，未自动应用。你可以显式应用，替换已有提示词前会再次确认。${resolved.warnings.join(" ")}`,
+        contextKey,
+      );
+      return;
+    }
+    applyResolvedSinglePreference(offer, true);
+  }, [
+    catalogError,
+    formSignature,
+    imageModels,
+    imagePrompt,
+    imageQuickReferenceImages,
+    imageReferenceImages,
+    imageSize,
+    loading,
+    mode,
+    prompts,
+    pending,
+    preparingQuickReference,
+    referenceFiles,
+    requesting,
+    savingBatchPreferences,
+    savingQuickReferencePreferences,
+    selectedImageModelId,
+    selectedImagePromptId,
+    selectedVideoModelId,
+    selectedVideoPromptId,
+    services.apiBaseUrl,
+    sessionGeneration,
+    singlePreferenceCategory,
+    singlePreferenceContextKey,
+    singlePreferenceMode,
+    singlePreferenceOffer,
+    userId,
+    uploadingReference,
+    videoDuration,
+    videoModels,
+    videoPrompt,
+    videoQuickReferenceAudios,
+    videoQuickReferenceImages,
+    videoReferenceAudios,
+    videoReferenceImages,
+    videoReferenceVideos,
+    videoResolution,
+    videoSize,
+  ]);
 
   useEffect(() => {
     const port = services.userPreferences;
@@ -888,26 +1403,6 @@ export function MediaGenerationPage({
   }, [imageModels, loading, mode, prompts, services, sessionGeneration, userId]);
 
   useEffect(() => {
-    if (selectedVideoModel === null) {
-      setVideoSize("");
-      setVideoDuration("");
-      setVideoResolution("");
-      return;
-    }
-    setVideoSize(videoOptions.defaultSize);
-    setVideoDuration(videoOptions.defaultDuration === null ? "" : String(videoOptions.defaultDuration));
-    setVideoResolution(videoOptions.defaultResolution);
-  }, [selectedVideoModelId, selectedVideoModel, videoOptions.defaultDuration, videoOptions.defaultResolution, videoOptions.defaultSize]);
-
-  useEffect(() => {
-    if (selectedImageModel === null) {
-      setImageSize("");
-      return;
-    }
-    setImageSize(imageOptions.defaultSize);
-  }, [selectedImageModelId, selectedImageModel, imageOptions.defaultSize]);
-
-  useEffect(() => {
     if (selectedSeriesId === "") {
       setChapters([]);
       setSelectedChapterId("");
@@ -1008,18 +1503,6 @@ export function MediaGenerationPage({
   }, [selectedChapterId, selectedSeriesId, services]);
 
   useEffect(() => {
-    if (selectedImagePromptId === "") return;
-    const prompt = prompts.find((candidate) => candidate.id === selectedImagePromptId);
-    if (prompt !== undefined) setImagePrompt(promptText(prompt));
-  }, [prompts, selectedImagePromptId]);
-
-  useEffect(() => {
-    if (selectedVideoPromptId === "") return;
-    const prompt = prompts.find((candidate) => candidate.id === selectedVideoPromptId);
-    if (prompt !== undefined) setVideoPrompt(promptText(prompt));
-  }, [prompts, selectedVideoPromptId]);
-
-  useEffect(() => {
     if (singleAssetId !== "" && !singleAssetChoices.some((asset) => asset.id === singleAssetId)) {
       setSingleAssetId("");
     }
@@ -1032,6 +1515,7 @@ export function MediaGenerationPage({
     if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
       || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
       || savingBatchPreferencesRef.current) return;
+    acceptedReceiptContextRef.current = null;
     setMode(value);
     setOutcome(null);
     setReferenceUploadStatus(null);
@@ -1039,6 +1523,7 @@ export function MediaGenerationPage({
 
   const applyReceipt = (signature: string, receipt: MediaGenerationReceipt) => {
     if (signature !== identityRef.current.signature) return;
+    acceptedReceiptContextRef.current = { userId, services, sessionGeneration, signature };
     setOutcome({ signature, receipt, message: receiptMessage(receipt) });
     updatePending(null);
   };
@@ -1098,6 +1583,9 @@ export function MediaGenerationPage({
   };
 
   const setReferenceFile = (kind: MediaReferenceKind, file: File | undefined) => {
+    if ((mode === "image" && kind === "image") || mode === "video") {
+      markSinglePreferenceEdited();
+    }
     setReferenceFiles((current) => {
       const next = { ...current };
       if (file === undefined) delete next[kind];
@@ -1109,11 +1597,21 @@ export function MediaGenerationPage({
 
   const appendReferenceUrl = (kind: MediaReferenceKind, url: string) => {
     const append = (current: string) => `${current}${current === "" || current.endsWith("\n") ? "" : "\n"}${url}`;
-    if (kind === "image" && mode === "image") setImageReferenceImages(append);
-    else if (kind === "image" && mode === "video") setVideoReferenceImages(append);
+    if (kind === "image" && mode === "image") {
+      markSinglePreferenceEdited();
+      setImageReferenceImages(append);
+    } else if (kind === "image" && mode === "video") {
+      markSinglePreferenceEdited();
+      setVideoReferenceImages(append);
+    }
     else if (kind === "image") setBatchReferenceImages(append);
-    else if (kind === "audio") setVideoReferenceAudios(append);
-    else setVideoReferenceVideos(append);
+    else if (kind === "audio") {
+      if (mode === "video") markSinglePreferenceEdited();
+      setVideoReferenceAudios(append);
+    } else {
+      if (mode === "video") markSinglePreferenceEdited();
+      setVideoReferenceVideos(append);
+    }
   };
 
   const referenceCount = (kind: MediaReferenceKind) => {
@@ -1202,7 +1700,7 @@ export function MediaGenerationPage({
   const submitImage = async () => {
     if (pendingRef.current !== null || requestingRef.current || quickReferenceActionRef.current
       || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
-      || selectedImageModel === null || imagePrompt.trim() === "") return;
+      || selectedImageModel === null || imagePrompt.trim() === "" || singleSelectionIssue !== null) return;
     const rawKey = crypto.randomUUID();
     const signature = formSignature;
     let run: MediaGenerationRun;
@@ -1221,6 +1719,7 @@ export function MediaGenerationPage({
       idempotencyKey: rawKey,
     });
     const controller = new AbortController();
+    acceptedReceiptContextRef.current = null;
     setOutcome(null);
     updateRequesting(true);
     try {
@@ -1255,7 +1754,7 @@ export function MediaGenerationPage({
   const submitVideo = async () => {
     if (pendingRef.current !== null || requestingRef.current || quickReferenceActionRef.current
       || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
-      || selectedVideoModel === null || videoPrompt.trim() === "") return;
+      || selectedVideoModel === null || videoPrompt.trim() === "" || singleSelectionIssue !== null) return;
     const target = singleTarget();
     const rawKey = crypto.randomUUID();
     const signature = formSignature;
@@ -1279,6 +1778,7 @@ export function MediaGenerationPage({
       idempotencyKey: rawKey,
     });
     const controller = new AbortController();
+    acceptedReceiptContextRef.current = null;
     setOutcome(null);
     updateRequesting(true);
     try {
@@ -1650,6 +2150,7 @@ export function MediaGenerationPage({
     const capturedSessionGeneration = sessionGeneration;
     const capturedSignature = identityRef.current.signature;
     const capturedMode: QuickReferenceMode = isImage ? "image" : "video";
+    const capturedPreferenceContextKey = singlePreferenceContextKey;
     const capturedSettings = Object.freeze({ ...quickReferenceSettingsRef.current[capturedMode] });
     const controller = new AbortController();
     quickReferenceActionControllerRef.current = controller;
@@ -1780,6 +2281,8 @@ export function MediaGenerationPage({
       }
       if (!isCurrentAction()) return;
 
+      editedSinglePreferenceContextsRef.current.add(capturedPreferenceContextKey);
+      setSinglePreferenceOffer(null);
       if (isImage) {
         setSelectedImagePromptId("");
         setImagePrompt(description);
@@ -1829,11 +2332,19 @@ export function MediaGenerationPage({
   const selectImagePrompt = (id: string) => {
     setSelectedImagePromptId(id);
     if (id === "") setImagePrompt("");
+    else {
+      const selectedPrompt = promptsForSingleMode("image", prompts).find((prompt) => prompt.id === id);
+      if (selectedPrompt !== undefined) setImagePrompt(promptText(selectedPrompt));
+    }
   };
 
   const selectVideoPrompt = (id: string) => {
     setSelectedVideoPromptId(id);
     if (id === "") setVideoPrompt("");
+    else {
+      const selectedPrompt = promptsForSingleMode("video", prompts).find((prompt) => prompt.id === id);
+      if (selectedPrompt !== undefined) setVideoPrompt(promptText(selectedPrompt));
+    }
   };
 
   const toggleBatchAsset = (key: string, checked: boolean) => {
@@ -1858,8 +2369,6 @@ export function MediaGenerationPage({
   const hasBatchPreferenceEdits = batchCheckEditsRef.current.size > 0
     || BATCH_ASSET_TYPES.some((type) => batchPreferenceEditsRef.current[type].size > 0);
   const hasQuickReferenceEdits = quickReferenceEdits.size > 0;
-  const currentImagePromptOptions = prompts.filter((prompt) => IMAGE_PROMPT_CATEGORIES.has(prompt.category));
-  const currentVideoPromptOptions = prompts.filter((prompt) => prompt.category === "video-design");
   const isImageMode = mode === "image";
   const singleModel = isImageMode ? selectedImageModel : selectedVideoModel;
   const singleOptions = isImageMode ? imageOptions : videoOptions;
@@ -1971,46 +2480,55 @@ export function MediaGenerationPage({
             <div><p className="eyebrow">{isImageMode ? "图片生成" : "视频生成"}</p><h2>{isImageMode ? "普通图片" : "普通视频"}</h2></div>
             <span>提交前会固定模型、目标与参考素材。</span>
           </div>
+          {singlePreferenceFeedback?.contextKey === singlePreferenceContextKey && (
+            <p className="media-generation-note media-generation-wide" role="status">{singlePreferenceFeedback.message}</p>
+          )}
+          {singlePreferenceOffer?.contextKey === singlePreferenceContextKey && (
+            <div className="media-generation-note media-generation-wide" role="group" aria-label="已记住的生成选项">
+              <span>当前表单保留中。应用记住的选项只调整模型、提示词选择和支持的参数；若更换为记住的模板，会先确认替换正文。</span>
+              <button className="secondary-button" disabled={isFrozen} onClick={applyRememberedSinglePreference} type="button">
+                应用已记住的{isImageMode ? "图片" : "视频"}选项
+              </button>
+            </div>
+          )}
           <div className="media-generation-fields">
             <label>
               <span>{isImageMode ? "图片模型" : "视频模型"}</span>
-              <select disabled={loading || isFrozen} onChange={(event) => isImageMode
-                ? setSelectedImageModelId(event.target.value)
-                : setSelectedVideoModelId(event.target.value)} value={isImageMode ? selectedImageModelId : selectedVideoModelId}>
+              <select disabled={loading || isFrozen} onChange={(event) => changeSingleModel(isImageMode ? "image" : "video", event.target.value)} value={isImageMode ? selectedImageModelId : selectedVideoModelId}>
                 <option value="">{isImageMode ? "选择图片模型" : "选择视频模型"}</option>
                 {(isImageMode ? imageModels : videoModels).map((model) => <option key={model.id} value={model.id}>{model.name}</option>)}
               </select>
             </label>
             <label>
               <span>提示词目录</span>
-              <select disabled={isFrozen} onChange={(event) => isImageMode
-                ? selectImagePrompt(event.target.value)
-                : selectVideoPrompt(event.target.value)} value={singlePromptId}>
+              <select disabled={isFrozen} onChange={(event) => changeSinglePrompt(isImageMode ? "image" : "video", event.target.value)} value={singlePromptId}>
                 <option value="">手动输入</option>
                 {singlePromptOptions.map((prompt) => <option key={prompt.id} value={prompt.id}>{prompt.name}</option>)}
               </select>
             </label>
             <label className="media-generation-wide">
               <span>{isImageMode ? "图片提示词" : "视频提示词"}</span>
-              <textarea disabled={isFrozen} onChange={(event) => isImageMode
-                ? setImagePrompt(event.target.value)
-                : setVideoPrompt(event.target.value)} rows={5} value={singlePrompt} />
+              <textarea disabled={isFrozen} onChange={(event) => {
+                markSinglePreferenceEdited();
+                if (isImageMode) setImagePrompt(event.target.value);
+                else setVideoPrompt(event.target.value);
+              }} rows={5} value={singlePrompt} />
             </label>
 
             {singleOptions.sizes.length > 0 && (
               <label><span>{isImageMode ? "图片尺寸" : "画面比例"}</span><select disabled={isFrozen} onChange={(event) => isImageMode
-                ? setImageSize(event.target.value)
-                : setVideoSize(event.target.value)} value={isImageMode ? imageSize : videoSize}>
+                ? changeSingleSize("image", event.target.value)
+                : changeSingleSize("video", event.target.value)} value={isImageMode ? imageSize : videoSize}>
                 {singleOptions.sizes.map((size) => <option key={size} value={size}>{size}</option>)}
               </select></label>
             )}
             {!isImageMode && videoOptions.durations.length > 0 && (
-              <label><span>时长（秒）</span><select disabled={isFrozen} onChange={(event) => setVideoDuration(event.target.value)} value={videoDuration}>
+              <label><span>时长（秒）</span><select disabled={isFrozen} onChange={(event) => changeVideoDuration(event.target.value)} value={videoDuration}>
                 {videoOptions.durations.map((duration) => <option key={duration} value={String(duration)}>{duration}</option>)}
               </select></label>
             )}
             {!isImageMode && videoOptions.resolutions.length > 0 && (
-              <label><span>分辨率</span><select disabled={isFrozen} onChange={(event) => setVideoResolution(event.target.value)} value={videoResolution}>
+              <label><span>分辨率</span><select disabled={isFrozen} onChange={(event) => changeVideoResolution(event.target.value)} value={videoResolution}>
                 {videoOptions.resolutions.map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
               </select></label>
             )}
@@ -2074,6 +2592,7 @@ export function MediaGenerationPage({
             )}
             {quickReferenceActionMessage !== null && <p className="media-generation-note media-generation-wide" role="status">{quickReferenceActionMessage}</p>}
             <label><span>参考图片 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
+              markSinglePreferenceEdited();
               singleReferenceSetter(event.target.value);
               setReferenceUploadStatus((current) => current?.kind === "image" ? null : current);
             }} rows={3} value={singleReferences} /></label>
@@ -2085,6 +2604,7 @@ export function MediaGenerationPage({
             {renderReferenceUploader("image")}
             {!isImageMode && <>
               <label><span>参考音频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
+                markSinglePreferenceEdited();
                 setVideoReferenceAudios(event.target.value);
                 setReferenceUploadStatus((current) => current?.kind === "audio" ? null : current);
               }} rows={3} value={videoReferenceAudios} /></label>
@@ -2095,6 +2615,7 @@ export function MediaGenerationPage({
               )}
               {renderReferenceUploader("audio")}
               <label className="media-generation-wide"><span>参考视频 URL（每行一项）</span><textarea disabled={isFrozen} onChange={(event) => {
+                markSinglePreferenceEdited();
                 setVideoReferenceVideos(event.target.value);
                 setReferenceUploadStatus((current) => current?.kind === "video" ? null : current);
               }} rows={3} value={videoReferenceVideos} /></label>
@@ -2104,10 +2625,11 @@ export function MediaGenerationPage({
           {chapterError !== null && <p className="media-generation-alert" role="alert">章节读取失败：{chapterError}</p>}
           {directoryError !== null && <p className="media-generation-alert" role="alert">章节素材读取失败：{directoryError}</p>}
           {singleTargetMode !== "standalone" && directoryLoading && <p role="status">正在读取章节分镜和素材目录…</p>}
+          {singleSelectionIssue !== null && <p className="media-generation-alert" role="alert">{singleSelectionIssue}</p>}
           {singleReferenceLimitMessage !== null && <p className="media-generation-alert" role="alert">{singleReferenceLimitMessage}</p>}
           <div className="media-generation-actions">
             <button className="primary-button" disabled={loading || isFrozen || singleModel === null || singlePrompt.trim() === ""
-              || singleReferenceLimitMessage !== null
+              || singleSelectionIssue !== null || singleReferenceLimitMessage !== null
               || (singleTargetMode === "frame_message" && (selectedChapterId === "" || singleStoryboardAssetId === ""))
               || (singleTargetMode === "asset_message" && (selectedChapterId === "" || singleAssetId === ""))}
               onClick={() => void (isImageMode ? submitImage() : submitVideo())} type="button">
