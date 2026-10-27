@@ -14,6 +14,89 @@ export interface TaskReceipt {
   externalProvider: string | null;
   createdAt: string | null;
   updatedAt: string | null;
+  historyTruth: TaskHistoryTruth;
+}
+
+export type TaskHistorySourceStatus = "legacy" | "registered" | "unsupported" | "unknown";
+export type TaskHistorySourceConflict = "intent_graph_mismatch" | "multiple_task_submission_intents";
+export type TaskWorkerObservationStatus =
+  | "active_lease"
+  | "expired_lease"
+  | "unclaimed"
+  | "unknown"
+  | "unsupported";
+export type TaskProviderObservationStatus =
+  | "verified_success"
+  | "known_failure"
+  | "partial"
+  | "unknown"
+  | "unsupported";
+
+export interface TaskHistoryProviderUnit {
+  operation: string | null;
+  graphVersion: string | null;
+  status: "verified_success" | "known_failure" | "unknown" | "unsupported";
+  unitResultStatus: string;
+  stepStatuses: string[];
+  submissionStatuses: string[];
+  providers: string[];
+  providerEvidenceCount: number;
+  timing: "timely" | "late" | "mixed" | "unknown";
+  timelyEvidenceCount: number;
+  lateEvidenceCount: number;
+  unknownTimingCount: number;
+  observedAt: string | null;
+  hasUnverifiedFailedSubmission: boolean;
+}
+
+export interface TaskLocalDispositionObservation {
+  status: "cancel_requested" | "deadline_elapsed_unsettled" | "policy_stopped" | "local_continuation";
+  source: string;
+  recordedAt: string | null;
+  reason: string | null;
+  phase: string | null;
+}
+
+export interface TaskHistoryTruth {
+  version: 1;
+  source: {
+    status: TaskHistorySourceStatus;
+    source: string;
+    unitCount: number | null;
+    registeredUnitCount: number;
+    operations: string[];
+    conflicts: TaskHistorySourceConflict[];
+  };
+  worker: {
+    status: TaskWorkerObservationStatus;
+    source: string;
+    recoveryStatus: string;
+    freshness: "within_lease" | "lease_expired" | "no_active_lease" | "unknown";
+    leaseUntil: string | null;
+    taskUpdatedAt: string | null;
+    evaluatedAt: string;
+  };
+  provider: {
+    status: TaskProviderObservationStatus;
+    source: string;
+    unitCount: number | null;
+    verifiedUnitCount: number;
+    knownFailureUnitCount: number;
+    unknownUnitCount: number;
+    unsupportedUnitCount: number;
+    units: TaskHistoryProviderUnit[];
+  };
+  localDisposition: {
+    status: "observed" | "none_recorded" | "unknown" | "unsupported";
+    sourceCoverage: string[];
+    unitCount: number | null;
+    observations: TaskLocalDispositionObservation[];
+  };
+  billingScope: {
+    unitCount: number | null;
+    legacyQuoteScope: "first_unit" | "single_unit" | "task_record" | "unknown";
+    aggregated: boolean;
+  };
 }
 
 export interface TaskRequestRecord {
@@ -65,6 +148,14 @@ function nullableSafeInteger(record: JsonRecord, key: string, label: string): nu
   return value;
 }
 
+function requiredSafeInteger(record: JsonRecord, key: string, label: string): number {
+  const value = requiredValue(record, key, label);
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+    throw new InvalidResponseError(label + "中的 " + key + " 字段格式无效。");
+  }
+  return value;
+}
+
 function requiredTaskRecord(value: unknown, expectedTaskId: string, label: string): JsonRecord {
   if (!isRecord(value)) {
     throw new InvalidResponseError(label + "格式无效。");
@@ -76,8 +167,195 @@ function requiredTaskRecord(value: unknown, expectedTaskId: string, label: strin
   return value;
 }
 
+function stringList(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((item) => typeof item !== "string")) {
+    throw new InvalidResponseError(label + "字段格式无效。");
+  }
+  return value as string[];
+}
+
+function booleanValue(record: JsonRecord, key: string, label: string): boolean {
+  const value = requiredValue(record, key, label);
+  if (typeof value !== "boolean") {
+    throw new InvalidResponseError(label + "中的 " + key + " 字段格式无效。");
+  }
+  return value;
+}
+
+function enumValue<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  label: string,
+): T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new InvalidResponseError(label + "字段格式无效。");
+  }
+  return value as T;
+}
+
+export function unsupportedTaskHistoryTruth(): TaskHistoryTruth {
+  return {
+    version: 1,
+    source: {
+      status: "unsupported",
+      source: "unavailable",
+      unitCount: null,
+      registeredUnitCount: 0,
+      operations: [],
+      conflicts: [],
+    },
+    worker: {
+      status: "unsupported",
+      source: "unavailable",
+      recoveryStatus: "unknown",
+      freshness: "unknown",
+      leaseUntil: null,
+      taskUpdatedAt: null,
+      evaluatedAt: "",
+    },
+    provider: {
+      status: "unsupported",
+      source: "unavailable",
+      unitCount: null,
+      verifiedUnitCount: 0,
+      knownFailureUnitCount: 0,
+      unknownUnitCount: 0,
+      unsupportedUnitCount: 0,
+      units: [],
+    },
+    localDisposition: {
+      status: "unknown",
+      sourceCoverage: [],
+      unitCount: null,
+      observations: [],
+    },
+    billingScope: {
+      unitCount: null,
+      legacyQuoteScope: "unknown",
+      aggregated: false,
+    },
+  };
+}
+
+function parseTaskHistoryTruth(value: unknown): TaskHistoryTruth {
+  if (!isRecord(value)) {
+    throw new InvalidResponseError("任务历史事实记录格式无效。");
+  }
+  const label = "任务历史事实记录";
+  const version = requiredValue(value, "version", label);
+  if (typeof version !== "number" || !Number.isSafeInteger(version) || version < 1) {
+    throw new InvalidResponseError(label + "版本字段格式无效。");
+  }
+  if (version !== 1) {
+    return unsupportedTaskHistoryTruth();
+  }
+
+  const source = requiredValue(value, "source", label);
+  const worker = requiredValue(value, "worker", label);
+  const provider = requiredValue(value, "provider", label);
+  const local = requiredValue(value, "local_disposition", label);
+  const billingScope = requiredValue(value, "billing_scope", label);
+  if (
+    !isRecord(source)
+    || !isRecord(worker)
+    || !isRecord(provider)
+    || !isRecord(local)
+    || !isRecord(billingScope)
+  ) {
+    throw new InvalidResponseError(label + "字段格式无效。");
+  }
+
+  const providerUnitsRaw = requiredValue(provider, "units", label);
+  if (!Array.isArray(providerUnitsRaw)) {
+    throw new InvalidResponseError(label + "中的 units 字段格式无效。");
+  }
+  const units = providerUnitsRaw.map((item): TaskHistoryProviderUnit => {
+    if (!isRecord(item)) throw new InvalidResponseError(label + "中的单元记录格式无效。");
+    return {
+      operation: nullableString(item, "operation", label),
+      graphVersion: nullableString(item, "graph_version", label),
+      status: enumValue(requiredValue(item, "status", label), ["verified_success", "known_failure", "unknown", "unsupported"], label),
+      unitResultStatus: requiredString(item, "unit_result_status", label),
+      stepStatuses: stringList(requiredValue(item, "step_statuses", label), label),
+      submissionStatuses: stringList(requiredValue(item, "submission_statuses", label), label),
+      providers: stringList(requiredValue(item, "providers", label), label),
+      providerEvidenceCount: requiredSafeInteger(item, "provider_evidence_count", label),
+      timing: enumValue(requiredValue(item, "timing", label), ["timely", "late", "mixed", "unknown"], label),
+      timelyEvidenceCount: requiredSafeInteger(item, "timely_evidence_count", label),
+      lateEvidenceCount: requiredSafeInteger(item, "late_evidence_count", label),
+      unknownTimingCount: requiredSafeInteger(item, "unknown_timing_count", label),
+      observedAt: nullableString(item, "observed_at", label),
+      hasUnverifiedFailedSubmission: booleanValue(item, "has_unverified_failed_submission", label),
+    };
+  });
+
+  const observationsRaw = requiredValue(local, "observations", label);
+  if (!Array.isArray(observationsRaw)) {
+    throw new InvalidResponseError(label + "中的 observations 字段格式无效。");
+  }
+  const observations = observationsRaw.map((item): TaskLocalDispositionObservation => {
+    if (!isRecord(item)) throw new InvalidResponseError(label + "中的处置记录格式无效。");
+    return {
+      status: enumValue(
+        requiredValue(item, "status", label),
+        ["cancel_requested", "deadline_elapsed_unsettled", "policy_stopped", "local_continuation"],
+        label,
+      ),
+      source: requiredString(item, "source", label),
+      recordedAt: nullableString(item, "recorded_at", label),
+      reason: nullableString(item, "reason", label),
+      phase: nullableString(item, "phase", label),
+    };
+  });
+
+  return {
+    version: 1,
+    source: {
+      status: enumValue(requiredValue(source, "status", label), ["legacy", "registered", "unsupported", "unknown"], label),
+      source: requiredString(source, "source", label),
+      unitCount: nullableSafeInteger(source, "unit_count", label),
+      registeredUnitCount: requiredSafeInteger(source, "registered_unit_count", label),
+      operations: stringList(requiredValue(source, "operations", label), label),
+      conflicts: stringList(requiredValue(source, "conflicts", label), label).map((conflict) => (
+        enumValue(conflict, ["intent_graph_mismatch", "multiple_task_submission_intents"], label)
+      )),
+    },
+    worker: {
+      status: enumValue(requiredValue(worker, "status", label), ["active_lease", "expired_lease", "unclaimed", "unknown", "unsupported"], label),
+      source: requiredString(worker, "source", label),
+      recoveryStatus: requiredString(worker, "recovery_status", label),
+      freshness: enumValue(requiredValue(worker, "freshness", label), ["within_lease", "lease_expired", "no_active_lease", "unknown"], label),
+      leaseUntil: nullableString(worker, "lease_until", label),
+      taskUpdatedAt: nullableString(worker, "task_updated_at", label),
+      evaluatedAt: requiredString(worker, "evaluated_at", label),
+    },
+    provider: {
+      status: enumValue(requiredValue(provider, "status", label), ["verified_success", "known_failure", "partial", "unknown", "unsupported"], label),
+      source: requiredString(provider, "source", label),
+      unitCount: nullableSafeInteger(provider, "unit_count", label),
+      verifiedUnitCount: requiredSafeInteger(provider, "verified_unit_count", label),
+      knownFailureUnitCount: requiredSafeInteger(provider, "known_failure_unit_count", label),
+      unknownUnitCount: requiredSafeInteger(provider, "unknown_unit_count", label),
+      unsupportedUnitCount: requiredSafeInteger(provider, "unsupported_unit_count", label),
+      units,
+    },
+    localDisposition: {
+      status: enumValue(requiredValue(local, "status", label), ["observed", "none_recorded", "unknown", "unsupported"], label),
+      sourceCoverage: stringList(requiredValue(local, "source_coverage", label), label),
+      unitCount: nullableSafeInteger(local, "unit_count", label),
+      observations,
+    },
+    billingScope: {
+      unitCount: nullableSafeInteger(billingScope, "unit_count", label),
+      legacyQuoteScope: enumValue(requiredValue(billingScope, "legacy_quote_scope", label), ["first_unit", "single_unit", "task_record", "unknown"], label),
+      aggregated: booleanValue(billingScope, "aggregated", label),
+    },
+  };
+}
+
 export function parseTaskReceipt(value: unknown, expectedTaskId: string): TaskReceipt {
   const record = requiredTaskRecord(value, expectedTaskId, "任务结果记录");
+  const rawHistoryTruth = record.history_truth;
   return {
     id: requiredString(record, "id", "任务结果记录"),
     type: requiredString(record, "type", "任务结果记录"),
@@ -92,6 +370,9 @@ export function parseTaskReceipt(value: unknown, expectedTaskId: string): TaskRe
     externalProvider: nullableString(record, "external_provider", "任务结果记录"),
     createdAt: nullableString(record, "created_at", "任务结果记录"),
     updatedAt: nullableString(record, "updated_at", "任务结果记录"),
+    historyTruth: rawHistoryTruth === undefined
+      ? unsupportedTaskHistoryTruth()
+      : parseTaskHistoryTruth(rawHistoryTruth),
   };
 }
 

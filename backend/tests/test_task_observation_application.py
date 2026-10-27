@@ -222,7 +222,8 @@ def test_task_receipt_uses_the_first_unit_without_falsey_fallback() -> None:
 
     assert result["quoted_amount"] == 0
     assert result["billing_status"] == ""
-    assert len(result) == 13
+    assert len(result) == 14
+    assert result["history_truth"]["worker"]["status"] == "unsupported"
     assert ("load_owned_task", "user-a", "task-a") in events
     assert ("first_billing_unit", "task-a") in events
     assert events[-2:] == [("rollback",), ("close",)]
