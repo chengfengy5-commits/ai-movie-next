@@ -29,6 +29,8 @@ from haoai_backend.series_exchange.tables import fused_assets
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import (
+    FUSED_UNKNOWN_PROGRESS_MESSAGE,
+    FUSED_UNKNOWN_REASON,
     FusedPromptText,
     FusedServerImageModel,
     FusedTaskClaim,
@@ -41,6 +43,7 @@ from .errors import (
     FusedGenerationPaymentRequired,
     FusedGenerationUnavailable,
 )
+from .ownership import FUSED_SERVER_CONTROL_MARKER, is_server_controlled_fused_task
 
 _LEGACY_FERNET_PREFIX = "gAAAAA"
 _user_credits = user_credits
@@ -263,6 +266,7 @@ class SqlAlchemyFusedGenerationUnitOfWork:
             "size": prepared.size,
             "has_reference": bool(prepared.reference_images),
             "model_id": prepared.server_model.id,
+            "server_controlled_execution": FUSED_SERVER_CONTROL_MARKER,
         }
         self._session.execute(
             insert(AITaskRow.__table__).values(
@@ -283,13 +287,44 @@ class SqlAlchemyFusedGenerationUnitOfWork:
             )
         )
 
-    def claim_task(self, task_id: str, claim_token: str) -> FusedTaskClaim | None:
+    def claim_task(
+        self,
+        task_id: str,
+        claim_token: str,
+        *,
+        expected_user_id: str,
+    ) -> FusedTaskClaim | None:
+        task_table = AITaskRow.__table__
+        task = self._session.execute(
+            select(
+                task_table.c.type,
+                task_table.c.user_id,
+                task_table.c.status,
+                task_table.c.claim_token,
+                task_table.c.request_data,
+            )
+            .where(task_table.c.id == task_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        if (
+            task is None
+            or task["type"] != "fused"
+            or task["user_id"] != expected_user_id
+            or task["status"] != "processing"
+            or task["claim_token"] is not None
+            or not is_server_controlled_fused_task(task["type"], task["request_data"])
+        ):
+            return None
+
         result = self._session.execute(
-            update(AITaskRow.__table__)
+            update(task_table)
             .where(
                 AITaskRow.id == task_id,
+                task_table.c.type == "fused",
+                task_table.c.user_id == expected_user_id,
                 AITaskRow.status == "processing",
                 AITaskRow.claim_token.is_(None),
+                task_table.c.request_data == task["request_data"],
             )
             .values(
                 claim_token=claim_token,
@@ -300,9 +335,66 @@ class SqlAlchemyFusedGenerationUnitOfWork:
         if result.rowcount != 1:
             return None
         cancelled = self._session.execute(
-            select(AITaskRow.user_cancelled_at).where(AITaskRow.id == task_id)
+            select(AITaskRow.user_cancelled_at).where(
+                AITaskRow.id == task_id,
+                task_table.c.user_id == expected_user_id,
+                task_table.c.claim_token == claim_token,
+            )
         ).scalar_one_or_none()
         return FusedTaskClaim(cancelled=cancelled is not None)
+
+    def retain_unknown(
+        self,
+        task_id: str,
+        user_id: str,
+        claim_token: str,
+        safe_reason: str,
+    ) -> bool:
+        task_table = AITaskRow.__table__
+        task = self._session.execute(
+            select(
+                task_table.c.type,
+                task_table.c.user_id,
+                task_table.c.status,
+                task_table.c.claim_token,
+                task_table.c.request_data,
+                task_table.c.recovery_status,
+            ).where(task_table.c.id == task_id)
+        ).mappings().one_or_none()
+        if (
+            task is None
+            or task["user_id"] != user_id
+            or task["status"] not in {"processing", "cancelling"}
+            or task["claim_token"] != claim_token
+            or task["recovery_status"] == "provider_result_unknown"
+            or not is_server_controlled_fused_task(task["type"], task["request_data"])
+        ):
+            return False
+
+        reason = (
+            safe_reason
+            if safe_reason == FUSED_UNKNOWN_REASON
+            else FUSED_UNKNOWN_REASON
+        )
+        result = self._session.execute(
+            update(task_table)
+            .where(
+                task_table.c.id == task_id,
+                task_table.c.user_id == user_id,
+                task_table.c.type == "fused",
+                task_table.c.status.in_(("processing", "cancelling")),
+                task_table.c.claim_token == claim_token,
+                task_table.c.request_data == task["request_data"],
+                task_table.c.recovery_status != "provider_result_unknown",
+            )
+            .values(
+                recovery_status="provider_result_unknown",
+                result=reason,
+                progress_message=FUSED_UNKNOWN_PROGRESS_MESSAGE,
+                updated_at=self.current_time(),
+            )
+        )
+        return result.rowcount == 1
 
     def finish_task(
         self,
@@ -319,9 +411,15 @@ class SqlAlchemyFusedGenerationUnitOfWork:
                 task_table.c.claim_token,
                 task_table.c.user_cancelled_at,
                 task_table.c.message_id,
+                task_table.c.recovery_status,
             ).where(task_table.c.id == prepared.task_id)
         ).mappings().one_or_none()
-        if task is None or task["status"] != "processing" or task["claim_token"] != claim_token:
+        if (
+            task is None
+            or task["status"] != "processing"
+            or task["claim_token"] != claim_token
+            or task["recovery_status"] == "provider_result_unknown"
+        ):
             return
 
         cancelled = task["user_cancelled_at"] is not None
@@ -485,6 +583,7 @@ class SqlAlchemyFusedGenerationUnitOfWork:
                 task_table.c.id == task_id,
                 task_table.c.status == "processing",
                 task_table.c.claim_token == claim_token,
+                task_table.c.recovery_status != "provider_result_unknown",
                 cancellation_predicate,
             )
             .values(

@@ -5,6 +5,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 
+FUSED_UNKNOWN_REASON = "图片生成结果待核对，请勿重新提交"
+FUSED_UNKNOWN_PROGRESS_MESSAGE = "图片生成结果待核对"
+
 
 @dataclass(frozen=True, slots=True)
 class FusedServerImageModel:
@@ -74,6 +77,13 @@ class FusedGenerationInput:
 @dataclass(frozen=True, slots=True)
 class FusedGenerationOutput:
     image_url: str
+
+
+@dataclass(frozen=True, slots=True)
+class FusedGenerationUnknown:
+    """A provider create may have happened, but no safe output was obtained."""
+
+    reason: str = field(default=FUSED_UNKNOWN_REASON, init=False)
 
 
 @dataclass(frozen=True, slots=True)

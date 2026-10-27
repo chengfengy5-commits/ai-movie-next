@@ -9,8 +9,14 @@ from typing import TypeVar
 
 from starlette.concurrency import run_in_threadpool
 
-from .domain import FusedGenerationInput, FusedTaskClaim, PreparedFusedGeneration
-from .errors import ProviderGenerationFailure
+from .domain import (
+    FUSED_UNKNOWN_REASON,
+    FusedGenerationInput,
+    FusedGenerationUnknown,
+    FusedTaskClaim,
+    PreparedFusedGeneration,
+)
+from .errors import FusedGenerationDispatchedCancellation, ProviderGenerationFailure
 from .ports import (
     FusedGenerationRuntime,
     FusedGenerationStorage,
@@ -29,7 +35,13 @@ class FusedGenerationExecution:
             return
         claim_token = token_urlsafe(32)
         claim_task = asyncio.create_task(
-            run_in_threadpool(_claim, self.uow_factory, prepared.task_id, claim_token)
+            run_in_threadpool(
+                _claim,
+                self.uow_factory,
+                prepared.task_id,
+                claim_token,
+                prepared.user_id,
+            )
         )
         claim, cancellation_requested = await _drain_owned_worker(claim_task)
         if cancellation_requested:
@@ -61,9 +73,17 @@ class FusedGenerationExecution:
                     server_model=prepared.server_model,
                 )
             )
-            provider_url = output.image_url if output is not None else None
-            if not isinstance(provider_url, str) or not provider_url.strip():
-                raise ProviderGenerationFailure("未获取到图片")
+            if not isinstance(output, FusedGenerationUnknown):
+                provider_url = output.image_url if output is not None else None
+                if not isinstance(provider_url, str) or not provider_url.strip():
+                    raise ProviderGenerationFailure("未获取到图片")
+        except FusedGenerationDispatchedCancellation:
+            await self._retain_unknown(
+                prepared,
+                claim_token,
+                FUSED_UNKNOWN_REASON,
+            )
+            raise asyncio.CancelledError
         except asyncio.CancelledError:
             await _finish_after_cancellation(
                 self.uow_factory,
@@ -86,6 +106,14 @@ class FusedGenerationExecution:
                 claim_token,
                 image_url=None,
                 error_message="图片生成失败，请稍后重试",
+            )
+            return
+
+        if isinstance(output, FusedGenerationUnknown):
+            await self._retain_unknown(
+                prepared,
+                claim_token,
+                FUSED_UNKNOWN_REASON,
             )
             return
 
@@ -139,15 +167,43 @@ class FusedGenerationExecution:
             # The transaction is finished, but an unknown commit result is never retried.
             raise asyncio.CancelledError
 
+    async def _retain_unknown(
+        self,
+        prepared: PreparedFusedGeneration,
+        claim_token: str,
+        safe_reason: str,
+    ) -> None:
+        if self.uow_factory is None:
+            return
+        retaining = asyncio.create_task(
+            run_in_threadpool(
+                _retain_unknown,
+                self.uow_factory,
+                prepared.task_id,
+                prepared.user_id,
+                claim_token,
+                safe_reason,
+            )
+        )
+        try:
+            _, cancellation_requested = await _drain_owned_worker(retaining)
+        except Exception:
+            # A failed or ambiguous retention commit must never fall through to
+            # terminal finalization or be retried automatically.
+            return
+        if cancellation_requested:
+            raise asyncio.CancelledError
+
 
 def _claim(
     uow_factory: FusedGenerationUnitOfWorkFactory,
     task_id: str,
     claim_token: str,
+    expected_user_id: str,
 ) -> FusedTaskClaim | None:
     uow = uow_factory()
     try:
-        claim = uow.claim_task(task_id, claim_token)
+        claim = uow.claim_task(task_id, claim_token, expected_user_id=expected_user_id)
         if claim is None:
             uow.rollback()
             return None
@@ -175,6 +231,24 @@ def _finish(
             image_url=image_url,
             error_message=error_message,
         )
+        uow.commit()
+    except Exception:
+        uow.rollback()
+        raise
+    finally:
+        uow.close()
+
+
+def _retain_unknown(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    task_id: str,
+    user_id: str,
+    claim_token: str,
+    safe_reason: str,
+) -> None:
+    uow = uow_factory()
+    try:
+        uow.retain_unknown(task_id, user_id, claim_token, safe_reason)
         uow.commit()
     except Exception:
         uow.rollback()
