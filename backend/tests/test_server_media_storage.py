@@ -13,6 +13,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 import uuid
 import zlib
 from contextlib import asynccontextmanager
@@ -41,6 +42,7 @@ from haoai_backend.authentication.tables import (
     users,
 )
 from haoai_backend.authentication.tokens import JoseTokenCodec
+from haoai_backend.chat_data.tables import chat_messages
 from haoai_backend.fused_generation.domain import (
     FusedServerImageModel,
     PreparedFusedGeneration,
@@ -51,13 +53,26 @@ from haoai_backend.generation_catalog.tables import (
     metadata as generation_catalog_metadata,
     system_models,
 )
-from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
+from haoai_backend.generation_core.base_schema import (
+    AITaskRow,
+    Base,
+    CreditLogRow,
+    FOUNDATION_TABLES,
+)
+from haoai_backend.generation_core.schema import FusedGenerationSubmissionRow
+from haoai_backend.shared.identity import TrustedActor
+from haoai_backend.generation_credentials.application import RegistrationStaged
+from haoai_backend.generation_credentials.domain import CredentialScope, make_server_attempt
+from haoai_backend.generation_credentials.persistence import (
+    metadata as credential_registry_metadata,
+)
 from haoai_backend.public_site_config.tables import (
     metadata as public_config_metadata,
     system_configs,
 )
 from haoai_backend.series_data.tables import (
     characters as generation_characters,
+    chapters as generation_chapters,
     metadata as series_data_metadata,
     series as generation_series,
 )
@@ -69,6 +84,7 @@ from haoai_backend.series_exchange.tables import (
 
 _SECRET = "synthetic-server-secret-for-tests"
 _PNG = b"\x89PNG\r\n\x1a\nsynthetic-image-data"
+_FUSED_MODEL_ID = "20000000-0000-4000-8000-000000000111"
 
 
 def _environment(tmp_path: Path, *, storage: bool) -> dict[str, str]:
@@ -1684,12 +1700,75 @@ def _fused_server_configuration(
     tmp_path: Path,
     *,
     provider_origin: str = "https://api.openai.com",
+    endpoint_base_path: str = "/v1",
+    allowed_provider_origins: tuple[str, ...] | None = None,
 ):
+    from backend.server.credentials import provision_credential_bundle
+
+    encode = lambda value: base64.b64encode(value).decode("ascii")
+    enrollment = {
+        "format": "haoai-root-enrollment-input-v1",
+        "proof_key": {
+            "key_id": "fused-host-proof-v1",
+            "key_base64": encode(b"f" * 32),
+        },
+        "guard_key": {
+            "key_id": "fused-host-guard-v1",
+            "key_base64": encode(b"g" * 32),
+        },
+        "aead_key": {
+            "key_id": "fused-host-aead-v1",
+            "algorithm_version": "aes-256-gcm-v1",
+            "key_base64": encode(b"a" * 32),
+        },
+        "records": [
+            {
+                "record_id": "fused-host-record-1",
+                "principal_id": "30000000-0000-4000-8000-000000000101",
+                "scope": {
+                    "source": "system",
+                    "row_id": _FUSED_MODEL_ID,
+                    "owner_or_system": "system",
+                    "provider": "openai",
+                },
+                "issuer_namespace": "fused-host-provider-account-v1",
+                "stable_account_subject": "synthetic-fused-host-subject",
+                "key_generation": "fused-host-generation-1",
+                "material_ref": "synthetic://fused-host/provider",
+                "provider_secret": "synthetic-provider-key",
+                "evidence_ref": "synthetic-evidence://fused-host/record-1",
+                "evidence_version": "fused-host-evidence-v1",
+                "valid_from": "2026-01-01T00:00:00+00:00",
+                "valid_until": None,
+                "revoked_at": None,
+                "endpoint_policy": {
+                    "provider_origin": provider_origin,
+                    "api_base_path": endpoint_base_path,
+                    "allowed_content_paths": [],
+                    "policy_version": "fused-host-endpoint-v1",
+                },
+            }
+        ],
+    }
+    input_path = tmp_path / "fused-host-root-input.json"
+    bundle_path = tmp_path / "fused-host-root-bundle.json"
+    descriptor = os.open(input_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        os.write(
+            descriptor,
+            json.dumps(enrollment, ensure_ascii=False, separators=(",", ":")).encode(),
+        )
+    finally:
+        os.close(descriptor)
+    assert provision_credential_bundle(input_path, bundle_path) == 1
     environment = _environment(tmp_path, storage=True)
     environment.update(
         {
             "FUSED_GENERATION_ENABLED": "true",
-            "FUSED_GENERATION_PROVIDER_ORIGINS": provider_origin,
+            "FUSED_GENERATION_PROVIDER_ORIGINS": ",".join(
+                allowed_provider_origins or (provider_origin,)
+            ),
+            "FUSED_GENERATION_CREDENTIALS_FILE": str(bundle_path),
         }
     )
     return load_server_configuration(environment)
@@ -1699,6 +1778,9 @@ def _seed_fused_server_database(
     engine: Engine,
     *,
     provider_origin: str = "https://api.openai.com",
+    model_base_path: str = "/v1",
+    base_url_is_null: bool = False,
+    fused_configuration=None,
 ) -> str:
     authentication_metadata.create_all(engine)
     now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
@@ -1709,7 +1791,7 @@ def _seed_fused_server_database(
                 username="server-test",
                 email="server-test@example.test",
                 hashed_password="synthetic-only",
-                is_superuser=False,
+                is_superuser=True,
                 membership_type="premium",
                 membership_expires_at=None,
                 avatar_url=None,
@@ -1754,11 +1836,13 @@ def _seed_fused_server_database(
             "exp": (now + timedelta(hours=1)).replace(tzinfo=timezone.utc),
         }
     )
-    Base.metadata.create_all(engine)
+    Base.metadata.create_all(engine, tables=list(FOUNDATION_TABLES))
+    credential_registry_metadata.create_all(engine)
     series_data_metadata.create_all(
         engine,
-        tables=[generation_series, generation_characters],
+        tables=[generation_series, generation_chapters, generation_characters],
     )
+    chat_messages.metadata.create_all(engine, tables=[chat_messages])
     generation_catalog_metadata.create_all(engine, tables=[system_models])
     series_exchange_metadata.create_all(engine)
     with engine.begin() as connection:
@@ -1787,6 +1871,17 @@ def _seed_fused_server_database(
             )
         )
         connection.execute(
+            insert(generation_chapters).values(
+                id="chapter-fused-server",
+                series_id="series-fused-server",
+                title="合成测试章节",
+                content="[]",
+                order=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        connection.execute(
             insert(generation_characters).values(
                 id="character-fused-server",
                 series_id="series-fused-server",
@@ -1807,13 +1902,17 @@ def _seed_fused_server_database(
         )
         connection.execute(
             insert(system_models).values(
-                id="system-fused-server",
+                id=_FUSED_MODEL_ID,
                 category="image",
                 name="合成融合模型",
                 provider="openai",
                 api_key=LegacyFernet(_SECRET).encrypt("synthetic-provider-key"),
                 model="gpt-image-1",
-                base_url=f"{provider_origin}/v1",
+                base_url=(
+                    None
+                    if base_url_is_null
+                    else f"{provider_origin}{model_base_path}"
+                ),
                 cost_per_call=4,
                 description=None,
                 params="{}",
@@ -1823,6 +1922,36 @@ def _seed_fused_server_database(
                 updated_at=now,
             )
         )
+    from backend.migrations.run_generation_migrations import apply_generation_migrations
+
+    apply_generation_migrations(
+        engine,
+        Path(__file__).resolve().parents[1] / "migrations",
+    )
+    if fused_configuration is not None:
+        assert fused_configuration.credential_registry is not None
+        assert fused_configuration.proof_authority is not None
+        scope = CredentialScope("system", _FUSED_MODEL_ID, "system", "openai")
+        attempt = make_server_attempt(
+            fused_configuration.proof_authority,
+            attempt_id="fused-host-registration-attempt-1",
+            actor_id="user-server-test",
+            operation="register",
+            scope=scope,
+            key_generation="fused-host-generation-1",
+            protected_record_id="fused-host-record-1",
+        )
+        from sqlalchemy.orm import sessionmaker
+
+        with sessionmaker(bind=engine, expire_on_commit=False)() as session:
+            staged = fused_configuration.credential_registry.stage_register_system_config(
+                session,
+                TrustedActor("user-server-test"),
+                scope.row_id,
+                attempt,
+            )
+            assert isinstance(staged, RegistrationStaged), staged
+            session.commit()
     return token
 
 
@@ -1831,7 +1960,7 @@ def _fused_request_body() -> dict[str, Any]:
         "series_id": "series-fused-server",
         "member_type": "character",
         "members": [{"kind": "asset", "id": "character-fused-server"}],
-        "model_id": "system-fused-server",
+        "model_id": _FUSED_MODEL_ID,
         "prompt_user": "保持角色服饰一致",
     }
 
@@ -1885,16 +2014,44 @@ def _install_fused_fake_transports(
     return provider_client, public_library
 
 
-def _post_fused_generation(app: Any, token: str, body: dict[str, Any]) -> httpx.Response:
+def _post_fused_generation(
+    app: Any,
+    token: str,
+    body: dict[str, Any],
+    *,
+    idempotency_key: str | None = None,
+) -> httpx.Response:
     async def send() -> httpx.Response:
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
             base_url="http://server-host.test",
         ) as client:
+            headers = {"Authorization": f"Bearer {token}"}
+            if idempotency_key is not None:
+                headers["Idempotency-Key"] = idempotency_key
             return await client.post(
                 "/api/fused-assets/generate",
-                headers={"Authorization": f"Bearer {token}"},
+                headers=headers,
                 json=body,
+            )
+
+    return asyncio.run(send())
+
+
+def _get_fused_submission(
+    app: Any,
+    token: str,
+    idempotency_key: str,
+) -> httpx.Response:
+    async def send() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://server-host.test",
+        ) as client:
+            return await client.get(
+                "/api/fused-assets/submissions",
+                headers={"Authorization": f"Bearer {token}"},
+                params={"idempotency_key": idempotency_key},
             )
 
     return asyncio.run(send())
@@ -1963,6 +2120,7 @@ def test_fused_only_server_host_runs_url_and_inline_results_through_owned_storag
     token = _seed_fused_server_database(
         host.app.state.server_engine,
         provider_origin=provider_origin,
+        fused_configuration=fused_configuration,
     )
     try:
         response = _post_fused_generation(
@@ -2001,6 +2159,9 @@ def test_fused_only_server_host_runs_url_and_inline_results_through_owned_storag
 
         with host.app.state.server_engine.connect() as connection:
             assets = connection.execute(select(fused_asset_rows)).mappings().all()
+            submissions = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().all()
             credits = connection.execute(
                 select(user_credits.c.credits).where(
                     user_credits.c.user_id == "user-server-test"
@@ -2012,6 +2173,11 @@ def test_fused_only_server_host_runs_url_and_inline_results_through_owned_storag
         assert len(assets) == 1
         assert assets[0]["status"] == "completed"
         assert assets[0]["image_url"] == task["result"]
+        assert len(submissions) == 1
+        assert submissions[0]["stage"] == "completed"
+        assert submissions[0]["task_id"] == task_id
+        assert isinstance(submissions[0]["idempotency_key"], str)
+        assert len(submissions[0]["idempotency_key"]) >= 16
         assert credits == 16
         assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
         if provider_url is not None:
@@ -2024,6 +2190,652 @@ def test_fused_only_server_host_runs_url_and_inline_results_through_owned_storag
 
     assert media_runtime.state == "closed"
     assert sdk_state["clients"][0].close_calls == 1
+
+
+def test_fused_submission_uses_registered_endpoint_when_model_base_url_is_null(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registered_origin = "https://registered-provider.example.test"
+    allowed_origins = ("https://api.openai.com", registered_origin)
+    response_body, _ = _fused_provider_response("url")
+    provider_client, _public_library = _install_fused_fake_transports(
+        monkeypatch,
+        response_body,
+    )
+    configuration = _fused_server_configuration(
+        tmp_path,
+        provider_origin=registered_origin,
+        endpoint_base_path="/",
+        allowed_provider_origins=allowed_origins,
+    )
+    sdk_session, sdk_config, _sdk_state = _sdk_factories()
+    host = create_server_host(configuration, sdk_factories=(sdk_session, sdk_config))
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        provider_origin=registered_origin,
+        base_url_is_null=True,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
+
+    try:
+        response = _post_fused_generation(host.app, token, _fused_request_body())
+
+        assert response.status_code == 200, response.text
+        assert len(provider_client.calls) == 1
+        method, request_url, request_options = provider_client.calls[0]
+        assert method == "POST"
+        assert request_url == f"{registered_origin}/images/edits"
+        assert request_options["headers"]["Authorization"] == (
+            "Bearer synthetic-provider-key"
+        )
+    finally:
+        host.close()
+
+
+def test_fused_submission_rejects_model_change_between_identity_read_and_capture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    initial_origin = "https://api.openai.com"
+    registered_origin = "https://registered-provider.example.test"
+    registered_base_url = f"{registered_origin}/v2"
+    response_body, _ = _fused_provider_response("url")
+    provider_client, _public_library = _install_fused_fake_transports(
+        monkeypatch,
+        response_body,
+    )
+    configuration = _fused_server_configuration(
+        tmp_path,
+        provider_origin=registered_origin,
+        endpoint_base_path="/v2",
+        allowed_provider_origins=(initial_origin, registered_origin),
+    )
+    sdk_session, sdk_config, _sdk_state = _sdk_factories()
+    host = create_server_host(configuration, sdk_factories=(sdk_session, sdk_config))
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        provider_origin=registered_origin,
+        model_base_path="/v2",
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
+
+    from haoai_backend.fused_generation.persistence import (
+        SqlAlchemyFusedGenerationUnitOfWork,
+    )
+
+    with host.app.state.server_engine.begin() as connection:
+        connection.execute(
+            update(system_models)
+            .where(system_models.c.id == _FUSED_MODEL_ID)
+            .values(base_url=f"{initial_origin}/v1")
+        )
+
+    original_capture = SqlAlchemyFusedGenerationUnitOfWork.capture_durable_binding
+
+    def switch_to_registered_model_before_capture(
+        uow,
+        registry,
+        scope,
+    ):
+        uow._session.execute(
+            update(system_models)
+            .where(system_models.c.id == _FUSED_MODEL_ID)
+            .values(base_url=registered_base_url)
+        )
+        return original_capture(uow, registry, scope)
+
+    monkeypatch.setattr(
+        SqlAlchemyFusedGenerationUnitOfWork,
+        "capture_durable_binding",
+        switch_to_registered_model_before_capture,
+    )
+
+    try:
+        response = _post_fused_generation(host.app, token, _fused_request_body())
+
+        assert response.status_code == 503, response.text
+        assert provider_client.calls == []
+        with host.app.state.server_engine.connect() as connection:
+            credit_balance = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            credit_logs = connection.execute(
+                select(CreditLogRow.__table__)
+            ).mappings().all()
+            tasks = connection.execute(
+                select(AITaskRow.__table__).where(AITaskRow.type == "fused")
+            ).mappings().all()
+            submissions = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().all()
+        assert credit_balance == 20
+        assert credit_logs == []
+        assert tasks == []
+        assert submissions == []
+    finally:
+        host.close()
+
+
+def test_fused_submission_idempotency_replays_original_task_and_rejects_new_body(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body, _ = _fused_provider_response("url")
+    provider_client, _ = _install_fused_fake_transports(monkeypatch, response_body)
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(configuration, sdk_factories=(sdk_session, sdk_config))
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
+    key = "fused-idempotency-host-case-1"
+    try:
+        first = _post_fused_generation(
+            host.app, token, _fused_request_body(), idempotency_key=key
+        )
+        assert first.status_code == 200, first.text
+        task_id = first.json()["task_id"]
+
+        replay = _post_fused_generation(
+            host.app, token, _fused_request_body(), idempotency_key=key
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == first.json()
+
+        changed = _fused_request_body()
+        changed["prompt_user"] = "同一键不能提交不同内容"
+        conflict = _post_fused_generation(
+            host.app, token, changed, idempotency_key=key
+        )
+        assert conflict.status_code == 409, conflict.text
+
+        receipt = _get_fused_submission(host.app, token, key)
+        assert receipt.status_code == 200, receipt.text
+        assert receipt.json() == {
+            "status": "completed",
+            "fee_disposition": "debit",
+            "fee_amount": 4,
+            "task_id": task_id,
+            "message_id": None,
+        }
+        assert "encrypted_snapshot" not in receipt.json()
+        assert "request" not in receipt.json()
+        assert len(provider_client.calls) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+        with host.app.state.server_engine.connect() as connection:
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+            submissions = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().all()
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        assert len(submissions) == 1
+        assert submissions[0]["stage"] == "completed"
+    finally:
+        host.close()
+
+
+def test_fused_submission_receipt_is_account_readable_without_membership_or_runtime(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from haoai_backend.app import create_app
+    from haoai_backend.authentication import AuthenticationRuntime
+
+    response_body, _ = _fused_provider_response("url")
+    provider_client, _ = _install_fused_fake_transports(monkeypatch, response_body)
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(configuration, sdk_factories=(sdk_session, sdk_config))
+    owner_token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
+    key = "fused-account-receipt-host-case-1"
+    other_jti = "jti-server-other"
+    other_token = JoseTokenCodec(_SECRET).encode(
+        {
+            "sub": "user-server-other",
+            "jti": other_jti,
+            "exp": (datetime.now(timezone.utc) + timedelta(hours=1)),
+        }
+    )
+
+    try:
+        accepted = _post_fused_generation(
+            host.app,
+            owner_token,
+            _fused_request_body(),
+            idempotency_key=key,
+        )
+        assert accepted.status_code == 200, accepted.text
+
+        now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+        with host.app.state.server_engine.begin() as connection:
+            connection.execute(
+                update(users)
+                .where(users.c.id == "user-server-test")
+                .values(
+                    is_superuser=False,
+                    membership_type="premium",
+                    membership_expires_at=now - timedelta(days=1),
+                )
+            )
+            connection.execute(
+                insert(user_sessions).values(
+                    id="session-server-other",
+                    user_id="user-server-other",
+                    jti=other_jti,
+                    user_agent="local test",
+                    ip_address="127.0.0.1",
+                    device_name="test",
+                    is_active=True,
+                    created_at=now - timedelta(minutes=5),
+                    last_seen_at=now,
+                    revoked_at=None,
+                )
+            )
+
+        # The original Host must authenticate the active session but must not
+        # require current membership for this owner-only, read-only receipt.
+        owner_receipt = _get_fused_submission(host.app, owner_token, key)
+        assert owner_receipt.status_code == 200, owner_receipt.text
+        assert owner_receipt.json()["task_id"] == accepted.json()["task_id"]
+
+        expired_post = _post_fused_generation(
+            host.app,
+            owner_token,
+            _fused_request_body(),
+            idempotency_key="fused-expired-member-new-post",
+        )
+        assert expired_post.status_code == 403, expired_post.text
+
+        # A plain create_app composition with the same authenticated account
+        # store can read receipts even though no fused worker, Root bundle, or
+        # crypto/proof capability is configured.
+        readonly_app = create_app(
+            session_factory=host.session_factory,
+            authentication_runtime=AuthenticationRuntime(
+                session_factory=host.session_factory,
+                secret_key=_SECRET,
+            ),
+        )
+        readonly_receipt = _get_fused_submission(readonly_app, owner_token, key)
+        assert readonly_receipt.status_code == 200, readonly_receipt.text
+        assert readonly_receipt.json() == owner_receipt.json()
+
+        readonly_post = _post_fused_generation(
+            readonly_app,
+            other_token,
+            _fused_request_body(),
+            idempotency_key="fused-unconfigured-new-post",
+        )
+        assert readonly_post.status_code == 503, readonly_post.text
+
+        foreign_receipt = _get_fused_submission(readonly_app, other_token, key)
+        assert foreign_receipt.status_code == 404, foreign_receipt.text
+
+        with host.app.state.server_engine.begin() as connection:
+            connection.execute(
+                update(user_sessions)
+                .where(user_sessions.c.jti == "jti-server-test")
+                .values(is_active=False, revoked_at=now)
+            )
+        revoked_receipt = _get_fused_submission(readonly_app, owner_token, key)
+        assert revoked_receipt.status_code == 401, revoked_receipt.text
+
+        with host.app.state.server_engine.connect() as connection:
+            owner_balance = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            debit_logs = connection.execute(
+                select(CreditLogRow.__table__).where(
+                    CreditLogRow.__table__.c.user_id == "user-server-test"
+                )
+            ).mappings().all()
+            fused_tasks = connection.execute(
+                select(AITaskRow.__table__).where(AITaskRow.type == "fused")
+            ).mappings().all()
+            submissions = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().all()
+        assert owner_balance == 16
+        assert [(row["type"], row["amount"]) for row in debit_logs] == [
+            ("usage", -4)
+        ]
+        assert len(fused_tasks) == 1
+        assert len(submissions) == 1
+        assert len(provider_client.calls) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+    finally:
+        host.close()
+
+
+def test_fused_dispatched_server_failure_is_retained_without_replay_or_refund(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider_client, _ = _install_fused_fake_transports(
+        monkeypatch,
+        b'{"error":"synthetic upstream failure"}',
+        status_code=503,
+    )
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(configuration, sdk_factories=(sdk_session, sdk_config))
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
+    key = "fused-dispatched-unknown-host-case-1"
+    try:
+        first = _post_fused_generation(
+            host.app, token, _fused_request_body(), idempotency_key=key
+        )
+        assert first.status_code == 200, first.text
+        task_id = first.json()["task_id"]
+        task = _fused_task_row(host.app.state.server_engine, task_id)
+        assert task["status"] == "processing"
+        assert task["recovery_status"] == "provider_result_unknown"
+        assert task["claim_token"]
+        assert task["progress_message"] == "图片生成结果待核对"
+
+        receipt = _get_fused_submission(host.app, token, key)
+        assert receipt.status_code == 200, receipt.text
+        assert receipt.json() == {
+            "status": "provider_result_unknown",
+            "fee_disposition": "debit",
+            "fee_amount": 4,
+            "task_id": task_id,
+            "message_id": None,
+        }
+
+        replay = _post_fused_generation(
+            host.app, token, _fused_request_body(), idempotency_key=key
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == first.json()
+        assert len(provider_client.calls) == 1
+        assert sdk_state["clients"] == []
+        with host.app.state.server_engine.connect() as connection:
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+            assets = connection.execute(select(fused_asset_rows)).mappings().all()
+            submissions = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().all()
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        assert assets == []
+        assert len(submissions) == 1
+        assert submissions[0]["stage"] == "provider_result_unknown"
+    finally:
+        host.close()
+
+
+def test_fused_dispatch_commit_ack_unknown_never_permits_provider_post(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body, _ = _fused_provider_response("url")
+    provider_client, _ = _install_fused_fake_transports(monkeypatch, response_body)
+    import haoai_backend.app as backend_app_module
+
+    original_factory = backend_app_module.fused_generation_uow_factory
+    state = {"dispatch_inserted": False, "ack_lost": False}
+
+    def instrumented_factory(session_factory, *, decrypt_api_key=None):
+        base_factory = original_factory(
+            session_factory,
+            decrypt_api_key=decrypt_api_key,
+        )
+
+        def make_uow():
+            uow = base_factory()
+            original_persist_dispatch_gate = uow.persist_dispatch_gate
+            original_commit = uow.commit
+
+            def persist_dispatch_gate(**kwargs):
+                inserted = original_persist_dispatch_gate(**kwargs)
+                if inserted:
+                    state["dispatch_inserted"] = True
+                return inserted
+
+            def commit():
+                original_commit()
+                if state["dispatch_inserted"]:
+                    state["dispatch_inserted"] = False
+                    state["ack_lost"] = True
+                    raise RuntimeError("synthetic commit acknowledgement loss")
+
+            uow.persist_dispatch_gate = persist_dispatch_gate
+            uow.commit = commit
+            return uow
+
+        return make_uow
+
+    monkeypatch.setattr(
+        backend_app_module,
+        "fused_generation_uow_factory",
+        instrumented_factory,
+    )
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(configuration, sdk_factories=(sdk_session, sdk_config))
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
+    key = "fused-dispatch-ack-unknown-case-1"
+    try:
+        first = _post_fused_generation(
+            host.app, token, _fused_request_body(), idempotency_key=key
+        )
+        assert first.status_code == 200, first.text
+        assert state["ack_lost"] is True
+        assert provider_client.calls == []
+        assert sdk_state["clients"] == []
+        task_id = first.json()["task_id"]
+        task = _fused_task_row(host.app.state.server_engine, task_id)
+        assert task["status"] == "processing"
+        assert task["claim_token"]
+        assert task["recovery_status"] == "provider_result_unknown"
+
+        replay = _post_fused_generation(
+            host.app, token, _fused_request_body(), idempotency_key=key
+        )
+        assert replay.status_code == 200, replay.text
+        assert replay.json() == first.json()
+        assert provider_client.calls == []
+        receipt = _get_fused_submission(host.app, token, key)
+        assert receipt.status_code == 200, receipt.text
+        assert receipt.json()["status"] == "provider_result_unknown"
+        with host.app.state.server_engine.connect() as connection:
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+            submissions = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().all()
+            assets = connection.execute(select(fused_asset_rows)).mappings().all()
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        assert len(submissions) == 1
+        assert submissions[0]["stage"] == "provider_result_unknown"
+        assert assets == []
+    finally:
+        host.close()
+
+
+def test_fused_host_recovery_accepts_snapshot_ready_using_reserved_ids_and_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body, _ = _fused_provider_response("url")
+    provider_client, _ = _install_fused_fake_transports(monkeypatch, response_body)
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(configuration, sdk_factories=(sdk_session, sdk_config))
+    fused_configuration = host.app.state.server_fused_generation_configuration
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=fused_configuration,
+    )
+    from haoai_backend.fused_generation import durable_application
+    from haoai_backend.fused_generation.persistence import (
+        SqlAlchemyFusedGenerationUnitOfWork,
+        fused_generation_uow_factory as make_fused_uow_factory,
+    )
+    from haoai_backend.fused_generation.schemas import FusedAssetGenerateRequest
+
+    session_factory = host.app.state.server_session_factory
+    uow_factory = make_fused_uow_factory(
+        session_factory,
+        decrypt_api_key=LegacyFernet(_SECRET).decrypt,
+    )
+    original_accept = SqlAlchemyFusedGenerationUnitOfWork.accept_durable_submission
+
+    def stop_before_accept(self, prepared, *, response_status=200, response_json):
+        return False
+
+    monkeypatch.setattr(
+        SqlAlchemyFusedGenerationUnitOfWork,
+        "accept_durable_submission",
+        stop_before_accept,
+    )
+    body = _fused_request_body()
+    body["chapter_id"] = "chapter-fused-server"
+    request = FusedAssetGenerateRequest.model_validate(body)
+    key = "fused-snapshot-ready-recovery-case-1"
+    try:
+        staged = durable_application.submit_durable_fused_generation(
+            uow_factory,
+            registry=fused_configuration.credential_registry,
+            crypto=fused_configuration.credential_crypto,
+            proof_authority=fused_configuration.proof_authority,
+            actor=TrustedActor("user-server-test"),
+            request=request,
+            idempotency_key=key,
+        )
+        assert staged.status_code == 202
+        with host.app.state.server_engine.connect() as connection:
+            before = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().one()
+            charges_before = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+        assert before["stage"] == "snapshot_ready"
+        reserved_task_id = before["task_id"]
+        reserved_message_id = before["message_id"]
+        assert reserved_task_id
+        assert reserved_message_id
+        assert [(row.type, row.amount) for row in charges_before] == [("usage", -4)]
+
+        monkeypatch.setattr(
+            SqlAlchemyFusedGenerationUnitOfWork,
+            "accept_durable_submission",
+            original_accept,
+        )
+        monkeypatch.setattr(
+            durable_application,
+            "_resolve_prompt",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("recovery must use the persisted prompt snapshot")
+            ),
+        )
+        async def run_recovery() -> httpx.Response:
+            async with host.app.router.lifespan_context(host.app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(
+                        app=host.asgi_app,
+                        raise_app_exceptions=False,
+                    ),
+                    base_url="http://server-host.test",
+                ) as client:
+                    deadline = time.monotonic() + 8
+                    task = None
+                    while time.monotonic() < deadline:
+                        with host.app.state.server_engine.connect() as connection:
+                            task = connection.execute(
+                                select(AITaskRow.__table__).where(
+                                    AITaskRow.id == reserved_task_id
+                                )
+                            ).mappings().one_or_none()
+                        if task is not None and task["status"] in {"completed", "failed"}:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert task is not None
+                    assert task["status"] == "completed"
+                    assert task["message_id"] == reserved_message_id
+                    assert len(provider_client.calls) == 1
+                    assert len(sdk_state["clients"]) == 1
+                    return await client.get(
+                        "/api/fused-assets/submissions",
+                        headers={"Authorization": f"Bearer {token}"},
+                        params={"idempotency_key": key},
+                    )
+
+        receipt = asyncio.run(run_recovery())
+        assert receipt.status_code == 200
+        assert receipt.json() == {
+            "status": "completed",
+            "fee_disposition": "debit",
+            "fee_amount": 4,
+            "task_id": reserved_task_id,
+            "message_id": reserved_message_id,
+        }
+        with host.app.state.server_engine.connect() as connection:
+            after = connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings().one()
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+            task_after = connection.execute(
+                select(AITaskRow.__table__).where(AITaskRow.id == reserved_task_id)
+            ).mappings().one()
+            messages = connection.execute(
+                select(chat_messages).where(chat_messages.c.id == reserved_message_id)
+            ).mappings().all()
+        assert after["stage"] == "completed"
+        assert after["task_id"] == reserved_task_id
+        assert after["message_id"] == reserved_message_id
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        assert len(messages) == 1
+        assert messages[0]["content"] == task_after["result"]
+    finally:
+        host.close()
 
 
 def test_fused_server_host_is_disabled_without_side_effects(tmp_path: Path) -> None:
@@ -2163,6 +2975,12 @@ def test_image_worker_and_fused_runtime_share_one_owned_media_owner(
     tmp_path: Path,
 ) -> None:
     credentials_path = _provision_image_single_bundle(tmp_path)
+    fused_credentials_tmp = tmp_path / "fused-credentials"
+    fused_credentials_tmp.mkdir()
+    fused_credentials_path = _fused_server_configuration(
+        fused_credentials_tmp
+    ).fused_generation_credentials_file
+    assert fused_credentials_path is not None
     environment = _environment(tmp_path, storage=True)
     environment.update(
         {
@@ -2170,6 +2988,7 @@ def test_image_worker_and_fused_runtime_share_one_owned_media_owner(
             "IMAGE_SINGLE_CREDENTIALS_FILE": str(credentials_path),
             "FUSED_GENERATION_ENABLED": "true",
             "FUSED_GENERATION_PROVIDER_ORIGINS": "https://api.openai.com",
+            "FUSED_GENERATION_CREDENTIALS_FILE": str(fused_credentials_path),
         }
     )
     configuration = load_server_configuration(environment)
@@ -2223,7 +3042,10 @@ def test_fused_server_storage_ack_unknown_retains_known_url_and_blocks_reexecuti
         configuration,
         sdk_factories=(sdk_session, sdk_config),
     )
-    token = _seed_fused_server_database(host.app.state.server_engine)
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
 
     try:
         response = _post_fused_generation(host.app, token, _fused_request_body())
@@ -2267,11 +3089,11 @@ def test_fused_server_storage_ack_unknown_retains_known_url_and_blocks_reexecuti
             size=None,
             prompt="合成角色",
             reference_images=("https://assets.example.test/reference.png",),
-            model_id="system-fused-server",
+            model_id=_FUSED_MODEL_ID,
             model_name="合成融合模型",
             credit_cost=4,
             server_model=FusedServerImageModel(
-                id="system-fused-server",
+                id=_FUSED_MODEL_ID,
                 name="合成融合模型",
                 cost_per_call=4,
                 provider="openai",
@@ -2315,7 +3137,10 @@ def test_fused_url_transfer_cancellation_drains_storage_and_retains_original_url
         configuration,
         sdk_factories=(sdk_session, sdk_config),
     )
-    token = _seed_fused_server_database(host.app.state.server_engine)
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
 
     async def send_then_cancel() -> None:
         async with httpx.AsyncClient(
@@ -2385,7 +3210,10 @@ def test_fused_url_after_store_rechecks_cancellation_and_retains_stored_locator(
         configuration,
         sdk_factories=(sdk_session, sdk_config),
     )
-    token = _seed_fused_server_database(host.app.state.server_engine)
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
 
     async def send_then_cancel_task() -> tuple[httpx.Response, str]:
         async with httpx.AsyncClient(
@@ -2460,7 +3288,10 @@ def test_fused_url_is_not_transferred_after_fresh_claim_authorization_is_lost(
         configuration,
         sdk_factories=(sdk_session, sdk_config),
     )
-    token = _seed_fused_server_database(host.app.state.server_engine)
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        fused_configuration=host.app.state.server_fused_generation_configuration,
+    )
 
     async def send_then_change_authorization() -> tuple[httpx.Response, str]:
         async with httpx.AsyncClient(

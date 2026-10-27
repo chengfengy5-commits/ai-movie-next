@@ -43,6 +43,7 @@ class ServerConfiguration:
     allowed_origins: tuple[str, ...] = ()
     fused_generation_enabled: bool = False
     fused_generation_provider_origins: tuple[str, ...] = ()
+    fused_generation_credentials_file: Path | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if type(self.user_task_max_concurrency) is not int:
@@ -75,6 +76,13 @@ class ServerConfiguration:
         ):
             raise ServerConfigurationError(
                 "FUSED_GENERATION_PROVIDER_ORIGINS must use unique canonical HTTPS origins"
+            )
+        if self.fused_generation_credentials_file is not None and (
+            not isinstance(self.fused_generation_credentials_file, Path)
+            or not self.fused_generation_credentials_file.is_absolute()
+        ):
+            raise ServerConfigurationError(
+                "FUSED_GENERATION_CREDENTIALS_FILE must be an absolute path"
             )
         if self.image_single_credentials_file is not None and (
             not isinstance(self.image_single_credentials_file, Path)
@@ -137,6 +145,10 @@ class ServerConfiguration:
                     "video.single requires complete object storage"
                 )
         if self.fused_generation_enabled:
+            if self.fused_generation_credentials_file is None:
+                raise ServerConfigurationError(
+                    "FUSED_GENERATION_CREDENTIALS_FILE is required when fused generation is enabled"
+                )
             if not self.fused_generation_provider_origins:
                 raise ServerConfigurationError(
                     "FUSED_GENERATION_PROVIDER_ORIGINS is required when fused generation is enabled"
@@ -261,6 +273,14 @@ def load_server_configuration(
         default=False,
     )
     fused_generation_provider_origins = _provider_origins(values)
+    fused_generation_credentials_file = _optional_absolute_path(
+        values,
+        "FUSED_GENERATION_CREDENTIALS_FILE",
+    )
+    if fused_generation_enabled and fused_generation_credentials_file is None:
+        raise ServerConfigurationError(
+            "FUSED_GENERATION_CREDENTIALS_FILE is required when fused generation is enabled"
+        )
     video_single_credentials_file = _optional_absolute_path(
         values,
         "VIDEO_SINGLE_CREDENTIALS_FILE",
@@ -330,6 +350,7 @@ def load_server_configuration(
             allowed_origins=allowed_origins,
             fused_generation_enabled=fused_generation_enabled,
             fused_generation_provider_origins=fused_generation_provider_origins,
+            fused_generation_credentials_file=fused_generation_credentials_file,
         )
 
     missing = tuple(
@@ -390,6 +411,7 @@ def load_server_configuration(
         allowed_origins=allowed_origins,
         fused_generation_enabled=fused_generation_enabled,
         fused_generation_provider_origins=fused_generation_provider_origins,
+        fused_generation_credentials_file=fused_generation_credentials_file,
     )
 
 

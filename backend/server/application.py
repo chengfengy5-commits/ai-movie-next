@@ -308,6 +308,7 @@ def create_server_host(
             fused_generation_configuration = (
                 build_fused_generation_host_configuration(
                     configuration,
+                    session_factory=session_factory,
                     media_resources=media_runtime_resources,
                 )
             )
@@ -393,6 +394,21 @@ def create_server_host(
             ),
             fused_generation_inline_image_storage=(
                 fused_generation_configuration.inline_image_storage
+                if fused_generation_configuration is not None
+                else None
+            ),
+            fused_generation_credential_registry=(
+                fused_generation_configuration.credential_registry
+                if fused_generation_configuration is not None
+                else None
+            ),
+            fused_generation_credential_crypto=(
+                fused_generation_configuration.credential_crypto
+                if fused_generation_configuration is not None
+                else None
+            ),
+            fused_generation_proof_authority=(
+                fused_generation_configuration.proof_authority
                 if fused_generation_configuration is not None
                 else None
             ),

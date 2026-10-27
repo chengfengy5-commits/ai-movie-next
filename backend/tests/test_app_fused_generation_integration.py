@@ -50,6 +50,7 @@ from haoai_backend.generation_catalog.tables import (
     system_prompts,
 )
 from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
+from haoai_backend.generation_core.schema import FusedGenerationSubmissionRow
 from haoai_backend.generation_contracts import PreparedReference, StoredMedia
 from haoai_backend.media_storage.owned_media_runtime import (
     OwnedMediaDependencies,
@@ -268,6 +269,7 @@ def fused_app(tmp_path: Path):
 
     authentication_metadata.create_all(engine)
     Base.metadata.create_all(engine)
+    FusedGenerationSubmissionRow.__table__.create(engine)
     series_metadata.create_all(engine, tables=[series, chapters, characters, props])
     catalog_metadata.create_all(
         engine,
@@ -596,10 +598,13 @@ def _request(
     token: str | None,
     content: bytes | None = None,
     body: dict[str, Any] | None = None,
+    idempotency_key: str | None = None,
 ) -> httpx.Response:
     async def send() -> httpx.Response:
         fixture.loop_threads.append(threading.get_ident())
         headers = {"Authorization": f"Bearer {token}"} if token else {}
+        if idempotency_key is not None:
+            headers["Idempotency-Key"] = idempotency_key
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=fixture.app, raise_app_exceptions=False),
             base_url="http://fused-generation.test",
@@ -794,6 +799,53 @@ def test_real_jwt_fused_task_commits_before_runtime_and_uses_server_config_and_w
     ]
     assert json.loads(chapter_content)[0]["fused"] == [asset["id"]]
     assert SERVER_KEY not in response.text
+
+
+@pytest.mark.parametrize("capability_mode", ["missing", "partial"])
+def test_keyed_fused_request_fails_before_legacy_charge_without_durable_capabilities(
+    fused_app: AppFixture,
+    capability_mode: str,
+):
+    fixture = fused_app
+    if capability_mode == "partial":
+        fixture.app = create_app(
+            session_factory=fixture.business_factory,
+            authentication_runtime=fixture.authentication_runtime,
+            fused_generation_runtime=fixture.runtime,
+            fused_generation_storage=fixture.storage,
+            fused_generation_inline_image_storage=fixture.inline_image_storage,
+            fused_generation_credential_registry=object(),
+        )
+
+    response = _request(
+        fixture,
+        token=fixture.token_for("owner", False),
+        body=_body(prompt_id="prompt-system"),
+        idempotency_key="client-owned-c1110-key",
+    )
+
+    assert response.status_code == 503, response.text
+    assert fixture.runtime.requests == []
+    assert fixture.storage.urls == []
+    with fixture.engine.connect() as connection:
+        credits = connection.execute(
+            select(user_credits.c.credits).where(user_credits.c.user_id == "owner")
+        ).scalar_one()
+        tasks = connection.execute(select(AITaskRow.__table__)).all()
+        charges = connection.execute(select(CreditLogRow.__table__)).all()
+        submissions = connection.execute(
+            select(FusedGenerationSubmissionRow.__table__)
+        ).all()
+    assert credits == 20
+    assert tasks == []
+    assert charges == []
+    assert submissions == []
+    assert all(
+        event[1] != fixture.loop_threads[0]
+        for event in fixture.events
+        if event[0] in {"auth-open", "auth-close", "business-open", "business-close"}
+    )
+    assert all(session.info.get("closed") for session in fixture.business_sessions)
 
 
 @pytest.mark.parametrize("wire_model", [None, ""], ids=["null", "empty"])

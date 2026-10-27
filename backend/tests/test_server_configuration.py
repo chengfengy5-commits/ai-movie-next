@@ -215,6 +215,9 @@ def test_fused_generation_is_off_by_default_and_has_an_independent_provider_allo
     environment.update(
         {
             "FUSED_GENERATION_ENABLED": "true",
+            "FUSED_GENERATION_CREDENTIALS_FILE": str(
+                tmp_path / "fused-credentials.json"
+            ),
             "FUSED_GENERATION_PROVIDER_ORIGINS": (
                 "https://API.OpenAI.com:443, https://images.example.test:8443"
             ),
@@ -226,6 +229,9 @@ def test_fused_generation_is_off_by_default_and_has_an_independent_provider_allo
         "https://api.openai.com",
         "https://images.example.test:8443",
     )
+    assert configuration.fused_generation_credentials_file == (
+        tmp_path / "fused-credentials.json"
+    )
 
 
 def test_fused_generation_requires_complete_storage_and_explicit_provider_origins(
@@ -235,6 +241,9 @@ def test_fused_generation_requires_complete_storage_and_explicit_provider_origin
     environment.update(
         {
             "FUSED_GENERATION_ENABLED": "true",
+            "FUSED_GENERATION_CREDENTIALS_FILE": str(
+                tmp_path / "fused-credentials.json"
+            ),
             "FUSED_GENERATION_PROVIDER_ORIGINS": "https://api.openai.com",
         }
     )
@@ -243,9 +252,29 @@ def test_fused_generation_requires_complete_storage_and_explicit_provider_origin
 
     environment = _r2_environment(tmp_path)
     environment["FUSED_GENERATION_ENABLED"] = "true"
+    environment["FUSED_GENERATION_CREDENTIALS_FILE"] = str(
+        tmp_path / "fused-credentials.json"
+    )
     with pytest.raises(
         ServerConfigurationError,
         match="FUSED_GENERATION_PROVIDER_ORIGINS is required",
+    ):
+        load_server_configuration(environment)
+
+
+def test_fused_generation_requires_a_root_credentials_file_when_enabled(
+    tmp_path: Path,
+) -> None:
+    environment = _r2_environment(tmp_path)
+    environment.update(
+        {
+            "FUSED_GENERATION_ENABLED": "true",
+            "FUSED_GENERATION_PROVIDER_ORIGINS": "https://api.openai.com",
+        }
+    )
+    with pytest.raises(
+        ServerConfigurationError,
+        match="FUSED_GENERATION_CREDENTIALS_FILE is required",
     ):
         load_server_configuration(environment)
 

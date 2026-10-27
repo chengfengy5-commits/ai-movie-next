@@ -58,14 +58,18 @@ GENERATION_SCHEMA_VERSION = "0001_generation_shared_records"
 GENERATION_SCHEMA_CHECKSUM = "4a5555181658fae91d035235a021d06fdbf3dde4ad0271375498fa9e57736bfa"
 CANVAS_RESULT_TARGETS_SCHEMA_VERSION = "0002_canvas_result_targets"
 CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM = "1d9482fc951fc4e13d9c0c3fe5c74fb3e605045a0427306d25906872cfda1f67"
-GENERATION_CURRENT_SCHEMA_VERSION = CANVAS_RESULT_TARGETS_SCHEMA_VERSION
-GENERATION_CURRENT_SCHEMA_CHECKSUM = CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM
+FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION = "0003_fused_generation_submissions"
+FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM = "4cefd8e428911da76e89297517ed3e6cb2dc7222d873f21b4c510d3a4e7c0680"
+GENERATION_CURRENT_SCHEMA_VERSION = FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION
+GENERATION_CURRENT_SCHEMA_CHECKSUM = FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM
 GENERATION_MIGRATION_HISTORY_TABLE = "generation_schema_migrations"
 GENERATION_SUPPORTED_VERSIONS = (
     GENERATION_SCHEMA_VERSION,
     CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
+    FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
 )
 CANVAS_RESULT_TARGETS_TABLE_NAME = "generation_result_targets"
+FUSED_GENERATION_SUBMISSIONS_TABLE_NAME = "fused_generation_submissions"
 
 
 class UnitFeeDecisionRow(FoundationBase):
@@ -151,6 +155,81 @@ class GenerationResultTargetRow(GenerationAuxiliaryBase):
     target_identity = Column(String(255), nullable=False)
     target_snapshot_digest = Column(String(64), nullable=False)
     generation_fulfilled_at = Column(DateTime(timezone=False), nullable=False)
+
+
+class FusedGenerationSubmissionRow(GenerationAuxiliaryBase):
+    """Durable idempotency, fee, snapshot, dispatch, and result facts for fused generation."""
+
+    __tablename__ = FUSED_GENERATION_SUBMISSIONS_TABLE_NAME
+    __table_args__ = (
+        UniqueConstraint("owner_id", "idempotency_key", name="uq_fused_submissions_owner_key"),
+        UniqueConstraint("task_id", name="uq_fused_submissions_task_id"),
+        Index("ix_fused_submissions_recovery", "stage", "updated_at", "submission_id"),
+        CheckConstraint("operation = 'fused.image'", name="ck_fused_submissions_operation"),
+        CheckConstraint(
+            "stage IN ('reserved', 'fee_committed', 'snapshot_ready', 'accepted', "
+            "'rejected_after_charge', 'charged_incomplete', 'dispatching', "
+            "'provider_result_unknown', 'result_known', 'media_ack_unknown', "
+            "'media_started', 'completed', 'failed')",
+            name="ck_fused_submissions_stage",
+        ),
+        CheckConstraint(
+            "fee_disposition IN ('debit', 'byok', 'zero')",
+            name="ck_fused_submissions_fee_disposition",
+        ),
+        CheckConstraint(
+            "fee_amount >= 0 AND ((fee_disposition = 'debit' AND fee_amount > 0 "
+            "AND debit_log_id IS NOT NULL) OR (fee_disposition IN ('byok', 'zero') "
+            "AND fee_amount = 0 AND debit_log_id IS NULL))",
+            name="ck_fused_submissions_fee_facts",
+        ),
+        CheckConstraint(
+            "length(request_digest) = 64",
+            name="ck_fused_submissions_request_digest",
+        ),
+    )
+
+    submission_id = Column(String(36), primary_key=True)
+    owner_id = Column(String(36), nullable=False)
+    operation = Column(String(32), nullable=False)
+    idempotency_key = Column(String(255), nullable=False)
+    request_digest = Column(String(64), nullable=False)
+    stage = Column(String(32), nullable=False)
+    fee_disposition = Column(String(16), nullable=False)
+    fee_amount = Column(Integer, nullable=False)
+    debit_log_id = Column(String(36), nullable=True)
+    task_id = Column(String(36), nullable=True)
+    message_id = Column(String(36), nullable=True)
+    encrypted_request = Column(Text, nullable=True)
+    request_nonce = Column(String(128), nullable=True)
+    encrypted_snapshot = Column(Text, nullable=True)
+    snapshot_nonce = Column(String(128), nullable=True)
+    encrypted_result = Column(Text, nullable=True)
+    result_nonce = Column(String(128), nullable=True)
+    result_kind = Column(String(16), nullable=True)
+    result_digest = Column(String(64), nullable=True)
+    seal_key_id = Column(String(128), nullable=True)
+    crypto_algorithm = Column(String(64), nullable=True)
+    model_source = Column(String(16), nullable=True)
+    model_row_id = Column(String(36), nullable=True)
+    provider = Column(String(64), nullable=True)
+    principal_id = Column(String(36), nullable=True)
+    binding_id = Column(String(36), nullable=True)
+    binding_version = Column(String(16), nullable=True)
+    endpoint_origin = Column(String(512), nullable=True)
+    allowed_content_paths = Column(Text, nullable=True)
+    rotation_provenance = Column(String(255), nullable=True)
+    snapshot_proof_key_id = Column(String(128), nullable=True)
+    snapshot_proof = Column(String(128), nullable=True)
+    response_status = Column(Integer, nullable=True)
+    response_json = Column(Text, nullable=True)
+    dispatch_nonce = Column(String(36), nullable=True)
+    dispatch_owner = Column(String(64), nullable=True)
+    dispatch_generation = Column(Integer, nullable=True)
+    wire_digest = Column(String(64), nullable=True)
+    asset_id = Column(String(36), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False)
+    updated_at = Column(DateTime(timezone=False), nullable=False)
 
 
 class ApplicationRecordRow(FoundationBase):
@@ -1044,6 +1123,25 @@ CANVAS_RESULT_TARGET_INDEX_REQUIREMENTS = {
         ),
     )
 }
+_fused_submission_requirement = _table_requirement(
+    FusedGenerationSubmissionRow.__table__
+)
+FUSED_GENERATION_SUBMISSION_REQUIREMENTS = {
+    FUSED_GENERATION_SUBMISSIONS_TABLE_NAME: TableRequirement(
+        columns=_fused_submission_requirement.columns,
+        primary_key=_fused_submission_requirement.primary_key,
+        foreign_keys=(
+            _fk("owner_id", "users"),
+            _fk("debit_log_id", "credit_logs"),
+        ),
+        unique_constraints=tuple(
+            UniqueRequirement(item.columns)
+            for item in _fused_submission_requirement.unique_constraints
+        ),
+        checks=_fused_submission_requirement.checks,
+        indexes=_fused_submission_requirement.indexes,
+    )
+}
 MIGRATION_HISTORY_REQUIREMENT = TableRequirement(
     {
         "version": ColumnRequirement("string", False, 64),
@@ -1245,6 +1343,17 @@ def check_canvas_result_target_schema(catalog: CatalogReader) -> SchemaCheck:
     return SchemaCheck(not issues, tuple(issues))
 
 
+def check_fused_generation_submission_schema(catalog: CatalogReader) -> SchemaCheck:
+    """Require the dedicated durable fused-submission ledger table."""
+
+    return _check_requirements(
+        catalog,
+        FUSED_GENERATION_SUBMISSION_REQUIREMENTS,
+        (FUSED_GENERATION_SUBMISSIONS_TABLE_NAME,),
+        reject_extra_columns=True,
+    )
+
+
 def check_migration_history_schema(catalog: CatalogReader) -> SchemaCheck:
     """Require the migration history key, typed columns, and nullability."""
 
@@ -1302,11 +1411,14 @@ __all__ = (
     "GENERATION_SCHEMA_CHECKSUM",
     "CANVAS_RESULT_TARGETS_SCHEMA_VERSION",
     "CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM",
+    "FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION",
+    "FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM",
     "GENERATION_CURRENT_SCHEMA_VERSION",
     "GENERATION_CURRENT_SCHEMA_CHECKSUM",
     "GENERATION_MIGRATION_HISTORY_TABLE",
     "GENERATION_SUPPORTED_VERSIONS",
     "CANVAS_RESULT_TARGETS_TABLE_NAME",
+    "FUSED_GENERATION_SUBMISSIONS_TABLE_NAME",
     "UserRow",
     "AITaskRow",
     "TaskQuoteRow",
@@ -1320,6 +1432,7 @@ __all__ = (
     "UnitFeeDecisionRow",
     "GenerationResultReceiptRow",
     "GenerationResultTargetRow",
+    "FusedGenerationSubmissionRow",
     "ApplicationRecordRow",
     "ExecutionAttemptGroupRow",
     "LocalContinuationWorkRow",
@@ -1333,6 +1446,7 @@ __all__ = (
     "GENERATION_RECORD_REQUIREMENTS",
     "CANVAS_RESULT_TARGET_REQUIREMENTS",
     "CANVAS_RESULT_TARGET_INDEX_REQUIREMENTS",
+    "FUSED_GENERATION_SUBMISSION_REQUIREMENTS",
     "FOUNDATION_REQUIREMENTS",
     "MIGRATION_HISTORY_REQUIREMENT",
     "CatalogColumn",
@@ -1349,6 +1463,7 @@ __all__ = (
     "check_foundation_schema",
     "check_generation_record_schema",
     "check_canvas_result_target_schema",
+    "check_fused_generation_submission_schema",
     "check_migration_history_schema",
     "check_generation_version_set",
     "sqlalchemy_catalog",

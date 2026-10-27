@@ -19,6 +19,11 @@ class FusedGenerationForbidden(FusedGenerationError):
         super().__init__(403, detail)
 
 
+class FusedGenerationConflict(FusedGenerationError):
+    def __init__(self, detail: str) -> None:
+        super().__init__(409, detail)
+
+
 class FusedGenerationNotFound(FusedGenerationError):
     def __init__(self, detail: str) -> None:
         super().__init__(404, detail)

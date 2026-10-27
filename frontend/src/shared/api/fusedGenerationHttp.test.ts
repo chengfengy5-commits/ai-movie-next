@@ -80,4 +80,51 @@ describe("fused generation HTTP adapter", () => {
     if (malformed === undefined) throw new Error("Expected a fused generation service.");
     await expect(malformed.submit(input, new AbortController().signal)).rejects.toBeInstanceOf(ApiError);
   });
+
+  it("sends the original idempotency key and exposes a sanitized read-only receipt lookup", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "fused-session-token");
+    storage.setItem(API_USER_KEY, JSON.stringify({ id: "actor-1" }));
+    const key = "fused-original-key-1110";
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ task_id: "task-1", message_id: null }))
+      .mockResolvedValueOnce(jsonResponse({
+        status: "provider_result_unknown",
+        fee_disposition: "debit",
+        fee_amount: 4,
+        task_id: "task-1",
+        message_id: null,
+        encrypted_snapshot: "must-not-escape",
+        request: { prompt: "must-not-escape" },
+      }));
+    const port = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher }).fusedGeneration;
+    if (port === undefined || port.lookupSubmission === undefined) {
+      throw new Error("Expected durable fused submission lookup support.");
+    }
+
+    const signal = new AbortController().signal;
+    await port.submit(input, signal, { idempotencyKey: key });
+    const receipt = await port.lookupSubmission(key, signal);
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    const [postUrl, postInit] = fetcher.mock.calls[0]!;
+    expect(String(postUrl)).toBe("http://127.0.0.1:4175/api/fused-assets/generate");
+    expect(new Headers(postInit?.headers).get("Idempotency-Key")).toBe(key);
+    expect(postInit?.method).toBe("POST");
+    const [getUrl, getInit] = fetcher.mock.calls[1]!;
+    expect(String(getUrl)).toBe(
+      "http://127.0.0.1:4175/api/fused-assets/submissions?idempotency_key=fused-original-key-1110",
+    );
+    expect(getInit?.method).toBe("GET");
+    expect(getInit?.body).toBeUndefined();
+    expect(receipt).toEqual({
+      status: "provider_result_unknown",
+      feeDisposition: "debit",
+      feeAmount: 4,
+      taskId: "task-1",
+      messageId: null,
+    });
+    expect(JSON.stringify(receipt)).not.toContain("must-not-escape");
+    expect(JSON.stringify(receipt)).not.toContain("prompt");
+  });
 });

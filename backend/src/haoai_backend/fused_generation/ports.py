@@ -6,6 +6,11 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from typing import Protocol
 
+from haoai_backend.generation_credentials.application import CredentialRegistry
+from haoai_backend.generation_credentials.binding_capture_ports import (
+    CapturedCredentialBinding,
+)
+from haoai_backend.generation_credentials.domain import CredentialScope
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import (
@@ -45,8 +50,81 @@ class FusedGenerationImageStorage(Protocol):
 
 
 class FusedGenerationUnitOfWork(Protocol):
+    """Operations borrowed by fused application services for one Session."""
+
     def current_time(self) -> datetime: ...
     def new_id(self) -> str: ...
+
+    # Durable submission reservation, snapshot acceptance, and receipt reads.
+    def resolve_durable_model_identity(
+        self,
+        user_id: str,
+        model_id: str,
+    ) -> tuple[FusedServerImageModel, CredentialScope]: ...
+    def capture_durable_binding(
+        self,
+        registry: CredentialRegistry,
+        scope: CredentialScope,
+    ) -> CapturedCredentialBinding | None: ...
+    def find_durable_submission(
+        self,
+        owner_id: str,
+        idempotency_key: str,
+    ) -> Mapping[str, object] | None: ...
+    def find_durable_submission_receipt(
+        self, owner_id: str, idempotency_key: str
+    ) -> Mapping[str, object] | None: ...
+    def durable_submission_by_id(
+        self,
+        submission_id: str,
+        *,
+        owner_id: str | None = None,
+    ) -> Mapping[str, object] | None: ...
+    def recoverable_durable_submissions(
+        self, *, limit: int = 32
+    ) -> tuple[Mapping[str, object], ...]: ...
+    def reserve_durable_submission(
+        self,
+        *,
+        submission_id: str,
+        owner_id: str,
+        idempotency_key: str,
+        request_digest: str,
+        model: FusedServerImageModel,
+        scope: CredentialScope,
+        captured_binding: CapturedCredentialBinding,
+        task_id: str,
+        message_id: str | None,
+        encrypted_request: str,
+        request_nonce: str,
+        seal_key_id: str,
+        crypto_algorithm: str,
+    ) -> None: ...
+    def save_durable_snapshot(
+        self,
+        *,
+        submission_id: str,
+        encrypted_snapshot: str,
+        snapshot_nonce: str,
+        snapshot_proof_key_id: str,
+        snapshot_proof: str,
+    ) -> bool: ...
+    def reject_durable_submission(
+        self,
+        *,
+        submission_id: str,
+        status_code: int,
+        response_json: str,
+    ) -> bool: ...
+    def accept_durable_submission(
+        self,
+        prepared: PreparedFusedGeneration,
+        *,
+        response_status: int = 200,
+        response_json: str,
+    ) -> bool: ...
+
+    # Shared task preparation and legacy execution.
     def require_series_access(self, actor: TrustedActor, series_id: str) -> None: ...
     def load_member_asset(
         self, member_type: str, series_id: str, asset_id: str
@@ -58,6 +136,76 @@ class FusedGenerationUnitOfWork(Protocol):
     def claim_task(
         self, task_id: str, claim_token: str, *, expected_user_id: str
     ) -> FusedTaskClaim | None: ...
+
+    # Durable task claim, one-time provider dispatch, and known result storage.
+    def claim_durable_task(
+        self,
+        task_id: str,
+        submission_id: str,
+        claim_token: str,
+        *,
+        expected_user_id: str,
+    ) -> FusedTaskClaim | None: ...
+    def persist_dispatch_gate(
+        self,
+        *,
+        task_id: str,
+        submission_id: str,
+        user_id: str,
+        claim_token: str,
+        generation: int,
+        dispatch_nonce: str,
+        wire_digest: str,
+    ) -> bool: ...
+    def dispatch_gate_matches(
+        self,
+        *,
+        task_id: str,
+        submission_id: str,
+        user_id: str,
+        claim_token: str,
+        generation: int,
+        dispatch_nonce: str,
+        wire_digest: str,
+    ) -> bool: ...
+    def persist_provider_result(
+        self,
+        *,
+        task_id: str,
+        submission_id: str,
+        claim_token: str,
+        generation: int,
+        encrypted_result: str,
+        result_nonce: str,
+        result_kind: str,
+        result_digest: str,
+    ) -> bool: ...
+    def result_record_matches(
+        self,
+        submission_id: str,
+        task_id: str,
+        claim_token: str,
+        generation: int,
+        result_digest: str,
+    ) -> bool: ...
+    def begin_durable_media_storage(
+        self,
+        task_id: str,
+        submission_id: str,
+        user_id: str,
+        claim_token: str,
+        generation: int,
+    ) -> bool: ...
+    def durable_media_storage_started_matches(
+        self,
+        task_id: str,
+        submission_id: str,
+        user_id: str,
+        claim_token: str,
+        generation: int,
+    ) -> bool: ...
+    def retain_interrupted_media_write(self, submission_id: str) -> bool: ...
+    def retain_dispatch_unknown(self, submission_id: str) -> bool: ...
     def authorize_media_storage(
         self, task_id: str, user_id: str, claim_token: str
     ) -> bool: ...

@@ -2139,6 +2139,7 @@ type ApiEndpoint =
   | "props"
   | "fusedAssets"
   | "fusedGenerate"
+  | "fusedSubmission"
   | "updateFusedAsset"
   | "deleteFusedAsset"
   | "createCharacter"
@@ -2500,6 +2501,15 @@ function apiRequestDefinition(
   if (endpoint === "fusedGenerate") {
     return { path: "/fused-assets/generate", method: "POST", expectedStatus: 200 };
   }
+  if (endpoint === "fusedSubmission") {
+    const key = identifiers?.idempotencyKey;
+    if (typeof key !== "string" || key.trim() !== key || key.length === 0 || key.length > 255
+      || /[\u0000-\u001f\u007f-\u009f]/u.test(key)) {
+      throw new ApiError("invalid-response", "融合提交核对键无效。", null);
+    }
+    const query = new URLSearchParams({ idempotency_key: key });
+    return { path: "/fused-assets/submissions?" + query.toString(), method: "GET" };
+  }
 
   const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
   if (endpoint === "chapters") {
@@ -2591,6 +2601,14 @@ export function createApiServices(
     }
     if (token !== null) {
       headers.set("Authorization", `Bearer ${token}`);
+    }
+    if (endpoint === "fusedGenerate" && identifiers?.idempotencyKey !== undefined) {
+      const key = identifiers.idempotencyKey;
+      if (typeof key !== "string" || key.trim() !== key || key.length === 0 || key.length > 255
+        || /[\u0000-\u001f\u007f-\u009f]/u.test(key)) {
+        throw new ApiError("invalid-response", "融合提交幂等键无效。", null);
+      }
+      headers.set("Idempotency-Key", key);
     }
 
     let response: Response;
@@ -3150,10 +3168,28 @@ export function createApiServices(
       timeoutMs,
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
-    fusedGeneration: createFusedGenerationHttp(async (input, signal) => {
-      const token = requireApiToken(storage);
-      return requestForCurrentApiSession("fusedGenerate", token, signal, input);
-    }),
+    fusedGeneration: createFusedGenerationHttp(
+      async (input, signal, options) => {
+        const token = requireApiToken(storage);
+        return requestForCurrentApiSession(
+          "fusedGenerate",
+          token,
+          signal,
+          input,
+          options === undefined ? undefined : { idempotencyKey: options.idempotencyKey },
+        );
+      },
+      async (idempotencyKey, signal) => {
+        const token = requireApiToken(storage);
+        return requestForCurrentApiSession(
+          "fusedSubmission",
+          token,
+          signal,
+          undefined,
+          { idempotencyKey },
+        );
+      },
+    ),
     mediaReferenceUpload: createMediaReferenceUploadHttpPort(apiBaseUrl, {
       storage,
       fetcher,

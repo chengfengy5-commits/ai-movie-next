@@ -4,6 +4,9 @@ import type {
   FusedGenerationJsonRequester,
   FusedGenerationPort,
   FusedGenerationReceipt,
+  FusedSubmissionJsonLookup,
+  FusedSubmissionReceipt,
+  FusedSubmissionStatus,
 } from "./fusedGeneration";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -24,6 +27,59 @@ function parseReceipt(value: unknown): FusedGenerationReceipt {
     throw new ApiError("invalid-response", "融合生成服务没有返回可核对的任务编号。", 200);
   }
   return Object.freeze({ taskId: value.task_id, messageId: value.message_id });
+}
+
+const submissionStatuses = new Set<FusedSubmissionStatus>([
+  "accepted",
+  "result_known",
+  "provider_result_unknown",
+  "media_result_unknown",
+  "charged_incomplete",
+  "rejected_after_charge",
+  "completed",
+  "failed",
+]);
+
+function isFeeDisposition(
+  value: unknown,
+): value is FusedSubmissionReceipt["feeDisposition"] {
+  return value === null || value === "debit" || value === "byok" || value === "zero";
+}
+
+function isFeeAmount(value: unknown): value is number | null {
+  return value === null || (typeof value === "number"
+    && Number.isSafeInteger(value) && value >= 0);
+}
+
+function isNullableSafeId(value: unknown): value is string | null {
+  return value === null || isSafeId(value);
+}
+
+function parseSubmissionReceipt(value: unknown): FusedSubmissionReceipt {
+  if (!isRecord(value) || typeof value.status !== "string"
+    || !submissionStatuses.has(value.status as FusedSubmissionStatus)) {
+    throw new ApiError("invalid-response", "融合提交查询没有返回可核对的状态。", 200);
+  }
+  const feeDisposition = value.fee_disposition;
+  if (!isFeeDisposition(feeDisposition)) {
+    throw new ApiError("invalid-response", "融合提交查询的费用状态无效。", 200);
+  }
+  const feeAmount = value.fee_amount;
+  if (!isFeeAmount(feeAmount)) {
+    throw new ApiError("invalid-response", "融合提交查询的费用金额无效。", 200);
+  }
+  const taskId = value.task_id;
+  const messageId = value.message_id;
+  if (!isNullableSafeId(taskId) || !isNullableSafeId(messageId)) {
+    throw new ApiError("invalid-response", "融合提交查询的任务身份无效。", 200);
+  }
+  return Object.freeze({
+    status: value.status as FusedSubmissionStatus,
+    feeDisposition,
+    feeAmount,
+    taskId,
+    messageId,
+  });
 }
 
 function validateInput(input: FusedGenerationInput): void {
@@ -61,9 +117,12 @@ function validateInput(input: FusedGenerationInput): void {
   }
 }
 
-export function createFusedGenerationHttp(requestJson: FusedGenerationJsonRequester): FusedGenerationPort {
+export function createFusedGenerationHttp(
+  requestJson: FusedGenerationJsonRequester,
+  lookupJson?: FusedSubmissionJsonLookup,
+): FusedGenerationPort {
   return {
-    async submit(input, signal) {
+    async submit(input, signal, options) {
       validateInput(input);
       const payload: FusedGenerationInput = {
         series_id: input.series_id,
@@ -80,7 +139,15 @@ export function createFusedGenerationHttp(requestJson: FusedGenerationJsonReques
         frame_index: null,
         name: null,
       };
-      return parseReceipt(await requestJson(payload, signal));
+      return parseReceipt(await requestJson(payload, signal, options));
     },
+    ...(lookupJson === undefined ? {} : {
+      async lookupSubmission(idempotencyKey: string, signal: AbortSignal) {
+        if (!isSafeId(idempotencyKey) || idempotencyKey.length > 255) {
+          throw new ApiError("invalid-response", "融合提交核对键无效。", null);
+        }
+        return parseSubmissionReceipt(await lookupJson(idempotencyKey, signal));
+      },
+    }),
   };
 }
