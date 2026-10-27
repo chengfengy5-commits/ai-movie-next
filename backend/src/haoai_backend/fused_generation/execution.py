@@ -17,6 +17,7 @@ from .domain import (
     FUSED_UNKNOWN_REASON,
     FusedGenerationInput,
     FusedGenerationInlineImage,
+    FusedGenerationStorageUnknown,
     FusedGenerationUnknown,
     FusedGenerationUnknownReason,
     FusedTaskClaim,
@@ -132,22 +133,121 @@ class FusedGenerationExecution:
         final_url = provider_url
         if self.storage is not None:
             try:
-                stored_url = await self.storage.store_generated_image(provider_url)
-                if isinstance(stored_url, str) and stored_url.strip():
-                    final_url = stored_url
-            except asyncio.CancelledError:
-                await _finish_after_cancellation(
+                authorized, cancelled = await _authorize_media_storage(
                     self.uow_factory,
+                    prepared.task_id,
+                    prepared.user_id,
+                    claim_token,
+                )
+            except asyncio.CancelledError:
+                await self._retain_known_media_result(
                     prepared,
                     claim_token,
-                    "任务被取消",
+                    provider_url,
+                )
+                raise
+            if cancelled:
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    provider_url,
+                )
+                raise asyncio.CancelledError
+            if not authorized:
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    provider_url,
+                )
+                return
+            try:
+                storage_result = await self.storage.store_generated_image(provider_url)
+            except asyncio.CancelledError:
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    provider_url,
                 )
                 raise
             except Exception:
-                # Keep the valid provider URL when transfer is temporarily unavailable.
-                pass
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    provider_url,
+                )
+                return
 
-        await self._finish(prepared, claim_token, image_url=final_url, error_message=None)
+            if isinstance(storage_result, FusedGenerationStorageUnknown):
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    provider_url,
+                )
+                if storage_result.cancellation_requested:
+                    raise asyncio.CancelledError
+                return
+            if storage_result is None:
+                pass
+            elif type(storage_result) is str and storage_result.strip():
+                final_url = storage_result
+            else:
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    provider_url,
+                )
+                return
+
+            try:
+                authorized, cancelled = await _authorize_media_storage(
+                    self.uow_factory,
+                    prepared.task_id,
+                    prepared.user_id,
+                    claim_token,
+                )
+            except asyncio.CancelledError:
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    final_url,
+                )
+                raise
+            if cancelled:
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    final_url,
+                )
+                raise asyncio.CancelledError
+            if not authorized:
+                await self._retain_known_media_result(
+                    prepared,
+                    claim_token,
+                    final_url,
+                )
+                return
+
+        try:
+            finished = await self._finish(
+                prepared,
+                claim_token,
+                image_url=final_url,
+                error_message=None,
+                preserve_if_cancelled=True,
+            )
+        except asyncio.CancelledError:
+            await self._retain_known_media_result(
+                prepared,
+                claim_token,
+                final_url,
+            )
+            raise
+        if not finished:
+            await self._retain_known_media_result(
+                prepared,
+                claim_token,
+                final_url,
+            )
 
     async def _store_inline_image(
         self,
@@ -173,7 +273,7 @@ class FusedGenerationExecution:
                 await retain_pending()
                 return
 
-            authorized, cancelled = await _authorize_inline_storage(
+            authorized, cancelled = await _authorize_media_storage(
                 self.uow_factory,
                 prepared.task_id,
                 prepared.user_id,
@@ -201,7 +301,7 @@ class FusedGenerationExecution:
                 await retain_pending()
                 return
 
-            authorized, cancelled = await _authorize_inline_storage(
+            authorized, cancelled = await _authorize_media_storage(
                 self.uow_factory,
                 prepared.task_id,
                 prepared.user_id,
@@ -290,6 +390,33 @@ class FusedGenerationExecution:
         if cancellation_requested:
             raise asyncio.CancelledError
 
+    async def _retain_known_media_result(
+        self,
+        prepared: PreparedFusedGeneration,
+        claim_token: str,
+        result_url: str,
+    ) -> None:
+        if self.uow_factory is None:
+            return
+        retaining = asyncio.create_task(
+            run_in_threadpool(
+                _retain_known_media_result,
+                self.uow_factory,
+                prepared.task_id,
+                prepared.user_id,
+                claim_token,
+                result_url,
+            )
+        )
+        try:
+            _, cancellation_requested = await _drain_owned_worker(retaining)
+        except Exception:
+            # A failed or ambiguous retention commit must not fall through to
+            # terminal finalization or trigger another transfer attempt.
+            return
+        if cancellation_requested:
+            raise asyncio.CancelledError
+
 
 def _claim(
     uow_factory: FusedGenerationUnitOfWorkFactory,
@@ -312,7 +439,7 @@ def _claim(
         uow.close()
 
 
-async def _authorize_inline_storage(
+async def _authorize_media_storage(
     uow_factory: FusedGenerationUnitOfWorkFactory | None,
     task_id: str,
     user_id: str,
@@ -322,7 +449,7 @@ async def _authorize_inline_storage(
         return False, False
     checking = asyncio.create_task(
         run_in_threadpool(
-            _authorize_inline_storage_sync,
+            _authorize_media_storage_sync,
             uow_factory,
             task_id,
             user_id,
@@ -336,7 +463,7 @@ async def _authorize_inline_storage(
     return authorized is True, cancellation_requested
 
 
-def _authorize_inline_storage_sync(
+def _authorize_media_storage_sync(
     uow_factory: FusedGenerationUnitOfWorkFactory,
     task_id: str,
     user_id: str,
@@ -344,7 +471,7 @@ def _authorize_inline_storage_sync(
 ) -> bool:
     uow = uow_factory()
     try:
-        return uow.authorize_inline_image_storage(task_id, user_id, claim_token)
+        return uow.authorize_media_storage(task_id, user_id, claim_token)
     finally:
         try:
             uow.rollback()
@@ -416,6 +543,29 @@ def _retain_unknown(
     uow = uow_factory()
     try:
         uow.retain_unknown(task_id, user_id, claim_token, safe_reason)
+        uow.commit()
+    except Exception:
+        uow.rollback()
+        raise
+    finally:
+        uow.close()
+
+
+def _retain_known_media_result(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    task_id: str,
+    user_id: str,
+    claim_token: str,
+    result_url: str,
+) -> None:
+    uow = uow_factory()
+    try:
+        uow.retain_known_media_result(
+            task_id,
+            user_id,
+            claim_token,
+            result_url,
+        )
         uow.commit()
     except Exception:
         uow.rollback()

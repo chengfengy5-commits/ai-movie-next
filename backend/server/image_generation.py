@@ -71,6 +71,7 @@ from .configuration import ServerConfiguration
 from .credentials import load_registry_capabilities
 from .generation import _database_clock, _uuid_id
 from .http import AiohttpAsyncHttpClientFactory
+from .media_runtime import ServerMediaRuntimeResources
 
 
 class ImageGenerationHostConfigurationError(RuntimeError):
@@ -142,11 +143,77 @@ class _SecretHandle:
         return "_SecretHandle(<redacted>)"
 
 
+def build_server_media_runtime_resources(
+    configuration: ServerConfiguration,
+    *,
+    s3_client_factory: S3ClientFactory | None,
+    include_video: bool,
+) -> ServerMediaRuntimeResources:
+    """Build one cold media owner shared by enabled generation families."""
+
+    if (
+        not isinstance(configuration, ServerConfiguration)
+        or configuration.r2_configuration is None
+        or configuration.r2_access_key is None
+        or configuration.r2_secret_key is None
+        or not isinstance(s3_client_factory, Boto3S3ClientFactory)
+    ):
+        raise ImageGenerationHostConfigurationError(
+            "generation media requires complete object storage"
+        )
+
+    media_policy = _image_media_policy(include_video=include_video)
+    http_library = _build_http_library()
+    generation_r2 = replace(configuration.r2_configuration, business_type="generation")
+    managed_origin_map = _managed_origin_map(configuration.r2_configuration)
+    media_runtime = OwnedMediaRuntime(
+        OwnedMediaDependencies(
+            transfer_tmp_dir=generation_r2.transfer_tmp_dir,
+            getaddrinfo=_system_getaddrinfo,
+            http_library=http_library,
+            media_policy=media_policy,
+            r2_configuration=generation_r2,
+            access_key=_SecretHandle(configuration.r2_access_key),
+            secret_key=_SecretHandle(configuration.r2_secret_key),
+            s3_client_factory=s3_client_factory,
+        ),
+        loop_factory=asyncio.new_event_loop,
+        thread_factory=threading.Thread,
+        executor_factory=concurrent.futures.ThreadPoolExecutor,
+    )
+
+    def media_store_factory() -> SynchronousMediaStore:
+        return SynchronousMediaStore(
+            media_runtime,
+            mode="url_or_inline",
+            reference_stager=None,
+            staging_directory=None,
+            managed_origin_map=managed_origin_map,
+        )
+
+    def public_media_fetcher_factory() -> PublicMediaFetcher:
+        return _OwnedRuntimePublicMediaFetcher(
+            media_runtime,
+            PinnedPublicMediaFetcher(
+                PublicFetchPolicy(_system_getaddrinfo),
+                media_policy,
+                http_library=http_library,
+            ),
+        )
+
+    return ServerMediaRuntimeResources(
+        runtime=media_runtime,
+        media_store_factory=media_store_factory,
+        public_media_fetcher_factory=public_media_fetcher_factory,
+    )
+
+
 def build_image_generation_host_configuration(
     configuration: ServerConfiguration,
     *,
     session_factory: Callable[[], Session],
     s3_client_factory: S3ClientFactory | None,
+    shared_media_resources: ServerMediaRuntimeResources | None = None,
 ) -> ImageGenerationHostConfiguration:
     """Build image.single dependencies without opening HTTP or S3 resources."""
 
@@ -199,72 +266,31 @@ def build_image_generation_host_configuration(
         id_factory=id_factory,
     )
     registry = build_credential_registry(capabilities)
-    media_policy = _image_media_policy(include_video=video_single_enabled)
-    http_library = _build_http_library()
-    generation_r2 = replace(r2_configuration, business_type="generation")
-    managed_origin_map = _managed_origin_map(r2_configuration)
-    media_runtime: OwnedMediaRuntime | None = None
-
-    def media_store_factory() -> SynchronousMediaStore:
-        if media_runtime is None:
-            raise ImageGenerationHostConfigurationError(
-                "image media runtime is unavailable"
-            )
-        return SynchronousMediaStore(
-            media_runtime,
-            mode="url_or_inline",
-            reference_stager=None,
-            staging_directory=None,
-            managed_origin_map=managed_origin_map,
-        )
-
-    def public_media_fetcher_factory() -> PublicMediaFetcher:
-        if media_runtime is None:
-            raise ImageGenerationHostConfigurationError(
-                "image media runtime is unavailable"
-            )
-        return _OwnedRuntimePublicMediaFetcher(
-            media_runtime,
-            PinnedPublicMediaFetcher(
-                PublicFetchPolicy(_system_getaddrinfo),
-                media_policy,
-                http_library=http_library,
-            ),
-        )
-
-    runtime = GenerationRuntimeConfig(
-        session_factory=session_factory,
-        db_clock=db_clock,
-        id_factory=id_factory,
-        http_client_factory=AiohttpAsyncHttpClientFactory(),
-        credential_resolver=registry.resolve_original_credential,
-        provider_factories=(),
-        media_store_factory=media_store_factory,
-        local_muse_staging_dir=None,
-        public_media_fetcher_factory=public_media_fetcher_factory,
-        bound_provider_content_fetcher_factory=_UnsupportedBoundContentFetcher,
-        local_muse_capability_factory=_UnsupportedLocalMuseCapability,
-        r2_storage_factory=_UnsupportedR2StorageCapability,
-        timeout_settings=RuntimeTimeoutSettings(
-            public_media_fetch_seconds=MAX_TRANSFER_SECONDS
-        ),
-        concurrency_settings=RuntimeConcurrencySettings(public_media_fetches=2),
+    owns_media_resources = shared_media_resources is None
+    media_resources = shared_media_resources or build_server_media_runtime_resources(
+        configuration,
+        s3_client_factory=s3_client_factory,
+        include_video=video_single_enabled,
     )
+    media_runtime = media_resources.runtime
     try:
-        media_runtime = OwnedMediaRuntime(
-            OwnedMediaDependencies(
-                transfer_tmp_dir=generation_r2.transfer_tmp_dir,
-                getaddrinfo=_system_getaddrinfo,
-                http_library=http_library,
-                media_policy=media_policy,
-                r2_configuration=generation_r2,
-                access_key=_SecretHandle(configuration.r2_access_key),
-                secret_key=_SecretHandle(configuration.r2_secret_key),
-                s3_client_factory=s3_client_factory,
+        runtime = GenerationRuntimeConfig(
+            session_factory=session_factory,
+            db_clock=db_clock,
+            id_factory=id_factory,
+            http_client_factory=AiohttpAsyncHttpClientFactory(),
+            credential_resolver=registry.resolve_original_credential,
+            provider_factories=(),
+            media_store_factory=media_resources.media_store_factory,
+            local_muse_staging_dir=None,
+            public_media_fetcher_factory=media_resources.public_media_fetcher_factory,
+            bound_provider_content_fetcher_factory=_UnsupportedBoundContentFetcher,
+            local_muse_capability_factory=_UnsupportedLocalMuseCapability,
+            r2_storage_factory=_UnsupportedR2StorageCapability,
+            timeout_settings=RuntimeTimeoutSettings(
+                public_media_fetch_seconds=MAX_TRANSFER_SECONDS
             ),
-            loop_factory=asyncio.new_event_loop,
-            thread_factory=threading.Thread,
-            executor_factory=concurrent.futures.ThreadPoolExecutor,
+            concurrency_settings=RuntimeConcurrencySettings(public_media_fetches=2),
         )
         single_worker = (
             GenerationWorkerConfiguration(runtime, capabilities)
@@ -311,7 +337,7 @@ def build_image_generation_host_configuration(
             image_references_enabled=True,
         )
     except BaseException:
-        if media_runtime is not None:
+        if owns_media_resources:
             media_runtime.close()
         raise
 

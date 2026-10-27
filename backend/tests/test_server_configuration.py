@@ -200,6 +200,79 @@ def test_image_batch_is_opt_in_and_requires_one_shared_credential_bundle(
     assert combined.image_batch_enabled is True
 
 
+def test_fused_generation_is_off_by_default_and_has_an_independent_provider_allowlist(
+    tmp_path: Path,
+) -> None:
+    environment = _base_environment(tmp_path)
+    environment["ALLOWED_ORIGINS"] = "https://app.example.test"
+
+    configuration = load_server_configuration(environment)
+
+    assert configuration.fused_generation_enabled is False
+    assert configuration.fused_generation_provider_origins == ()
+
+    environment = _r2_environment(tmp_path)
+    environment.update(
+        {
+            "FUSED_GENERATION_ENABLED": "true",
+            "FUSED_GENERATION_PROVIDER_ORIGINS": (
+                "https://API.OpenAI.com:443, https://images.example.test:8443"
+            ),
+        }
+    )
+    configuration = load_server_configuration(environment)
+    assert configuration.fused_generation_enabled is True
+    assert configuration.fused_generation_provider_origins == (
+        "https://api.openai.com",
+        "https://images.example.test:8443",
+    )
+
+
+def test_fused_generation_requires_complete_storage_and_explicit_provider_origins(
+    tmp_path: Path,
+) -> None:
+    environment = _base_environment(tmp_path)
+    environment.update(
+        {
+            "FUSED_GENERATION_ENABLED": "true",
+            "FUSED_GENERATION_PROVIDER_ORIGINS": "https://api.openai.com",
+        }
+    )
+    with pytest.raises(ServerConfigurationError, match="complete object storage"):
+        load_server_configuration(environment)
+
+    environment = _r2_environment(tmp_path)
+    environment["FUSED_GENERATION_ENABLED"] = "true"
+    with pytest.raises(
+        ServerConfigurationError,
+        match="FUSED_GENERATION_PROVIDER_ORIGINS is required",
+    ):
+        load_server_configuration(environment)
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "http://images.example.test",
+        "https://images.example.test/v1",
+        "https://user:secret@images.example.test",
+        "https://127.0.0.1",
+        "https://images.example.test:0",
+        "https://images.example.test:",
+        "https://images.example.test?key=value",
+    ],
+)
+def test_fused_provider_origins_reject_non_https_or_non_origin_values(
+    tmp_path: Path,
+    origin: str,
+) -> None:
+    environment = _base_environment(tmp_path)
+    environment["FUSED_GENERATION_PROVIDER_ORIGINS"] = origin
+
+    with pytest.raises(ServerConfigurationError):
+        load_server_configuration(environment)
+
+
 def test_disabled_image_single_does_not_open_configured_credentials_file(
     tmp_path: Path,
 ) -> None:

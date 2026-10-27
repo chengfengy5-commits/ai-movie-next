@@ -9,6 +9,7 @@ FUSED_UNKNOWN_REASON = "图片生成结果待核对，请勿重新提交"
 FUSED_UNKNOWN_PROGRESS_MESSAGE = "图片生成结果待核对"
 FUSED_MEDIA_STORAGE_UNKNOWN_REASON = "图片已返回，媒体保存结果待核对"
 FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE = "图片已返回，保存结果待核对"
+FUSED_DELIVERY_PENDING_PROGRESS_MESSAGE = "融合图已生成，转存结果待核对"
 FUSED_UNKNOWN_REASONS = frozenset(
     {FUSED_UNKNOWN_REASON, FUSED_MEDIA_STORAGE_UNKNOWN_REASON}
 )
@@ -97,6 +98,13 @@ class FusedGenerationInlineImage:
 
 
 @dataclass(frozen=True, slots=True)
+class FusedGenerationStorageUnknown:
+    """A provider URL is known, but its transfer outcome is ambiguous."""
+
+    cancellation_requested: bool = False
+
+
+@dataclass(frozen=True, slots=True)
 class FusedGenerationUnknown:
     """A provider create may have happened, but no safe output was obtained."""
 
@@ -105,6 +113,9 @@ class FusedGenerationUnknown:
 
 FusedGenerationRuntimeOutput: TypeAlias = (
     FusedGenerationOutput | FusedGenerationInlineImage | FusedGenerationUnknown
+)
+FusedGenerationStorageOutcome: TypeAlias = (
+    str | None | FusedGenerationStorageUnknown
 )
 
 

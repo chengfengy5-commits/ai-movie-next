@@ -12,6 +12,7 @@ from .domain import (
     FusedGenerationInput,
     FusedGenerationInlineImage,
     FusedGenerationRuntimeOutput,
+    FusedGenerationStorageOutcome,
     FusedGenerationUnknownReason,
     FusedPromptText,
     FusedServerImageModel,
@@ -30,9 +31,11 @@ class FusedGenerationRuntime(Protocol):
 
 
 class FusedGenerationStorage(Protocol):
-    """Optional transfer adapter; returning None means keep the provider URL."""
+    """Transfer adapter; None is a definite transfer failure, not an unknown result."""
 
-    async def store_generated_image(self, provider_url: str) -> str | None: ...
+    async def store_generated_image(
+        self, provider_url: str
+    ) -> FusedGenerationStorageOutcome: ...
 
 
 class FusedGenerationImageStorage(Protocol):
@@ -55,7 +58,7 @@ class FusedGenerationUnitOfWork(Protocol):
     def claim_task(
         self, task_id: str, claim_token: str, *, expected_user_id: str
     ) -> FusedTaskClaim | None: ...
-    def authorize_inline_image_storage(
+    def authorize_media_storage(
         self, task_id: str, user_id: str, claim_token: str
     ) -> bool: ...
     def retain_unknown(
@@ -64,6 +67,13 @@ class FusedGenerationUnitOfWork(Protocol):
         user_id: str,
         claim_token: str,
         safe_reason: FusedGenerationUnknownReason,
+    ) -> bool: ...
+    def retain_known_media_result(
+        self,
+        task_id: str,
+        user_id: str,
+        claim_token: str,
+        result_url: str,
     ) -> bool: ...
     def finish_task(
         self,

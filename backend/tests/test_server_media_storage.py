@@ -24,23 +24,46 @@ from urllib.parse import urlsplit
 import httpx
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import event, insert
+from sqlalchemy import event, insert, select, update
 from sqlalchemy.engine import Engine
 
 from backend.server import __main__ as server_cli
 from backend.server import application as server_application
 from backend.server.application import _OwnedResources, create_server_host
 from backend.server.application import ServerHostAssemblyError
+from backend.server import fused_generation as server_fused_generation
 from backend.server.configuration import load_server_configuration
+from haoai_backend.admin_system_models.crypto import LegacyFernet
 from haoai_backend.authentication.tables import (
     metadata as authentication_metadata,
+    user_credits,
     user_sessions,
     users,
 )
 from haoai_backend.authentication.tokens import JoseTokenCodec
+from haoai_backend.fused_generation.domain import (
+    FusedServerImageModel,
+    PreparedFusedGeneration,
+)
+from haoai_backend.fused_generation.execution import FusedGenerationExecution
+from haoai_backend.fused_generation.persistence import fused_generation_uow_factory
+from haoai_backend.generation_catalog.tables import (
+    metadata as generation_catalog_metadata,
+    system_models,
+)
+from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
 from haoai_backend.public_site_config.tables import (
     metadata as public_config_metadata,
     system_configs,
+)
+from haoai_backend.series_data.tables import (
+    characters as generation_characters,
+    metadata as series_data_metadata,
+    series as generation_series,
+)
+from haoai_backend.series_exchange.tables import (
+    fused_assets as fused_asset_rows,
+    metadata as series_exchange_metadata,
 )
 
 
@@ -132,11 +155,17 @@ def _seed_authenticated_user(engine: Engine) -> str:
 
 
 class _FakeS3Client:
-    def __init__(self, *, close_failures: int = 0) -> None:
+    def __init__(
+        self,
+        *,
+        close_failures: int = 0,
+        state: dict[str, Any] | None = None,
+    ) -> None:
         self.calls: list[dict[str, Any]] = []
         self.head_bucket_calls: list[str] = []
         self.close_calls = 0
         self.close_failures = close_failures
+        self.state = state or {}
 
     def put_object(self, **kwargs: Any) -> dict[str, Any]:
         self.calls.append(
@@ -145,6 +174,14 @@ class _FakeS3Client:
                 "body_bytes": kwargs["Body"].read(),
             }
         )
+        put_started = self.state.get("put_started")
+        if isinstance(put_started, threading.Event):
+            put_started.set()
+        put_release = self.state.get("put_release")
+        if isinstance(put_release, threading.Event) and not put_release.wait(timeout=5):
+            raise TimeoutError("synthetic storage wait expired")
+        if self.state.get("put_mode") == "ack_unknown":
+            raise TimeoutError("synthetic write acknowledgement lost")
         return {
             "ResponseMetadata": {
                 "HTTPStatusCode": 200,
@@ -169,7 +206,10 @@ class _FakeBotoSession:
     def client(self, service: str, **kwargs: object) -> _FakeS3Client:
         assert service == "s3"
         self.state["client_options"].append(kwargs)
-        client = _FakeS3Client(close_failures=self.state["close_failures"])
+        client = _FakeS3Client(
+            close_failures=self.state["close_failures"],
+            state=self.state,
+        )
         self.state["clients"].append(client)
         return client
 
@@ -1588,3 +1628,908 @@ print("clean")
 
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "clean"
+
+
+class _FakeFusedProviderResponse:
+    def __init__(self, status_code: int, body: bytes) -> None:
+        self.status_code = status_code
+        self.headers = {"content-length": str(len(body))}
+        self._body = body
+
+    async def iter_bytes(self, *, chunk_size: int):
+        assert chunk_size > 0
+
+        async def chunks():
+            yield self._body
+
+        return chunks()
+
+
+class _FakeFusedProviderClient:
+    def __init__(self, response: _FakeFusedProviderResponse) -> None:
+        self.response = response
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+        self.request_started = threading.Event()
+        self.request_release = threading.Event()
+        self.request_release.set()
+
+    async def request(self, method: str, url: str, **kwargs: Any):
+        self.calls.append((method, url, kwargs))
+        self.request_started.set()
+        while not self.request_release.is_set():
+            await asyncio.sleep(0.005)
+        return self.response
+
+
+class _FakeFusedProviderContext:
+    def __init__(self, client: _FakeFusedProviderClient) -> None:
+        self.client = client
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, _exc_type, _exc, _traceback):
+        return None
+
+
+class _FakeFusedProviderHttpFactory:
+    def __init__(self, client: _FakeFusedProviderClient) -> None:
+        self.client = client
+
+    def __call__(self) -> _FakeFusedProviderContext:
+        return _FakeFusedProviderContext(self.client)
+
+
+def _fused_server_configuration(
+    tmp_path: Path,
+    *,
+    provider_origin: str = "https://api.openai.com",
+):
+    environment = _environment(tmp_path, storage=True)
+    environment.update(
+        {
+            "FUSED_GENERATION_ENABLED": "true",
+            "FUSED_GENERATION_PROVIDER_ORIGINS": provider_origin,
+        }
+    )
+    return load_server_configuration(environment)
+
+
+def _seed_fused_server_database(
+    engine: Engine,
+    *,
+    provider_origin: str = "https://api.openai.com",
+) -> str:
+    authentication_metadata.create_all(engine)
+    now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(users).values(
+                id="user-server-test",
+                username="server-test",
+                email="server-test@example.test",
+                hashed_password="synthetic-only",
+                is_superuser=False,
+                membership_type="premium",
+                membership_expires_at=None,
+                avatar_url=None,
+                bio=None,
+                created_at=now - timedelta(days=1),
+                password_updated_at=now - timedelta(days=1),
+            )
+        )
+        connection.execute(
+            insert(users).values(
+                id="user-server-other",
+                username="server-other",
+                email="server-other@example.test",
+                hashed_password="synthetic-only",
+                is_superuser=False,
+                membership_type="premium",
+                membership_expires_at=None,
+                avatar_url=None,
+                bio=None,
+                created_at=now - timedelta(days=1),
+                password_updated_at=now - timedelta(days=1),
+            )
+        )
+        connection.execute(
+            insert(user_sessions).values(
+                id="session-server-test",
+                user_id="user-server-test",
+                jti="jti-server-test",
+                user_agent="local test",
+                ip_address="127.0.0.1",
+                device_name="test",
+                is_active=True,
+                created_at=now - timedelta(minutes=5),
+                last_seen_at=now,
+                revoked_at=None,
+            )
+        )
+    token = JoseTokenCodec(_SECRET).encode(
+        {
+            "sub": "user-server-test",
+            "jti": "jti-server-test",
+            "exp": (now + timedelta(hours=1)).replace(tzinfo=timezone.utc),
+        }
+    )
+    Base.metadata.create_all(engine)
+    series_data_metadata.create_all(
+        engine,
+        tables=[generation_series, generation_characters],
+    )
+    generation_catalog_metadata.create_all(engine, tables=[system_models])
+    series_exchange_metadata.create_all(engine)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(user_credits).values(
+                id="credit-fused-server",
+                user_id="user-server-test",
+                credits=20,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(generation_series).values(
+                id="series-fused-server",
+                user_id="user-server-test",
+                name="合成测试剧集",
+                description="",
+                image_url=None,
+                style_prompt_id=None,
+                team_id=None,
+                claimed_by=None,
+                claimed_at=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(generation_characters).values(
+                id="character-fused-server",
+                series_id="series-fused-server",
+                name="合成角色",
+                aliases=None,
+                canonical_key=None,
+                gender=None,
+                age=None,
+                role=None,
+                appearance=None,
+                description=None,
+                image_url="https://assets.example.test/reference.png",
+                audio_url=None,
+                voice_ref=None,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+        connection.execute(
+            insert(system_models).values(
+                id="system-fused-server",
+                category="image",
+                name="合成融合模型",
+                provider="openai",
+                api_key=LegacyFernet(_SECRET).encrypt("synthetic-provider-key"),
+                model="gpt-image-1",
+                base_url=f"{provider_origin}/v1",
+                cost_per_call=4,
+                description=None,
+                params="{}",
+                is_active=True,
+                sort_order=1,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return token
+
+
+def _fused_request_body() -> dict[str, Any]:
+    return {
+        "series_id": "series-fused-server",
+        "member_type": "character",
+        "members": [{"kind": "asset", "id": "character-fused-server"}],
+        "model_id": "system-fused-server",
+        "prompt_user": "保持角色服饰一致",
+    }
+
+
+def _install_fused_fake_transports(
+    monkeypatch: pytest.MonkeyPatch,
+    body: bytes,
+    *,
+    status_code: int = 200,
+) -> tuple[_FakeFusedProviderClient, _ControlledPublicHttpLibrary]:
+    import backend.server.image_generation as image_generation_module
+
+    provider_client = _FakeFusedProviderClient(
+        _FakeFusedProviderResponse(status_code, body)
+    )
+    public_library = _ControlledPublicHttpLibrary(_prepared_png())
+    public_library.blocked = False
+    public_library.release.set()
+    monkeypatch.setattr(
+        server_fused_generation,
+        "AiohttpAsyncHttpClientFactory",
+        lambda: _FakeFusedProviderHttpFactory(provider_client),
+    )
+    monkeypatch.setattr(
+        image_generation_module,
+        "_build_http_library",
+        lambda: public_library,
+    )
+
+    async def fake_getaddrinfo(
+        host: str,
+        port: int,
+        *,
+        family: int,
+        type: int,
+    ):
+        assert host in {"assets.example.test", "provider-images.example.test"}
+        assert family == socket.AF_UNSPEC
+        assert type == socket.SOCK_STREAM
+        return (
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", port),
+            ),
+        )
+
+    monkeypatch.setattr(image_generation_module, "_system_getaddrinfo", fake_getaddrinfo)
+    return provider_client, public_library
+
+
+def _post_fused_generation(app: Any, token: str, body: dict[str, Any]) -> httpx.Response:
+    async def send() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
+            base_url="http://server-host.test",
+        ) as client:
+            return await client.post(
+                "/api/fused-assets/generate",
+                headers={"Authorization": f"Bearer {token}"},
+                json=body,
+            )
+
+    return asyncio.run(send())
+
+
+def _fused_task_row(engine: Engine, task_id: str) -> Any:
+    with engine.connect() as connection:
+        return connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+        ).mappings().one()
+
+
+def _fused_provider_response(kind: str) -> tuple[bytes, str | None]:
+    if kind == "url":
+        return (
+            json.dumps(
+                {"data": [{"url": "https://provider-images.example.test/result.png"}]}
+            ).encode(),
+            "https://provider-images.example.test/result.png",
+        )
+    if kind == "inline":
+        encoded = base64.b64encode(_prepared_png()).decode("ascii")
+        return json.dumps({"data": [{"b64_json": encoded}]}).encode(), None
+    raise AssertionError(f"unexpected test output kind: {kind}")
+
+
+@pytest.mark.parametrize(
+    ("output_kind", "provider_origin"),
+    [
+        ("url", "https://api.openai.com"),
+        ("inline", "https://api.openai.com"),
+        ("url", "https://api.openai.com:8443"),
+    ],
+)
+def test_fused_only_server_host_runs_url_and_inline_results_through_owned_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    output_kind: str,
+    provider_origin: str,
+) -> None:
+    response_body, provider_url = _fused_provider_response(output_kind)
+    provider_client, public_library = _install_fused_fake_transports(
+        monkeypatch,
+        response_body,
+    )
+    configuration = _fused_server_configuration(
+        tmp_path,
+        provider_origin=provider_origin,
+    )
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    media_runtime = host.app.state.server_resources._media_runtime
+    fused_configuration = host.app.state.server_fused_generation_configuration
+
+    assert host.app.state.server_image_generation_configuration is None
+    assert fused_configuration is not None
+    assert media_runtime.state == "new"
+    assert media_runtime.owner_thread_id is None
+    assert sdk_state["clients"] == []
+    assert provider_client.calls == []
+    assert public_library.get_calls == []
+
+    token = _seed_fused_server_database(
+        host.app.state.server_engine,
+        provider_origin=provider_origin,
+    )
+    try:
+        response = _post_fused_generation(
+            host.app,
+            token,
+            _fused_request_body(),
+        )
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+        task = _fused_task_row(host.app.state.server_engine, task_id)
+        assert task["status"] == "completed", (
+            task["recovery_status"],
+            task["result"],
+            task["progress_message"],
+            len(provider_client.calls),
+            len(public_library.get_calls),
+            len(sdk_state["clients"][0].calls) if sdk_state["clients"] else 0,
+        )
+        assert task["recovery_status"] == "ready"
+        assert task["claim_token"] is None
+        assert len(provider_client.calls) == 1
+        method, request_url, request_options = provider_client.calls[0]
+        assert method == "POST"
+        assert request_url == f"{provider_origin}/v1/images/edits"
+        assert request_options["headers"]["Authorization"] == (
+            "Bearer synthetic-provider-key"
+        )
+        assert request_options["follow_redirects"] is False
+        assert len(public_library.get_calls) == (2 if output_kind == "url" else 1)
+        assert len(sdk_state["clients"]) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+        storage_call = sdk_state["clients"][0].calls[0]
+        assert storage_call["ContentType"] == "image/png"
+        assert storage_call["body_bytes"] == _prepared_png()
+        assert storage_call["Key"].split("/")[3] == "generation"
+
+        with host.app.state.server_engine.connect() as connection:
+            assets = connection.execute(select(fused_asset_rows)).mappings().all()
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+        assert len(assets) == 1
+        assert assets[0]["status"] == "completed"
+        assert assets[0]["image_url"] == task["result"]
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        if provider_url is not None:
+            assert task["result"] == assets[0]["image_url"]
+            assert task["result"].startswith("https://cdn.example.test/media/")
+        else:
+            assert task["result"].startswith("https://cdn.example.test/media/")
+    finally:
+        host.close()
+
+    assert media_runtime.state == "closed"
+    assert sdk_state["clients"][0].close_calls == 1
+
+
+def test_fused_server_host_is_disabled_without_side_effects(tmp_path: Path) -> None:
+    configuration = load_server_configuration(_environment(tmp_path, storage=False))
+    host = create_server_host(configuration)
+    token = _seed_authenticated_user(host.app.state.server_engine)
+    try:
+        assert host.app.state.server_fused_generation_configuration is None
+        assert host.app.state.server_resources._media_runtime is None
+        response = _post_fused_generation(host.app, token, {})
+        assert response.status_code == 503
+        assert response.json() == {"detail": "融合生成服务尚未接线"}
+    finally:
+        host.close()
+
+
+def test_fused_only_host_shutdown_drains_an_active_pinned_media_call_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import backend.server.image_generation as image_generation_module
+    from haoai_backend.generation_contracts.types import ReferenceInput
+
+    library = _ControlledPublicHttpLibrary(_prepared_png())
+    monkeypatch.setattr(image_generation_module, "_build_http_library", lambda: library)
+
+    async def fake_getaddrinfo(host: str, port: int, *, family: int, type: int):
+        assert host == "assets.example.test"
+        assert family == socket.AF_UNSPEC
+        assert type == socket.SOCK_STREAM
+        return (
+            (
+                socket.AF_INET,
+                socket.SOCK_STREAM,
+                socket.IPPROTO_TCP,
+                "",
+                ("93.184.216.34", port),
+            ),
+        )
+
+    monkeypatch.setattr(image_generation_module, "_system_getaddrinfo", fake_getaddrinfo)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(
+        _fused_server_configuration(tmp_path),
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    resources = host.app.state.server_resources
+    media_runtime = resources._media_runtime
+    fused_configuration = host.app.state.server_fused_generation_configuration
+    close_calls = 0
+    original_close = media_runtime.close
+
+    def count_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        original_close()
+
+    media_runtime.close = count_close
+    assert media_runtime.state == "new"
+    assert media_runtime.owner_thread_id is None
+    assert sdk_state["clients"] == []
+
+    async def fetch_and_shutdown() -> None:
+        fetcher = fused_configuration.runtime._public_media_fetcher
+        fetch = asyncio.create_task(
+            fetcher.fetch_public(
+                ReferenceInput(
+                    kind="public_http",
+                    locator="https://assets.example.test/reference.png",
+                ),
+                max_bytes=1024,
+                timeout_seconds=5,
+            )
+        )
+        assert await asyncio.to_thread(library.first_started.wait, 3)
+        closing = asyncio.create_task(asyncio.to_thread(host.close))
+        await asyncio.sleep(0.05)
+        assert not closing.done()
+        library.release.set()
+        result = await fetch
+        assert getattr(result, "content", None) == _prepared_png()
+        await closing
+
+    try:
+        asyncio.run(fetch_and_shutdown())
+    finally:
+        library.release.set()
+        host.close()
+
+    assert close_calls == 1
+    assert media_runtime.state == "closed"
+    assert media_runtime._thread is not None and not media_runtime._thread.is_alive()
+    assert sdk_state["clients"] == []
+
+
+def test_fused_host_assembly_failure_closes_cold_media_owner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import backend.server.image_generation as image_generation_module
+    import haoai_backend.app as app_module
+
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    created_resources = []
+    original_builder = image_generation_module.build_server_media_runtime_resources
+
+    def observe_builder(*args: Any, **kwargs: Any):
+        resources = original_builder(*args, **kwargs)
+        created_resources.append(resources)
+        return resources
+
+    monkeypatch.setattr(
+        image_generation_module,
+        "build_server_media_runtime_resources",
+        observe_builder,
+    )
+
+    def fail_create_app(**_kwargs: Any):
+        raise RuntimeError("synthetic app assembly failure")
+
+    monkeypatch.setattr(app_module, "create_app", fail_create_app)
+
+    with pytest.raises(ServerHostAssemblyError, match="assembly failed"):
+        create_server_host(
+            _fused_server_configuration(tmp_path),
+            sdk_factories=(sdk_session, sdk_config),
+        )
+
+    assert len(created_resources) == 1
+    runtime = created_resources[0].runtime
+    assert runtime.state == "closed"
+    assert runtime.owner_thread_id is None
+    assert sdk_state["clients"] == []
+
+
+def test_image_worker_and_fused_runtime_share_one_owned_media_owner(
+    tmp_path: Path,
+) -> None:
+    credentials_path = _provision_image_single_bundle(tmp_path)
+    environment = _environment(tmp_path, storage=True)
+    environment.update(
+        {
+            "IMAGE_SINGLE_ENABLED": "true",
+            "IMAGE_SINGLE_CREDENTIALS_FILE": str(credentials_path),
+            "FUSED_GENERATION_ENABLED": "true",
+            "FUSED_GENERATION_PROVIDER_ORIGINS": "https://api.openai.com",
+        }
+    )
+    configuration = load_server_configuration(environment)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    image_configuration = host.app.state.server_image_generation_configuration
+    fused_configuration = host.app.state.server_fused_generation_configuration
+    media_runtime = image_configuration.media_runtime
+    assert media_runtime is not None
+    assert fused_configuration is not None
+    assert host.app.state.server_resources._media_runtime is media_runtime
+    assert fused_configuration.storage._media_store._runtime is media_runtime
+    assert fused_configuration.inline_image_storage._media_store._runtime is media_runtime
+    assert fused_configuration.runtime._public_media_fetcher._runtime is media_runtime
+    assert media_runtime.state == "new"
+    assert sdk_state["clients"] == []
+
+    close_calls = 0
+    original_close = media_runtime.close
+
+    def count_close() -> None:
+        nonlocal close_calls
+        close_calls += 1
+        original_close()
+
+    media_runtime.close = count_close
+    host.close()
+    host.close()
+
+    assert close_calls == 1
+    assert media_runtime.state == "closed"
+    assert sdk_state["clients"] == []
+
+
+def test_fused_server_storage_ack_unknown_retains_known_url_and_blocks_reexecution(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body, provider_url = _fused_provider_response("url")
+    provider_client, _public_library = _install_fused_fake_transports(
+        monkeypatch,
+        response_body,
+    )
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    sdk_state["put_mode"] = "ack_unknown"
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    token = _seed_fused_server_database(host.app.state.server_engine)
+
+    try:
+        response = _post_fused_generation(host.app, token, _fused_request_body())
+        assert response.status_code == 200, response.text
+        task_id = response.json()["task_id"]
+        task = _fused_task_row(host.app.state.server_engine, task_id)
+        assert task["status"] == "processing"
+        assert task["recovery_status"] == "provider_result_unknown"
+        assert task["progress_message"] == "融合图已生成，转存结果待核对"
+        assert task["result"] == provider_url
+        assert task["claim_token"]
+        assert len(provider_client.calls) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+        with host.app.state.server_engine.connect() as connection:
+            assert connection.execute(select(fused_asset_rows)).all() == []
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+
+        from haoai_backend.fused_generation.domain import (
+            FusedServerImageModel,
+            PreparedFusedGeneration,
+        )
+
+        prepared = PreparedFusedGeneration(
+            task_id=task_id,
+            message_id=None,
+            user_id="user-server-test",
+            series_id="series-fused-server",
+            chapter_id=None,
+            member_type="character",
+            members=({"kind": "asset", "id": "character-fused-server", "name": "合成角色"},),
+            name="角色融合 1合1",
+            size=None,
+            prompt="合成角色",
+            reference_images=("https://assets.example.test/reference.png",),
+            model_id="system-fused-server",
+            model_name="合成融合模型",
+            credit_cost=4,
+            server_model=FusedServerImageModel(
+                id="system-fused-server",
+                name="合成融合模型",
+                cost_per_call=4,
+                provider="openai",
+                wire_model="gpt-image-1",
+                api_key="synthetic-provider-key",
+                base_url="https://api.openai.com/v1",
+                params="{}",
+                is_system=True,
+            ),
+            target_frame=None,
+        )
+        fused_configuration = host.app.state.server_fused_generation_configuration
+        execution = FusedGenerationExecution(
+            runtime=fused_configuration.runtime,
+            uow_factory=fused_generation_uow_factory(host.session_factory),
+            storage=fused_configuration.storage,
+            inline_image_storage=fused_configuration.inline_image_storage,
+        )
+        asyncio.run(execution.execute(prepared))
+        assert len(provider_client.calls) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+        assert _fused_task_row(host.app.state.server_engine, task_id)["result"] == provider_url
+    finally:
+        host.close()
+
+
+def test_fused_url_transfer_cancellation_drains_storage_and_retains_original_url(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body, provider_url = _fused_provider_response("url")
+    provider_client, _public_library = _install_fused_fake_transports(
+        monkeypatch,
+        response_body,
+    )
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    sdk_state["put_started"] = threading.Event()
+    sdk_state["put_release"] = threading.Event()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    token = _seed_fused_server_database(host.app.state.server_engine)
+
+    async def send_then_cancel() -> None:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host.app, raise_app_exceptions=False),
+            base_url="http://server-host.test",
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/api/fused-assets/generate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=_fused_request_body(),
+                )
+            )
+            assert await asyncio.to_thread(sdk_state["put_started"].wait, 3)
+            request.cancel()
+            await asyncio.sleep(0)
+            assert not request.done()
+            sdk_state["put_release"].set()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+    try:
+        asyncio.run(send_then_cancel())
+        with host.app.state.server_engine.connect() as connection:
+            task_id = connection.execute(
+                select(AITaskRow.id).where(AITaskRow.type == "fused")
+            ).scalar_one()
+            assets = connection.execute(select(fused_asset_rows)).all()
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+        task = _fused_task_row(host.app.state.server_engine, task_id)
+        assert task["status"] == "processing"
+        assert task["recovery_status"] == "provider_result_unknown"
+        assert task["progress_message"] == "融合图已生成，转存结果待核对"
+        assert task["result"] == provider_url
+        assert task["claim_token"]
+        assert assets == []
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        assert len(provider_client.calls) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+    finally:
+        sdk_state["put_release"].set()
+        host.close()
+
+
+def test_fused_url_after_store_rechecks_cancellation_and_retains_stored_locator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response_body, _provider_url = _fused_provider_response("url")
+    provider_client, _public_library = _install_fused_fake_transports(
+        monkeypatch,
+        response_body,
+    )
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    sdk_state["put_started"] = threading.Event()
+    sdk_state["put_release"] = threading.Event()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    token = _seed_fused_server_database(host.app.state.server_engine)
+
+    async def send_then_cancel_task() -> tuple[httpx.Response, str]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host.app, raise_app_exceptions=False),
+            base_url="http://server-host.test",
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/api/fused-assets/generate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=_fused_request_body(),
+                )
+            )
+            assert await asyncio.to_thread(sdk_state["put_started"].wait, 3)
+            with host.app.state.server_engine.begin() as connection:
+                task_id = connection.execute(
+                    select(AITaskRow.id).where(AITaskRow.type == "fused")
+                ).scalar_one()
+                connection.execute(
+                    update(AITaskRow.__table__)
+                    .where(AITaskRow.id == task_id)
+                    .values(status="cancelling")
+                )
+            sdk_state["put_release"].set()
+            response = await request
+            return response, task_id
+
+    try:
+        response, task_id = asyncio.run(send_then_cancel_task())
+        assert response.status_code == 200, response.text
+        task = _fused_task_row(host.app.state.server_engine, task_id)
+        with host.app.state.server_engine.connect() as connection:
+            assets = connection.execute(select(fused_asset_rows)).all()
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+        assert task["status"] == "cancelling"
+        assert task["recovery_status"] == "provider_result_unknown"
+        assert task["result"].startswith("https://cdn.example.test/media/")
+        assert task["progress_message"] == "融合图已生成，转存结果待核对"
+        assert task["claim_token"]
+        assert assets == []
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        assert len(provider_client.calls) == 1
+        assert len(sdk_state["clients"][0].calls) == 1
+    finally:
+        sdk_state["put_release"].set()
+        host.close()
+
+
+@pytest.mark.parametrize("authorization_change", ["cancelling", "claim_lost", "owner_changed"])
+def test_fused_url_is_not_transferred_after_fresh_claim_authorization_is_lost(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    authorization_change: str,
+) -> None:
+    response_body, provider_url = _fused_provider_response("url")
+    provider_client, _public_library = _install_fused_fake_transports(
+        monkeypatch,
+        response_body,
+    )
+    provider_client.request_release.clear()
+    configuration = _fused_server_configuration(tmp_path)
+    sdk_session, sdk_config, sdk_state = _sdk_factories()
+    host = create_server_host(
+        configuration,
+        sdk_factories=(sdk_session, sdk_config),
+    )
+    token = _seed_fused_server_database(host.app.state.server_engine)
+
+    async def send_then_change_authorization() -> tuple[httpx.Response, str]:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=host.app, raise_app_exceptions=False),
+            base_url="http://server-host.test",
+        ) as client:
+            request = asyncio.create_task(
+                client.post(
+                    "/api/fused-assets/generate",
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=_fused_request_body(),
+                )
+            )
+            assert await asyncio.to_thread(provider_client.request_started.wait, 3)
+            with host.app.state.server_engine.begin() as connection:
+                task_id = connection.execute(
+                    select(AITaskRow.id).where(AITaskRow.type == "fused")
+                ).scalar_one()
+                values: dict[str, str] = {}
+                if authorization_change == "cancelling":
+                    values["status"] = "cancelling"
+                elif authorization_change == "claim_lost":
+                    values["claim_token"] = "lost-claim-token"
+                else:
+                    values["user_id"] = "user-server-other"
+                connection.execute(
+                    update(AITaskRow.__table__)
+                    .where(AITaskRow.id == task_id)
+                    .values(**values)
+                )
+            provider_client.request_release.set()
+            return await request, task_id
+
+    try:
+        response, task_id = asyncio.run(send_then_change_authorization())
+        assert response.status_code == 200, response.text
+        task = _fused_task_row(host.app.state.server_engine, task_id)
+        assert len(provider_client.calls) == 1
+        assert sdk_state["clients"] == []
+        with host.app.state.server_engine.connect() as connection:
+            assets = connection.execute(select(fused_asset_rows)).all()
+            credits = connection.execute(
+                select(user_credits.c.credits).where(
+                    user_credits.c.user_id == "user-server-test"
+                )
+            ).scalar_one()
+            logs = connection.execute(
+                select(CreditLogRow.__table__.c.type, CreditLogRow.__table__.c.amount)
+            ).all()
+        assert assets == []
+        assert credits == 16
+        assert [(row.type, row.amount) for row in logs] == [("usage", -4)]
+        if authorization_change == "cancelling":
+            assert task["status"] == "cancelling"
+            assert task["recovery_status"] == "provider_result_unknown"
+            assert task["result"] == provider_url
+            assert task["progress_message"] == "融合图已生成，转存结果待核对"
+            assert task["claim_token"]
+        elif authorization_change == "claim_lost":
+            assert task["status"] == "processing"
+            assert task["recovery_status"] == "ready"
+            assert task["result"] is None
+            assert task["claim_token"] == "lost-claim-token"
+        else:
+            assert task["status"] == "processing"
+            assert task["user_id"] == "user-server-other"
+            assert task["recovery_status"] == "ready"
+            assert task["result"] is None
+            assert task["claim_token"]
+    finally:
+        provider_client.request_release.set()
+        host.close()

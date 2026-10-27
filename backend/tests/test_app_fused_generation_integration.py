@@ -103,7 +103,7 @@ class FakeRuntime:
         return FusedGenerationOutput("https://provider.test/fused-result.png")
 
 
-class FailingStorage:
+class DefinitiveFailureStorage:
     def __init__(self, events):
         self.events = events
         self.urls = []
@@ -111,7 +111,7 @@ class FailingStorage:
     async def store_generated_image(self, provider_url: str) -> str | None:
         self.events.append(("storage-transfer", threading.get_ident()))
         self.urls.append(provider_url)
-        raise OSError("private storage endpoint detail")
+        return None
 
 
 class FakeProviderResponse:
@@ -244,7 +244,7 @@ class AppFixture:
     loop_threads: list[int]
     token_for: Callable[[str, bool], str]
     runtime: FakeRuntime
-    storage: FailingStorage
+    storage: DefinitiveFailureStorage
     inline_image_storage: RecordingFusedImageStorage
     inline_storage_state: FakeR2State
     inline_media_runtime: OwnedMediaRuntime
@@ -522,7 +522,7 @@ def fused_app(tmp_path: Path):
 
     loop_threads: list[int] = []
     runtime = FakeRuntime(events, business_sessions)
-    storage = FailingStorage(events)
+    storage = DefinitiveFailureStorage(events)
     inline_storage_state = FakeR2State()
     media_directory = tmp_path / "fused-inline-media"
     media_directory.mkdir()

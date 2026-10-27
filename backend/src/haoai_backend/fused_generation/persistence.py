@@ -29,6 +29,7 @@ from haoai_backend.series_exchange.tables import fused_assets
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import (
+    FUSED_DELIVERY_PENDING_PROGRESS_MESSAGE,
     FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE,
     FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
     FUSED_UNKNOWN_PROGRESS_MESSAGE,
@@ -347,7 +348,7 @@ class SqlAlchemyFusedGenerationUnitOfWork:
         ).scalar_one_or_none()
         return FusedTaskClaim(cancelled=cancelled is not None)
 
-    def authorize_inline_image_storage(
+    def authorize_media_storage(
         self,
         task_id: str,
         user_id: str,
@@ -431,6 +432,63 @@ class SqlAlchemyFusedGenerationUnitOfWork:
                 recovery_status="provider_result_unknown",
                 result=reason,
                 progress_message=progress_message,
+                updated_at=self.current_time(),
+            )
+        )
+        return result.rowcount == 1
+
+    def retain_known_media_result(
+        self,
+        task_id: str,
+        user_id: str,
+        claim_token: str,
+        result_url: str,
+    ) -> bool:
+        if (
+            type(result_url) is not str
+            or not result_url
+            or result_url != result_url.strip()
+        ):
+            return False
+        task_table = AITaskRow.__table__
+        task = self._session.execute(
+            select(
+                task_table.c.type,
+                task_table.c.user_id,
+                task_table.c.status,
+                task_table.c.claim_token,
+                task_table.c.request_data,
+                task_table.c.recovery_status,
+            )
+            .where(task_table.c.id == task_id)
+            .with_for_update()
+        ).mappings().one_or_none()
+        if (
+            task is None
+            or task["type"] != "fused"
+            or task["user_id"] != user_id
+            or task["status"] not in {"processing", "cancelling"}
+            or task["claim_token"] != claim_token
+            or task["recovery_status"] != "ready"
+            or not is_server_controlled_fused_task(task["type"], task["request_data"])
+        ):
+            return False
+
+        result = self._session.execute(
+            update(task_table)
+            .where(
+                task_table.c.id == task_id,
+                task_table.c.user_id == user_id,
+                task_table.c.type == "fused",
+                task_table.c.status.in_(("processing", "cancelling")),
+                task_table.c.claim_token == claim_token,
+                task_table.c.request_data == task["request_data"],
+                task_table.c.recovery_status == "ready",
+            )
+            .values(
+                recovery_status="provider_result_unknown",
+                result=result_url,
+                progress_message=FUSED_DELIVERY_PENDING_PROGRESS_MESSAGE,
                 updated_at=self.current_time(),
             )
         )

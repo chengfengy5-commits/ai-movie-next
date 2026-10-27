@@ -70,6 +70,8 @@ class ExecutionState:
         self.finish_attempt_count = 0
         self.retain_attempt_count = 0
         self.retain_count = 0
+        self.retain_known_attempt_count = 0
+        self.retain_known_count = 0
         self.commit_count = 0
         self.finish_args = []
         self.events = []
@@ -152,7 +154,22 @@ class FakeUnitOfWork:
         )
         return True
 
-    def authorize_inline_image_storage(self, task_id, user_id, claim_token):
+    def retain_known_media_result(self, task_id, user_id, claim_token, result_url):
+        self.state.retain_known_attempt_count += 1
+        if (
+            self.state.user_id != user_id
+            or self.state.status not in {"processing", "cancelling"}
+            or self.state.claim_token != claim_token
+            or self.state.recovery_status != "ready"
+        ):
+            return False
+        self.state.retain_known_count += 1
+        self.state.recovery_status = "provider_result_unknown"
+        self.state.result = result_url
+        self.state.progress_message = "融合图已生成，转存结果待核对"
+        return True
+
+    def authorize_media_storage(self, task_id, user_id, claim_token):
         self.state.storage_authorize_count += 1
         return (
             self.state.server_owned
@@ -354,7 +371,7 @@ class FailingStorage:
     async def store_generated_image(self, provider_url: str) -> str | None:
         assert self.state.active_sessions == 0
         self.calls.append(provider_url)
-        raise OSError("temporary storage failure")
+        return None
 
 
 def test_storage_failure_keeps_provider_url_and_duplicate_execution_is_terminal_noop():
@@ -561,6 +578,36 @@ def test_cancel_during_inline_finish_accepts_committed_terminal_without_retentio
     assert state.finish_count == 1
     assert state.retain_attempt_count == 0
     assert state.retain_count == 0
+    assert state.open_count == state.close_count
+    assert state.active_sessions == 0
+
+
+def test_cancel_during_url_finish_retains_known_url_when_cas_does_not_terminalize():
+    state = ExecutionState()
+    runtime = Runtime(state)
+    execution = FusedGenerationExecution(runtime, BlockingFinishFactory(state))
+
+    async def exercise():
+        task = asyncio.create_task(execution.execute(_prepared()))
+        assert await asyncio.to_thread(state.finish_started.wait, 2)
+        state.status = "cancelling"
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        state.finish_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert state.status == "cancelling"
+    assert state.claim_token is not None
+    assert state.recovery_status == "provider_result_unknown"
+    assert state.result == "https://provider.test/result.png"
+    assert state.progress_message == "融合图已生成，转存结果待核对"
+    assert state.retain_known_attempt_count == 1
+    assert state.retain_known_count == 1
+    assert state.finish_count == 0
     assert state.open_count == state.close_count
     assert state.active_sessions == 0
 

@@ -56,11 +56,13 @@ from haoai_backend.generation_runtime.worker_capacity import WorkerCapacityBoots
 
 from .browser_cors import ServerBrowserCorsApp
 from .configuration import ServerConfiguration, ServerConfigurationError
+from .fused_generation import FusedGenerationHostConfiguration
 from .generation import (
     _database_clock,
     _uuid_id,
     build_frame_optimize_configuration,
 )
+from .media_runtime import ServerMediaRuntimeResources
 
 
 class ServerHostAssemblyError(RuntimeError):
@@ -197,6 +199,8 @@ def create_server_host(
 
     engine: Engine | None = None
     resources: _OwnedResources | None = None
+    media_runtime_resources: ServerMediaRuntimeResources | None = None
+    fused_generation_configuration: FusedGenerationHostConfiguration | None = None
     try:
         engine = _create_engine(configuration.database_url)
         session_factory = sessionmaker(
@@ -269,6 +273,21 @@ def create_server_host(
             )
 
         image_generation_configuration = None
+        generation_media_enabled = bool(
+            configuration.image_single_enabled
+            or configuration.image_batch_enabled
+            or configuration.video_single_enabled
+            or configuration.fused_generation_enabled
+        )
+        if generation_media_enabled:
+            from .image_generation import build_server_media_runtime_resources
+
+            media_runtime_resources = build_server_media_runtime_resources(
+                configuration,
+                s3_client_factory=upload_factory,
+                include_video=configuration.video_single_enabled,
+            )
+
         if (
             configuration.image_single_enabled
             or configuration.image_batch_enabled
@@ -280,6 +299,17 @@ def create_server_host(
                 configuration,
                 session_factory=session_factory,
                 s3_client_factory=upload_factory,
+                shared_media_resources=media_runtime_resources,
+            )
+
+        if configuration.fused_generation_enabled:
+            from .fused_generation import build_fused_generation_host_configuration
+
+            fused_generation_configuration = (
+                build_fused_generation_host_configuration(
+                    configuration,
+                    media_resources=media_runtime_resources,
+                )
             )
 
         chat_text_generation_configuration = None
@@ -326,8 +356,8 @@ def create_server_host(
             engine,
             storage,
             (
-                image_generation_configuration.media_runtime
-                if image_generation_configuration is not None
+                media_runtime_resources.runtime
+                if media_runtime_resources is not None
                 else None
             ),
         )
@@ -351,6 +381,21 @@ def create_server_host(
             ),
             runtime_status_storage_probe=storage_probe,
             media_upload_application=media_application,
+            fused_generation_runtime=(
+                fused_generation_configuration.runtime
+                if fused_generation_configuration is not None
+                else None
+            ),
+            fused_generation_storage=(
+                fused_generation_configuration.storage
+                if fused_generation_configuration is not None
+                else None
+            ),
+            fused_generation_inline_image_storage=(
+                fused_generation_configuration.inline_image_storage
+                if fused_generation_configuration is not None
+                else None
+            ),
             frame_optimize_worker_configuration=frame_optimize_configuration,
             storyboard_asset_generation_runtime=storyboard_asset_generation_runtime,
             chat_media_admission_configuration=(
@@ -385,6 +430,9 @@ def create_server_host(
         app.state.server_image_generation_configuration = (
             image_generation_configuration
         )
+        app.state.server_fused_generation_configuration = (
+            fused_generation_configuration
+        )
         app.state.server_image_batch_worker_configuration = (
             image_generation_configuration.image_batch_worker_configuration
             if image_generation_configuration is not None
@@ -417,11 +465,17 @@ def create_server_host(
                 resources.close()
             except BaseException:
                 cleanup_failed = True
-        elif engine is not None:
-            try:
-                engine.dispose()
-            except BaseException:
-                cleanup_failed = True
+        else:
+            if media_runtime_resources is not None:
+                try:
+                    media_runtime_resources.runtime.close()
+                except BaseException:
+                    cleanup_failed = True
+            if engine is not None:
+                try:
+                    engine.dispose()
+                except BaseException:
+                    cleanup_failed = True
         if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
             raise
         if cleanup_failed:
