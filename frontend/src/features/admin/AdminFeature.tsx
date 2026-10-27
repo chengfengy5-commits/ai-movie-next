@@ -29,6 +29,9 @@ import { DEFAULT_ADMIN_TASK_LIST_STATE, type AdminTaskListState, type AdminTasks
 import { AdminSmtpAccounts } from "../admin-smtp-accounts/AdminSmtpAccounts";
 import { createAdminSmtpAccountsApi } from "../admin-smtp-accounts/adminSmtpAccountsApi";
 import type { AdminSmtpAccountExitSnapshot, AdminSmtpAccountMode, AdminSmtpAccountsApi, PendingAdminSmtpAccountExit } from "../admin-smtp-accounts/adminSmtpAccountsTypes";
+import { createAistarslabApi } from "./aistarslabApi";
+import type { AistarslabQuickConfigExitNotice } from "./AistarslabQuickConfig";
+import type { AistarslabApi } from "./aistarslabApi";
 import "./Admin.css";
 
 const ADMIN_TOKEN_KEY = "admin_token";
@@ -106,6 +109,14 @@ interface ActiveSmtpAccountExit {
   viewIdentity: number;
   sessionGeneration: number;
   api: AdminSmtpAccountsApi;
+}
+
+interface ActiveAistarslabQuickConfigExit {
+  owner: symbol;
+  notice: AistarslabQuickConfigExitNotice;
+  viewIdentity: number;
+  sessionGeneration: number;
+  api: AistarslabApi;
 }
 
 interface AdminFeatureProps {
@@ -249,6 +260,8 @@ export function AdminFeature({
   const tasksApiRef = useRef<AdminTasksApi | null>(null);
   const smtpAccountsExit = useRef<ActiveSmtpAccountExit | null>(null);
   const smtpAccountsApiRef = useRef<AdminSmtpAccountsApi | null>(null);
+  const aistarslabExit = useRef<ActiveAistarslabQuickConfigExit | null>(null);
+  const aistarslabApiRef = useRef<AistarslabApi | null>(null);
   const [seriesListState, setSeriesListState] = useState<AdminSeriesListState>(DEFAULT_ADMIN_SERIES_LIST_STATE);
   const [taskListState, setTaskListState] = useState<AdminTaskListState>(DEFAULT_ADMIN_TASK_LIST_STATE);
   const [seriesListVersion, setSeriesListVersion] = useState(0);
@@ -315,10 +328,23 @@ export function AdminFeature({
           : message + "\n\n离开会放弃当前草稿。仍要离开吗？";
       if (!window.confirm(question)) return false;
     }
+    const aistarslabPending = aistarslabExit.current;
+    if (!options?.force && aistarslabPending
+      && aistarslabPending.viewIdentity === viewIdentity.current
+      && aistarslabPending.sessionGeneration === sessionGeneration.current
+      && aistarslabPending.api === aistarslabApiRef.current) {
+      const question = aistarslabPending.notice.kind === "write-in-flight"
+        ? "AIStarsLab 系统模型创建请求已发出。离开会停止本地跟踪，但不能撤销服务端操作。仍要离开吗？"
+        : aistarslabPending.notice.kind === "created-needs-readback"
+          ? "AIStarsLab 系统模型已创建，但详情尚未核对。离开会停止本地核对，不会撤销创建。仍要离开吗？"
+          : "AIStarsLab 系统模型创建结果未知；服务端可能已经新增了共享模型。离开会停止本地跟踪，不会自动重试或按名称认领。仍要离开吗？";
+      if (!window.confirm(question)) return false;
+    }
     membershipExit.current = null;
     systemConfigExit.current = null;
     seriesExit.current = null;
     smtpAccountsExit.current = null;
+    aistarslabExit.current = null;
     viewIdentity.current += 1;
     setView(nextView);
     return true;
@@ -328,6 +354,11 @@ export function AdminFeature({
     () => createAdminApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
   );
+  const aistarslabApi = useMemo(
+    () => createAistarslabApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
+    [fetcher, safeApiBaseUrl, storage],
+  );
+  aistarslabApiRef.current = aistarslabApi;
   const promptsApi = useMemo(
     () => createSystemPromptsApi(fetcher, () => storage.getItem(ADMIN_TOKEN_KEY), safeApiBaseUrl),
     [fetcher, safeApiBaseUrl, storage],
@@ -372,6 +403,7 @@ export function AdminFeature({
     systemConfigExit.current = null;
     seriesExit.current = null;
     smtpAccountsExit.current = null;
+    aistarslabExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -386,6 +418,7 @@ export function AdminFeature({
     systemConfigExit.current = null;
     seriesExit.current = null;
     smtpAccountsExit.current = null;
+    aistarslabExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -402,6 +435,7 @@ export function AdminFeature({
     systemConfigExit.current = null;
     seriesExit.current = null;
     smtpAccountsExit.current = null;
+    aistarslabExit.current = null;
     setSeriesListState(DEFAULT_ADMIN_SERIES_LIST_STATE);
     setTaskListState(DEFAULT_ADMIN_TASK_LIST_STATE);
     setSeriesNotice(null);
@@ -419,7 +453,24 @@ export function AdminFeature({
   const activeSessionGeneration = sessionGeneration.current;
   const activeMembershipApi = membershipApi;
   const activeSystemConfigApi = systemConfigApi;
+  const activeAistarslabApi = aistarslabApi;
   const activeAdministratorId = session?.user.id ?? "";
+  const handleAistarslabExitStateChange = useCallback((owner: symbol, notice: AistarslabQuickConfigExitNotice | null) => {
+    if (viewIdentity.current !== activeViewIdentity || sessionGeneration.current !== activeSessionGeneration
+      || aistarslabApiRef.current !== activeAistarslabApi
+      || (view.kind !== "model-create" && view.kind !== "model-edit")) return;
+    if (notice) {
+      aistarslabExit.current = {
+        owner,
+        notice,
+        viewIdentity: activeViewIdentity,
+        sessionGeneration: activeSessionGeneration,
+        api: activeAistarslabApi,
+      };
+    } else if (aistarslabExit.current?.owner === owner) {
+      aistarslabExit.current = null;
+    }
+  }, [activeAistarslabApi, activeSessionGeneration, activeViewIdentity, view.kind]);
   const membershipOwnerScope = "session-" + activeSessionGeneration + ":admin-" + activeAdministratorId;
   const membershipViewKey = view.kind === "redemption-codes" ? "redemption/list"
     : view.kind === "redemption-create" ? "redemption/create"
@@ -840,22 +891,30 @@ export function AdminFeature({
           ) : view.kind === "system-models" ? (
             <SystemModels
               api={api}
+              aistarslabApi={aistarslabApi}
+              adminActorId={session?.user.id ?? ""}
+              adminSessionGeneration={activeSessionGeneration}
               onUnauthorized={handleUnauthorized}
               mode="list"
               modelId={undefined}
               onCreate={() => navigate({ kind: "model-create" })}
               onEdit={(id) => navigate({ kind: "model-edit", id })}
               reloadVersion={modelListVersion}
+              onAistarslabExitStateChange={handleAistarslabExitStateChange}
             />
           ) : view.kind === "model-create" || view.kind === "model-edit" ? (
             <SystemModels
               api={api}
+              aistarslabApi={aistarslabApi}
+              adminActorId={session?.user.id ?? ""}
+              adminSessionGeneration={activeSessionGeneration}
               onUnauthorized={handleUnauthorized}
               onCancel={() => navigate({ kind: "system-models" })}
               onSaved={handleModelsSaved}
               mode={view.kind === "model-create" ? "create" : "edit"}
               modelId={view.kind === "model-edit" ? view.id : undefined}
               reloadVersion={modelListVersion}
+              onAistarslabExitStateChange={handleAistarslabExitStateChange}
             />
           ) : view.kind === "system-prompts" || view.kind === "prompt-create" || view.kind === "prompt-edit" ? (
             <SystemPrompts
