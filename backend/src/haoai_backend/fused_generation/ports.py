@@ -11,6 +11,7 @@ from haoai_backend.shared.identity import TrustedActor
 from .domain import (
     FusedGenerationInput,
     FusedGenerationOutput,
+    FusedGenerationUnknown,
     FusedPromptText,
     FusedServerImageModel,
     FusedTaskClaim,
@@ -21,7 +22,9 @@ from .domain import (
 class FusedGenerationRuntime(Protocol):
     """Configured server-side driver; receives only the selected model identity."""
 
-    async def generate(self, request: FusedGenerationInput) -> FusedGenerationOutput: ...
+    async def generate(
+        self, request: FusedGenerationInput
+    ) -> FusedGenerationOutput | FusedGenerationUnknown: ...
 
 
 class FusedGenerationStorage(Protocol):
@@ -41,7 +44,16 @@ class FusedGenerationUnitOfWork(Protocol):
     def resolve_image_prompt(self, user_id: str, prompt_id: str) -> FusedPromptText | None: ...
     def load_chapter(self, chapter_id: str) -> Mapping[str, object] | None: ...
     def stage_request(self, prepared: PreparedFusedGeneration, user_id: str) -> None: ...
-    def claim_task(self, task_id: str, claim_token: str) -> FusedTaskClaim | None: ...
+    def claim_task(
+        self, task_id: str, claim_token: str, *, expected_user_id: str
+    ) -> FusedTaskClaim | None: ...
+    def retain_unknown(
+        self,
+        task_id: str,
+        user_id: str,
+        claim_token: str,
+        safe_reason: str,
+    ) -> bool: ...
     def finish_task(
         self,
         prepared: PreparedFusedGeneration,

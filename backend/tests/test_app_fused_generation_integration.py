@@ -25,8 +25,15 @@ from haoai_backend.authentication.tables import (
 )
 from haoai_backend.authentication.tokens import JoseTokenCodec
 from haoai_backend.chat_data.tables import chat_messages, metadata as chat_metadata
-from haoai_backend.fused_generation.domain import FusedGenerationOutput
+from haoai_backend.fused_generation.domain import (
+    FusedGenerationOutput,
+    FusedServerImageModel,
+    PreparedFusedGeneration,
+)
 from haoai_backend.fused_generation.errors import ProviderGenerationFailure
+from haoai_backend.fused_generation.execution import FusedGenerationExecution
+from haoai_backend.fused_generation.openai_runtime import FusedOpenAIImageRuntime
+from haoai_backend.fused_generation.persistence import fused_generation_uow_factory
 from haoai_backend.generation_catalog.tables import (
     metadata as catalog_metadata,
     model_configs,
@@ -35,6 +42,7 @@ from haoai_backend.generation_catalog.tables import (
     system_prompts,
 )
 from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
+from haoai_backend.generation_contracts import PreparedReference
 from haoai_backend.series_data.tables import (
     chapters,
     characters,
@@ -84,6 +92,55 @@ class FailingStorage:
         self.events.append(("storage-transfer", threading.get_ident()))
         self.urls.append(provider_url)
         raise OSError("private storage endpoint detail")
+
+
+class FakeProviderResponse:
+    def __init__(self, status_code: int, body: bytes) -> None:
+        self.status_code = status_code
+        self.headers = {"content-length": str(len(body))}
+        self.body = body
+
+    async def iter_bytes(self, *, chunk_size: int):
+        async def chunks():
+            if self.body:
+                yield self.body
+
+        return chunks()
+
+
+class FakeProviderHttpClient:
+    def __init__(self, response: FakeProviderResponse) -> None:
+        self.response = response
+        self.calls = []
+
+    async def request(self, method, url, **kwargs):
+        self.calls.append((method, url, kwargs))
+        return self.response
+
+
+class FakeProviderHttpContext:
+    def __init__(self, client: FakeProviderHttpClient) -> None:
+        self.client = client
+
+    async def __aenter__(self):
+        return self.client
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        return None
+
+
+class FakePublicMediaFetcher:
+    def __init__(self) -> None:
+        self.calls = []
+
+    async def fetch_public(self, reference, *, max_bytes: int, timeout_seconds: float):
+        self.calls.append((reference, max_bytes, timeout_seconds))
+        return PreparedReference(
+            kind="bytes",
+            locator=None,
+            content=b"synthetic-public-reference-image",
+            media_type="image/png",
+        )
 
 
 @dataclass
@@ -417,6 +474,86 @@ def _request(
             return await client.post("/api/fused-assets/generate", **kwargs)
 
     return asyncio.run(send())
+
+
+def _task_api_request(
+    fixture: AppFixture,
+    method: str,
+    path: str,
+    *,
+    body: dict[str, Any],
+) -> httpx.Response:
+    async def send() -> httpx.Response:
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=fixture.app, raise_app_exceptions=False),
+            base_url="http://fused-generation.test",
+        ) as client:
+            return await client.request(
+                method,
+                path,
+                headers={
+                    "Authorization": f"Bearer {fixture.token_for('owner', False)}"
+                },
+                json=body,
+            )
+
+    return asyncio.run(send())
+
+
+def _configure_openai_runtime(
+    fixture: AppFixture, response: FakeProviderResponse
+) -> tuple[FusedOpenAIImageRuntime, FakeProviderHttpClient, FakePublicMediaFetcher]:
+    with fixture.engine.begin() as connection:
+        connection.execute(
+            update(system_models)
+            .where(system_models.c.id == "system-model")
+            .values(provider="openai", base_url="https://api.openai.com/v1")
+        )
+    client = FakeProviderHttpClient(response)
+    media_fetcher = FakePublicMediaFetcher()
+    runtime = FusedOpenAIImageRuntime(
+        http_client_factory=lambda: FakeProviderHttpContext(client),
+        public_media_fetcher=media_fetcher,
+    )
+    fixture.app = create_app(
+        session_factory=fixture.business_factory,
+        authentication_runtime=fixture.authentication_runtime,
+        fused_generation_runtime=runtime,
+        fused_generation_storage=fixture.storage,
+    )
+    return runtime, client, media_fetcher
+
+
+def _prepared_for_duplicate_execution(
+    task_id: str,
+    message_id: str,
+) -> PreparedFusedGeneration:
+    return PreparedFusedGeneration(
+        task_id=task_id,
+        message_id=message_id,
+        user_id="owner",
+        series_id="series-owner",
+        chapter_id=None,
+        member_type="character",
+        members=({"kind": "asset", "id": "character-owner", "name": "林岚"},),
+        name="角色融合 1合1",
+        size=None,
+        prompt="【角色资产对照】\n图片1 = 林岚",
+        reference_images=("https://assets.test/lin.png",),
+        model_id="system-model",
+        model_name="系统融合模型",
+        credit_cost=4,
+        server_model=FusedServerImageModel(
+            id="system-model",
+            name="系统融合模型",
+            cost_per_call=4,
+            provider="openai",
+            wire_model="image-v1",
+            api_key=SERVER_KEY,
+            base_url="https://api.openai.com/v1",
+        ),
+        target_frame=None,
+    )
 
 
 def _body(*, model_id: str = "system-model", prompt_id: str | None = None) -> dict[str, Any]:
@@ -883,3 +1020,179 @@ def test_real_http_provider_failure_refunds_once_and_sanitizes_persisted_error(
         (4, "refund", "任务失败退回 4 积分"),
     }
     assert SERVER_KEY not in response.text
+
+
+def test_real_openai_runtime_url_success_creates_asset_once_through_jwt_route(
+    fused_app: AppFixture,
+):
+    fixture = fused_app
+    provider_url = "https://cdn.openai.example/fused-result.png"
+    body = json.dumps({"data": [{"url": provider_url}]}).encode("utf-8")
+    runtime, client, fetcher = _configure_openai_runtime(
+        fixture, FakeProviderResponse(200, body)
+    )
+
+    response = _request(fixture, token=fixture.token_for("owner", False), body=_body())
+
+    assert response.status_code == 200, response.text
+    task_id = response.json()["task_id"]
+    assert len(client.calls) == 1
+    method, url, kwargs = client.calls[0]
+    assert method == "POST"
+    assert url == "https://api.openai.com/v1/images/edits"
+    assert kwargs["follow_redirects"] is False
+    assert kwargs["headers"]["Authorization"] == f"Bearer {SERVER_KEY}"
+    assert kwargs["content"].count(b'name="image"') == 1
+    assert fetcher.calls
+    assert fetcher.calls[0][0].locator == "https://assets.test/lin.png"
+    assert fixture.storage.urls == [provider_url]
+
+    with fixture.engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        logs = connection.execute(
+            select(CreditLogRow.__table__).where(CreditLogRow.user_id == "owner")
+        ).mappings().all()
+        balance = connection.execute(
+            select(user_credits.c.credits).where(user_credits.c.user_id == "owner")
+        ).scalar_one()
+        chapter_content = connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-owner")
+        ).scalar_one()
+    assert task["status"] == "completed"
+    assert task["claim_token"] is None
+    assert task["recovery_status"] == "ready"
+    assert len(assets) == 1 and assets[0]["status"] == "completed"
+    assert assets[0]["image_url"] == provider_url
+    assert len(logs) == 1 and logs[0]["type"] == "usage"
+    assert balance == 16
+    assert json.loads(chapter_content)[0]["fused"] == [assets[0]["id"]]
+
+    duplicate = _prepared_for_duplicate_execution(
+        task_id,
+        response.json()["message_id"],
+    )
+    asyncio.run(
+        FusedGenerationExecution(
+            runtime,
+            fused_generation_uow_factory(fixture.business_factory),
+            fixture.storage,
+        ).execute(duplicate)
+    )
+    assert len(client.calls) == 1
+
+
+def test_real_openai_runtime_unknown_is_retained_and_generic_writes_are_guarded(
+    fused_app: AppFixture,
+):
+    fixture = fused_app
+    runtime, client, _ = _configure_openai_runtime(
+        fixture, FakeProviderResponse(500, b"provider response with private detail")
+    )
+
+    response = _request(fixture, token=fixture.token_for("owner", False), body=_body())
+
+    assert response.status_code == 200, response.text
+    task_id = response.json()["task_id"]
+    assert len(client.calls) == 1
+    assert fixture.storage.urls == []
+
+    with fixture.engine.connect() as connection:
+        task_before = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+        ).mappings().one()
+        assets_before = connection.execute(select(fused_assets)).mappings().all()
+        logs_before = connection.execute(
+            select(CreditLogRow.__table__).where(CreditLogRow.user_id == "owner")
+        ).mappings().all()
+        balance_before = connection.execute(
+            select(user_credits.c.credits).where(user_credits.c.user_id == "owner")
+        ).scalar_one()
+        chapter_before = connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-owner")
+        ).scalar_one()
+    claim_token = task_before["claim_token"]
+    assert task_before["status"] == "processing"
+    assert task_before["recovery_status"] == "provider_result_unknown"
+    assert task_before["result"] == "图片生成结果待核对，请勿重新提交"
+    assert task_before["progress_message"] == "图片生成结果待核对"
+    assert claim_token
+    assert json.loads(task_before["request_data"])["server_controlled_execution"] == (
+        "fused_generation_runtime_v1"
+    )
+    assert assets_before == []
+    assert len(logs_before) == 1 and logs_before[0]["type"] == "usage"
+    assert balance_before == 16
+    assert json.loads(chapter_before)[0]["fused"] == []
+
+    status_update = _task_api_request(
+        fixture,
+        "PUT",
+        f"/api/tasks/{task_id}",
+        body={"status": "failed", "result": "late generic status"},
+    )
+    progress_update = _task_api_request(
+        fixture,
+        "PUT",
+        f"/api/tasks/{task_id}/progress",
+        body={"progress": 100, "progress_message": "late generic progress"},
+    )
+    assert status_update.status_code == 409, status_update.text
+    assert progress_update.status_code == 409, progress_update.text
+
+    duplicate = _prepared_for_duplicate_execution(
+        task_id,
+        response.json()["message_id"],
+    )
+    asyncio.run(
+        FusedGenerationExecution(
+            runtime,
+            fused_generation_uow_factory(fixture.business_factory),
+            fixture.storage,
+        ).execute(duplicate)
+    )
+    assert len(client.calls) == 1
+
+    legacy_create = _task_api_request(
+        fixture,
+        "POST",
+        "/api/tasks",
+        body={"type": "fused", "credit_cost": 0, "request_data": "{}"},
+    )
+    assert legacy_create.status_code == 200, legacy_create.text
+    legacy_task_id = legacy_create.json()["id"]
+    legacy_status = _task_api_request(
+        fixture,
+        "PUT",
+        f"/api/tasks/{legacy_task_id}",
+        body={"status": "failed", "result": "legacy update"},
+    )
+    legacy_progress = _task_api_request(
+        fixture,
+        "PUT",
+        f"/api/tasks/{legacy_task_id}/progress",
+        body={"progress": 31, "progress_message": "legacy progress"},
+    )
+    assert legacy_status.status_code == 200, legacy_status.text
+    assert legacy_progress.status_code == 200, legacy_progress.text
+
+    with fixture.engine.connect() as connection:
+        task_after = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+        ).mappings().one()
+        assets_after = connection.execute(select(fused_assets)).mappings().all()
+        logs_after = connection.execute(
+            select(CreditLogRow.__table__).where(CreditLogRow.user_id == "owner")
+        ).mappings().all()
+        balance_after = connection.execute(
+            select(user_credits.c.credits).where(user_credits.c.user_id == "owner")
+        ).scalar_one()
+    assert task_after["status"] == "processing"
+    assert task_after["claim_token"] == claim_token
+    assert task_after["recovery_status"] == "provider_result_unknown"
+    assert task_after["progress_message"] == "图片生成结果待核对"
+    assert assets_after == []
+    assert len(logs_after) == 1 and logs_after[0]["type"] == "usage"
+    assert balance_after == 16

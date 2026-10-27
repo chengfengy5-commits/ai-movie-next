@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import json
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -17,12 +19,22 @@ from haoai_backend.authentication.tables import (
     users,
 )
 from haoai_backend.chat_data.tables import chat_messages, metadata as chat_metadata
-from haoai_backend.fused_generation.domain import FusedFrameTarget, FusedServerImageModel, PreparedFusedGeneration
+from haoai_backend.fused_generation.domain import (
+    FUSED_UNKNOWN_PROGRESS_MESSAGE,
+    FUSED_UNKNOWN_REASON,
+    FusedFrameTarget,
+    FusedGenerationUnknown,
+    FusedServerImageModel,
+    PreparedFusedGeneration,
+)
 from haoai_backend.fused_generation.errors import (
     FusedGenerationPaymentRequired,
     FusedGenerationUnavailable,
 )
 from haoai_backend.fused_generation.persistence import SqlAlchemyFusedGenerationUnitOfWork
+from haoai_backend.fused_generation.execution import FusedGenerationExecution
+from haoai_backend.fused_generation.persistence import fused_generation_uow_factory
+from haoai_backend.fused_generation.ownership import FUSED_SERVER_CONTROL_MARKER
 from haoai_backend.generation_catalog.tables import (
     metadata as catalog_metadata,
     model_configs,
@@ -341,7 +353,9 @@ def test_failure_finalization_refunds_once_and_duplicate_terminal_delivery_is_no
     _stage_task(factory, prepared)
 
     claim_uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
-    claim = claim_uow.claim_task(prepared.task_id, "claim-a")
+    claim = claim_uow.claim_task(
+        prepared.task_id, "claim-a", expected_user_id=prepared.user_id
+    )
     assert claim is not None and claim.cancelled is False
     claim_uow.commit()
     claim_uow.close()
@@ -373,6 +387,233 @@ def test_failure_finalization_refunds_once_and_duplicate_terminal_delivery_is_no
     assert asset["status"] == "failed"
     assert asset["error_message"] == "上游暂时不可用"
     assert json.loads(chapter_content)[0]["fused"] == [asset["id"]]
+
+
+def test_unknown_retention_requires_owner_token_and_marked_fused_task_and_blocks_late_finish(
+    fused_database,
+):
+    engine, factory = fused_database
+    prepared = _prepared()
+    _stage_task(factory, prepared)
+
+    claim_uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    claim = claim_uow.claim_task(
+        prepared.task_id, "claim-a", expected_user_id=prepared.user_id
+    )
+    assert claim is not None and claim.cancelled is False
+    claim_uow.commit()
+    claim_uow.close()
+
+    uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert not uow.retain_unknown(prepared.task_id, "other-user", "claim-a", "private")
+    assert not uow.retain_unknown(prepared.task_id, prepared.user_id, "wrong-token", "private")
+    assert uow.retain_unknown(prepared.task_id, prepared.user_id, "claim-a", "upstream secret")
+    uow.commit()
+    uow.close()
+
+    claim_again = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert claim_again.claim_task(
+        prepared.task_id, "claim-b", expected_user_id=prepared.user_id
+    ) is None
+    claim_again.rollback()
+    claim_again.close()
+
+    late_finish = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    late_finish.finish_task(
+        prepared,
+        "claim-a",
+        image_url="https://provider.test/late-success.png",
+        error_message=None,
+    )
+    late_finish.commit()
+    late_finish.close()
+
+    with engine.connect() as connection:
+        task = connection.execute(select(AITaskRow.__table__)).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+    assert task["status"] == "processing"
+    assert task["claim_token"] == "claim-a"
+    assert task["recovery_status"] == "provider_result_unknown"
+    assert task["result"] == FUSED_UNKNOWN_REASON
+    assert task["progress_message"] == FUSED_UNKNOWN_PROGRESS_MESSAGE
+    assert assets == []
+    assert wallet == 12
+    assert logs == []
+
+
+def test_unknown_retention_accepts_existing_cancelling_status_and_preserves_it(
+    fused_database,
+):
+    engine, factory = fused_database
+    prepared = replace(_prepared(), task_id="task-cancelling")
+    _stage_task(factory, prepared)
+
+    claim_uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    claim = claim_uow.claim_task(
+        prepared.task_id, "claim-c", expected_user_id=prepared.user_id
+    )
+    assert claim is not None
+    claim_uow.commit()
+    claim_uow.close()
+
+    with engine.begin() as connection:
+        connection.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.id == prepared.task_id)
+            .values(status="cancelling")
+        )
+
+    uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert uow.retain_unknown(
+        prepared.task_id, prepared.user_id, "claim-c", FUSED_UNKNOWN_REASON
+    )
+    uow.commit()
+    uow.close()
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+    assert task["status"] == "cancelling"
+    assert task["claim_token"] == "claim-c"
+    assert task["recovery_status"] == "provider_result_unknown"
+
+
+def test_unknown_retention_does_not_take_ownership_of_unmarked_legacy_fused_task(
+    fused_database,
+):
+    engine, factory = fused_database
+    prepared = replace(_prepared(), task_id="legacy-fused")
+    _stage_task(factory, prepared)
+    with engine.begin() as connection:
+        connection.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.id == prepared.task_id)
+            .values(request_data="{}")
+        )
+
+    runtime = UnknownRuntime()
+    execution = FusedGenerationExecution(runtime, fused_generation_uow_factory(factory))
+    asyncio.run(execution.execute(prepared))
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+    assert runtime.calls == 0
+    assert task["status"] == "processing"
+    assert task["claim_token"] is None
+    assert task["recovery_status"] == "ready"
+    assert task["request_data"] == "{}"
+    assert assets == []
+    assert wallet == 12
+    assert logs == []
+
+
+def test_execution_does_not_claim_fused_task_for_wrong_prepared_owner(fused_database):
+    engine, factory = fused_database
+    prepared = replace(_prepared(), task_id="wrong-prepared-owner")
+    _stage_task(factory, prepared)
+    runtime = UnknownRuntime()
+    execution = FusedGenerationExecution(runtime, fused_generation_uow_factory(factory))
+
+    asyncio.run(execution.execute(replace(prepared, user_id="other-owner")))
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+    assert runtime.calls == 0
+    assert task["user_id"] == prepared.user_id
+    assert task["status"] == "processing"
+    assert task["claim_token"] is None
+    assert task["recovery_status"] == "ready"
+    assert (
+        json.loads(task["request_data"])["server_controlled_execution"]
+        == FUSED_SERVER_CONTROL_MARKER
+    )
+    assert assets == []
+    assert wallet == 12
+    assert logs == []
+
+
+class RetainCommitAckUnknownSession(Session):
+    def execute(self, statement, *args, **kwargs):
+        result = super().execute(statement, *args, **kwargs)
+        if (
+            isinstance(statement, Update)
+            and statement.table.name == "ai_tasks"
+            and any(
+                getattr(key, "key", key) == "recovery_status"
+                for key in statement._values
+            )
+        ):
+            self.info["raise_after_retain_commit"] = True
+        return result
+
+    def commit(self) -> None:
+        super().commit()
+        if self.info.pop("raise_after_retain_commit", False):
+            raise RuntimeError("retention commit acknowledgement is unknown")
+
+
+class UnknownRuntime:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def generate(self, request):
+        self.calls += 1
+        return FusedGenerationUnknown()
+
+
+def test_real_sqlite_retain_commit_ack_unknown_is_not_retried_or_finalized(
+    fused_database,
+):
+    engine, _ = fused_database
+    prepared = _prepared()
+    _stage_task(
+        sessionmaker(engine, expire_on_commit=False, future=True),
+        prepared,
+    )
+    ack_unknown_factory = sessionmaker(
+        engine,
+        class_=RetainCommitAckUnknownSession,
+        expire_on_commit=False,
+        future=True,
+    )
+    runtime = UnknownRuntime()
+    execution = FusedGenerationExecution(
+        runtime,
+        fused_generation_uow_factory(ack_unknown_factory),
+    )
+
+    asyncio.run(execution.execute(prepared))
+    asyncio.run(execution.execute(prepared))
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+    assert runtime.calls == 1
+    assert task["status"] == "processing"
+    assert task["claim_token"]
+    assert task["recovery_status"] == "provider_result_unknown"
+    assert task["result"] == FUSED_UNKNOWN_REASON
+    assert task["progress_message"] == FUSED_UNKNOWN_PROGRESS_MESSAGE
+    assert assets == []
+    assert wallet == 12
+    assert logs == []
 
 
 class CancelBeforeTerminalSession(Session):
@@ -410,7 +651,9 @@ def test_cancel_committed_between_read_and_terminal_compare_wins(fused_database)
     prepared = _prepared(target=target)
     _stage_task(factory, prepared)
     uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
-    claim = uow.claim_task(prepared.task_id, "claim-a")
+    claim = uow.claim_task(
+        prepared.task_id, "claim-a", expected_user_id=prepared.user_id
+    )
     assert claim is not None
     uow.commit()
     uow.close()
@@ -471,7 +714,9 @@ def test_frame_content_compare_preserves_concurrent_chapter_edit_and_keeps_asset
     prepared = _prepared(target=target)
     _stage_task(factory, prepared)
     uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
-    claim = uow.claim_task(prepared.task_id, "claim-a")
+    claim = uow.claim_task(
+        prepared.task_id, "claim-a", expected_user_id=prepared.user_id
+    )
     assert claim is not None
     uow.commit()
     uow.close()

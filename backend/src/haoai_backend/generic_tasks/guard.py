@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from haoai_backend.fused_generation.ownership import is_server_controlled_fused_task
 from haoai_backend.generic_tasks.domain import GenericTaskRecord
 from haoai_backend.generic_tasks.errors import GenericTaskError
 from haoai_backend.generic_tasks.ports import GenericTaskUnitOfWork
@@ -26,7 +27,9 @@ def reject_controlled_task_update(
 ) -> None:
     """Reject updates if any of the three source ownership signals applies."""
 
-    if task.type in CONTROLLED_TASK_TYPES:
+    if task.type in CONTROLLED_TASK_TYPES or is_server_controlled_fused_task(
+        task.type, task.request_data
+    ):
         raise GenericTaskError(409, _CONTROLLED_TASK_DETAIL)
 
     if unit_of_work.has_billing_unit(task.id):

@@ -8,11 +8,15 @@ import pytest
 
 from haoai_backend.fused_generation.domain import (
     FusedGenerationOutput,
+    FusedGenerationUnknown,
     FusedServerImageModel,
     FusedTaskClaim,
     PreparedFusedGeneration,
 )
-from haoai_backend.fused_generation.errors import ProviderGenerationFailure
+from haoai_backend.fused_generation.errors import (
+    FusedGenerationDispatchedCancellation,
+    ProviderGenerationFailure,
+)
 from haoai_backend.fused_generation.execution import FusedGenerationExecution
 
 
@@ -49,6 +53,7 @@ def _prepared() -> PreparedFusedGeneration:
 
 class ExecutionState:
     def __init__(self) -> None:
+        self.user_id = "owner-a"
         self.status = "processing"
         self.cancelled = False
         self.active_sessions = 0
@@ -57,9 +62,19 @@ class ExecutionState:
         self.claim_count = 0
         self.finish_count = 0
         self.finish_attempt_count = 0
+        self.retain_attempt_count = 0
+        self.retain_count = 0
         self.commit_count = 0
         self.finish_args = []
         self.events = []
+        self.claim_token = None
+        self.recovery_status = "ready"
+        self.result = None
+        self.progress_message = "正在生成融合图..."
+        self.fail_retain_commit = False
+        self.block_retain = False
+        self.retain_started = threading.Event()
+        self.retain_release = threading.Event()
         self.claim_started = threading.Event()
         self.claim_release = threading.Event()
         self.claim_closed = threading.Event()
@@ -99,23 +114,52 @@ class FakeUnitOfWork:
     def stage_request(self, prepared, user_id):
         raise AssertionError("execution does not stage a second task")
 
-    def claim_task(self, task_id, claim_token):
+    def claim_task(self, task_id, claim_token, *, expected_user_id):
         self.state.claim_count += 1
-        if self.state.status != "processing":
+        if (
+            expected_user_id != self.state.user_id
+            or self.state.status != "processing"
+            or self.state.claim_token is not None
+        ):
             return None
+        self.state.claim_token = claim_token
         return FusedTaskClaim(cancelled=self.state.cancelled)
+
+    def retain_unknown(self, task_id, user_id, claim_token, safe_reason):
+        self.state.retain_attempt_count += 1
+        if self.state.block_retain:
+            self.state.retain_started.set()
+            if not self.state.retain_release.wait(timeout=5):
+                raise AssertionError("retain worker was not released")
+        if (
+            self.state.status not in {"processing", "cancelling"}
+            or self.state.claim_token != claim_token
+        ):
+            return False
+        self.state.retain_count += 1
+        self.state.recovery_status = "provider_result_unknown"
+        self.state.result = safe_reason
+        self.state.progress_message = "图片生成结果待核对"
+        return True
 
     def finish_task(self, prepared, claim_token, *, image_url, error_message):
         self.state.finish_attempt_count += 1
-        if self.state.status != "processing":
+        if (
+            self.state.status != "processing"
+            or self.state.claim_token != claim_token
+            or self.state.recovery_status == "provider_result_unknown"
+        ):
             return
         self.state.finish_count += 1
         self.state.finish_args.append((image_url, error_message))
         self.state.status = "completed" if image_url else "failed"
+        self.state.claim_token = None
 
     def commit(self):
         self.state.commit_count += 1
         self.state.events.append("commit")
+        if self.state.fail_retain_commit and self.state.recovery_status == "provider_result_unknown":
+            raise OSError("lost retain commit acknowledgement")
 
     def rollback(self):
         pass
@@ -135,11 +179,13 @@ class Factory:
 
 
 class BlockingClaimUnitOfWork(FakeUnitOfWork):
-    def claim_task(self, task_id, claim_token):
+    def claim_task(self, task_id, claim_token, *, expected_user_id):
         self.state.claim_started.set()
         if not self.state.claim_release.wait(timeout=5):
             raise AssertionError("claim worker was not released")
-        return super().claim_task(task_id, claim_token)
+        return super().claim_task(
+            task_id, claim_token, expected_user_id=expected_user_id
+        )
 
     def close(self):
         super().close()
@@ -266,6 +312,75 @@ def test_provider_error_is_sanitized_and_finalized_once():
     assert state.finish_args == [(None, "upstream refused token [已隐藏]")]
     assert SERVER_SECRET not in repr(state.finish_args)
     assert state.active_sessions == 0
+
+
+def test_provider_result_unknown_is_retained_and_duplicate_execution_does_not_recall_runtime():
+    state = ExecutionState()
+    runtime = Runtime(state, output=FusedGenerationUnknown())
+    execution = FusedGenerationExecution(runtime, Factory(state))
+
+    asyncio.run(execution.execute(_prepared()))
+    first_claim_token = state.claim_token
+    asyncio.run(execution.execute(_prepared()))
+
+    assert runtime.calls == 1
+    assert state.status == "processing"
+    assert state.claim_token == first_claim_token
+    assert state.recovery_status == "provider_result_unknown"
+    assert state.progress_message == "图片生成结果待核对"
+    assert state.retain_count == 1
+    assert state.finish_count == 0
+
+
+def test_dispatched_cancellation_retains_unknown_before_propagating_cancellation():
+    state = ExecutionState()
+    runtime = Runtime(state, error=FusedGenerationDispatchedCancellation())
+    execution = FusedGenerationExecution(runtime, Factory(state))
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(execution.execute(_prepared()))
+
+    assert state.recovery_status == "provider_result_unknown"
+    assert state.claim_token is not None
+    assert state.finish_count == 0
+    assert state.retain_count == 1
+
+
+def test_ambiguous_retain_commit_is_not_retried_or_finalized():
+    state = ExecutionState()
+    state.fail_retain_commit = True
+    runtime = Runtime(state, output=FusedGenerationUnknown())
+
+    asyncio.run(FusedGenerationExecution(runtime, Factory(state)).execute(_prepared()))
+
+    assert runtime.calls == 1
+    assert state.retain_attempt_count == 1
+    assert state.finish_count == 0
+    assert state.claim_token is not None
+
+
+def test_cancellation_while_retaining_unknown_does_not_fall_through_to_refund_finalizer():
+    state = ExecutionState()
+    state.block_retain = True
+    runtime = Runtime(state, output=FusedGenerationUnknown())
+    execution = FusedGenerationExecution(runtime, Factory(state))
+
+    async def exercise():
+        task = asyncio.create_task(execution.execute(_prepared()))
+        assert await asyncio.to_thread(state.retain_started.wait, 2)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done()
+        assert state.finish_count == 0
+        state.retain_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+
+    assert state.recovery_status == "provider_result_unknown"
+    assert state.retain_count == 1
+    assert state.finish_count == 0
 
 
 def test_task_cancelled_before_provider_call_is_finalized_as_failure():

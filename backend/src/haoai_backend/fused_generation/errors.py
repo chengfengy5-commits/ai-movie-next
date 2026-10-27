@@ -1,5 +1,7 @@
 """Stable business errors for fused generation."""
 
+import asyncio
+
 from haoai_backend.shared.errors import BusinessError
 
 
@@ -43,3 +45,7 @@ class ProviderGenerationFailure(Exception):
     def __init__(self, detail: str) -> None:
         super().__init__(detail)
         self.detail = detail
+
+
+class FusedGenerationDispatchedCancellation(asyncio.CancelledError):
+    """Cancellation after a provider create may have been dispatched."""
