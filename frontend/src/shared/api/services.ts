@@ -148,7 +148,7 @@ import {
   type CreatorSettingsServicePort,
 } from "./creatorSettings";
 import { createProviderQuotaHttp } from "./providerQuotaHttp";
-import type { ProviderQuotaServicePort } from "./providerQuota";
+import type { ProviderQuotaAccountInput, ProviderQuotaProbeInput, ProviderQuotaServicePort } from "./providerQuota";
 import type { FrameReviewServicePort } from "./frameReview";
 import type { FrameOptimizeServicePort } from "./frameOptimize";
 import {
@@ -1990,6 +1990,27 @@ function timeoutSignal(parent: AbortSignal, timeoutMs: number): {
 const STORYBOARD_STREAM_TOTAL_TIMEOUT_MS = 5 * 60_000;
 const STORYBOARD_STREAM_IDLE_TIMEOUT_MS = 45_000;
 const PROVIDER_QUOTA_BALANCE_TIMEOUT_MS = 60_000;
+const PROVIDER_QUOTA_PROBE_TIMEOUT_MS = 60_000;
+
+function serializeProviderQuotaAccountInput(input: ProviderQuotaAccountInput): Record<string, unknown> {
+  return {
+    name: input.name,
+    provider_type: input.providerType,
+    base_url: input.baseUrl,
+    username: input.username,
+    password: input.password,
+    is_active: input.isActive,
+  };
+}
+
+function serializeProviderQuotaProbeInput(input: ProviderQuotaProbeInput): Record<string, unknown> {
+  return {
+    provider_type: input.providerType,
+    base_url: input.baseUrl,
+    username: input.username,
+    password: input.password,
+  };
+}
 
 function storyboardStreamTimeout(parent: AbortSignal): {
   signal: AbortSignal;
@@ -2132,6 +2153,10 @@ type ApiEndpoint =
   | "creatorModels"
   | "providerQuotaAccounts"
   | "providerQuotaAccountBalance"
+  | "providerQuotaCreateAccount"
+  | "providerQuotaUpdateAccount"
+  | "providerQuotaDeleteAccount"
+  | "providerQuotaProbe"
   | "creatorModel"
   | "promoteCreatorModelToSystem"
   | "demoteCreatorModelToPersonal"
@@ -2313,9 +2338,22 @@ function apiRequestDefinition(
   if (endpoint === "providerQuotaAccounts") {
     return { path: "/provider-quota/accounts", method: "GET" };
   }
+  if (endpoint === "providerQuotaCreateAccount") {
+    return { path: "/provider-quota/accounts", method: "POST" };
+  }
   if (endpoint === "providerQuotaAccountBalance") {
     const accountId = encodeApiPathId(identifiers?.providerQuotaAccountId, "供应商监控账号");
     return { path: `/provider-quota/accounts/${accountId}/balance`, method: "GET" };
+  }
+  if (endpoint === "providerQuotaUpdateAccount" || endpoint === "providerQuotaDeleteAccount") {
+    const accountId = encodeApiPathId(identifiers?.providerQuotaAccountId, "供应商监控账号");
+    return {
+      path: `/provider-quota/accounts/${accountId}`,
+      method: endpoint === "providerQuotaUpdateAccount" ? "PUT" : "DELETE",
+    };
+  }
+  if (endpoint === "providerQuotaProbe") {
+    return { path: "/provider-quota/probe", method: "POST" };
   }
   if (endpoint === "testCreatorModelConnection") {
     return { path: "/models/test-connection", method: "POST" };
@@ -3171,6 +3209,37 @@ export function createApiServices(
           undefined,
           { providerQuotaAccountId: call.accountId },
           PROVIDER_QUOTA_BALANCE_TIMEOUT_MS,
+        );
+      }
+      if (call.endpoint === "providerQuotaProbe") {
+        return requestForCurrentApiSession(
+          call.endpoint,
+          token,
+          signal,
+          serializeProviderQuotaProbeInput(call.input),
+          undefined,
+          PROVIDER_QUOTA_PROBE_TIMEOUT_MS,
+        );
+      }
+      if (call.endpoint === "providerQuotaCreateAccount") {
+        return requestForCurrentApiSession(call.endpoint, token, signal, serializeProviderQuotaAccountInput(call.input));
+      }
+      if (call.endpoint === "providerQuotaUpdateAccount") {
+        return requestForCurrentApiSession(
+          call.endpoint,
+          token,
+          signal,
+          serializeProviderQuotaAccountInput(call.input),
+          { providerQuotaAccountId: call.accountId },
+        );
+      }
+      if (call.endpoint === "providerQuotaDeleteAccount") {
+        return requestForCurrentApiSession(
+          call.endpoint,
+          token,
+          signal,
+          undefined,
+          { providerQuotaAccountId: call.accountId },
         );
       }
       return requestForCurrentApiSession(call.endpoint, token, signal);

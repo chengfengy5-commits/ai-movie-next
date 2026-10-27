@@ -10,7 +10,7 @@
 
 Root849时点记录的已发布功能基线为 main@`69c715105ea0f7e8337b446d3844f53f4a9a041b`；Root849已将feature `89e077c3a0c27f24d2811da5669caa6fed530541` 发布至main并确认fresh remote精确一致。feature工作树干净，main已跟踪文件与暂存区干净，8个受保护未跟踪文件保留。上一发布基线为Root851的canvas legacy revision修复：feature `dea08354eed0cd962da860791d1fbd910af015ef`、main `fd4d72854ba4c10d9b41a7a9ae4d6797c685fcaa`。此前Root839发布的后台worker执行容量消费者feature为`270994d95e7b00fe1b675640407fa53d0464281d`、main为`184376c80086954c82ef5f7b612fc67fadfb4cf5`；更早基线仍按各自收据对应的历史状态解释。该段计数及范围按对应历史时点校准，不改写此前各收据对应的历史状态。
 Root859时点的整合基线为 main@`59ff56eba55e9131f20667a35b44e3c83b84e6e6`，fresh remote 精确一致；其中包含 Root859 发布的 C856 feature `2674441d419a9810e30e2a2423718fe063b75b47`，以及 Root873 发布的 F870 feature `660e173fcb2416560ef8d61cae2e43898805158d`（当时 main@`661ea2ddc1a55e57aef03d5baf1a469a95cdaa7b`）。该段为对应发布时点记录；之后各次发布和最新进度见文末按日期追加的记录，历史收据仍按各自源码快照解释。
-Root991时点的发布基线为 main@`9521baea0429f5762ae9033fca91c4687cd362c3`；Root963、965、968、972、974、976六批媒体与聊天入口切片及其对应验证层次见历史记录，985、988、991的发布记录随后追加。截至2026-10-27，当前发布基线为 main@`094ca7cfd8d44265ff433b846351264d5c51b0dd`；H994、F997、H1006、C1003、H1012、F1009 的范围和分层证据见文末最新记录。A01–A39原义务清单仍以只读的102分析快照和原规范为准。
+Root991时点的发布基线为 main@`9521baea0429f5762ae9033fca91c4687cd362c3`；Root963、965、968、972、974、976六批媒体与聊天入口切片及其对应验证层次见历史记录，985、988、991的发布记录随后追加。Root1009发布时点基线为 main@`094ca7cfd8d44265ff433b846351264d5c51b0dd`；F1022本批开发基线为 main@`07570eab6b3fba677760bdbf07bc0a9f0ebb6dca`，含C1019/Root1021。H994、F997、H1006、C1003、H1012、F1009 的范围和分层证据见文末最新记录。A01–A39原义务清单仍以只读的102分析快照和原规范为准。
 
 固定旧源共有 248 个显式 method/path 声明；backend385 收据中的 create_app registry 为 250 个方法、36 个参数项，旧声明已登记差集为0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
 
@@ -241,7 +241,7 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 | --- | --- | --- | --- | --- | --- |
 | U11.1 | 个人/系统模型与提示词 CRUD、复制、排序 | C | C | V=P / A=U；CreatorSettingsPage 和独立 port 的读写/排序已接入 | 用当前真实 API 覆盖系统/个人权限、脏稿、未知写入及排序冲突；不把连接测试等后续动作重算成 CRUD 缺失。 |
 | U11.2 | 会员、套餐/联系说明、兑换及父页余额更新 | C | C | V=P / A=P；9df 已提交推送，97-02 finding 闭合；83 文件/1248 tests、TSC/build 全绿；113 两账户真实 SQL/HTTP 浏览器主路径通过 | 保留双账号拒绝重复码、简介保存回读、键盘返回/重开、390px 无横向溢出等证据；脏离开确认已弹出但取消因工具超时未证，密码提交及网络/重启浏览器变体待验，不能记为账户全完成。 |
-| U11.3 | 模型连接测试、系统/个人转换、额度和账户偏好 | P | P | V=P / A=U；Root988显式密钥连接测试UI/POST已接；F997系统/个人模型转换、H994四类型批量偏好、F1009额度监控页已接。当前收据为局部focused/TSC/Vite，连接测试不触发模型/密钥保存，也不证明真实外部额度查询 | 保留系统/个人转换和批量偏好的权限、隔离与完整验收；接额度账户CRUD、probe、PAT及quick_ref等偏好消费者；真实上游未调用，账户/余额验收仍待。 |
+| U11.3 | 模型连接测试、系统/个人转换、额度和账户偏好 | P | P | V=P / A=U；Root988显式密钥连接测试UI/POST已接；F997系统/个人模型转换、H994四类型批量偏好、F1009额度监控页已接；F1022补账号CRUD、启停、二次确认删除和probe，4项focused、TSC通过、Vite 280模块构建通过。连接测试不触发模型/密钥保存；账户测试为fake/受控，不证明真实上游查询 | F1022本地验证及Root1023复核完成，提交与推送见Git及Root1024发布收据；保留PAT、quick_ref等偏好消费者与完整账户/余额验收义务。真实上游未调用，GUI接受未做。 |
 
 ### U12 管理后台资源与运营配置
 
@@ -281,7 +281,7 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 | INT-PROVIDERS | 部分真实 transport adapter 和显式 ports 已有 | 完成剩余 adapter、loopback/fake 协议、原 credential principal/snapshot 绑定及配置消费者；实际账号/付费调用另授权。 |
 | INT-STORAGE | 非 core 的 `backend.server` host/CLI 已消费显式 R2 配置，装配原 R2 adapter 并交给同一 `create_app`；鉴权与业务共用 Session factory。原始 `create_app` 默认 `storage=None`，缺显式配置时存储能力不可用。Root577 的 155 项定向合成 SQLite/fake SDK/in-process ASGI 检查通过，registry 250 方法/36 参数 exact，使用隔离 multipart 0.0.32；P2-576-01～03 已关闭。Root991另接入完整R2配置下的OSS重试pinned fetcher和managed-origin短路，4个focused结果来自合成SQLite/fake DNS/HTTP/S3。C1003已接入媒体历史分页、按需预览、转存POST、原message `content` PUT及独立GET回读与删除分页；C1015接入image历史选用；C1019本批接入image/video历史Blob下载到浏览器。 | 接入融合生成runtime与MediaStore组合；完成storyboard和其余音视频媒体引用消费者；补真实配置下的R2、浏览器及文件落地验收。本批host/前端focused测试不证明真实R2、PG、HTTP listener、部署或浏览器文件结果。 |
 | INT-SMTP | 651已将SMTP adapter接到同一host、验证码与重置密码；Root650定向288项及owned TLS SMTP sink验证通过。655邮箱回执恢复经Root654前端74项、类型和构建通过 | 补账户管理的当前完整HTTP/owned SQL与浏览器验收；真实邮箱交付需适用授权，owned sink不是外部邮箱接受。旧后台密码返回合同未在本批改为服务端脱敏，前端不回填秘密。 |
-| INT-QUOTA | provider quota/balance transports 与连接测试组件已有；F988已接入显式密钥连接测试UI和POST；F997系统/个人模型转换、H994批量偏好和F1009额度监控页已接入 | 补额度账户CRUD、probe、PAT及quick_ref等偏好消费者；owned transport和受控页面不代表真实上游余额查询或账户接受。 |
+| INT-QUOTA | provider quota/balance transports 与连接测试组件已有；F988已接入显式密钥连接测试UI和POST；F997系统/个人模型转换、H994批量偏好和F1009额度监控页已接入；F1022增加账号CRUD/probe HTTP与管理页面 | F1022本地验证及Root1023复核完成，提交与推送见Git及Root1024发布收据；保留PAT及quick_ref偏好消费者、真实上游余额查询与账户GUI接受。owned transport、fake测试和受控页面不代表真实上游或账户接受。 |
 | INT-DOWNLOAD | U08.3已接入章节逐镜与已保存粗剪两个导出入口、实际字节读取和逐项导出队列；受保护同源与匿名公开媒体分开读取。固定旧R2兼容签名函数仍只返回URL，signed不是权限或下载成功证明。 | 补真实浏览器与文件落地验收，并覆盖尚未验证的异常、取消和重试反馈；素材逐项下载不等于U08.4单个成片。 |
 | INT-ARCHITECTURE | 106 个应用/领域文件已有静态 import 盘点 | 修复上述直接 persistence/provider 边界，并复核现有职责与同事务约束。 |
 
@@ -587,7 +587,7 @@ C947本段记录 `codex/image-batch-host-947` 的实现与作者验证范围：`
 
 ## 近期切片与当前状态校准（2026-10-27）
 
-当前发布基线为 main@`094ca7cfd8d44265ff433b846351264d5c51b0dd`。下表逐批保留源码提交与原有验证口径；各项覆盖范围可能重叠，测试数量不相加。受控HTTP、SQLite、fake transport、TSC和Vite证据不表示真实Provider、上游服务、生产数据库、R2、浏览器/E2E或部署验收。
+下表以Root1009发布时点的main@`094ca7cfd8d44265ff433b846351264d5c51b0dd`为已发布基线；F1022基线为main@`07570eab6b3fba677760bdbf07bc0a9f0ebb6dca`，含C1019/Root1021。下表逐批保留源码提交与原有验证口径；各项覆盖范围可能重叠，测试数量不相加。受控HTTP、SQLite、fake transport、TSC和Vite证据不表示真实Provider、上游服务、生产数据库、R2、浏览器/E2E或部署验收。
 
 | 批次 | feature → main | 本批交付与证据 |
 | --- | --- | --- |
@@ -599,7 +599,8 @@ C947本段记录 `codex/image-batch-host-947` 的实现与作者验证范围：`
 | C1019 历史媒体下载 | 本批提交记录见Git及发布收据 | image/video历史记录可按原消息身份读取媒体Blob并交给浏览器一次下载；视频读取可停止本地等待。动作反馈移至对话框固定状态区，删除后仍可见。2个直接测试文件15项通过，TSC通过，Vite构建278模块通过；不证明真实浏览器文件落地或真实R2。 |
 | H1012 aistarslab ports分层 | `62366e1` → `40892cf` | application改为依赖persistence/provider ports；7项通过，保留73条warning。 |
 | F1009 provider quota monitor | `6a46872` → `094ca7c` | quota监控界面切片；2项focused（每个测试文件1项），另有页面24项未选中；TSC与Vite 278模块构建通过。没有调用真实上游。 |
+| F1022 quota account editor | 基线 `07570eab` | 管理员监控页新增账号新建、编辑、启停、删除二次确认与显式连接测试；2个测试文件4项focused通过（24项未选中），TSC通过，Vite 280模块构建通过并保留chunk-size warning。覆盖snake_case HTTP body、安全凭据投影、未知创建不重试和规范化回读；Root1023复核通过；提交和推送记录见Git及Root1024收据，不调用真实供应商。 |
 
-状态仍按整行和接受义务分层：U11.3保持P/P、V=P/A=U；转换、批量偏好和quota monitor已有局部实现，额度账户CRUD/probe/PAT、quick_ref等偏好消费者与完整账户验收仍待。U05.5保持P/P、V=P/A=U；素材历史浏览/转存/删除、图片选用及本地图片/视频下载已有局部接线，M01反馈已移至稳定状态区；视频/storyboard选用、其他媒体引用链、真实R2和浏览器文件落地验收仍待。C1019本批源码与局部验证已完成，实际浏览器文件落地仍待接受。U12.6的CORS消费者已接入，`frontend_url`此前已由`app.py`向`smtp_delivery.frontend_base_url`注入，SMTP application/persistence读取`system_configs.frontend_url`；这不是H1006新增功能。B-ARCH的aistarslab application persistence/provider ports边界已完成，generation_credentials application的直接SQLAlchemy/concrete repository依赖仍待。U08.4已由用户明确选择保持旧版逐镜及粗剪素材导出，不新增单个MP4合成；本次范围确认仅取消该额外条件开发动作，其余功能、实际文件输出及整体验收义务保留。
+状态仍按整行和接受义务分层：U11.3保持P/P、V=P/A=U；模型转换、批量偏好、quota monitor和F1022账号管理已有局部实现，章鱼哥PAT、quick_ref等偏好消费者与完整账户验收仍待。U05.5保持P/P、V=P/A=U；素材历史浏览/转存/删除、图片选用及本地图片/视频下载已有局部接线，M01反馈已移至稳定状态区；视频/storyboard选用、其他媒体引用链、真实R2和浏览器文件落地验收仍待。C1019本批源码与局部验证已完成，实际浏览器文件落地仍待接受。U12.6的CORS消费者已接入，`frontend_url`此前已由`app.py`向`smtp_delivery.frontend_base_url`注入，SMTP application/persistence读取`system_configs.frontend_url`；这不是H1006新增功能。B-ARCH的aistarslab application persistence/provider ports边界已完成，generation_credentials application的直接SQLAlchemy/concrete repository依赖仍待。U08.4已由用户明确选择保持旧版逐镜及粗剪素材导出，不新增单个MP4合成；本次范围确认仅取消该额外条件开发动作，其余功能、实际文件输出及整体验收义务保留。
 
 按用户最新范围确认，当前去重后为16行开发、16行接线、51行验证/接受义务；原17行开发中U08.4的条件MP4合成不再适用，这不是本批实现了合成功能。原始102快照及历史计数不改写，全部51个有序UI ID保留，实际文件接受仍沿用U08.3。A01–A39整项完整接受数仍为0，A39仍为`OFFLINE_PENDING`；端到端用户验收继续暂缓。
