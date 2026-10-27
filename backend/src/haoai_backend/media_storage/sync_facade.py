@@ -16,9 +16,20 @@ from haoai_backend.generation_contracts import (
 )
 
 from .managed_urls import normalize_managed_url as _normalize_managed_url
+from .owned_write_values import (
+    OwnedObjectMaterial,
+    OwnedObjectPlan,
+    OwnedObjectPutResult,
+    OwnedObjectVerification,
+    OwnedObjectWritePermit,
+)
 from .owned_media_runtime import OwnedMediaRuntime, OwnedMediaServices
 from .public_fetch_policy import UnsafeRemoteURL
-from .reference_staging import ReferenceStager
+from .reference_staging import (
+    ReferenceStager,
+    _media_type_failure,
+    _normalize_media_type,
+)
 from .transfer_types import MAX_TRANSFER_BYTES, MAX_TRANSFER_SECONDS
 
 PreparationMode = Literal["local_muse", "url_or_inline"]
@@ -212,6 +223,160 @@ class SynchronousMediaStore:
             ) from None
         if isinstance(result, TransferFailure):
             raise MediaStoreOperationError(result)
+        return result
+
+    def prepare_owned_bytes(
+        self,
+        input: ReferenceInput,
+        object_policy: object,
+        *,
+        owner_ref: str,
+        submission_ref: str,
+        slot: str,
+        provider_result_digest: str,
+    ) -> OwnedObjectMaterial:
+        self._runtime.assert_sync_caller()
+        maximum = _object_policy_limit(object_policy)
+        if isinstance(maximum, TransferFailure):
+            raise MediaStoreOperationError(maximum)
+        stager = self._reference_stager
+        if not isinstance(input, ReferenceInput):
+            raise MediaStoreOperationError(
+                _failure("invalid_reference", "媒体参考格式无效")
+            )
+        if input.kind == "bytes":
+            if (
+                input.locator is not None
+                or input.content is None
+                or input.provider_operation_ref is not None
+            ):
+                prepared = _failure("invalid_reference", "字节参考包含冲突字段")
+            elif not isinstance(input.content, bytes) or not input.content:
+                prepared = _failure("invalid_reference", "字节参考内容为空或格式无效")
+            else:
+                media_type = _normalize_media_type(input.media_type)
+                if media_type is None:
+                    prepared = _media_type_failure(input.media_type)
+                else:
+                    prepared = (input.content, media_type)
+        elif input.kind == "data_uri":
+            if stager is None:
+                prepared = _failure(
+                    "configuration_unavailable",
+                    "Data URI 媒体验证能力未配置",
+                )
+            else:
+                prepared = stager._decode_data_uri(input)
+        else:
+            raise MediaStoreOperationError(
+                _failure("unsupported_reference", "仅支持已验证的内联媒体")
+            )
+        if isinstance(prepared, TransferFailure):
+            raise MediaStoreOperationError(prepared)
+        content, media_type = prepared
+        if len(content) > maximum:
+            raise MediaStoreOperationError(
+                _failure("reference_too_large", "媒体内容超过大小限制")
+            )
+        try:
+            result = self._runtime.call_blocking_under_shared_slot(
+                lambda services: services.storage.plan_bytes(
+                    content,
+                    media_type,
+                    owner_ref=owner_ref,
+                    submission_ref=submission_ref,
+                    slot=slot,
+                    provider_result_digest=provider_result_digest,
+                )
+            )
+        except Exception:
+            raise MediaStoreOperationError(
+                _failure("storage_unavailable", "R2 媒体计划能力不可用")
+            ) from None
+        if isinstance(result, TransferFailure):
+            raise MediaStoreOperationError(result)
+        return result
+
+    def prepare_owned_public_media(
+        self,
+        input: ReferenceInput,
+        object_policy: object,
+        *,
+        owner_ref: str,
+        submission_ref: str,
+        slot: str,
+        provider_result_digest: str,
+    ) -> OwnedObjectMaterial:
+        self._runtime.assert_sync_caller()
+        options = _bounded_options(object_policy, "媒体对象策略")
+        if isinstance(options, TransferFailure):
+            raise MediaStoreOperationError(options)
+        max_bytes, timeout_seconds = options
+        if not isinstance(input, ReferenceInput):
+            raise MediaStoreOperationError(
+                _failure("invalid_reference", "媒体参考格式无效")
+            )
+
+        async def prepare(
+            services: OwnedMediaServices,
+        ) -> OwnedObjectMaterial | TransferFailure:
+            transfer = services.remote_transfer
+            if transfer is None:
+                return _failure("transport_unavailable", "公网媒体安全能力未配置")
+            return await transfer.prepare_owned(
+                input,
+                owner_ref=owner_ref,
+                submission_ref=submission_ref,
+                slot=slot,
+                provider_result_digest=provider_result_digest,
+                max_bytes=max_bytes,
+                timeout_seconds=timeout_seconds,
+            )
+
+        try:
+            result = self._runtime.run(prepare)
+        except Exception:
+            raise MediaStoreOperationError(
+                _failure("transfer_failure", "公网媒体准备失败")
+            ) from None
+        if isinstance(result, TransferFailure):
+            raise MediaStoreOperationError(result)
+        return result
+
+    def put_planned_media(
+        self,
+        material: OwnedObjectMaterial,
+        permit: OwnedObjectWritePermit,
+    ) -> OwnedObjectPutResult | TransferFailure:
+        self._runtime.assert_sync_caller()
+        if not isinstance(material, OwnedObjectMaterial):
+            return _failure("invalid_plan", "媒体写入计划无效")
+        try:
+            result = self._runtime.call_blocking_under_shared_slot(
+                lambda services: services.storage.put_planned(material, permit)
+            )
+        except Exception:
+            return OwnedObjectPutResult("unknown", error_code="storage_call_unverified")
+        return result
+
+    def verify_planned_media(
+        self, plan: OwnedObjectPlan
+    ) -> OwnedObjectVerification:
+        self._runtime.assert_sync_caller()
+        if not isinstance(plan, OwnedObjectPlan):
+            return OwnedObjectVerification(
+                "unavailable",
+                safe_detail="媒体写入计划无效",
+            )
+        try:
+            result = self._runtime.call_blocking_under_shared_slot(
+                lambda services: services.storage.verify_planned(plan)
+            )
+        except Exception:
+            return OwnedObjectVerification(
+                "unavailable",
+                safe_detail="R2 对象内容暂时无法核验",
+            )
         return result
 
     def release_prepared_reference(

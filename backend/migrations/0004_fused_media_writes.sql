@@ -1,0 +1,65 @@
+CREATE TABLE fused_media_writes (
+    write_id VARCHAR(32) NOT NULL PRIMARY KEY,
+    submission_id VARCHAR(36) NOT NULL,
+    owner_id VARCHAR(36) NOT NULL,
+    task_id VARCHAR(36) NOT NULL,
+    slot VARCHAR(64) NOT NULL,
+    provider_result_digest VARCHAR(64) NOT NULL,
+    result_kind VARCHAR(16) NOT NULL,
+    material_sha256 VARCHAR(64) NOT NULL,
+    media_type VARCHAR(128) NOT NULL,
+    size_bytes INTEGER NOT NULL,
+    config_fingerprint VARCHAR(64) NOT NULL,
+    config_version INTEGER NOT NULL,
+    bucket VARCHAR(255) NOT NULL,
+    object_key VARCHAR(512) NOT NULL,
+    object_key_digest VARCHAR(64) NOT NULL,
+    public_base VARCHAR(1024) NOT NULL,
+    plan_version INTEGER NOT NULL,
+    encrypted_material TEXT NOT NULL,
+    material_nonce VARCHAR(128) NOT NULL,
+    material_key_id VARCHAR(128) NOT NULL,
+    material_algorithm VARCHAR(64) NOT NULL,
+    phase VARCHAR(24) NOT NULL,
+    revision INTEGER NOT NULL,
+    put_nonce VARCHAR(36),
+    put_owner VARCHAR(64),
+    put_generation INTEGER,
+    verify_owner VARCHAR(64),
+    verify_lease_until TIMESTAMP,
+    next_verify_at TIMESTAMP NOT NULL,
+    attempt_count INTEGER NOT NULL,
+    verified_sha256 VARCHAR(64),
+    verified_media_type VARCHAR(128),
+    verified_size_bytes INTEGER,
+    verified_at TIMESTAMP,
+    verified_locator TEXT,
+    verification_request_id VARCHAR(255),
+    asset_id VARCHAR(36),
+    applied_at TIMESTAMP,
+    created_at TIMESTAMP NOT NULL,
+    updated_at TIMESTAMP NOT NULL,
+    CONSTRAINT fk_fused_media_writes_submission_id_fused_generation_submissions
+        FOREIGN KEY (submission_id) REFERENCES fused_generation_submissions(submission_id),
+    CONSTRAINT fk_fused_media_writes_owner_id_users
+        FOREIGN KEY (owner_id) REFERENCES users(id),
+    CONSTRAINT fk_fused_media_writes_task_id_ai_tasks
+        FOREIGN KEY (task_id) REFERENCES ai_tasks(id),
+    CONSTRAINT uq_fused_media_write_slot UNIQUE (submission_id, slot),
+    CONSTRAINT uq_fused_media_write_object_key
+        UNIQUE (config_fingerprint, bucket, object_key_digest),
+    CONSTRAINT ck_fused_media_writes_phase CHECK (phase IN (
+        'planned', 'put_started', 'ack_unknown', 'verified', 'applied', 'content_conflict'
+    )),
+    CONSTRAINT ck_fused_media_writes_result_kind CHECK (result_kind IN ('url', 'inline')),
+    CONSTRAINT ck_fused_media_writes_result_digest CHECK (length(provider_result_digest) = 64),
+    CONSTRAINT ck_fused_media_writes_material_digest CHECK (length(material_sha256) = 64),
+    CONSTRAINT ck_fused_media_writes_config_digest CHECK (length(config_fingerprint) = 64),
+    CONSTRAINT ck_fused_media_writes_key_digest CHECK (length(object_key_digest) = 64),
+    CONSTRAINT ck_fused_media_writes_size CHECK (size_bytes > 0),
+    CONSTRAINT ck_fused_media_writes_plan_version CHECK (config_version > 0 AND plan_version = 1),
+    CONSTRAINT ck_fused_media_writes_revision CHECK (revision > 0 AND attempt_count >= 0)
+);
+
+CREATE INDEX ix_fused_media_writes_recovery
+    ON fused_media_writes (phase, next_verify_at, updated_at, submission_id);

@@ -73,6 +73,19 @@ class FusedGenerationRecoveryWorker:
                     if type(submission_id) is not str or type(owner_id) is not str:
                         continue
                     await self._execution.execute_submission(submission_id, owner_id)
+                media_writes = await run_in_threadpool(
+                    _read_recoverable_fused_media_writes,
+                    self._uow_factory,
+                    self._scan_limit,
+                )
+                for row in media_writes:
+                    if self._stop.is_set():
+                        return
+                    submission_id = row.get("submission_id")
+                    owner_id = row.get("owner_id")
+                    if type(submission_id) is not str or type(owner_id) is not str:
+                        continue
+                    await self._execution.recover_media_write(submission_id, owner_id)
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -93,6 +106,20 @@ def _read_recoverable_submissions(
     uow = uow_factory()
     try:
         return uow.recoverable_durable_submissions(limit=limit)
+    finally:
+        try:
+            uow.rollback()
+        finally:
+            uow.close()
+
+
+def _read_recoverable_fused_media_writes(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    limit: int,
+) -> tuple[Mapping[str, object], ...]:
+    uow = uow_factory()
+    try:
+        return uow.recoverable_fused_media_writes(limit=limit)
     finally:
         try:
             uow.rollback()

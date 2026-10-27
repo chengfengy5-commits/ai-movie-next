@@ -60,16 +60,20 @@ CANVAS_RESULT_TARGETS_SCHEMA_VERSION = "0002_canvas_result_targets"
 CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM = "1d9482fc951fc4e13d9c0c3fe5c74fb3e605045a0427306d25906872cfda1f67"
 FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION = "0003_fused_generation_submissions"
 FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM = "4cefd8e428911da76e89297517ed3e6cb2dc7222d873f21b4c510d3a4e7c0680"
-GENERATION_CURRENT_SCHEMA_VERSION = FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION
-GENERATION_CURRENT_SCHEMA_CHECKSUM = FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM
+FUSED_MEDIA_WRITES_SCHEMA_VERSION = "0004_fused_media_writes"
+FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM = "7c65b87f73082ab88437f686c60030475c5876d9c6dd1ba750a2bb20bc985905"
+GENERATION_CURRENT_SCHEMA_VERSION = FUSED_MEDIA_WRITES_SCHEMA_VERSION
+GENERATION_CURRENT_SCHEMA_CHECKSUM = FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM
 GENERATION_MIGRATION_HISTORY_TABLE = "generation_schema_migrations"
 GENERATION_SUPPORTED_VERSIONS = (
     GENERATION_SCHEMA_VERSION,
     CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
     FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
+    FUSED_MEDIA_WRITES_SCHEMA_VERSION,
 )
 CANVAS_RESULT_TARGETS_TABLE_NAME = "generation_result_targets"
 FUSED_GENERATION_SUBMISSIONS_TABLE_NAME = "fused_generation_submissions"
+FUSED_MEDIA_WRITES_TABLE_NAME = "fused_media_writes"
 
 
 class UnitFeeDecisionRow(FoundationBase):
@@ -228,6 +232,81 @@ class FusedGenerationSubmissionRow(GenerationAuxiliaryBase):
     dispatch_generation = Column(Integer, nullable=True)
     wire_digest = Column(String(64), nullable=True)
     asset_id = Column(String(36), nullable=True)
+    created_at = Column(DateTime(timezone=False), nullable=False)
+    updated_at = Column(DateTime(timezone=False), nullable=False)
+
+
+class FusedMediaWriteRow(GenerationAuxiliaryBase):
+    """One immutable planned object and its independently verified write state."""
+
+    __tablename__ = FUSED_MEDIA_WRITES_TABLE_NAME
+    __table_args__ = (
+        UniqueConstraint("submission_id", "slot", name="uq_fused_media_write_slot"),
+        UniqueConstraint(
+            "config_fingerprint",
+            "bucket",
+            "object_key_digest",
+            name="uq_fused_media_write_object_key",
+        ),
+        Index(
+            "ix_fused_media_writes_recovery",
+            "phase",
+            "next_verify_at",
+            "updated_at",
+            "submission_id",
+        ),
+        CheckConstraint(
+            "phase IN ('planned', 'put_started', 'ack_unknown', 'verified', 'applied', 'content_conflict')",
+            name="ck_fused_media_writes_phase",
+        ),
+        CheckConstraint("result_kind IN ('url', 'inline')", name="ck_fused_media_writes_result_kind"),
+        CheckConstraint("length(provider_result_digest) = 64", name="ck_fused_media_writes_result_digest"),
+        CheckConstraint("length(material_sha256) = 64", name="ck_fused_media_writes_material_digest"),
+        CheckConstraint("length(config_fingerprint) = 64", name="ck_fused_media_writes_config_digest"),
+        CheckConstraint("length(object_key_digest) = 64", name="ck_fused_media_writes_key_digest"),
+        CheckConstraint("size_bytes > 0", name="ck_fused_media_writes_size"),
+        CheckConstraint("config_version > 0 AND plan_version = 1", name="ck_fused_media_writes_plan_version"),
+        CheckConstraint("revision > 0 AND attempt_count >= 0", name="ck_fused_media_writes_revision"),
+    )
+
+    write_id = Column(String(32), primary_key=True)
+    submission_id = Column(String(36), nullable=False)
+    owner_id = Column(String(36), nullable=False)
+    task_id = Column(String(36), nullable=False)
+    slot = Column(String(64), nullable=False)
+    provider_result_digest = Column(String(64), nullable=False)
+    result_kind = Column(String(16), nullable=False)
+    material_sha256 = Column(String(64), nullable=False)
+    media_type = Column(String(128), nullable=False)
+    size_bytes = Column(Integer, nullable=False)
+    config_fingerprint = Column(String(64), nullable=False)
+    config_version = Column(Integer, nullable=False)
+    bucket = Column(String(255), nullable=False)
+    object_key = Column(String(512), nullable=False)
+    object_key_digest = Column(String(64), nullable=False)
+    public_base = Column(String(1024), nullable=False)
+    plan_version = Column(Integer, nullable=False)
+    encrypted_material = Column(Text, nullable=False)
+    material_nonce = Column(String(128), nullable=False)
+    material_key_id = Column(String(128), nullable=False)
+    material_algorithm = Column(String(64), nullable=False)
+    phase = Column(String(24), nullable=False)
+    revision = Column(Integer, nullable=False)
+    put_nonce = Column(String(36), nullable=True)
+    put_owner = Column(String(64), nullable=True)
+    put_generation = Column(Integer, nullable=True)
+    verify_owner = Column(String(64), nullable=True)
+    verify_lease_until = Column(DateTime(timezone=False), nullable=True)
+    next_verify_at = Column(DateTime(timezone=False), nullable=False)
+    attempt_count = Column(Integer, nullable=False)
+    verified_sha256 = Column(String(64), nullable=True)
+    verified_media_type = Column(String(128), nullable=True)
+    verified_size_bytes = Column(Integer, nullable=True)
+    verified_at = Column(DateTime(timezone=False), nullable=True)
+    verified_locator = Column(Text, nullable=True)
+    verification_request_id = Column(String(255), nullable=True)
+    asset_id = Column(String(36), nullable=True)
+    applied_at = Column(DateTime(timezone=False), nullable=True)
     created_at = Column(DateTime(timezone=False), nullable=False)
     updated_at = Column(DateTime(timezone=False), nullable=False)
 
@@ -1142,6 +1221,24 @@ FUSED_GENERATION_SUBMISSION_REQUIREMENTS = {
         indexes=_fused_submission_requirement.indexes,
     )
 }
+_fused_media_write_requirement = _table_requirement(FusedMediaWriteRow.__table__)
+FUSED_MEDIA_WRITE_REQUIREMENTS = {
+    FUSED_MEDIA_WRITES_TABLE_NAME: TableRequirement(
+        columns=_fused_media_write_requirement.columns,
+        primary_key=_fused_media_write_requirement.primary_key,
+        foreign_keys=(
+            _fk("submission_id", "fused_generation_submissions", "submission_id"),
+            _fk("owner_id", "users"),
+            _fk("task_id", "ai_tasks"),
+        ),
+        unique_constraints=tuple(
+            UniqueRequirement(item.columns)
+            for item in _fused_media_write_requirement.unique_constraints
+        ),
+        checks=_fused_media_write_requirement.checks,
+        indexes=_fused_media_write_requirement.indexes,
+    )
+}
 MIGRATION_HISTORY_REQUIREMENT = TableRequirement(
     {
         "version": ColumnRequirement("string", False, 64),
@@ -1354,6 +1451,17 @@ def check_fused_generation_submission_schema(catalog: CatalogReader) -> SchemaCh
     )
 
 
+def check_fused_media_write_schema(catalog: CatalogReader) -> SchemaCheck:
+    """Require the journal used to recover planned fused media objects."""
+
+    return _check_requirements(
+        catalog,
+        FUSED_MEDIA_WRITE_REQUIREMENTS,
+        (FUSED_MEDIA_WRITES_TABLE_NAME,),
+        reject_extra_columns=True,
+    )
+
+
 def check_migration_history_schema(catalog: CatalogReader) -> SchemaCheck:
     """Require the migration history key, typed columns, and nullability."""
 
@@ -1413,12 +1521,15 @@ __all__ = (
     "CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM",
     "FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION",
     "FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM",
+    "FUSED_MEDIA_WRITES_SCHEMA_VERSION",
+    "FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM",
     "GENERATION_CURRENT_SCHEMA_VERSION",
     "GENERATION_CURRENT_SCHEMA_CHECKSUM",
     "GENERATION_MIGRATION_HISTORY_TABLE",
     "GENERATION_SUPPORTED_VERSIONS",
     "CANVAS_RESULT_TARGETS_TABLE_NAME",
     "FUSED_GENERATION_SUBMISSIONS_TABLE_NAME",
+    "FUSED_MEDIA_WRITES_TABLE_NAME",
     "UserRow",
     "AITaskRow",
     "TaskQuoteRow",
@@ -1433,6 +1544,7 @@ __all__ = (
     "GenerationResultReceiptRow",
     "GenerationResultTargetRow",
     "FusedGenerationSubmissionRow",
+    "FusedMediaWriteRow",
     "ApplicationRecordRow",
     "ExecutionAttemptGroupRow",
     "LocalContinuationWorkRow",
@@ -1447,6 +1559,7 @@ __all__ = (
     "CANVAS_RESULT_TARGET_REQUIREMENTS",
     "CANVAS_RESULT_TARGET_INDEX_REQUIREMENTS",
     "FUSED_GENERATION_SUBMISSION_REQUIREMENTS",
+    "FUSED_MEDIA_WRITE_REQUIREMENTS",
     "FOUNDATION_REQUIREMENTS",
     "MIGRATION_HISTORY_REQUIREMENT",
     "CatalogColumn",
@@ -1464,6 +1577,7 @@ __all__ = (
     "check_generation_record_schema",
     "check_canvas_result_target_schema",
     "check_fused_generation_submission_schema",
+    "check_fused_media_write_schema",
     "check_migration_history_schema",
     "check_generation_version_set",
     "sqlalchemy_catalog",

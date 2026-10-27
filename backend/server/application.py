@@ -397,6 +397,11 @@ def create_server_host(
                 if fused_generation_configuration is not None
                 else None
             ),
+            fused_generation_planned_media_storage=(
+                fused_generation_configuration.planned_media_storage
+                if fused_generation_configuration is not None
+                else None
+            ),
             fused_generation_credential_registry=(
                 fused_generation_configuration.credential_registry
                 if fused_generation_configuration is not None

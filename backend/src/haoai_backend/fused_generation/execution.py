@@ -8,11 +8,19 @@ from dataclasses import dataclass
 from secrets import token_urlsafe
 from typing import TypeVar
 from collections.abc import Mapping
+from urllib.parse import quote
 from uuid import uuid4
 
 from starlette.concurrency import run_in_threadpool
 
 from haoai_backend.generation_contracts import StoredMedia
+from haoai_backend.media_storage.owned_write_values import (
+    OwnedObjectMaterial,
+    OwnedObjectPlan,
+    OwnedObjectPutResult,
+    OwnedObjectVerification,
+)
+from haoai_backend.media_storage.sync_facade import MediaStoreOperationError
 from haoai_backend.generation_contracts.types import BoundCredential
 from haoai_backend.generation_credentials.application import CredentialRegistry
 from haoai_backend.generation_credentials.domain import (
@@ -38,12 +46,26 @@ from .durable_application import (
     load_durable_prepared_snapshot,
     load_durable_provider_result,
 )
-from .durable_values import decode_result, encode_result, result_digest, seal_json_value
+from .durable_values import (
+    decode_result,
+    encode_result,
+    open_owned_media_material,
+    owned_object_plan_from_journal,
+    owned_plan_matches_journal,
+    result_digest,
+    seal_json_value,
+    seal_owned_media_material,
+)
 from .ports import (
     FusedGenerationImageStorage,
+    FusedGenerationPlannedMediaStorage,
     FusedGenerationRuntime,
     FusedGenerationStorage,
     FusedGenerationUnitOfWorkFactory,
+)
+
+_UNKNOWN_MEDIA_PREPARATION_FAILURES = frozenset(
+    {"cleanup_failure", "storage_outcome_unverified", "timeout", "transfer_failure"}
 )
 
 
@@ -56,6 +78,7 @@ class FusedGenerationExecution:
     credential_registry: CredentialRegistry | None = None
     credential_crypto: CredentialCrypto | None = None
     proof_authority: HmacProofAuthority | None = None
+    planned_media_storage: FusedGenerationPlannedMediaStorage | None = None
 
     async def execute_submission(self, submission_id: str, owner_id: str) -> None:
         """Run or safely recover one accepted durable submission."""
@@ -160,6 +183,356 @@ class FusedGenerationExecution:
             return
 
         await self._create_durable_result(prepared, claim_token, claim.generation)
+
+    async def recover_media_write(self, submission_id: str, owner_id: str) -> None:
+        """Verify a journaled original key without dispatching a provider call."""
+
+        if (
+            self.uow_factory is None
+            or self.planned_media_storage is None
+            or self.credential_crypto is None
+            or self.proof_authority is None
+        ):
+            return
+        row = await run_in_threadpool(
+            _read_durable_submission,
+            self.uow_factory,
+            submission_id,
+            owner_id,
+        )
+        if row is None or row.get("stage") not in {"media_started", "media_ack_unknown"}:
+            return
+        prepared = load_durable_prepared_snapshot(
+            row,
+            crypto=self.credential_crypto,
+            proof_authority=self.proof_authority,
+        )
+        if prepared is None:
+            return
+        await self._verify_durable_media_write(
+            row,
+            prepared,
+            allow_active_task=False,
+        )
+
+    async def _deliver_planned_media(
+        self,
+        prepared: PreparedFusedGeneration,
+        claim_token: str,
+        generation: int,
+        output: FusedGenerationOutput | FusedGenerationInlineImage,
+    ) -> None:
+        assert self.uow_factory is not None
+        assert self.planned_media_storage is not None
+        assert self.credential_crypto is not None
+        binding = prepared.credential_binding
+        if binding is None or prepared.submission_id is None or prepared.request_digest is None:
+            await self._retain_unknown(prepared, claim_token, FUSED_MEDIA_STORAGE_UNKNOWN_REASON)
+            return
+
+        result_hash = result_digest(output)
+        row = await run_in_threadpool(
+            _read_fused_media_write,
+            self.uow_factory,
+            prepared.submission_id,
+        )
+        if row is None:
+            try:
+                material = await run_in_threadpool(
+                    _prepare_planned_fused_media,
+                    self.planned_media_storage,
+                    output,
+                    prepared,
+                    result_hash,
+                )
+            except MediaStoreOperationError as error:
+                if (
+                    isinstance(output, FusedGenerationOutput)
+                    and error.failure.code not in _UNKNOWN_MEDIA_PREPARATION_FAILURES
+                ):
+                    await self._finish(
+                        prepared,
+                        claim_token,
+                        image_url=output.image_url,
+                        error_message=None,
+                        preserve_if_cancelled=True,
+                    )
+                elif isinstance(output, FusedGenerationOutput):
+                    await self._retain_known_media_result(
+                        prepared,
+                        claim_token,
+                        output.image_url,
+                    )
+                else:
+                    await self._retain_unknown(
+                        prepared,
+                        claim_token,
+                        FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
+                    )
+                return
+            except Exception:
+                await self._retain_unknown(
+                    prepared,
+                    claim_token,
+                    FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
+                )
+                return
+
+            encrypted, nonce, key_id, algorithm = seal_owned_media_material(
+                material,
+                crypto=self.credential_crypto,
+                submission_id=prepared.submission_id,
+                owner_id=prepared.user_id,
+                request_digest=prepared.request_digest,
+                task_id=prepared.task_id,
+                binding=binding,
+            )
+            persisted = await run_in_threadpool(
+                _persist_fused_media_plan,
+                self.uow_factory,
+                prepared,
+                claim_token,
+                generation,
+                output,
+                material,
+                encrypted,
+                nonce,
+                key_id,
+                algorithm,
+            )
+            if not persisted:
+                return
+            row = await run_in_threadpool(
+                _read_fused_media_write,
+                self.uow_factory,
+                prepared.submission_id,
+            )
+        if row is None:
+            return
+
+        material = _open_journaled_media_material(
+            row,
+            prepared,
+            self.credential_crypto,
+        )
+        if material is None or row.get("provider_result_digest") != result_hash:
+            return
+        phase = row.get("phase")
+        if phase == "planned":
+            write_nonce = str(uuid4())
+            claimed = await run_in_threadpool(
+                _claim_fused_media_put,
+                self.uow_factory,
+                prepared,
+                claim_token,
+                generation,
+                write_nonce,
+            )
+            if not claimed:
+                return
+            permit = _CommittedFusedMediaWritePermit(material.plan)
+            putting = asyncio.create_task(
+                run_in_threadpool(
+                    self.planned_media_storage.put_planned,
+                    material,
+                    permit,
+                )
+            )
+            try:
+                put_result, cancellation_requested = await _drain_owned_worker(putting)
+            except Exception:
+                put_result = OwnedObjectPutResult("unknown", error_code="storage_call_unverified")
+                cancellation_requested = False
+            if cancellation_requested:
+                await run_in_threadpool(
+                    _record_fused_media_put_unknown,
+                    self.uow_factory,
+                    prepared.submission_id,
+                    material.plan.write_id,
+                )
+                await self._retain_result_after_cancellation(
+                    prepared,
+                    claim_token,
+                    output,
+                )
+                raise asyncio.CancelledError
+            if put_result.status == "unknown":
+                await run_in_threadpool(
+                    _record_fused_media_put_unknown,
+                    self.uow_factory,
+                    prepared.submission_id,
+                    material.plan.write_id,
+                )
+                await self._retain_result_after_cancellation(
+                    prepared,
+                    claim_token,
+                    output,
+                )
+            row = await run_in_threadpool(
+                _read_durable_submission,
+                self.uow_factory,
+                prepared.submission_id,
+                prepared.user_id,
+            )
+            if row is None:
+                return
+            await self._verify_durable_media_write(
+                row,
+                prepared,
+                allow_active_task=True,
+                expected_claim_token=claim_token,
+                expected_generation=generation,
+            )
+            write = await run_in_threadpool(
+                _read_fused_media_write,
+                self.uow_factory,
+                prepared.submission_id,
+            )
+            locator = write.get("verified_locator") if write is not None else None
+            if write is not None and write.get("phase") == "verified":
+                if isinstance(output, FusedGenerationOutput) and type(locator) is str:
+                    await self._retain_known_media_result(
+                        prepared,
+                        claim_token,
+                        locator,
+                    )
+                elif isinstance(output, FusedGenerationInlineImage):
+                    await self._retain_unknown(
+                        prepared,
+                        claim_token,
+                        FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
+                    )
+            return
+        if phase in {"put_started", "ack_unknown", "verified"}:
+            ledger = await run_in_threadpool(
+                _read_durable_submission,
+                self.uow_factory,
+                prepared.submission_id,
+                prepared.user_id,
+            )
+            if ledger is not None:
+                await self._verify_durable_media_write(
+                    ledger,
+                    prepared,
+                    allow_active_task=True,
+                    expected_claim_token=claim_token,
+                    expected_generation=generation,
+                )
+
+    async def _verify_durable_media_write(
+        self,
+        ledger: Mapping[str, object],
+        prepared: PreparedFusedGeneration,
+        *,
+        allow_active_task: bool,
+        expected_claim_token: str | None = None,
+        expected_generation: int | None = None,
+    ) -> None:
+        assert self.uow_factory is not None
+        assert self.planned_media_storage is not None
+        assert self.credential_crypto is not None
+        submission_id = prepared.submission_id
+        if submission_id is None:
+            return
+        row = await run_in_threadpool(
+            _read_fused_media_write,
+            self.uow_factory,
+            submission_id,
+        )
+        if row is None:
+            return
+        material = _open_journaled_media_material(row, prepared, self.credential_crypto)
+        if material is None:
+            return
+        if (
+            row.get("provider_result_digest") != ledger.get("result_digest")
+            or row.get("phase") not in {"put_started", "ack_unknown", "verified"}
+        ):
+            return
+        verifier_token = token_urlsafe(32)
+        claimed = await run_in_threadpool(
+            _claim_fused_media_verification,
+            self.uow_factory,
+            submission_id,
+            prepared.user_id,
+            verifier_token,
+            allow_active_task,
+            expected_claim_token,
+            expected_generation,
+        )
+        if not claimed:
+            return
+        row = await run_in_threadpool(
+            _read_fused_media_write,
+            self.uow_factory,
+            submission_id,
+        )
+        if (
+            row is None
+            or row.get("verify_owner") != verifier_token
+            or row.get("phase") not in {"put_started", "ack_unknown", "verified"}
+        ):
+            return
+        if row.get("phase") != "verified":
+            try:
+                verification = await run_in_threadpool(
+                    self.planned_media_storage.verify_planned,
+                    material.plan,
+                )
+            except Exception:
+                verification = OwnedObjectVerification(
+                    "unavailable",
+                    safe_detail="媒体对象核验暂不可用",
+                )
+            stored = verification.stored_media
+            locator = None
+            if (
+                verification.status == "verified"
+                and stored is not None
+                and stored.locator
+                == f"{material.plan.public_base}/{quote(material.plan.object_key, safe='/')}"
+                and stored.content_digest == material.plan.material_sha256
+                and stored.media_type == material.plan.media_type
+                and stored.size_bytes == material.plan.size_bytes
+            ):
+                locator = stored.locator
+            elif verification.status == "verified":
+                verification = OwnedObjectVerification(
+                    "unavailable",
+                    safe_detail="对象核验结果与原持久计划不一致",
+                )
+            recorded = await run_in_threadpool(
+                _record_fused_media_verification,
+                self.uow_factory,
+                submission_id,
+                material.plan.write_id,
+                verifier_token,
+                verification,
+                locator,
+            )
+            if not recorded or verification.status != "verified":
+                return
+            row = await run_in_threadpool(
+                _read_fused_media_write,
+                self.uow_factory,
+                submission_id,
+            )
+        if (
+            row is None
+            or row.get("phase") != "verified"
+            or row.get("verify_owner") != verifier_token
+            or type(row.get("verified_locator")) is not str
+        ):
+            return
+        locator = row["verified_locator"]
+        await run_in_threadpool(
+            _complete_verified_fused_media,
+            self.uow_factory,
+            prepared,
+            material.plan.write_id,
+            verifier_token,
+            locator,
+        )
 
     async def _create_durable_result(
         self,
@@ -345,6 +718,9 @@ class FusedGenerationExecution:
         output: FusedGenerationOutput | FusedGenerationInlineImage,
     ) -> None:
         assert self.uow_factory is not None
+        if self.planned_media_storage is not None and prepared.submission_id is not None:
+            await self._deliver_planned_media(prepared, claim_token, generation, output)
+            return
         if isinstance(output, FusedGenerationOutput) and self.storage is None:
             await self._finish(
                 prepared,
@@ -935,6 +1311,371 @@ def _claim_durable(
         return claim
     finally:
         uow.close()
+
+
+class _CommittedFusedMediaWritePermit:
+    """A single in-process write allowance after a confirmed journal commit."""
+
+    __slots__ = ("_plan", "_used")
+
+    def __init__(self, plan: OwnedObjectPlan) -> None:
+        self._plan = plan
+        self._used = False
+
+    def claim(self, plan: OwnedObjectPlan) -> bool:
+        if self._used or type(plan) is not OwnedObjectPlan or plan != self._plan:
+            return False
+        self._used = True
+        return True
+
+
+def _prepare_planned_fused_media(
+    storage: FusedGenerationPlannedMediaStorage,
+    output: FusedGenerationOutput | FusedGenerationInlineImage,
+    prepared: PreparedFusedGeneration,
+    result_hash: str,
+) -> OwnedObjectMaterial:
+    if prepared.submission_id is None:
+        raise ValueError("durable fused submission id is missing")
+    if type(output) is FusedGenerationOutput:
+        return storage.prepare_public_image(
+            output.image_url,
+            owner_id=prepared.user_id,
+            submission_id=prepared.submission_id,
+            result_digest=result_hash,
+        )
+    return storage.prepare_inline_image(
+        output,
+        owner_id=prepared.user_id,
+        submission_id=prepared.submission_id,
+        result_digest=result_hash,
+    )
+
+
+def _read_fused_media_write(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    submission_id: str,
+) -> Mapping[str, object] | None:
+    uow = uow_factory()
+    try:
+        return uow.fused_media_write_by_submission(submission_id)
+    finally:
+        try:
+            uow.rollback()
+        finally:
+            uow.close()
+
+
+def _open_journaled_media_material(
+    row: Mapping[str, object],
+    prepared: PreparedFusedGeneration,
+    crypto: CredentialCrypto,
+) -> OwnedObjectMaterial | None:
+    binding = prepared.credential_binding
+    if (
+        binding is None
+        or prepared.submission_id is None
+        or prepared.request_digest is None
+        or row.get("submission_id") != prepared.submission_id
+        or row.get("owner_id") != prepared.user_id
+        or row.get("task_id") != prepared.task_id
+    ):
+        return None
+    material = open_owned_media_material(
+        row.get("encrypted_material"),
+        row.get("material_nonce"),
+        row.get("material_key_id"),
+        row.get("material_algorithm"),
+        crypto=crypto,
+        submission_id=prepared.submission_id,
+        owner_id=prepared.user_id,
+        request_digest=prepared.request_digest,
+        task_id=prepared.task_id,
+        binding=binding,
+    )
+    if (
+        material is None
+        or not owned_plan_matches_journal(row, material.plan)
+        or row.get("object_key_digest")
+        != hashlib.sha256(material.plan.object_key.encode("utf-8")).hexdigest()
+    ):
+        return None
+    return material
+
+
+def _persist_fused_media_plan(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    prepared: PreparedFusedGeneration,
+    claim_token: str,
+    generation: int,
+    output: FusedGenerationOutput | FusedGenerationInlineImage,
+    material: OwnedObjectMaterial,
+    encrypted: str,
+    nonce: str,
+    key_id: str,
+    algorithm: str,
+) -> bool:
+    submission_id = prepared.submission_id
+    if submission_id is None:
+        return False
+    plan = material.plan
+    uow = uow_factory()
+    try:
+        saved = uow.persist_fused_media_plan(
+            submission_id=submission_id,
+            task_id=prepared.task_id,
+            owner_id=prepared.user_id,
+            claim_token=claim_token,
+            generation=generation,
+            result_digest=plan.provider_result_digest,
+            result_kind="url" if type(output) is FusedGenerationOutput else "inline",
+            material_sha256=plan.material_sha256,
+            media_type=plan.media_type,
+            size_bytes=plan.size_bytes,
+            config_fingerprint=plan.config_fingerprint,
+            config_version=plan.config_version,
+            bucket=plan.bucket,
+            object_key=plan.object_key,
+            public_base=plan.public_base,
+            write_id=plan.write_id,
+            plan_version=plan.plan_version,
+            encrypted_material=encrypted,
+            material_nonce=nonce,
+            material_key_id=key_id,
+            material_algorithm=algorithm,
+        )
+        if not saved:
+            uow.rollback()
+            return False
+        try:
+            uow.commit()
+        except Exception:
+            # A plan may be durable, but this call did not receive a confirmed
+            # commit; only a later recovery scan may decide what to do.
+            return False
+        return True
+    except Exception:
+        uow.rollback()
+        return False
+    finally:
+        uow.close()
+
+
+def _claim_fused_media_put(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    prepared: PreparedFusedGeneration,
+    claim_token: str,
+    generation: int,
+    write_nonce: str,
+) -> bool:
+    submission_id = prepared.submission_id
+    if submission_id is None:
+        return False
+    uow = uow_factory()
+    try:
+        claimed = uow.claim_fused_media_put(
+            submission_id=submission_id,
+            task_id=prepared.task_id,
+            owner_id=prepared.user_id,
+            claim_token=claim_token,
+            generation=generation,
+            write_nonce=write_nonce,
+        )
+        if not claimed:
+            uow.rollback()
+            return False
+        try:
+            uow.commit()
+        except Exception:
+            return False
+    except Exception:
+        uow.rollback()
+        return False
+    finally:
+        uow.close()
+    check = uow_factory()
+    try:
+        return check.fused_media_put_claim_matches(
+            submission_id=submission_id,
+            task_id=prepared.task_id,
+            owner_id=prepared.user_id,
+            claim_token=claim_token,
+            generation=generation,
+            write_nonce=write_nonce,
+        )
+    finally:
+        try:
+            check.rollback()
+        finally:
+            check.close()
+
+
+def _record_fused_media_put_unknown(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    submission_id: str,
+    write_id: str,
+) -> bool:
+    uow = uow_factory()
+    try:
+        changed = uow.record_fused_media_put_outcome(
+            submission_id,
+            write_id,
+            unknown=True,
+        )
+        if not changed:
+            uow.rollback()
+            return False
+        uow.commit()
+        return True
+    except Exception:
+        uow.rollback()
+        return False
+    finally:
+        uow.close()
+
+
+def _claim_fused_media_verification(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    submission_id: str,
+    owner_id: str,
+    verifier_token: str,
+    allow_active_task: bool,
+    expected_claim_token: str | None,
+    expected_generation: int | None,
+) -> bool:
+    uow = uow_factory()
+    try:
+        claimed = uow.claim_fused_media_verification(
+            submission_id=submission_id,
+            owner_id=owner_id,
+            verifier_token=verifier_token,
+            lease_seconds=90,
+            allow_active_task=allow_active_task,
+            expected_claim_token=expected_claim_token,
+            expected_generation=expected_generation,
+        )
+        if claimed is None:
+            uow.rollback()
+            return False
+        try:
+            uow.commit()
+        except Exception:
+            return False
+    except Exception:
+        uow.rollback()
+        return False
+    finally:
+        uow.close()
+    check = uow_factory()
+    try:
+        row = check.fused_media_write_by_submission(submission_id)
+        return bool(
+            row is not None
+            and row.get("verify_owner") == verifier_token
+            and row.get("phase") in {"put_started", "ack_unknown", "verified"}
+            and row.get("verify_lease_until") is not None
+            and row.get("verify_lease_until") > check.current_time()
+        )
+    finally:
+        try:
+            check.rollback()
+        finally:
+            check.close()
+
+
+def _record_fused_media_verification(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    submission_id: str,
+    write_id: str,
+    verifier_token: str,
+    verification: OwnedObjectVerification,
+    locator: str | None,
+) -> bool:
+    stored = verification.stored_media
+    uow = uow_factory()
+    try:
+        changed = uow.record_fused_media_verification(
+            submission_id=submission_id,
+            write_id=write_id,
+            verifier_token=verifier_token,
+            status=verification.status,
+            observed_sha256=verification.observed_sha256,
+            observed_size_bytes=verification.observed_size_bytes,
+            media_type=stored.media_type if stored is not None else None,
+            locator=locator,
+            request_id=verification.request_id,
+        )
+        if not changed:
+            uow.rollback()
+            return False
+        try:
+            uow.commit()
+        except Exception:
+            return False
+        return True
+    except Exception:
+        uow.rollback()
+        return False
+    finally:
+        uow.close()
+
+
+def _complete_verified_fused_media(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    prepared: PreparedFusedGeneration,
+    write_id: str,
+    verifier_token: str,
+    locator: str,
+) -> bool:
+    uow = uow_factory()
+    try:
+        completed = uow.complete_verified_fused_media(
+            prepared,
+            write_id=write_id,
+            verifier_token=verifier_token,
+            locator=locator,
+        )
+        if not completed:
+            uow.rollback()
+        else:
+            try:
+                uow.commit()
+            except Exception:
+                pass
+    except Exception:
+        try:
+            uow.rollback()
+        except Exception:
+            pass
+    finally:
+        uow.close()
+    return _fused_media_application_matches(
+        uow_factory,
+        prepared.submission_id or "",
+    )
+
+
+def _fused_media_application_matches(
+    uow_factory: FusedGenerationUnitOfWorkFactory,
+    submission_id: str,
+) -> bool:
+    uow = uow_factory()
+    try:
+        ledger = uow.durable_submission_by_id(submission_id)
+        write = uow.fused_media_write_by_submission(submission_id)
+        return bool(
+            ledger is not None
+            and write is not None
+            and ledger.get("stage") == "completed"
+            and write.get("phase") == "applied"
+            and type(ledger.get("asset_id")) is str
+            and ledger.get("asset_id") == write.get("asset_id")
+        )
+    finally:
+        try:
+            uow.rollback()
+        finally:
+            uow.close()
 
 
 def _accept_durable_snapshot_for_recovery(

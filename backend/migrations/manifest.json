@@ -31,6 +31,14 @@
       "tables": [
         "fused_generation_submissions"
       ]
+    },
+    {
+      "version": "0004_fused_media_writes",
+      "file": "0004_fused_media_writes.sql",
+      "sha256": "7c65b87f73082ab88437f686c60030475c5876d9c6dd1ba750a2bb20bc985905",
+      "tables": [
+        "fused_media_writes"
+      ]
     }
   ]
 }

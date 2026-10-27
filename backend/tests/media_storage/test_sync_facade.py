@@ -3,12 +3,14 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import hashlib
+import io
 import socket
 import tempfile
 import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from haoai_backend.generation_contracts import (
     GenerationRuntimeConfig,
@@ -32,9 +34,12 @@ from haoai_backend.media_storage.transfer_types import (
     MediaTypeRule,
     R2Configuration,
     SafeMediaPolicy,
+    S3ObjectRead,
     SecretValue,
+    TRANSFER_CHUNK_BYTES,
     WriteReceipt,
 )
+from haoai_backend.media_storage.pinned_http import EncodedRequestTarget
 
 
 class _UnusedHttpLibrary:
@@ -316,6 +321,346 @@ class SyncFacadeTests(unittest.TestCase):
                     video.content_digest,
                     hashlib.sha256(video_bytes).hexdigest(),
                 )
+            finally:
+                runtime.close()
+
+    def test_owned_inline_prepare_retains_validated_bytes_without_writing(self) -> None:
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            stager = _stager(directory)
+            configuration = R2Configuration(
+                endpoint_url="https://account.r2.example.test",
+                bucket="media-bucket",
+                public_base_url="https://media.example.test",
+                transfer_tmp_dir=directory,
+                business_type="generation",
+                environment="production",
+                connect_timeout_seconds=7,
+                read_timeout_seconds=19,
+            )
+            runtime = _runtime(directory, r2_configuration=configuration)
+            store = SynchronousMediaStore(
+                runtime,
+                mode="url_or_inline",
+                reference_stager=stager,
+                staging_directory=None,
+            )
+            try:
+                material = store.prepare_owned_bytes(
+                    ReferenceInput(
+                        kind="data_uri",
+                        locator="data:image/png;base64,cG5n",
+                    ),
+                    {"max_bytes": 3},
+                    owner_ref="owner-42",
+                    submission_ref="submission-77",
+                    slot="primary",
+                    provider_result_digest=hashlib.sha256(
+                        b"provider result envelope"
+                    ).hexdigest(),
+                )
+
+                self.assertEqual(material.content, b"png")
+                self.assertEqual(material.plan.media_type, "image/png")
+                self.assertEqual(
+                    material.plan.material_sha256,
+                    hashlib.sha256(b"png").hexdigest(),
+                )
+                self.assertNotEqual(
+                    material.plan.provider_result_digest,
+                    material.plan.material_sha256,
+                )
+            finally:
+                runtime.close()
+
+    def test_owned_planned_io_uses_runtime_executor_and_returns_get_verified_media(self) -> None:
+        class _Secret:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+            def reveal(self) -> SecretValue:
+                return SecretValue(self.value)
+
+        class _Client:
+            def __init__(self, factory) -> None:
+                self.factory = factory
+                self.closed = False
+
+            def put_object(self, **_kwargs):
+                raise AssertionError("planned writes must use IfNoneMatch")
+
+            def put_object_if_absent(self, **kwargs):
+                self.factory.worker_threads.append(threading.get_ident())
+                self.factory.put_calls += 1
+                self.factory.key = kwargs["Key"]
+                self.factory.body = kwargs["Body"].read()
+                self.factory.objects[kwargs["Key"]] = self.factory.body
+                return WriteReceipt(kwargs["Key"], 200, "put-request")
+
+            def get_object_stream(self, *, Bucket, Key):
+                self.factory.worker_threads.append(threading.get_ident())
+                self.factory.get_calls += 1
+                body = io.BytesIO(self.factory.objects[Key])
+                return S3ObjectRead(
+                    status_code=200,
+                    content_length=len(self.factory.objects[Key]),
+                    content_type="image/png",
+                    content_range=None,
+                    body=body,
+                    request_id="get-request",
+                )
+
+            def close(self) -> None:
+                self.closed = True
+
+        class _Factory:
+            def __init__(self) -> None:
+                self.worker_threads: list[int] = []
+                self.objects: dict[str, bytes] = {}
+                self.put_calls = 0
+                self.get_calls = 0
+                self.body: bytes | None = None
+                self.key: str | None = None
+                self.settings = []
+
+            def create(self, settings, access_key, secret_key):
+                self.settings.append(settings)
+                if access_key.value != "access" or secret_key.value != "secret":
+                    raise AssertionError("Root credentials were not explicitly resolved")
+                return _Client(self)
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            stager = _stager(directory)
+            configuration = R2Configuration(
+                endpoint_url="https://account.r2.example.test",
+                bucket="media-bucket",
+                public_base_url="https://media.example.test",
+                transfer_tmp_dir=directory,
+                business_type="generation",
+                environment="production",
+                connect_timeout_seconds=7,
+                read_timeout_seconds=19,
+            )
+            factory = _Factory()
+            runtime = _runtime(
+                directory,
+                r2_configuration=configuration,
+                access_key=_Secret("access"),
+                secret_key=_Secret("secret"),
+                s3_client_factory=factory,
+            )
+            store = SynchronousMediaStore(
+                runtime,
+                mode="url_or_inline",
+                reference_stager=stager,
+                staging_directory=None,
+            )
+            caller_thread = threading.get_ident()
+
+            class BoundPermit:
+                def __init__(self, write_id: str) -> None:
+                    self.write_id = write_id
+                    self.used = False
+
+                def claim(self, plan) -> bool:
+                    if self.used or plan.write_id != self.write_id:
+                        return False
+                    self.used = True
+                    return True
+
+            try:
+                material = store.prepare_owned_bytes(
+                    ReferenceInput(
+                        kind="bytes",
+                        content=b"owned-png",
+                        media_type="image/png",
+                    ),
+                    {"max_bytes": 128},
+                    owner_ref="owner-42",
+                    submission_ref="submission-77",
+                    slot="primary",
+                    provider_result_digest=hashlib.sha256(b"provider-result").hexdigest(),
+                )
+                outcome = store.put_planned_media(
+                    material,
+                    BoundPermit(material.plan.write_id),
+                )
+                verification = store.verify_planned_media(material.plan)
+
+                self.assertEqual(outcome.status, "created")
+                self.assertEqual(verification.status, "verified")
+                self.assertEqual(factory.put_calls, 1)
+                self.assertEqual(factory.get_calls, 1)
+                self.assertEqual(factory.body, b"owned-png")
+                self.assertEqual(factory.key, material.plan.object_key)
+                self.assertTrue(all(thread != caller_thread for thread in factory.worker_threads))
+                self.assertEqual(
+                    [settings.total_max_attempts for settings in factory.settings],
+                    [1, 1],
+                )
+                self.assertTrue(
+                    all(settings.operation_policy == "owned_once" for settings in factory.settings)
+                )
+            finally:
+                runtime.close()
+
+    def test_owned_public_prepare_uses_pinned_http_and_returns_real_response_bytes(self) -> None:
+        payload = b"public-provider-image"
+
+        class _Chunks:
+            def __init__(self) -> None:
+                self.values = [payload]
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if not self.values:
+                    raise StopAsyncIteration
+                return self.values.pop(0)
+
+            async def aclose(self) -> None:
+                self.closed = True
+
+        class _Response:
+            status = 200
+
+            def __init__(self) -> None:
+                self.headers = {
+                    "Content-Type": "image/png",
+                    "Content-Length": str(len(payload)),
+                }
+                self.chunks = _Chunks()
+                self.closed = False
+
+            def iter_chunks(self, chunk_size: int):
+                if chunk_size != TRANSFER_CHUNK_BYTES:
+                    raise AssertionError("unexpected HTTP chunk size")
+                return self.chunks
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class _Connector:
+            def __init__(self, resolver) -> None:
+                self.resolver = resolver
+                self.closed = False
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class _Session:
+            def __init__(self, connector, response) -> None:
+                self.connector = connector
+                self.response = response
+                self.closed = False
+
+            async def get(self, target, *, headers, timeout_seconds, allow_redirects):
+                parsed = urlsplit(target.raw_url)
+                await self.connector.resolver.resolve(
+                    target.tls_hostname,
+                    parsed.port or 443,
+                )
+                if headers != {"Host": parsed.netloc} or allow_redirects:
+                    raise AssertionError("unsafe pinned HTTP request options")
+                return self.response
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class _HttpLibrary:
+            def __init__(self) -> None:
+                self.response = _Response()
+                self.connector_value = None
+                self.session_value = None
+
+            def encoded_url(self, raw_url: str, *, preserve_encoded: bool):
+                parsed = urlsplit(raw_url)
+                return EncodedRequestTarget(
+                    raw_url,
+                    parsed.netloc,
+                    parsed.hostname or "",
+                    preserve_encoded,
+                )
+
+            def connector(self, resolver, *, tls_hostname, verify_tls, use_dns_cache):
+                if not verify_tls or use_dns_cache:
+                    raise AssertionError("pinned DNS/TLS options changed")
+                self.connector_value = _Connector(resolver)
+                return self.connector_value
+
+            def session(
+                self,
+                connector,
+                *,
+                trust_env,
+                cookies_enabled,
+                auto_decompress,
+                connector_owned_by_session,
+            ):
+                if trust_env or cookies_enabled or not auto_decompress or connector_owned_by_session:
+                    raise AssertionError("pinned session options changed")
+                self.session_value = _Session(connector, self.response)
+                return self.session_value
+
+        async def resolve(host, port, *, family, type):
+            return (
+                (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", ("8.8.8.8", port)),
+            )
+
+        with tempfile.TemporaryDirectory() as raw:
+            directory = Path(raw)
+            stager = _stager(directory)
+            configuration = R2Configuration(
+                endpoint_url="https://account.r2.example.test",
+                bucket="media-bucket",
+                public_base_url="https://media.example.test",
+                transfer_tmp_dir=directory,
+                business_type="generation",
+                environment="production",
+                connect_timeout_seconds=7,
+                read_timeout_seconds=19,
+            )
+            library = _HttpLibrary()
+            runtime = _runtime(
+                directory,
+                getaddrinfo=resolve,
+                http_library=library,
+                r2_configuration=configuration,
+            )
+            store = SynchronousMediaStore(
+                runtime,
+                mode="url_or_inline",
+                reference_stager=stager,
+                staging_directory=None,
+            )
+            try:
+                material = store.prepare_owned_public_media(
+                    ReferenceInput(
+                        kind="public_http",
+                        locator="https://provider.example.test/result.png",
+                    ),
+                    {"max_bytes": 1024, "timeout_seconds": 5},
+                    owner_ref="owner-42",
+                    submission_ref="submission-77",
+                    slot="primary",
+                    provider_result_digest=hashlib.sha256(
+                        b"provider URL envelope"
+                    ).hexdigest(),
+                )
+
+                self.assertEqual(material.content, payload)
+                self.assertEqual(
+                    material.plan.material_sha256,
+                    hashlib.sha256(payload).hexdigest(),
+                )
+                self.assertEqual(material.plan.media_type, "image/png")
+                self.assertTrue(library.response.closed)
+                self.assertTrue(library.response.chunks.closed)
+                self.assertTrue(library.session_value.closed)
+                self.assertTrue(library.connector_value.closed)
             finally:
                 runtime.close()
 

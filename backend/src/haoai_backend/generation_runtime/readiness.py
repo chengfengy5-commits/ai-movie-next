@@ -12,6 +12,10 @@ from sqlalchemy.orm import Session
 from haoai_backend.generation_core.schema import (
     CANVAS_RESULT_TARGETS_SCHEMA_CHECKSUM,
     CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
+    FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM,
+    FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION,
+    FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM,
+    FUSED_MEDIA_WRITES_SCHEMA_VERSION,
     GENERATION_MIGRATION_HISTORY_TABLE,
     GENERATION_SCHEMA_CHECKSUM,
     GENERATION_SCHEMA_VERSION,
@@ -19,6 +23,8 @@ from haoai_backend.generation_core.schema import (
     check_foundation_schema,
     check_generation_record_schema,
     check_generation_version_set,
+    check_fused_generation_submission_schema,
+    check_fused_media_write_schema,
     check_migration_history_schema,
     sqlalchemy_catalog,
 )
@@ -62,8 +68,12 @@ def check_generation_readiness(session: Session) -> GenerationReadiness:
 
             records = check_generation_record_schema(catalog)
             targets = check_canvas_result_target_schema(catalog)
+            submissions = check_fused_generation_submission_schema(catalog)
+            media_writes = check_fused_media_write_schema(catalog)
             history = check_migration_history_schema(catalog)
-            issues.extend(_issues_from_checks(records, targets, history))
+            issues.extend(
+                _issues_from_checks(records, targets, submissions, media_writes, history)
+            )
             if issues:
                 return GenerationReadiness("not_ready", tuple(issues))
 
@@ -101,6 +111,19 @@ def check_generation_readiness(session: Session) -> GenerationReadiness:
                         CANVAS_RESULT_TARGETS_SCHEMA_VERSION,
                     )
                 )
+            expected_checksums = (
+                (FUSED_GENERATION_SUBMISSIONS_SCHEMA_VERSION, FUSED_GENERATION_SUBMISSIONS_SCHEMA_CHECKSUM),
+                (FUSED_MEDIA_WRITES_SCHEMA_VERSION, FUSED_MEDIA_WRITES_SCHEMA_CHECKSUM),
+            )
+            for version, expected_checksum in expected_checksums:
+                matching = [row for row in rows if str(row[0]) == version]
+                if len(matching) != 1 or str(matching[0][1]) != expected_checksum:
+                    issues.append(
+                        ReadinessIssue(
+                            "generation_migration_checksum_mismatch",
+                            version,
+                        )
+                    )
     except SQLAlchemyError as error:
         issues.append(ReadinessIssue("catalog_unavailable", type(error).__name__))
 

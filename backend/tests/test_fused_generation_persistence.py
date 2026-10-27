@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import hashlib
+import hmac
 import json
+import os
+import threading
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import pytest
+from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from sqlalchemy import create_engine, event, insert, select, update
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.sql.dml import Update
@@ -25,6 +32,7 @@ from haoai_backend.fused_generation.domain import (
     FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
     FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE,
     FusedGenerationInlineImage,
+    FusedGenerationOutput,
     FUSED_UNKNOWN_PROGRESS_MESSAGE,
     FUSED_UNKNOWN_REASON,
     FusedFrameTarget,
@@ -37,9 +45,16 @@ from haoai_backend.fused_generation.errors import (
     FusedGenerationUnavailable,
 )
 from haoai_backend.fused_generation.persistence import SqlAlchemyFusedGenerationUnitOfWork
-from haoai_backend.fused_generation.execution import FusedGenerationExecution
+from haoai_backend.fused_generation.execution import (
+    FusedGenerationExecution,
+    _complete_verified_fused_media,
+)
 from haoai_backend.fused_generation.persistence import fused_generation_uow_factory
 from haoai_backend.fused_generation.ownership import FUSED_SERVER_CONTROL_MARKER
+from haoai_backend.fused_generation.recovery_worker import FusedGenerationRecoveryWorker
+from haoai_backend.fused_generation.media_storage import (
+    SynchronousFusedGenerationPlannedMediaStorage,
+)
 from haoai_backend.generation_catalog.tables import (
     metadata as catalog_metadata,
     model_configs,
@@ -48,8 +63,38 @@ from haoai_backend.generation_catalog.tables import (
     system_prompts,
 )
 from haoai_backend.generation_core.base_schema import AITaskRow, Base, CreditLogRow
-from haoai_backend.generation_core.schema import FusedGenerationSubmissionRow
-from haoai_backend.generation_contracts import StoredMedia
+from haoai_backend.generation_core.schema import (
+    FusedGenerationSubmissionRow,
+    FusedMediaWriteRow,
+)
+from haoai_backend.generation_contracts import ReferenceInput, StoredMedia
+from haoai_backend.generation_contracts.types import CredentialBinding
+from haoai_backend.generation_credentials.domain import (
+    CredentialCrypto,
+    HmacProofAuthority,
+    SealedMaterial,
+)
+from haoai_backend.media_storage.owned_write_values import (
+    OwnedObjectMaterial,
+    OwnedObjectPlan,
+    OwnedObjectPutResult,
+    OwnedObjectVerification,
+)
+from haoai_backend.media_storage.owned_media_runtime import (
+    OwnedMediaDependencies,
+    OwnedMediaRuntime,
+)
+from haoai_backend.media_storage.sync_facade import (
+    MediaStoreOperationError,
+    SynchronousMediaStore,
+)
+from haoai_backend.fused_generation.durable_values import (
+    json_digest,
+    prepared_to_document,
+    result_digest,
+    seal_json_value,
+    snapshot_proof_payload,
+)
 from haoai_backend.series_data.tables import (
     chapters,
     characters,
@@ -77,6 +122,7 @@ def fused_database(tmp_path: Path):
     authentication_metadata.create_all(engine)
     Base.metadata.create_all(engine)
     FusedGenerationSubmissionRow.__table__.create(engine)
+    FusedMediaWriteRow.__table__.create(engine)
     series_metadata.create_all(engine, tables=[series, chapters, characters, props])
     catalog_metadata.create_all(
         engine,
@@ -288,6 +334,54 @@ def test_recovery_scan_and_receipt_read_project_only_small_safe_fields(fused_dat
     assert "encrypted_" not in statements[1]
     assert "request_nonce" not in statements[1]
     assert "result_digest" not in statements[1]
+
+
+@pytest.mark.parametrize("completion_result", [False, "commit_ack_unknown"])
+def test_verified_media_commit_confirmation_closes_uow_before_independent_read(
+    completion_result,
+):
+    state = {"active": False, "phase": "applied", "stage": "completed"}
+
+    class SingleConnectionUow:
+        def __init__(self):
+            assert not state["active"]
+            state["active"] = True
+
+        def complete_verified_fused_media(self, *_args, **_kwargs):
+            return completion_result is not False
+
+        def rollback(self):
+            return None
+
+        def commit(self):
+            if completion_result == "commit_ack_unknown":
+                raise RuntimeError("commit acknowledgement lost")
+
+        def durable_submission_by_id(self, _submission_id):
+            assert state["active"]
+            return {"stage": state["stage"], "asset_id": "asset-a"}
+
+        def fused_media_write_by_submission(self, _submission_id):
+            assert state["active"]
+            return {"phase": state["phase"], "asset_id": "asset-a"}
+
+        def close(self):
+            assert state["active"]
+            state["active"] = False
+
+    def single_connection_factory():
+        assert not state["active"], "independent confirmation opened before UOW close"
+        return SingleConnectionUow()
+
+    prepared = replace(_prepared(), submission_id="submission-a")
+    assert _complete_verified_fused_media(
+        single_connection_factory,
+        prepared,
+        "write-a",
+        "verify-a",
+        "https://owned.example.test/result.png",
+    )
+    assert not state["active"]
 
 
 def test_system_model_charge_is_atomic_and_owned_model_is_free(fused_database):
@@ -834,6 +928,676 @@ class InlineImageStorage:
             media_type=image.media_type,
             size_bytes=len(image.content),
         )
+
+
+class PlannedFusedMediaStorage:
+    def __init__(self, state: dict[str, Any]) -> None:
+        self.state = state
+
+    def prepare_public_image(
+        self,
+        image_url: str,
+        *,
+        owner_id: str,
+        submission_id: str,
+        result_digest: str,
+    ) -> OwnedObjectMaterial:
+        self.state["prepared_urls"].append(image_url)
+        content = b"synthetic downloaded fused image bytes"
+        plan = OwnedObjectPlan(
+            write_id=uuid4().hex,
+            owner_ref=owner_id,
+            submission_ref=submission_id,
+            slot="primary",
+            provider_result_digest=result_digest,
+            material_sha256=hashlib.sha256(content).hexdigest(),
+            media_type="image/png",
+            size_bytes=len(content),
+            config_fingerprint="f" * 64,
+            config_version=1,
+            bucket="fused-test-bucket",
+            object_key=f"generation/test/{uuid4().hex}.png",
+            public_base="https://cdn.example.test/media",
+        )
+        return OwnedObjectMaterial(plan, content)
+
+    def prepare_inline_image(
+        self,
+        image: FusedGenerationInlineImage,
+        *,
+        owner_id: str,
+        submission_id: str,
+        result_digest: str,
+    ) -> OwnedObjectMaterial:
+        raise AssertionError("URL fixture should not prepare inline media")
+
+    def put_planned(self, material: OwnedObjectMaterial, permit) -> OwnedObjectPutResult:
+        if permit.claim(material.plan) is not True:
+            return OwnedObjectPutResult("unknown", error_code="permit_denied")
+        self.state["put_calls"] += 1
+        self.state["object_store"][material.plan.object_key] = material.content
+        return OwnedObjectPutResult("unknown", error_code="ack_lost")
+
+    def verify_planned(self, plan: OwnedObjectPlan) -> OwnedObjectVerification:
+        self.state["verify_calls"] += 1
+        outcomes = self.state["verification_outcomes"]
+        if outcomes:
+            outcome = outcomes.pop(0)
+            if outcome == "not_found_pending":
+                return OwnedObjectVerification("not_found_pending")
+            if outcome == "unavailable":
+                return OwnedObjectVerification("unavailable")
+            if outcome == "content_conflict":
+                return OwnedObjectVerification("content_conflict")
+        content = self.state["object_store"].get(plan.object_key)
+        if content is None:
+            return OwnedObjectVerification("not_found_pending")
+        digest = hashlib.sha256(content).hexdigest()
+        if len(content) != plan.size_bytes or digest != plan.material_sha256:
+            return OwnedObjectVerification("content_conflict")
+        locator = f"{plan.public_base.rstrip('/')}/{plan.object_key}"
+        return OwnedObjectVerification(
+            "verified",
+            stored_media=StoredMedia(
+                locator=locator,
+                content_digest=digest,
+                media_type=plan.media_type,
+                size_bytes=len(content),
+            ),
+            observed_sha256=digest,
+            observed_size_bytes=len(content),
+            request_id=f"fake-read-{self.state['verify_calls']}",
+        )
+
+
+def _durable_media_test_crypto() -> CredentialCrypto:
+    key = b"fused-media-test-key-32-bytes!!!"
+
+    def seal(value: str, associated_data: bytes) -> SealedMaterial:
+        nonce = os.urandom(12)
+        ciphertext = AESGCM(key).encrypt(nonce, value.encode("utf-8"), associated_data)
+        return SealedMaterial(ciphertext, nonce, "fused-media-test-key", "aesgcm-test-v1")
+
+    def unseal(material: SealedMaterial, associated_data: bytes) -> str | None:
+        try:
+            return AESGCM(key).decrypt(
+                material.nonce,
+                material.ciphertext,
+                associated_data,
+            ).decode("utf-8")
+        except (InvalidTag, UnicodeDecodeError):
+            return None
+
+    return CredentialCrypto(
+        seal_key_id="fused-media-test-key",
+        guard_key_id="fused-media-test-guard",
+        algorithm_version="aesgcm-test-v1",
+        seal=seal,
+        unseal=unseal,
+        consistency_guard=lambda value, data: hmac.new(
+            key, data + value.encode("utf-8"), hashlib.sha256
+        ).hexdigest(),
+        resolve_secret_handle=lambda _reference: None,
+        resolve_legacy_config_value=lambda _value: None,
+        self_test=lambda: True,
+    )
+
+
+def _stage_durable_media_result(
+    engine,
+    factory,
+    *,
+    target: FusedFrameTarget | None,
+    output: FusedGenerationOutput | FusedGenerationInlineImage,
+    task_id: str = "task-media-write",
+    submission_id: str = "submission-media-write",
+) -> tuple[PreparedFusedGeneration, CredentialCrypto, HmacProofAuthority]:
+    request_hash = hashlib.sha256(submission_id.encode("utf-8")).hexdigest()
+    binding = CredentialBinding(
+        source="system",
+        row_id="system-model",
+        owner_or_system="system",
+        provider="provider-a",
+        original_principal_id="principal-original",
+        endpoint_origin="https://provider.example.test",
+        allowed_content_paths=("/v1/images/edits",),
+        binding_version="1",
+    )
+    prepared = replace(
+        _prepared(target=target),
+        task_id=task_id,
+        submission_id=submission_id,
+        idempotency_key=f"durable-media-write-{submission_id}",
+        request_digest=request_hash,
+        credential_binding=binding,
+    )
+    _stage_task(factory, prepared)
+    now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    with engine.begin() as connection:
+        connection.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.id == prepared.task_id)
+            .values(
+                claim_token="media-write-claim",
+                execution_generation=1,
+                lease_until=now + timedelta(minutes=2),
+            )
+        )
+
+    crypto = _durable_media_test_crypto()
+    authority = HmacProofAuthority("fused-media-proof-v1", b"p" * 32)
+    document = prepared_to_document(prepared)
+    encrypted, nonce, key_id, algorithm = seal_json_value(
+        document,
+        crypto=crypto,
+        submission_id=submission_id,
+        owner_id=prepared.user_id,
+        request_digest=request_hash,
+        task_id=prepared.task_id,
+        binding=binding,
+        purpose="fused-final-snapshot-v1",
+    )
+    snapshot_digest = json_digest(document)
+    proof = authority.sign(
+        "fused-generation-snapshot-v1",
+        snapshot_proof_payload(
+            snapshot_digest,
+            submission_id=submission_id,
+            owner_id=prepared.user_id,
+            request_digest=request_hash,
+            task_id=prepared.task_id,
+            binding=binding,
+        ),
+    )
+    created = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    with engine.begin() as connection:
+        connection.execute(
+            insert(FusedGenerationSubmissionRow.__table__).values(
+                submission_id=submission_id,
+                owner_id=prepared.user_id,
+                operation="fused.image",
+                idempotency_key=prepared.idempotency_key,
+                request_digest=request_hash,
+                stage="result_known",
+                fee_disposition="byok",
+                fee_amount=0,
+                debit_log_id=None,
+                task_id=prepared.task_id,
+                message_id=prepared.message_id,
+                encrypted_snapshot=encrypted,
+                snapshot_nonce=nonce,
+                result_digest=result_digest(output),
+                result_kind=("inline" if isinstance(output, FusedGenerationInlineImage) else "url"),
+                seal_key_id=key_id,
+                crypto_algorithm=algorithm,
+                model_source=binding.source,
+                model_row_id=binding.row_id,
+                provider=binding.provider,
+                principal_id=binding.original_principal_id,
+                binding_id="binding-original",
+                binding_version=binding.binding_version,
+                endpoint_origin=binding.endpoint_origin,
+                allowed_content_paths=json.dumps(list(binding.allowed_content_paths)),
+                snapshot_proof_key_id=authority.key_id,
+                snapshot_proof=proof,
+                created_at=created,
+                updated_at=created,
+            )
+        )
+    return prepared, crypto, authority
+
+
+def test_durable_media_ack_unknown_recovers_original_key_and_applies_once(fused_database):
+    engine, factory = fused_database
+    target = FusedFrameTarget(
+        chapter_id="chapter-a",
+        frame_index=0,
+        identity=json.dumps(
+            {"text": "镜头A"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    )
+    output = FusedGenerationOutput("https://provider.example.test/result.png")
+    prepared, crypto, proof_authority = _stage_durable_media_result(
+        engine,
+        factory,
+        target=target,
+        output=output,
+    )
+    state: dict[str, Any] = {
+        "prepared_urls": [],
+        "put_calls": 0,
+        "verify_calls": 0,
+        "object_store": {},
+        "verification_outcomes": ["not_found_pending"],
+    }
+    first_storage = PlannedFusedMediaStorage(state)
+    first_execution = FusedGenerationExecution(
+        runtime=None,
+        uow_factory=fused_generation_uow_factory(factory),
+        credential_crypto=crypto,
+        proof_authority=proof_authority,
+        planned_media_storage=first_storage,
+    )
+
+    asyncio.run(
+        first_execution._deliver_planned_media(
+            prepared,
+            "media-write-claim",
+            1,
+            output,
+        )
+    )
+
+    with engine.connect() as connection:
+        write = connection.execute(select(FusedMediaWriteRow.__table__)).mappings().one()
+        submission = connection.execute(
+            select(FusedGenerationSubmissionRow.__table__).where(
+                FusedGenerationSubmissionRow.submission_id == prepared.submission_id
+            )
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+    original_key = write["object_key"]
+    assert state["prepared_urls"] == [output.image_url]
+    assert state["put_calls"] == 1
+    assert write["phase"] == "ack_unknown"
+    assert submission["stage"] == "media_ack_unknown"
+    assert assets == []
+
+    retry_at = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(seconds=1)
+    with engine.begin() as connection:
+        connection.execute(
+            update(FusedMediaWriteRow.__table__)
+            .where(FusedMediaWriteRow.write_id == write["write_id"])
+            .values(next_verify_at=retry_at)
+        )
+        connection.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.id == prepared.task_id)
+            .values(lease_until=retry_at)
+        )
+
+    restarted_storage = PlannedFusedMediaStorage(state)
+    restarted_execution = FusedGenerationExecution(
+        runtime=None,
+        uow_factory=fused_generation_uow_factory(factory),
+        credential_crypto=crypto,
+        proof_authority=proof_authority,
+        planned_media_storage=restarted_storage,
+    )
+    asyncio.run(
+        restarted_execution.recover_media_write(
+            prepared.submission_id or "",
+            prepared.user_id,
+        )
+    )
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+        submission = connection.execute(
+            select(FusedGenerationSubmissionRow.__table__).where(
+                FusedGenerationSubmissionRow.submission_id == prepared.submission_id
+            )
+        ).mappings().one()
+        write = connection.execute(select(FusedMediaWriteRow.__table__)).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        message = connection.execute(
+            select(chat_messages.c.content).where(chat_messages.c.id == prepared.message_id)
+        ).scalar_one()
+        chapter = connection.execute(
+            select(chapters.c.content).where(chapters.c.id == "chapter-a")
+        ).scalar_one()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        credit_logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+
+    assert state["put_calls"] == 1
+    assert state["verify_calls"] == 2
+    assert write["object_key"] == original_key
+    assert write["phase"] == "applied"
+    assert write["verified_sha256"] == write["material_sha256"]
+    assert write["asset_id"] == submission["asset_id"]
+    assert task["status"] == "completed"
+    assert task["result"] == write["verified_locator"]
+    assert submission["stage"] == "completed"
+    assert len(assets) == 1
+    assert assets[0]["id"] == submission["asset_id"]
+    assert assets[0]["image_url"] == write["verified_locator"]
+    assert message == write["verified_locator"]
+    assert json.loads(chapter)[0]["fused"] == [assets[0]["id"]]
+    assert wallet == 12
+    assert credit_logs == []
+
+
+def test_invalid_inline_image_is_retained_before_media_plan_or_put(fused_database):
+    engine, factory = fused_database
+    output = FusedGenerationInlineImage(
+        content=b"not a PNG image",
+        media_type="image/png",
+    )
+    prepared, crypto, proof_authority = _stage_durable_media_result(
+        engine,
+        factory,
+        target=None,
+        output=output,
+    )
+    with engine.connect() as connection:
+        initial_wallet = connection.execute(
+            select(user_credits.c.credits)
+        ).scalar_one()
+        initial_logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+
+    media_runtime = OwnedMediaRuntime(
+        OwnedMediaDependencies(
+            transfer_tmp_dir=Path("/tmp"),
+            getaddrinfo=None,
+            http_library=None,
+            media_policy=None,
+            r2_configuration=None,
+            access_key=None,
+            secret_key=None,
+            s3_client_factory=None,
+        ),
+        loop_factory=asyncio.new_event_loop,
+        thread_factory=threading.Thread,
+        executor_factory=concurrent.futures.ThreadPoolExecutor,
+    )
+    media_store = SynchronousMediaStore(
+        media_runtime,
+        mode="url_or_inline",
+        reference_stager=None,
+        staging_directory=None,
+    )
+    execution = FusedGenerationExecution(
+        runtime=None,
+        uow_factory=fused_generation_uow_factory(factory),
+        credential_crypto=crypto,
+        proof_authority=proof_authority,
+        planned_media_storage=SynchronousFusedGenerationPlannedMediaStorage(
+            media_store
+        ),
+    )
+    asyncio.run(
+        execution._deliver_planned_media(
+            prepared,
+            "media-write-claim",
+            1,
+            output,
+        )
+    )
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+        writes = connection.execute(select(FusedMediaWriteRow.__table__)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        credit_logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+
+    assert media_runtime.state == "new"
+    assert writes == []
+    assert task["status"] == "processing"
+    assert task["recovery_status"] == "provider_result_unknown"
+    assert wallet == initial_wallet
+    assert credit_logs == initial_logs
+
+
+@pytest.mark.parametrize(
+    ("media_type", "content"),
+    [
+        ("audio/wav", b"RIFFsynthetic-audioWAVE"),
+        ("image/png", b"not actually a PNG"),
+    ],
+    ids=("non-image-mime", "invalid-png-signature"),
+)
+def test_public_image_rejects_non_image_material_before_journal_or_put(
+    fused_database,
+    monkeypatch: pytest.MonkeyPatch,
+    media_type: str,
+    content: bytes,
+) -> None:
+    engine, factory = fused_database
+    output = FusedGenerationOutput("https://provider.example.test/public-image.png")
+    prepared, crypto, proof_authority = _stage_durable_media_result(
+        engine,
+        factory,
+        target=None,
+        output=output,
+    )
+    state = {"prepare_calls": 0, "put_calls": 0}
+    media_runtime = OwnedMediaRuntime(
+        OwnedMediaDependencies(
+            transfer_tmp_dir=Path("/tmp"),
+            getaddrinfo=None,
+            http_library=None,
+            media_policy=None,
+            r2_configuration=None,
+            access_key=None,
+            secret_key=None,
+            s3_client_factory=None,
+        ),
+        loop_factory=asyncio.new_event_loop,
+        thread_factory=threading.Thread,
+        executor_factory=concurrent.futures.ThreadPoolExecutor,
+    )
+    media_store = SynchronousMediaStore(
+        media_runtime,
+        mode="url_or_inline",
+        reference_stager=None,
+        staging_directory=None,
+    )
+
+    def prepare_owned_public_media(
+        input: ReferenceInput,
+        _object_policy: object,
+        *,
+        owner_ref: str,
+        submission_ref: str,
+        slot: str,
+        provider_result_digest: str,
+    ) -> OwnedObjectMaterial:
+        assert input.kind == "public_http"
+        assert input.locator == output.image_url
+        state["prepare_calls"] += 1
+        plan = OwnedObjectPlan(
+            write_id=uuid4().hex,
+            owner_ref=owner_ref,
+            submission_ref=submission_ref,
+            slot=slot,
+            provider_result_digest=provider_result_digest,
+            material_sha256=hashlib.sha256(content).hexdigest(),
+            media_type=media_type,
+            size_bytes=len(content),
+            config_fingerprint="f" * 64,
+            config_version=1,
+            bucket="fused-test-bucket",
+            object_key=f"generation/{submission_ref}/primary.png",
+            public_base="https://cdn.example.test/media",
+        )
+        return OwnedObjectMaterial(plan, content)
+
+    def put_planned_media(_material, _permit):
+        state["put_calls"] += 1
+        raise AssertionError("invalid public image content must never be uploaded")
+
+    monkeypatch.setattr(
+        media_store, "prepare_owned_public_media", prepare_owned_public_media
+    )
+    monkeypatch.setattr(media_store, "put_planned_media", put_planned_media)
+    planned_storage = SynchronousFusedGenerationPlannedMediaStorage(media_store)
+
+    with pytest.raises(MediaStoreOperationError) as raised:
+        planned_storage.prepare_public_image(
+            output.image_url,
+            owner_id=prepared.user_id,
+            submission_id=prepared.submission_id or "",
+            result_digest=result_digest(output),
+        )
+    assert raised.value.failure.code == "invalid_image_content"
+
+    execution = FusedGenerationExecution(
+        runtime=None,
+        uow_factory=fused_generation_uow_factory(factory),
+        credential_crypto=crypto,
+        proof_authority=proof_authority,
+        planned_media_storage=planned_storage,
+    )
+    asyncio.run(
+        execution._deliver_planned_media(
+            prepared,
+            "media-write-claim",
+            1,
+            output,
+        )
+    )
+
+    with engine.connect() as connection:
+        writes = connection.execute(select(FusedMediaWriteRow.__table__)).mappings().all()
+    assert state["prepare_calls"] == 2
+    assert state["put_calls"] == 0
+    assert writes == []
+    assert media_runtime.state == "new"
+
+
+def test_media_recovery_scan_skips_ineligible_head_and_gets_later_journaled_key(
+    fused_database,
+):
+    engine, factory = fused_database
+    pending_output = FusedGenerationOutput("https://provider.example.test/pending.png")
+    cancelled, crypto, proof_authority = _stage_durable_media_result(
+        engine,
+        factory,
+        target=None,
+        output=pending_output,
+        task_id="task-media-cancelled",
+        submission_id="submission-media-cancelled",
+    )
+    recoverable_output = FusedGenerationOutput(
+        "https://provider.example.test/recoverable.png"
+    )
+    recoverable, _, _ = _stage_durable_media_result(
+        engine,
+        factory,
+        target=None,
+        output=recoverable_output,
+        task_id="task-media-recoverable",
+        submission_id="submission-media-recoverable",
+    )
+    keyless, _, _ = _stage_durable_media_result(
+        engine,
+        factory,
+        target=None,
+        output=FusedGenerationOutput("https://provider.example.test/keyless.png"),
+        task_id="task-media-keyless",
+        submission_id="submission-media-keyless",
+    )
+    state: dict[str, Any] = {
+        "prepared_urls": [],
+        "put_calls": 0,
+        "verify_calls": 0,
+        "object_store": {},
+        "verification_outcomes": ["not_found_pending", "not_found_pending"],
+    }
+    storage = PlannedFusedMediaStorage(state)
+    uow_factory = fused_generation_uow_factory(factory)
+    execution = FusedGenerationExecution(
+        runtime=None,
+        uow_factory=uow_factory,
+        credential_crypto=crypto,
+        proof_authority=proof_authority,
+        planned_media_storage=storage,
+    )
+    for prepared, output in (
+        (cancelled, pending_output),
+        (recoverable, recoverable_output),
+    ):
+        asyncio.run(
+            execution._deliver_planned_media(
+                prepared,
+                "media-write-claim",
+                1,
+                output,
+            )
+        )
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None, microsecond=0)
+    retry_at = now - timedelta(seconds=1)
+    with engine.begin() as connection:
+        connection.execute(
+            update(FusedGenerationSubmissionRow.__table__)
+            .where(
+                FusedGenerationSubmissionRow.submission_id == keyless.submission_id
+            )
+            .values(stage="media_ack_unknown", updated_at=retry_at)
+        )
+        for prepared in (cancelled, recoverable, keyless):
+            values = {"lease_until": retry_at}
+            if prepared is cancelled:
+                values["user_cancelled_at"] = retry_at
+            connection.execute(
+                update(AITaskRow.__table__)
+                .where(AITaskRow.id == prepared.task_id)
+                .values(**values)
+            )
+        connection.execute(
+            update(FusedMediaWriteRow.__table__).values(next_verify_at=retry_at)
+        )
+
+    worker = FusedGenerationRecoveryWorker(
+        execution,
+        uow_factory,
+        poll_interval_seconds=0.1,
+        scan_limit=1,
+    )
+
+    async def wait_for_later_verification() -> None:
+        worker.start()
+        try:
+            for _ in range(100):
+                with engine.connect() as connection:
+                    task_status = connection.execute(
+                        select(AITaskRow.status).where(
+                            AITaskRow.id == recoverable.task_id
+                        )
+                    ).scalar_one()
+                if state["verify_calls"] == 3 and task_status == "completed":
+                    return
+                await asyncio.sleep(0.01)
+        finally:
+            await worker.shutdown()
+
+    asyncio.run(wait_for_later_verification())
+
+    with engine.connect() as connection:
+        writes = {
+            row["submission_id"]: row
+            for row in connection.execute(
+                select(FusedMediaWriteRow.__table__)
+            ).mappings()
+        }
+        tasks = {
+            row["id"]: row
+            for row in connection.execute(select(AITaskRow.__table__)).mappings()
+        }
+        submissions = {
+            row["submission_id"]: row
+            for row in connection.execute(
+                select(FusedGenerationSubmissionRow.__table__)
+            ).mappings()
+        }
+
+    assert state["put_calls"] == 2
+    assert state["verify_calls"] == 3
+    assert writes[cancelled.submission_id or ""]["phase"] == "ack_unknown"
+    assert writes[recoverable.submission_id or ""]["phase"] == "applied"
+    assert tasks[cancelled.task_id]["user_cancelled_at"] is not None
+    assert tasks[cancelled.task_id]["status"] == "processing"
+    assert tasks[recoverable.task_id]["status"] == "completed"
+    assert submissions[keyless.submission_id or ""]["stage"] == "media_ack_unknown"
+    assert keyless.submission_id not in writes
 
 
 def test_cancel_committed_between_read_and_terminal_compare_wins(fused_database):
