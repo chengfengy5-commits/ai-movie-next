@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import type {
   Chapter,
   StoryboardFrame,
@@ -13,6 +13,13 @@ import {
   type FrameAssetReferencesProjection,
 } from "./frameAssetReferences";
 import { resolveFrameAssetReferenceNavigationId } from "./frameAssetReferenceNavigation";
+import "./FrameAssetReferencesPanel.css";
+import {
+  readFrameAssetReferenceScrollTop,
+  uniqueStoryboardFrameId,
+  writeFrameAssetReferenceScrollTop,
+  type FrameAssetReferenceScrollScope,
+} from "./frameAssetReferenceScrollPreferences";
 
 export interface FrameAssetReferenceOwner {
   userId: string;
@@ -46,6 +53,15 @@ type ReadState =
   | { category: FrameAssetReferenceCategory; status: "loading" }
   | { category: FrameAssetReferenceCategory; status: "ready"; directory: FrameAssetDirectory }
   | { category: FrameAssetReferenceCategory; status: "error"; error: ApiError };
+
+interface ScheduledScrollRestore {
+  category: FrameAssetReferenceCategory;
+  readGeneration: number;
+  manualInteractionGeneration: number;
+  openEpoch: number;
+  scrollTop: number;
+  frameId: number;
+}
 
 const assetCategories: Array<{ id: FrameAssetReferenceCategory; label: string }> = [
   { id: "characters", label: "角色" },
@@ -219,6 +235,10 @@ export function FrameAssetReferencesPanel({
   const readGeneration = useRef(0);
   const activeController = useRef<AbortController | null>(null);
   const cache = useRef(new Map<FrameAssetReferenceCategory, FrameAssetDirectory>());
+  const scrollViewportRef = useRef<HTMLDivElement | null>(null);
+  const scrollRestoreRef = useRef<ScheduledScrollRestore | null>(null);
+  const manualScrollGenerationRef = useRef(0);
+  const [scrollPreferenceFeedback, setScrollPreferenceFeedback] = useState<string | null>(null);
   const unauthorizedCallback = useRef(onUnauthorized);
   unauthorizedCallback.current = onUnauthorized;
 
@@ -228,9 +248,145 @@ export function FrameAssetReferencesPanel({
     activeController.current = null;
   }
 
+  function scrollPreferenceScope(category: FrameAssetReferenceCategory): FrameAssetReferenceScrollScope | null {
+    const storyboardId = uniqueStoryboardFrameId(boundOwner.chapter, boundOwner.frame);
+    const apiBaseUrl = boundOwner.services.apiBaseUrl;
+    if (storyboardId === null || apiBaseUrl === null || apiBaseUrl.trim() === "") return null;
+    return {
+      userId: boundOwner.userId,
+      apiBaseUrl,
+      seriesId: boundOwner.seriesId,
+      chapterId: boundOwner.chapter.id,
+      storyboardId,
+      category,
+    };
+  }
+
+  function isCurrentScrollViewport(category: FrameAssetReferenceCategory, generation: number): boolean {
+    const current = readStateRef.current;
+    return !scopeInvalidatedRef.current
+      && sameScope(boundOwner, currentScopeRef.current)
+      && selectedCategoryRef.current === category
+      && readGeneration.current === generation
+      && current?.category === category
+      && current.status === "ready";
+  }
+
+  function cancelScrollRestore(): void {
+    const scheduled = scrollRestoreRef.current;
+    if (scheduled === null) return;
+    scrollRestoreRef.current = null;
+    window.cancelAnimationFrame(scheduled.frameId);
+  }
+
+  function persistScrollPosition(
+    category: FrameAssetReferenceCategory,
+    generation: number,
+    reportUnavailable: boolean,
+  ): void {
+    if (!isCurrentScrollViewport(category, generation)) return;
+    const viewport = scrollViewportRef.current;
+    if (viewport === null) return;
+    const scope = scrollPreferenceScope(category);
+    if (scope === null) {
+      if (reportUnavailable) {
+        setScrollPreferenceFeedback("当前账号、接口或镜头身份不完整，列表仍可滚动，但不会记住位置。");
+      }
+      return;
+    }
+
+    const result = writeFrameAssetReferenceScrollTop(scope, viewport.scrollTop);
+    if (result === "unavailable" && reportUnavailable) {
+      setScrollPreferenceFeedback("浏览器未能记住此列表位置；仍可手动滚动。");
+    } else if (result === "saved" && reportUnavailable) {
+      setScrollPreferenceFeedback((current) => (
+        current === "浏览器未能记住此列表位置；仍可手动滚动。" ? null : current
+      ));
+    }
+  }
+
+  function saveCurrentScrollPosition(): void {
+    const category = selectedCategoryRef.current;
+    const current = readStateRef.current;
+    if (category === null || current?.category !== category || current.status !== "ready") return;
+    const scheduled = scrollRestoreRef.current;
+    if (scheduled?.category === category
+      && scheduled.readGeneration === readGeneration.current
+      && scheduled.manualInteractionGeneration === manualScrollGenerationRef.current) return;
+    persistScrollPosition(category, readGeneration.current, false);
+  }
+
+  function cancelRestoreForManualScroll(): void {
+    manualScrollGenerationRef.current += 1;
+    cancelScrollRestore();
+  }
+
   useEffect(() => () => {
+    saveCurrentScrollPosition();
+    cancelScrollRestore();
     invalidateRead();
   }, []);
+
+  const currentReadState = readState?.category === selectedCategory ? readState : null;
+
+  useLayoutEffect(() => {
+    if (scopeInvalidated || scopeInvalidatedRef.current || !sameScope(boundOwner, currentScopeRef.current)
+      || selectedCategory === null || currentReadState?.status !== "ready") {
+      cancelScrollRestore();
+      return undefined;
+    }
+
+    const category = selectedCategory;
+    const generation = readGeneration.current;
+    const scope = scrollPreferenceScope(category);
+    if (scope === null) {
+      setScrollPreferenceFeedback("当前账号、接口或镜头身份不完整，列表仍可滚动，但不会记住位置。");
+      return undefined;
+    }
+
+    setScrollPreferenceFeedback((current) => (
+      current === "当前账号、接口或镜头身份不完整，列表仍可滚动，但不会记住位置。"
+        || current === "浏览器未能读取此列表位置；仍可手动滚动。"
+        ? null
+        : current
+    ));
+    const saved = readFrameAssetReferenceScrollTop(scope);
+    if (saved.kind === "unavailable") {
+      setScrollPreferenceFeedback("浏览器未能读取此列表位置；仍可手动滚动。");
+      return undefined;
+    }
+    if (saved.kind !== "stored" || saved.scrollTop === 0) return undefined;
+
+    cancelScrollRestore();
+    const scheduled: ScheduledScrollRestore = {
+      category,
+      readGeneration: generation,
+      manualInteractionGeneration: manualScrollGenerationRef.current,
+      openEpoch: boundOwner.openEpoch,
+      scrollTop: saved.scrollTop,
+      frameId: 0,
+    };
+    try {
+      scheduled.frameId = window.requestAnimationFrame(() => {
+        if (scrollRestoreRef.current !== scheduled) return;
+        scrollRestoreRef.current = null;
+        const viewport = scrollViewportRef.current;
+        if (viewport === null
+          || scheduled.openEpoch !== boundOwner.openEpoch
+          || scheduled.manualInteractionGeneration !== manualScrollGenerationRef.current
+          || !isCurrentScrollViewport(category, generation)) return;
+        const maximum = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+        viewport.scrollTop = Math.min(saved.scrollTop, maximum);
+      });
+      scrollRestoreRef.current = scheduled;
+    } catch {
+      setScrollPreferenceFeedback("浏览器未能恢复此列表位置；仍可手动滚动。");
+    }
+
+    return () => {
+      if (scrollRestoreRef.current === scheduled) cancelScrollRestore();
+    };
+  }, [boundOwner, currentReadState, selectedCategory, scopeInvalidated]);
 
   function loadCategory(category: FrameAssetReferenceCategory, force: boolean) {
     if (scopeInvalidatedRef.current || selectedCategoryRef.current !== category) {
@@ -294,6 +450,9 @@ export function FrameAssetReferencesPanel({
     if (scopeInvalidatedRef.current || selectedCategoryRef.current === category) {
       return;
     }
+    saveCurrentScrollPosition();
+    cancelScrollRestore();
+    setScrollPreferenceFeedback(null);
     selectedCategoryRef.current = category;
     setSelectedCategory(category);
     loadCategory(category, false);
@@ -302,6 +461,8 @@ export function FrameAssetReferencesPanel({
   function retryCurrentCategory() {
     const category = selectedCategoryRef.current;
     if (category !== null) {
+      saveCurrentScrollPosition();
+      cancelScrollRestore();
       loadCategory(category, true);
     }
   }
@@ -310,6 +471,8 @@ export function FrameAssetReferencesPanel({
     if (scopeInvalidatedRef.current) {
       return;
     }
+    saveCurrentScrollPosition();
+    cancelScrollRestore();
     scopeInvalidatedRef.current = true;
     invalidateRead();
     setScopeInvalidated(true);
@@ -320,7 +483,6 @@ export function FrameAssetReferencesPanel({
     return null;
   }
 
-  const currentReadState = readState?.category === selectedCategory ? readState : null;
   const baseProjection = selectedCategory === null
     ? null
     : projectFrameAssetDirectory(boundOwner.frame, selectedCategory, boundOwner.seriesId, null);
@@ -338,6 +500,19 @@ export function FrameAssetReferencesPanel({
   const localWithoutLookup = baseProjection !== null
     && (baseProjection.status !== "references" || !baseProjection.hasValidReferences);
   const presentation = currentReadState?.status === "error" ? errorMessage(currentReadState.error) : null;
+  const readyScrollGeneration = currentReadState?.status === "ready" ? readGeneration.current : null;
+
+  function handleReferenceViewportScroll(category: FrameAssetReferenceCategory, generation: number): void {
+    const scheduled = scrollRestoreRef.current;
+    const viewport = scrollViewportRef.current;
+    if (scheduled !== null && viewport !== null
+      && scheduled.category === category
+      && scheduled.readGeneration === generation
+      && Math.floor(viewport.scrollTop) !== scheduled.scrollTop) {
+      cancelRestoreForManualScroll();
+    }
+    persistScrollPosition(category, generation, true);
+  }
 
   function createNavigationTarget(rowIndex: number): FrameAssetReferenceAssetTarget | null {
     if (
@@ -418,6 +593,10 @@ export function FrameAssetReferencesPanel({
         )}
       </div>
 
+      {scrollPreferenceFeedback !== null && (
+        <p className="frame-asset-reference-scroll-feedback" role="status">{scrollPreferenceFeedback}</p>
+      )}
+
       {selectedCategory === null && (
         <p className="frame-asset-reference-state" role="status">请选择素材分类。</p>
       )}
@@ -451,13 +630,32 @@ export function FrameAssetReferencesPanel({
         <p className="frame-asset-reference-state" role="status">没有可显示的关联素材。</p>
       )}
 
-      {readyProjection !== null && (
-        <ReferenceDetails
-          {...(onNavigateToAsset === undefined
-            ? {}
-            : { createNavigationTarget, onNavigateToAsset })}
-          projection={readyProjection}
-        />
+      {readyProjection?.status === "references" && readyProjection.rows.length > 0
+        && selectedCategory !== null && readyScrollGeneration !== null && (
+        <div
+          aria-label="关联素材列表"
+          className="frame-asset-reference-scroll-viewport"
+          key={`${selectedCategory}:${readyScrollGeneration}`}
+          onKeyDown={(event) => {
+            if (["ArrowDown", "ArrowUp", "End", "Home", "PageDown", "PageUp", " "].includes(event.key)) {
+              cancelRestoreForManualScroll();
+            }
+          }}
+          onPointerDown={cancelRestoreForManualScroll}
+          onScroll={() => handleReferenceViewportScroll(selectedCategory, readyScrollGeneration)}
+          onTouchStart={cancelRestoreForManualScroll}
+          onWheel={cancelRestoreForManualScroll}
+          ref={scrollViewportRef}
+          role="region"
+          tabIndex={0}
+        >
+          <ReferenceDetails
+            {...(onNavigateToAsset === undefined
+              ? {}
+              : { createNavigationTarget, onNavigateToAsset })}
+            projection={readyProjection}
+          />
+        </div>
       )}
       {currentReadState?.status === "loading" && invalidRows.length > 0 && (
         <ReferenceDetails projection={{ status: "references", rows: invalidRows, hasValidReferences: false }} />

@@ -1,5 +1,5 @@
 import { StrictMode, useLayoutEffect, useState } from "react";
-import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Character, Chapter, Prop, Scene, StoryboardFrame } from "../../shared/api/contracts";
@@ -11,6 +11,11 @@ import {
   type FrameAssetReferenceOwner,
   type FrameAssetReferenceScope,
 } from "./FrameAssetReferencesPanel";
+import {
+  readFrameAssetReferenceScrollTop,
+  uniqueStoryboardFrameId,
+  writeFrameAssetReferenceScrollTop,
+} from "./frameAssetReferenceScrollPreferences";
 
 const seriesId = "reference-panel-series";
 
@@ -162,6 +167,60 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function stableStoryboardFrame(id: string, overrides: Record<string, unknown> = {}): StoryboardFrame {
+  return frame({ storyboard: [id], ...overrides });
+}
+
+function scrollScopeFor(
+  owner: FrameAssetReferenceOwner,
+  category: "characters" | "scenes" | "props",
+) {
+  const storyboardId = uniqueStoryboardFrameId(owner.chapter, owner.frame);
+  const apiBaseUrl = owner.services.apiBaseUrl;
+  if (storyboardId === null || apiBaseUrl === null || apiBaseUrl.trim() === "") {
+    throw new Error("Test owner must have a stable storyboard ID and API scope.");
+  }
+  return {
+    userId: owner.userId,
+    apiBaseUrl,
+    seriesId: owner.seriesId,
+    chapterId: owner.chapter.id,
+    storyboardId,
+    category,
+  };
+}
+
+function stubAnimationFrames() {
+  let nextId = 0;
+  const callbacks = new Map<number, FrameRequestCallback>();
+  const cancelled = new Set<number>();
+  vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+    nextId += 1;
+    callbacks.set(nextId, callback);
+    return nextId;
+  });
+  vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+    cancelled.add(id);
+  });
+  return {
+    latestId: () => nextId,
+    isCancelled: (id: number) => cancelled.has(id),
+    flush(id: number) {
+      const callback = callbacks.get(id);
+      if (callback === undefined) return;
+      callbacks.delete(id);
+      callback(0);
+    },
+  };
+}
+
+function setScrollBounds(element: HTMLElement, scrollHeight: number, clientHeight: number): void {
+  Object.defineProperties(element, {
+    scrollHeight: { configurable: true, value: scrollHeight },
+    clientHeight: { configurable: true, value: clientHeight },
+  });
+}
+
 function LayoutCommitObserver({ onCommit }: { onCommit(): void }) {
   useLayoutEffect(() => {
     onCommit();
@@ -170,7 +229,10 @@ function LayoutCommitObserver({ onCommit }: { onCommit(): void }) {
 }
 
 describe("frame asset references panel", () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    window.localStorage.clear();
+  });
 
   it("does not fetch on open, shows only text, and reads only the selected category", async () => {
     const user = userEvent.setup();
@@ -636,4 +698,166 @@ describe("frame asset references panel", () => {
       expect(screen.queryByRole("button", { name: "角色" })).not.toBeInTheDocument();
     },
   );
+
+  it("restores the selected frame list after reopening and clamps a stable frame after reordering", async () => {
+    const user = userEvent.setup();
+    const characterIds = Array.from({ length: 12 }, (_, index) => `scroll-character-${index + 1}`);
+    const targetFrame = stableStoryboardFrame("scroll-frame-stable", { character: characterIds });
+    const otherFrame = stableStoryboardFrame("scroll-frame-other", { character: [], scene: [], prop: [] });
+    const firstChapter = { ...chapter(targetFrame), content: [targetFrame, otherFrame] };
+    const serviceSet = services({
+      listCharacters: vi.fn(async () => characterIds.map((id, index) => character({ id, name: `角色 ${index + 1}` }))),
+    });
+    const firstOwner = createOwner(firstChapter, targetFrame, serviceSet, 1);
+    const animationFrames = stubAnimationFrames();
+    const firstPanel = renderPanel(firstOwner);
+
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(await screen.findByText("角色 12", { selector: "strong" })).toBeInTheDocument();
+    const firstViewport = screen.getByRole("region", { name: "关联素材列表" });
+    setScrollBounds(firstViewport, 760, 180);
+    firstViewport.scrollTop = 240;
+    fireEvent.scroll(firstViewport);
+    expect(readFrameAssetReferenceScrollTop(scrollScopeFor(firstOwner, "characters")))
+      .toEqual({ kind: "stored", scrollTop: 240 });
+    firstPanel.unmount();
+
+    const reorderedChapter = { ...firstChapter, content: [otherFrame, targetFrame] };
+    const reopenedOwner = { ...createOwner(reorderedChapter, targetFrame, serviceSet, 2), position: 2 };
+    const reopenedPanel = renderPanel(reopenedOwner);
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(await screen.findByText("角色 12", { selector: "strong" })).toBeInTheDocument();
+    const reopenedViewport = screen.getByRole("region", { name: "关联素材列表" });
+    setScrollBounds(reopenedViewport, 340, 180);
+    const restoreFrame = animationFrames.latestId();
+    expect(restoreFrame).toBeGreaterThan(0);
+
+    act(() => animationFrames.flush(restoreFrame));
+    expect(reopenedViewport.scrollTop).toBe(160);
+    expect(readFrameAssetReferenceScrollTop(scrollScopeFor(reopenedOwner, "characters")))
+      .toEqual({ kind: "stored", scrollTop: 240 });
+    reopenedPanel.unmount();
+  });
+
+  it("keeps manual scroll and category positions when a prior restore callback arrives late", async () => {
+    const user = userEvent.setup();
+    const sourceFrame = stableStoryboardFrame("scroll-frame-category", {
+      character: ["character-1"],
+      scene: ["scene-1"],
+    });
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services());
+    const characterScope = scrollScopeFor(owner, "characters");
+    const sceneScope = scrollScopeFor(owner, "scenes");
+    expect(writeFrameAssetReferenceScrollTop(characterScope, 140)).toBe("saved");
+    expect(writeFrameAssetReferenceScrollTop(sceneScope, 60)).toBe("saved");
+    const animationFrames = stubAnimationFrames();
+    renderPanel(owner);
+
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(await screen.findByText("<b>沈照</b>", { selector: "strong" })).toBeInTheDocument();
+    const characterViewport = screen.getByRole("region", { name: "关联素材列表" });
+    setScrollBounds(characterViewport, 500, 160);
+    const characterRestoreFrame = animationFrames.latestId();
+
+    fireEvent.wheel(characterViewport);
+    characterViewport.scrollTop = 42;
+    fireEvent.scroll(characterViewport);
+    expect(readFrameAssetReferenceScrollTop(characterScope)).toEqual({ kind: "stored", scrollTop: 42 });
+    act(() => animationFrames.flush(characterRestoreFrame));
+    expect(characterViewport.scrollTop).toBe(42);
+
+    await user.click(screen.getByRole("button", { name: "场景" }));
+    expect(await screen.findByText("盐仓码头", { selector: "strong" })).toBeInTheDocument();
+    const sceneViewport = screen.getByRole("region", { name: "关联素材列表" });
+    setScrollBounds(sceneViewport, 500, 160);
+    const sceneRestoreFrame = animationFrames.latestId();
+    act(() => animationFrames.flush(characterRestoreFrame));
+    expect(sceneViewport.scrollTop).toBe(0);
+    act(() => animationFrames.flush(sceneRestoreFrame));
+    expect(sceneViewport.scrollTop).toBe(60);
+  });
+
+  it.each(["missing", "duplicate"] as const)(
+    "does not save or restore scroll when the stable frame ID is %s",
+    async (identityState) => {
+      const user = userEvent.setup();
+      const targetFrame = identityState === "missing"
+        ? frame({ character: ["character-1"] })
+        : stableStoryboardFrame("duplicate-frame-id", { character: ["character-1"] });
+      const frames = identityState === "duplicate"
+        ? [targetFrame, stableStoryboardFrame("duplicate-frame-id", { character: [] })]
+        : [targetFrame];
+      const owner = createOwner({ ...chapter(targetFrame), content: frames }, targetFrame, services());
+      renderPanel(owner);
+
+      await user.click(screen.getByRole("button", { name: "角色" }));
+      expect(await screen.findByText("<b>沈照</b>", { selector: "strong" })).toBeInTheDocument();
+      const viewport = screen.getByRole("region", { name: "关联素材列表" });
+      setScrollBounds(viewport, 500, 160);
+      viewport.scrollTop = 75;
+      fireEvent.scroll(viewport);
+
+      expect(await screen.findByText("当前账号、接口或镜头身份不完整，列表仍可滚动，但不会记住位置。"))
+        .toBeInTheDocument();
+      expect(window.localStorage.length).toBe(0);
+    },
+  );
+
+  it("keeps the selected list usable without a stable API scope", async () => {
+    const user = userEvent.setup();
+    const sourceFrame = stableStoryboardFrame("scroll-frame-without-api", { character: ["character-1"] });
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services({ apiBaseUrl: null }));
+    renderPanel(owner);
+
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(await screen.findByText("<b>沈照</b>", { selector: "strong" })).toBeInTheDocument();
+    const viewport = screen.getByRole("region", { name: "关联素材列表" });
+    setScrollBounds(viewport, 500, 160);
+    viewport.scrollTop = 75;
+    fireEvent.scroll(viewport);
+
+    expect(await screen.findByText("当前账号、接口或镜头身份不完整，列表仍可滚动，但不会记住位置。"))
+      .toBeInTheDocument();
+    expect(viewport.scrollTop).toBe(75);
+    expect(window.localStorage.length).toBe(0);
+  });
+
+  it("does not apply a noncooperative restore after the owner scope changes", async () => {
+    const user = userEvent.setup();
+    const sourceFrame = stableStoryboardFrame("scroll-frame-stale", { character: ["character-1"] });
+    const pendingCharacters = deferred<Character[]>();
+    const owner = createOwner(chapter(sourceFrame), sourceFrame, services({
+      listCharacters: vi.fn(() => pendingCharacters.promise),
+    }));
+    const preferenceScope = scrollScopeFor(owner, "characters");
+    expect(writeFrameAssetReferenceScrollTop(preferenceScope, 180)).toBe("saved");
+    const animationFrames = stubAnimationFrames();
+    const panel = renderPanel(owner);
+
+    await user.click(screen.getByRole("button", { name: "角色" }));
+    expect(screen.getByRole("status")).toHaveTextContent("正在读取角色");
+    await act(async () => {
+      pendingCharacters.resolve([character()]);
+      await pendingCharacters.promise;
+    });
+    expect(await screen.findByText("<b>沈照</b>", { selector: "strong" })).toBeInTheDocument();
+    const oldViewport = screen.getByRole("region", { name: "关联素材列表" });
+    setScrollBounds(oldViewport, 500, 160);
+    const restoreFrame = animationFrames.latestId();
+
+    panel.rerender(
+      <FrameAssetReferencesPanel
+        currentScope={{ ...currentScope(owner), userId: "other-scroll-owner" }}
+        onClose={vi.fn()}
+        onUnauthorized={vi.fn()}
+        owner={owner}
+      />,
+    );
+    expect(screen.queryByRole("region", { name: "镜头 1 的关联素材" })).not.toBeInTheDocument();
+    expect(animationFrames.isCancelled(restoreFrame)).toBe(true);
+    act(() => animationFrames.flush(restoreFrame));
+
+    expect(oldViewport.scrollTop).toBe(0);
+    expect(readFrameAssetReferenceScrollTop(preferenceScope)).toEqual({ kind: "stored", scrollTop: 180 });
+  });
 });
