@@ -78,8 +78,8 @@ type HistoryState =
   | { status: "error"; chapterId: string; mode: AssetGenerationHistoryMode; message: string };
 
 type ActionNotice =
-  | { readonly messageId: string; readonly kind: "transferring"; readonly message: string }
-  | { readonly messageId: string; readonly kind: "unknown" | "error" | "success"; readonly message: string };
+  | { readonly messageId: string; readonly kind: "downloading" | "transferring"; readonly message: string }
+  | { readonly messageId: string; readonly kind: "cancelled" | "unknown" | "error" | "success"; readonly message: string };
 
 interface ImageAdoptionConfirmation {
   readonly messageId: string;
@@ -95,6 +95,22 @@ interface ActiveTransfer {
 
 const videoExtensions = new Set(["mp4", "webm", "mov", "avi", "mkv", "m4v", "ogv"]);
 const imageExtensions = new Set(["jpg", "jpeg", "png", "gif", "webp", "bmp"]);
+const imageDownloadExtensions: Readonly<Record<string, string>> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/gif": "gif",
+  "image/webp": "webp",
+  "image/bmp": "bmp",
+};
+const videoDownloadExtensions: Readonly<Record<string, string>> = {
+  "video/mp4": "mp4",
+  "video/webm": "webm",
+  "video/quicktime": "mov",
+  "video/x-msvideo": "avi",
+  "video/x-matroska": "mkv",
+  "video/x-m4v": "m4v",
+  "video/ogg": "ogv",
+};
 const HISTORY_PAGE_SIZE = 10;
 
 function unauthorized(error: unknown): boolean {
@@ -184,6 +200,67 @@ function prepareEntries(
 
 function mediaPreviewLabel(mode: AssetGenerationHistoryMode): string {
   return mode === "image" ? "图片" : "视频";
+}
+
+function safeFilenamePart(value: string, fallback: string): string {
+  const safe = value
+    .replace(/[<>:"/\\|?*\u0000-\u001f\u007f-\u009f]/gu, "_")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/[. ]+$/gu, "")
+    .slice(0, 80);
+  return safe === "" ? fallback : safe;
+}
+
+function historyDownloadFilename(
+  assetName: string,
+  messageId: string,
+  mode: AssetGenerationHistoryMode,
+  blob: Blob,
+): string | null {
+  const mimeType = blob.type.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  const extensions = mode === "image" ? imageDownloadExtensions : videoDownloadExtensions;
+  const extension = extensions[mimeType];
+  if (extension === undefined) return null;
+  return `${safeFilenamePart(assetName, "素材")}-${safeFilenamePart(messageId, "history")}.${extension}`;
+}
+
+function startHistoryBlobDownload(blob: Blob, filename: string, isCurrent: () => boolean): boolean {
+  if (!isCurrent()) return false;
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      URL.revokeObjectURL(objectUrl);
+    } finally {
+      anchor.remove();
+    }
+  };
+
+  try {
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    if (!isCurrent()) {
+      release();
+      return false;
+    }
+    anchor.click();
+  } catch (error) {
+    release();
+    throw error;
+  }
+
+  try {
+    window.setTimeout(release, 1_000);
+  } catch {
+    release();
+  }
+  return true;
 }
 
 function displayTime(value: string): string {
@@ -353,6 +430,7 @@ export function AssetGenerationHistoryDialog({
   selectionRef.current = { chapterId: selectedChapterId, mode };
   const actionBusyRef = useRef(false);
   const transferRef = useRef<ActiveTransfer | null>(null);
+  const downloadRef = useRef<ActiveTransfer | null>(null);
   const actionControllerRef = useRef<AbortController | null>(null);
   const activeControllersRef = useRef(new Set<AbortController>());
   const unauthorizedRef = useRef(onUnauthorized);
@@ -363,6 +441,7 @@ export function AssetGenerationHistoryDialog({
     for (const controller of activeControllersRef.current) controller.abort();
     activeControllersRef.current.clear();
     transferRef.current?.controller.abort();
+    downloadRef.current?.controller.abort();
     actionControllerRef.current?.abort();
   }, []);
 
@@ -499,7 +578,11 @@ export function AssetGenerationHistoryDialog({
       && entry.message.chat_mode === mode;
   }
 
-  async function readFreshMessages(run: AssetGenerationHistoryRun): Promise<readonly AssetGenerationHistoryMessage[]> {
+  async function readFreshMessages(
+    run: AssetGenerationHistoryRun,
+    signal?: AbortSignal,
+  ): Promise<readonly AssetGenerationHistoryMessage[]> {
+    if (signal !== undefined) return await run.readMessages(signal);
     const controller = createController();
     try {
       return await run.readMessages(controller.signal);
@@ -511,9 +594,10 @@ export function AssetGenerationHistoryDialog({
   async function verifyOriginal(
     run: AssetGenerationHistoryRun,
     entry: HistoryEntry,
+    signal?: AbortSignal,
   ): Promise<AssetGenerationHistoryMessage | null> {
     if (!matchesLoadedEntry(run, entry)) return null;
-    const messages = await readFreshMessages(run);
+    const messages = await readFreshMessages(run, signal);
     if (!matchesLoadedEntry(run, entry)) return null;
     return exactCurrentMessage(messages, entry.message);
   }
@@ -534,6 +618,57 @@ export function AssetGenerationHistoryDialog({
 
   async function readBack(run: AssetGenerationHistoryRun): Promise<readonly AssetGenerationHistoryMessage[]> {
     return readFreshMessages(run);
+  }
+
+  async function downloadEntry(entry: HistoryEntry): Promise<void> {
+    if (entry.mediaRoute === null || !beginAction(entry.message.id) || currentHistory === null) return;
+    const run = currentHistory.run;
+    const messageId = entry.message.id;
+    const controller = createController();
+    actionControllerRef.current = controller;
+    downloadRef.current = { messageId, controller, run };
+    setActionNotice({ messageId, kind: "downloading", message: `正在读取${mediaPreviewLabel(mode)}；尚未交给浏览器下载。` });
+    const isDownloadCurrent = () => !controller.signal.aborted && matchesLoadedEntry(run, entry);
+
+    try {
+      const original = await verifyOriginal(run, entry, controller.signal);
+      if (original === null || !isDownloadCurrent()) {
+        if (selectedContextIsCurrent(run) && !controller.signal.aborted) {
+          setActionNotice({ messageId, kind: "error", message: "原消息已变化或身份无法唯一核对，未启动下载。" });
+        }
+        return;
+      }
+
+      const blob = await run.readMedia(entry.mediaRoute.url, controller.signal);
+      if (!isDownloadCurrent()) return;
+      const filename = historyDownloadFilename(assetName, original.id, mode, blob);
+      if (filename === null) {
+        setActionNotice({ messageId, kind: "error", message: "媒体读取成功，但内容类型不受支持，未启动下载。" });
+        return;
+      }
+      if (!startHistoryBlobDownload(blob, filename, isDownloadCurrent)) return;
+      setActionNotice({ messageId, kind: "success", message: "已交给浏览器下载；本地无法确认文件是否已写入磁盘。" });
+    } catch (error) {
+      if (!matchesLoadedEntry(run, entry)) return;
+      if (controller.signal.aborted) {
+        setActionNotice({ messageId, kind: "cancelled", message: "已停止本地媒体读取，未交给浏览器下载。" });
+      } else {
+        if (unauthorized(error)) unauthorizedRef.current();
+        setActionNotice({ messageId, kind: "error", message: errorMessage(error, "read") });
+      }
+    } finally {
+      endAction(messageId);
+      if (downloadRef.current?.controller === controller) downloadRef.current = null;
+      if (actionControllerRef.current === controller) actionControllerRef.current = null;
+      releaseController(controller);
+    }
+  }
+
+  function stopDownloadRead(messageId: string): void {
+    const active = downloadRef.current;
+    if (active?.messageId !== messageId) return;
+    active.controller.abort();
+    setActionNotice({ messageId, kind: "downloading", message: "正在停止本地媒体读取…" });
   }
 
   async function transfer(entry: HistoryEntry): Promise<void> {
@@ -900,6 +1035,28 @@ export function AssetGenerationHistoryDialog({
           </div>
           <button className="secondary-button" disabled={!canRefreshHistory} onClick={refreshHistory} type="button">重新读取</button>
         </div>
+        {actionNotice !== null && (
+          <div
+            aria-label={`历史消息 ${actionNotice.messageId} 操作状态`}
+            className={`asset-generation-history-notice ${actionNotice.kind}`}
+            role="status"
+          >
+            <p>{actionNotice.message}</p>
+            {actionNotice.kind === "transferring" && transferRef.current?.messageId === actionNotice.messageId && (
+              <button className="secondary-button" onClick={() => stopTransferWait(actionNotice.messageId)} type="button">
+                停止本地等待
+              </button>
+            )}
+            {actionNotice.kind === "downloading" && downloadRef.current?.messageId === actionNotice.messageId && (
+              <button className="secondary-button" onClick={() => stopDownloadRead(actionNotice.messageId)} type="button">
+                停止本地读取
+              </button>
+            )}
+            {actionNotice.kind === "unknown" && (
+              <button className="secondary-button" onClick={() => setActionNotice(null)} type="button">停止本地跟踪</button>
+            )}
+          </div>
+        )}
         <div className="asset-generation-history-body">
           {chapterState.status === "loading" && <p className="asset-generation-history-state" role="status">正在读取剧集章节目录…</p>}
           {chapterState.status === "error" && <p className="asset-generation-history-state" role="alert">{chapterState.message}</p>}
@@ -1015,14 +1172,19 @@ export function AssetGenerationHistoryDialog({
                           <button
                             className="secondary-button"
                             disabled={busyMessageId !== null}
+                            onClick={() => void downloadEntry(entry)}
+                            type="button"
+                          >
+                            {isBusy && notice?.kind === "downloading" ? "读取中…" : "下载"}
+                          </button>
+                          <button
+                            className="secondary-button"
+                            disabled={busyMessageId !== null}
                             onClick={() => void transfer(entry)}
                             type="button"
                           >
                             {isBusy && notice?.kind === "transferring" ? "转存处理中…" : "转存到 OSS"}
                           </button>
-                          {isBusy && notice?.kind === "transferring" && transferRef.current?.messageId === messageId && (
-                            <button className="secondary-button" onClick={() => stopTransferWait(messageId)} type="button">停止本地等待</button>
-                          )}
                           {deleteConfirmation === messageId ? (
                             <span className="asset-generation-history-confirm">
                               <span>删除这条记录？</span>
@@ -1067,14 +1229,6 @@ export function AssetGenerationHistoryDialog({
                           >
                             取消
                           </button>
-                        </div>
-                      )}
-                      {notice !== null && (
-                        <div className={`asset-generation-history-notice ${notice.kind}`} role="status">
-                          <p>{notice.message}</p>
-                          {notice.kind === "unknown" && (
-                            <button className="secondary-button" onClick={() => setActionNotice(null)} type="button">停止本地跟踪</button>
-                          )}
                         </div>
                       )}
                     </li>
