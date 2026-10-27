@@ -1,0 +1,237 @@
+.provider-quota-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px;
+  border: 1px solid #dce2ea;
+  border-radius: 12px;
+  background: #f8fafc;
+  color: #26313d;
+}
+
+.provider-quota-panel button {
+  min-height: 36px;
+  padding: 7px 11px;
+  border: 1px solid #cbd3de;
+  border-radius: 8px;
+  background: #fff;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+
+.provider-quota-panel button:hover:not(:disabled) {
+  background: #f0f4f8;
+}
+
+.provider-quota-panel button:focus-visible,
+.provider-quota-panel a:focus-visible {
+  outline: 3px solid #a7c8ff;
+  outline-offset: 2px;
+}
+
+.provider-quota-panel button:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+.provider-quota-panel-header,
+.provider-quota-panel-actions,
+.provider-quota-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.provider-quota-panel-header h2 {
+  margin: 0;
+  color: #1d2732;
+  font-size: 18px;
+}
+
+.provider-quota-panel-header p {
+  margin: 6px 0 0;
+  color: #647080;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.provider-quota-panel-actions {
+  flex: 0 0 auto;
+}
+
+.provider-quota-panel-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.provider-quota-panel-summary span {
+  padding: 4px 9px;
+  border: 1px solid #e0e5eb;
+  border-radius: 999px;
+  background: #fff;
+  color: #4a5664;
+  font-size: 12px;
+}
+
+.provider-quota-panel-summary .is-warn {
+  border-color: #e5cc88;
+  background: #fff7df;
+  color: #785611;
+}
+
+.provider-quota-panel-summary .is-error {
+  border-color: #e7b4ae;
+  background: #fff1ef;
+  color: #8a3025;
+}
+
+.provider-quota-panel-message,
+.provider-quota-panel-error {
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: 8px;
+  background: #eef4ff;
+  color: #304e7f;
+  line-height: 1.5;
+}
+
+.provider-quota-panel-error {
+  background: #fff1ef;
+  color: #8a3025;
+}
+
+.provider-quota-panel-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 250px), 1fr));
+  gap: 12px;
+}
+
+.provider-quota-card {
+  display: grid;
+  align-content: start;
+  gap: 11px;
+  min-width: 0;
+  padding: 15px;
+  border: 1px solid #dfe4eb;
+  border-radius: 10px;
+  background: #fff;
+}
+
+.provider-quota-card.is-loading {
+  background: #fbfcfe;
+}
+
+.provider-quota-card.is-disabled {
+  background: #f3f5f7;
+  color: #66717e;
+}
+
+.provider-quota-card.is-error {
+  border-color: #e7c3bf;
+}
+
+.provider-quota-card.is-warn {
+  border-color: #e5cc88;
+  background: #fffdf7;
+}
+
+.provider-quota-card-header {
+  align-items: center;
+}
+
+.provider-quota-card-header > div {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.provider-quota-card-header strong {
+  overflow: hidden;
+  color: #202a35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-quota-card-header small {
+  overflow: hidden;
+  color: #75808e;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.provider-quota-card-header a {
+  flex: 0 0 auto;
+  color: #315f9e;
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.provider-quota-card-header a:hover {
+  text-decoration: underline;
+}
+
+.provider-quota-card-status {
+  color: #596574;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.provider-quota-card.is-warn .provider-quota-card-status {
+  color: #785611;
+}
+
+.provider-quota-card.is-error .provider-quota-card-status {
+  color: #8a3025;
+}
+
+.provider-quota-card-main {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.provider-quota-card-main strong {
+  color: #202a35;
+  font-size: 25px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+.provider-quota-card-main span {
+  color: #647080;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.provider-quota-card-details {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px 12px;
+  color: #647080;
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.provider-quota-card footer {
+  color: #7a8592;
+  font-size: 11px;
+  text-align: right;
+}
+
+@media (max-width: 680px) {
+  .provider-quota-panel-header {
+    flex-direction: column;
+  }
+
+  .provider-quota-panel-actions {
+    width: 100%;
+  }
+
+  .provider-quota-panel-actions button {
+    flex: 1 1 auto;
+  }
+}

@@ -19,6 +19,7 @@ import { ChatAssistantPage, type ChatAssistantSourceIntent } from "../features/c
 import { AccountPage } from "../features/account/AccountPage";
 import { TeamsPage } from "../features/teams/TeamsPage";
 import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
+import type { ProviderQuotaServicePort } from "../shared/api/providerQuota";
 import {
   createTeamCollaborationWriteScope,
   sameTeamCollaborationWriteScope,
@@ -511,6 +512,9 @@ function Dashboard() {
   const creatorSettingsService = (services as typeof services & {
     creatorSettings?: CreatorSettingsServicePort;
   }).creatorSettings;
+  const providerQuotaService = (services as typeof services & {
+    providerQuota?: ProviderQuotaServicePort;
+  }).providerQuota;
 
   return (
     <div className="workspace-shell">
@@ -883,6 +887,7 @@ function Dashboard() {
             <CreatorSettingsPage
               key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
               {...(creatorSettingsService === undefined ? {} : { service: creatorSettingsService })}
+              {...(providerQuotaService === undefined ? {} : { providerQuotaService })}
               isSuperuser={state.user.is_superuser}
               userId={state.user.id}
               onUnauthorized={logoutFromWorkspace}

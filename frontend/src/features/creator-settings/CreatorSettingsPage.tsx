@@ -14,6 +14,8 @@ import type {
 } from "../../shared/api/creatorSettings";
 import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { ModelConnectionTest } from "./ModelConnectionTest";
+import { ProviderQuotaPanel } from "./ProviderQuotaPanel";
+import type { ProviderQuotaServicePort } from "../../shared/api/providerQuota";
 import "./creatorSettings.css";
 
 type SettingsTab = "models" | "prompts";
@@ -78,6 +80,7 @@ type Verification =
 
 interface CreatorSettingsPageProps {
   service?: CreatorSettingsServicePort;
+  providerQuotaService?: ProviderQuotaServicePort | undefined;
   userId: string;
   isSuperuser?: boolean;
   onUnauthorized(): void;
@@ -217,6 +220,7 @@ function draftHasChanges(draft: SettingsDraft | null): boolean {
 
 export function CreatorSettingsPage({
   service,
+  providerQuotaService,
   userId,
   isSuperuser = false,
   onUnauthorized,
@@ -232,6 +236,7 @@ export function CreatorSettingsPage({
   const [pending, setPending] = useState(false);
   const [listError, setListError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  const [providerQuotaOpen, setProviderQuotaOpen] = useState(false);
   const [draft, setDraft] = useState<SettingsDraft | null>(null);
   const [modelDraftGeneration, setModelDraftGeneration] = useState(0);
   const [orderDraft, setOrderDraft] = useState<{ tab: SettingsTab; category: string; baseline: string[]; ids: string[] } | null>(null);
@@ -271,6 +276,7 @@ export function CreatorSettingsPage({
     pendingLock.current = false;
     setListError(null);
     setNotice(null);
+    setProviderQuotaOpen(false);
     setDraft(null);
     setModelDraftGeneration((generation) => generation + 1);
     conversionGeneration.current += 1;
@@ -468,6 +474,7 @@ export function CreatorSettingsPage({
     if (pendingLock.current || verification !== null || !confirmDiscard()) return false;
     invalidateCurrentView();
     discardDrafts();
+    setProviderQuotaOpen(false);
     setTab(nextTab);
     setNotice(null);
     return true;
@@ -1330,12 +1337,32 @@ export function CreatorSettingsPage({
           </select>
         </label>
         <div className="creator-settings-toolbar-actions">
+          {isSuperuser && tab === "models" && (
+            <button
+              aria-controls="creator-provider-quota-panel"
+              aria-expanded={providerQuotaOpen}
+              onClick={() => setProviderQuotaOpen((open) => !open)}
+              type="button"
+            >
+              {providerQuotaOpen ? "收起额度监控" : "供应商额度监控"}
+            </button>
+          )}
           <button className="creator-settings-primary" disabled={!canUseService || pending || verification !== null} onClick={startCreate} type="button">
             新建{tab === "models" ? "模型" : "提示词"}
           </button>
           <button disabled={pending || verification !== null} onClick={() => void refreshList(tab)} type="button">刷新列表</button>
         </div>
       </div>
+
+      {providerQuotaOpen && isSuperuser && tab === "models" && (
+        <ProviderQuotaPanel
+          actorId={userId}
+          isSuperuser={isSuperuser}
+          onClose={() => setProviderQuotaOpen(false)}
+          onUnauthorized={onUnauthorized}
+          service={providerQuotaService}
+        />
+      )}
 
       <div className="creator-settings-content">
         <div className="creator-settings-list" aria-label={tab === "models" ? "模型列表" : "提示词列表"}>
