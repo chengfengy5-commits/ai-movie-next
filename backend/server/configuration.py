@@ -41,6 +41,8 @@ class ServerConfiguration:
     video_single_enabled: bool = False
     video_single_credentials_file: Path | None = field(default=None, repr=False)
     allowed_origins: tuple[str, ...] = ()
+    fused_generation_enabled: bool = False
+    fused_generation_provider_origins: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.user_task_max_concurrency) is not int:
@@ -53,10 +55,27 @@ class ServerConfiguration:
             raise ServerConfigurationError("TEXT_CHAT_ENABLED must be explicit")
         if type(self.video_single_enabled) is not bool:
             raise ServerConfigurationError("VIDEO_SINGLE_ENABLED must be explicit")
+        if type(self.fused_generation_enabled) is not bool:
+            raise ServerConfigurationError("FUSED_GENERATION_ENABLED must be explicit")
         if not isinstance(self.allowed_origins, tuple) or any(
             not isinstance(origin, str) for origin in self.allowed_origins
         ):
             raise ServerConfigurationError("ALLOWED_ORIGINS must be comma-separated text")
+        if not isinstance(self.fused_generation_provider_origins, tuple) or any(
+            not isinstance(origin, str) for origin in self.fused_generation_provider_origins
+        ):
+            raise ServerConfigurationError(
+                "FUSED_GENERATION_PROVIDER_ORIGINS must be comma-separated HTTPS origins"
+            )
+        if any(
+            _provider_origin(origin) != origin
+            for origin in self.fused_generation_provider_origins
+        ) or len(set(self.fused_generation_provider_origins)) != len(
+            self.fused_generation_provider_origins
+        ):
+            raise ServerConfigurationError(
+                "FUSED_GENERATION_PROVIDER_ORIGINS must use unique canonical HTTPS origins"
+            )
         if self.image_single_credentials_file is not None and (
             not isinstance(self.image_single_credentials_file, Path)
             or not self.image_single_credentials_file.is_absolute()
@@ -116,6 +135,19 @@ class ServerConfiguration:
             ):
                 raise ServerConfigurationError(
                     "video.single requires complete object storage"
+                )
+        if self.fused_generation_enabled:
+            if not self.fused_generation_provider_origins:
+                raise ServerConfigurationError(
+                    "FUSED_GENERATION_PROVIDER_ORIGINS is required when fused generation is enabled"
+                )
+            if (
+                self.r2_configuration is None
+                or self.r2_access_key is None
+                or self.r2_secret_key is None
+            ):
+                raise ServerConfigurationError(
+                    "fused generation requires complete object storage"
                 )
 
         enabled_media_credentials = tuple(
@@ -223,6 +255,12 @@ def load_server_configuration(
         "VIDEO_SINGLE_ENABLED",
         default=False,
     )
+    fused_generation_enabled = _boolean(
+        values,
+        "FUSED_GENERATION_ENABLED",
+        default=False,
+    )
+    fused_generation_provider_origins = _provider_origins(values)
     video_single_credentials_file = _optional_absolute_path(
         values,
         "VIDEO_SINGLE_CREDENTIALS_FILE",
@@ -264,6 +302,10 @@ def load_server_configuration(
             raise ServerConfigurationError(
                 "video.single requires complete object storage"
             )
+        if fused_generation_enabled:
+            raise ServerConfigurationError(
+                "fused generation requires complete object storage"
+            )
         if allow_r2_dev:
             raise ServerConfigurationError(
                 "ALLOW_R2_DEV requires complete object storage"
@@ -286,6 +328,8 @@ def load_server_configuration(
             video_single_enabled=video_single_enabled,
             video_single_credentials_file=video_single_credentials_file,
             allowed_origins=allowed_origins,
+            fused_generation_enabled=fused_generation_enabled,
+            fused_generation_provider_origins=fused_generation_provider_origins,
         )
 
     missing = tuple(
@@ -344,7 +388,75 @@ def load_server_configuration(
         video_single_enabled=video_single_enabled,
         video_single_credentials_file=video_single_credentials_file,
         allowed_origins=allowed_origins,
+        fused_generation_enabled=fused_generation_enabled,
+        fused_generation_provider_origins=fused_generation_provider_origins,
     )
+
+
+def _provider_origins(environ: Mapping[str, str]) -> tuple[str, ...]:
+    value = environ.get("FUSED_GENERATION_PROVIDER_ORIGINS", "")
+    if value is None:
+        value = ""
+    if not isinstance(value, str):
+        raise ServerConfigurationError(
+            "FUSED_GENERATION_PROVIDER_ORIGINS must be comma-separated HTTPS origins"
+        )
+    if not value.strip():
+        return ()
+
+    parts = value.split(",")
+    if any(not part.strip() for part in parts):
+        raise ServerConfigurationError(
+            "FUSED_GENERATION_PROVIDER_ORIGINS contains an empty origin"
+        )
+    origins: list[str] = []
+    for part in parts:
+        origin = _provider_origin(part.strip())
+        if origin not in origins:
+            origins.append(origin)
+    return tuple(origins)
+
+
+def _provider_origin(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+        hostname = parsed.hostname
+        host_authority = f"[{hostname}]" if hostname and ":" in hostname else hostname
+        if host_authority:
+            parse_public_http_url(f"https://{host_authority}")
+    except (TypeError, ValueError):
+        raise ServerConfigurationError(
+            "FUSED_GENERATION_PROVIDER_ORIGINS contains an invalid origin"
+        ) from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or not hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or "@" in parsed.netloc
+        or "?" in value
+        or "#" in value
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+        or parsed.netloc.endswith(":")
+        or (port is not None and port == 0)
+    ):
+        raise ServerConfigurationError(
+            "FUSED_GENERATION_PROVIDER_ORIGINS must contain HTTPS origins only"
+        )
+    try:
+        canonical_host = hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError:
+        raise ServerConfigurationError(
+            "FUSED_GENERATION_PROVIDER_ORIGINS contains an invalid hostname"
+        ) from None
+    if ":" in canonical_host:
+        canonical_host = f"[{canonical_host}]"
+    port_suffix = f":{port}" if port not in {None, 443} else ""
+    return f"https://{canonical_host}{port_suffix}"
 
 
 def _required(environ: Mapping[str, str], name: str) -> str:

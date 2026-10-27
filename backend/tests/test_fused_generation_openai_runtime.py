@@ -345,6 +345,43 @@ def test_custom_provider_origin_requires_explicit_allowlist_entry():
     assert client.calls[0]["url"] == "https://image-gateway.example/openai/v1/images/edits"
 
 
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "https://api.openai.com:0/v1",
+        "https://api.openai.com:/v1",
+    ],
+    ids=["port-zero", "empty-port"],
+)
+def test_invalid_provider_port_is_rejected_before_fetching_references_or_posting(
+    base_url: str,
+):
+    client = FakeHttpClient(FakeResponse(200, _success_body()))
+    runtime, _, fetcher = _runtime(client)
+
+    with pytest.raises(ProviderGenerationFailure):
+        asyncio.run(runtime.generate(_request(base_url=base_url)))
+
+    assert fetcher.calls == []
+    assert client.calls == []
+
+
+def test_allowed_provider_origin_with_explicit_port_is_used_verbatim():
+    client = FakeHttpClient(FakeResponse(200, _success_body()))
+    runtime, _, _ = _runtime(
+        client,
+        allowed_provider_origins=("https://api.openai.com:8443",),
+    )
+
+    result = asyncio.run(
+        runtime.generate(_request(base_url="https://api.openai.com:8443/v1"))
+    )
+
+    assert result == FusedGenerationOutput("https://cdn.openai.example/generated.png")
+    assert len(client.calls) == 1
+    assert client.calls[0]["url"] == "https://api.openai.com:8443/v1/images/edits"
+
+
 def test_valid_base64_image_is_decoded_and_payload_is_hidden_from_repr():
     image_bytes = _synthetic_png()
     body = json.dumps(

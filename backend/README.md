@@ -145,6 +145,20 @@ R2 完整配置下，认证后的 `POST /api/upload/retry-oss` 使用 DNS 固定
 
 `image.single` host 默认关闭。显式设置 `IMAGE_SINGLE_ENABLED=true` 时，必须同时提供绝对路径 `IMAGE_SINGLE_CREDENTIALS_FILE` 和完整 R2 配置；关闭时不会读取该文件或构造单图媒体 runtime。仅启用单图时，video 和 batch 路由在认证后返回 503，不打开业务 Session 或创建/扣费。`image.single` 接收 `reference_images`，按输入顺序保留重复项，并仅在该列表为空时回退到旧的 `reference_image` 字段。data URI 与受限的 HTTPS 公网图片会在发起 provider 编辑请求前完成校验。
 
+融合生成 host 默认关闭。显式设置 `FUSED_GENERATION_ENABLED=true` 时，必须提供完整 R2 配置以及独立的 `FUSED_GENERATION_PROVIDER_ORIGINS` HTTPS origin allowlist，例如 `https://api.openai.com,https://image-gateway.example`；该 allowlist 不读取或继承 `ALLOWED_ORIGINS`，也不会从数据库模型的 `base_url` 推导信任。启用后融合路由使用数据库中原有的模型/费用解析，Provider 请求和 R2 写入仍只在收到实际任务时发生。融合媒体 runtime 与启用的 image worker 共用一个 owned media owner；只启用融合生成时不要求或读取 image credentials 文件。
+
+本地环境变量示例（仓库启动入口不加载 `.env`，运行时应显式注入）：
+
+```sh
+export FUSED_GENERATION_ENABLED=false
+export FUSED_GENERATION_PROVIDER_ORIGINS=
+# 显式启用时改为 true，并给出独立的 HTTPS provider origins：
+# export FUSED_GENERATION_ENABLED=true
+# export FUSED_GENERATION_PROVIDER_ORIGINS=https://api.openai.com,https://image-gateway.example:8443
+```
+
+已返回 Provider URL 但转存取消或写入/清理结果不确定时，host 会把原 URL 与固定“融合图已生成，转存结果待核对”提示保留在受控任务中，不退款、不重新调用 Provider，也不自动重试存储。普通明确转存失败仍按原路径交付已知 Provider URL。持久原始输入、幂等键、凭据快照、Provider 查询和重启恢复仍待后续切片；本接线不表示融合迁移全项完成。
+
 普通 `video.single` host 也默认关闭。显式设置 `VIDEO_SINGLE_ENABLED=true` 时，必须提供绝对路径 `VIDEO_SINGLE_CREDENTIALS_FILE` 和完整 R2 配置；如果同时启用单图或批量图片，所有媒体 worker 必须共用同一凭据文件。视频复用单图/批量图片的 registry、owned media runtime、worker capacity 和 app lifespan，不另外创建 host 或媒体存储 facade。普通视频目前接入 xAI 和 Manxiaobai 的单任务流程，接受 `video/mp4`、`video/webm`、`video/quicktime`、`video/x-m4v`、`video/x-msvideo`、`video/x-matroska`，传输与存储上限仍为 50 MiB、超时仍为 600 秒。HaoAI 三步视频尝试组不会降级为普通单任务。关闭时不会读取视频凭据文件或构造视频 worker。
 
 聊天文本流默认关闭。显式设置 `TEXT_CHAT_ENABLED=true` 后，host 才会接通 `/api/chat/stream` 的 OpenAI 兼容文本 runtime；模型、provider、密钥和自定义 base URL 沿用数据库中的文本模型配置，不需要额外凭据文件。该开关不读取 `.env`，host 构造时不发起 provider 请求。

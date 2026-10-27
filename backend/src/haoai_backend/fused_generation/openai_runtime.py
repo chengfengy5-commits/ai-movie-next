@@ -268,9 +268,13 @@ def _parse_origin(value: str, *, allow_path: bool) -> tuple[str, str, int]:
     try:
         parsed = urlsplit(value)
         hostname = parsed.hostname
-        port = parsed.port or 443
+        port = parsed.port
     except ValueError as exc:
         raise ValueError("URL authority is invalid") from exc
+    if parsed.netloc.endswith(":") or port == 0:
+        raise ValueError("URL authority is invalid")
+    if port is None:
+        port = 443
     if (
         parsed.scheme != "https"
         or not parsed.netloc

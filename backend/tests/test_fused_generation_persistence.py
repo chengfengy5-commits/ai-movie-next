@@ -21,6 +21,7 @@ from haoai_backend.authentication.tables import (
 )
 from haoai_backend.chat_data.tables import chat_messages, metadata as chat_metadata
 from haoai_backend.fused_generation.domain import (
+    FUSED_DELIVERY_PENDING_PROGRESS_MESSAGE,
     FUSED_MEDIA_STORAGE_UNKNOWN_REASON,
     FUSED_MEDIA_STORAGE_UNKNOWN_PROGRESS_MESSAGE,
     FusedGenerationInlineImage,
@@ -503,6 +504,68 @@ def test_unknown_retention_accepts_existing_cancelling_status_and_preserves_it(
     assert logs == []
 
 
+def test_known_provider_url_retention_preserves_cancelling_task_and_blocks_late_finish(
+    fused_database,
+):
+    engine, factory = fused_database
+    prepared = replace(_prepared(), task_id="task-known-url-cancelling")
+    _stage_task(factory, prepared)
+
+    claim_uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    claim = claim_uow.claim_task(
+        prepared.task_id,
+        "claim-known-url",
+        expected_user_id=prepared.user_id,
+    )
+    assert claim is not None
+    claim_uow.commit()
+    claim_uow.close()
+
+    with engine.begin() as connection:
+        connection.execute(
+            update(AITaskRow.__table__)
+            .where(AITaskRow.id == prepared.task_id)
+            .values(status="cancelling")
+        )
+
+    uow = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert uow.retain_known_media_result(
+        prepared.task_id,
+        prepared.user_id,
+        "claim-known-url",
+        "https://provider.example.test/known-result.png?opaque=synthetic",
+    )
+    uow.commit()
+    uow.close()
+
+    late_finish = SqlAlchemyFusedGenerationUnitOfWork(factory())
+    assert not late_finish.finish_task(
+        prepared,
+        "claim-known-url",
+        image_url="https://cdn.example.test/fused/late.png",
+        error_message=None,
+        preserve_if_cancelled=True,
+    )
+    late_finish.commit()
+    late_finish.close()
+
+    with engine.connect() as connection:
+        task = connection.execute(
+            select(AITaskRow.__table__).where(AITaskRow.id == prepared.task_id)
+        ).mappings().one()
+        assets = connection.execute(select(fused_assets)).mappings().all()
+        wallet = connection.execute(select(user_credits.c.credits)).scalar_one()
+        logs = connection.execute(select(CreditLogRow.__table__)).mappings().all()
+    assert task["status"] == "cancelling"
+    assert task["claim_token"] == "claim-known-url"
+    assert task["recovery_status"] == "provider_result_unknown"
+    assert task["result"] == "https://provider.example.test/known-result.png?opaque=synthetic"
+    assert task["progress_message"] == FUSED_DELIVERY_PENDING_PROGRESS_MESSAGE
+    assert assets == []
+    assert wallet == 12
+    assert logs == []
+
+
 def test_unknown_retention_does_not_take_ownership_of_unmarked_legacy_fused_task(
     fused_database,
 ):
@@ -553,13 +616,13 @@ def test_inline_storage_authorization_rechecks_owner_marker_status_and_token(fus
     claim_uow.close()
 
     authorized = SqlAlchemyFusedGenerationUnitOfWork(factory())
-    assert authorized.authorize_inline_image_storage(
+    assert authorized.authorize_media_storage(
         prepared.task_id, prepared.user_id, "claim-inline"
     )
-    assert not authorized.authorize_inline_image_storage(
+    assert not authorized.authorize_media_storage(
         prepared.task_id, "other-owner", "claim-inline"
     )
-    assert not authorized.authorize_inline_image_storage(
+    assert not authorized.authorize_media_storage(
         prepared.task_id, prepared.user_id, "wrong-token"
     )
     authorized.rollback()
@@ -572,7 +635,7 @@ def test_inline_storage_authorization_rechecks_owner_marker_status_and_token(fus
             .values(request_data="{}")
         )
     unmarked = SqlAlchemyFusedGenerationUnitOfWork(factory())
-    assert not unmarked.authorize_inline_image_storage(
+    assert not unmarked.authorize_media_storage(
         prepared.task_id, prepared.user_id, "claim-inline"
     )
     unmarked.rollback()
@@ -585,7 +648,7 @@ def test_inline_storage_authorization_rechecks_owner_marker_status_and_token(fus
             .values(status="cancelling")
         )
     cancelling = SqlAlchemyFusedGenerationUnitOfWork(factory())
-    assert not cancelling.authorize_inline_image_storage(
+    assert not cancelling.authorize_media_storage(
         prepared.task_id, prepared.user_id, "claim-inline"
     )
     cancelling.rollback()
