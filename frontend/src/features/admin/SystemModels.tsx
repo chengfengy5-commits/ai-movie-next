@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type FormEvent } from "react";
 import { ApiError } from "../../shared/api/errors";
 import { AistarslabQuickConfig, type AistarslabQuickConfigExitNotice } from "./AistarslabQuickConfig";
+import { AistarslabChannelSync, type AistarslabChannelSyncExitNotice } from "./AistarslabChannelSync";
 import type { AistarslabApi, AistarslabBuiltParams } from "./aistarslabApi";
 import type {
   AdminApi,
@@ -89,6 +90,7 @@ interface SystemModelsProps {
   aistarslabApi: AistarslabApi;
   adminActorId: string;
   adminSessionGeneration: number;
+  viewIdentity: number;
   onUnauthorized(): void;
   mode: ModelMode;
   modelId: string | undefined;
@@ -98,6 +100,7 @@ interface SystemModelsProps {
   onCancel?(): void;
   onSaved?(): void;
   onAistarslabExitStateChange?(owner: symbol, notice: AistarslabQuickConfigExitNotice | null): void;
+  onAistarslabSyncExitStateChange?(owner: symbol, notice: AistarslabChannelSyncExitNotice | null): void;
 }
 
 interface QualityRateRow {
@@ -239,7 +242,12 @@ function handleUnauthorized(error: unknown, onUnauthorized: () => void): boolean
 
 interface ModelListProps {
   api: AdminApi;
+  aistarslabApi: AistarslabApi;
+  adminActorId: string;
+  adminSessionGeneration: number;
+  viewIdentity: number;
   onUnauthorized(): void;
+  onAistarslabSyncExitStateChange?(owner: symbol, notice: AistarslabChannelSyncExitNotice | null): void;
   onCreate: (() => void) | undefined;
   onEdit: ((id: string) => void) | undefined;
   reloadVersion: number;
@@ -250,9 +258,10 @@ interface ModelListPaginationProps {
   page: number;
   pageCount: number;
   onPageChange(page: number): void;
+  disabled?: boolean;
 }
 
-function ModelListPagination({ total, page, pageCount, onPageChange }: ModelListPaginationProps) {
+function ModelListPagination({ total, page, pageCount, onPageChange, disabled = false }: ModelListPaginationProps) {
   return (
     <footer className="admin-table-footer">
       <span>共 {total.toLocaleString("zh-CN")} 个模型</span>
@@ -260,7 +269,7 @@ function ModelListPagination({ total, page, pageCount, onPageChange }: ModelList
         <button
           className="admin-button admin-button-secondary"
           type="button"
-          disabled={page <= 1}
+          disabled={disabled || page <= 1}
           onClick={() => onPageChange(Math.max(1, page - 1))}
         >
           上一页
@@ -269,7 +278,7 @@ function ModelListPagination({ total, page, pageCount, onPageChange }: ModelList
         <button
           className="admin-button admin-button-secondary"
           type="button"
-          disabled={page >= pageCount}
+          disabled={disabled || page >= pageCount}
           onClick={() => onPageChange(Math.min(pageCount, page + 1))}
         >
           下一页
@@ -281,7 +290,12 @@ function ModelListPagination({ total, page, pageCount, onPageChange }: ModelList
 
 function ModelList({
   api,
+  aistarslabApi,
+  adminActorId,
+  adminSessionGeneration,
+  viewIdentity,
   onUnauthorized,
+  onAistarslabSyncExitStateChange,
   onCreate,
   onEdit,
   reloadVersion,
@@ -298,6 +312,8 @@ function ModelList({
   const [loadError, setLoadError] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
+  const [syncLocked, setSyncLocked] = useState(false);
+  const syncActivityOwner = useRef<symbol | null>(null);
   const mounted = useRef(true);
   const deleteController = useRef<AbortController | null>(null);
 
@@ -308,6 +324,11 @@ function ModelList({
       deleteController.current?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    syncActivityOwner.current = null;
+    setSyncLocked(false);
+  }, [aistarslabApi, adminActorId, adminSessionGeneration, viewIdentity]);
 
   const query = useMemo<AdminModelQuery>(() => {
     const result: AdminModelQuery = { skip: (page - 1) * PAGE_SIZE, limit: PAGE_SIZE };
@@ -345,11 +366,23 @@ function ModelList({
   }, [api, onUnauthorized, query, reloadVersion, retry, listVersion]);
 
   function applyFilterChange(change: () => void) {
+    if (syncLocked) return;
     change();
     setPage(1);
   }
 
+  function updateSyncActivity(owner: symbol, activeSync: boolean) {
+    if (activeSync) {
+      syncActivityOwner.current = owner;
+      setSyncLocked(true);
+    } else if (syncActivityOwner.current === owner) {
+      syncActivityOwner.current = null;
+      setSyncLocked(false);
+    }
+  }
+
   async function removeModel(model: AdminModel) {
+    if (syncLocked) return;
     if (!window.confirm("确认删除模型“" + model.name + "”吗？")) return;
     const deleteQuery = query;
     const deletePage = page;
@@ -389,16 +422,28 @@ function ModelList({
           <h1>系统模型</h1>
           <p>管理平台使用的文本、图片和视频模型。</p>
         </div>
-        <button className="admin-button admin-button-primary" type="button" onClick={onCreate}>
+        <button className="admin-button admin-button-primary" type="button" disabled={syncLocked} onClick={onCreate}>
           新建模型
         </button>
       </header>
+
+      <AistarslabChannelSync
+        api={aistarslabApi}
+        actorId={adminActorId}
+        sessionGeneration={adminSessionGeneration}
+        viewIdentity={viewIdentity}
+        onUnauthorized={onUnauthorized}
+        onActivityChange={updateSyncActivity}
+        onExitStateChange={(owner, notice) => onAistarslabSyncExitStateChange?.(owner, notice)}
+        onModelsChanged={() => setListVersion((value) => value + 1)}
+      />
 
       <section className="admin-filter-panel" aria-label="模型筛选">
         <label>
           <span>分类</span>
           <select
             value={category}
+            disabled={syncLocked}
             onChange={(event) => applyFilterChange(() => setCategory(event.target.value))}
           >
             <option value="">全部分类</option>
@@ -409,6 +454,7 @@ function ModelList({
           <span>提供商</span>
           <select
             value={provider}
+            disabled={syncLocked}
             onChange={(event) => applyFilterChange(() => setProvider(event.target.value))}
           >
             <option value="">全部提供商</option>
@@ -419,6 +465,7 @@ function ModelList({
           <span>启用状态</span>
           <select
             value={active}
+            disabled={syncLocked}
             onChange={(event) => applyFilterChange(() => setActive(event.target.value))}
           >
             <option value="">全部</option>
@@ -429,6 +476,7 @@ function ModelList({
         <button
           className="admin-button admin-button-secondary"
           type="button"
+          disabled={syncLocked}
           onClick={() => {
             setCategory("");
             setProvider("");
@@ -458,7 +506,7 @@ function ModelList({
             <strong>没有符合条件的模型</strong>
             <p>{total === 0 ? "调整筛选条件，或新建一个系统模型。" : "当前页没有模型记录。"}</p>
           </section>
-          <ModelListPagination total={total} page={page} pageCount={pageCount} onPageChange={setPage} />
+          <ModelListPagination total={total} page={page} pageCount={pageCount} onPageChange={setPage} disabled={syncLocked} />
         </div>
       ) : (
         <div className="admin-table-wrap">
@@ -479,7 +527,7 @@ function ModelList({
               {rows.map((model) => (
                 <tr key={model.id}>
                   <td>
-                    <button className="admin-table-link" type="button" onClick={() => onEdit?.(model.id)}>
+                    <button className="admin-table-link" type="button" disabled={syncLocked} onClick={() => onEdit?.(model.id)}>
                       {model.name}
                     </button>
                   </td>
@@ -490,11 +538,11 @@ function ModelList({
                   <td><span className={model.is_active ? "admin-status-pill is-on" : "admin-status-pill"}>{model.is_active ? "启用" : "禁用"}</span></td>
                   <td>{model.sort_order}</td>
                   <td className="admin-table-actions">
-                    <button className="admin-text-button" type="button" onClick={() => onEdit?.(model.id)}>编辑</button>
+                    <button className="admin-text-button" type="button" disabled={syncLocked} onClick={() => onEdit?.(model.id)}>编辑</button>
                     <button
                       className="admin-text-button is-danger"
                       type="button"
-                      disabled={deletingId !== null}
+                      disabled={deletingId !== null || syncLocked}
                       onClick={() => { void removeModel(model); }}
                     >
                       {deletingId === model.id ? "删除中…" : "删除"}
@@ -504,7 +552,7 @@ function ModelList({
               ))}
             </tbody>
           </table>
-          <ModelListPagination total={total} page={page} pageCount={pageCount} onPageChange={setPage} />
+          <ModelListPagination total={total} page={page} pageCount={pageCount} onPageChange={setPage} disabled={syncLocked} />
         </div>
       )}
     </section>
@@ -1049,7 +1097,14 @@ export function SystemModels(props: SystemModelsProps) {
     return (
       <ModelList
         api={props.api}
+        aistarslabApi={props.aistarslabApi}
+        adminActorId={props.adminActorId}
+        adminSessionGeneration={props.adminSessionGeneration}
+        viewIdentity={props.viewIdentity}
         onUnauthorized={props.onUnauthorized}
+        {...(props.onAistarslabSyncExitStateChange
+          ? { onAistarslabSyncExitStateChange: props.onAistarslabSyncExitStateChange }
+          : {})}
         onCreate={props.onCreate}
         onEdit={props.onEdit}
         reloadVersion={props.reloadVersion}

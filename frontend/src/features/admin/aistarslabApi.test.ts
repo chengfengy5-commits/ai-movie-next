@@ -54,6 +54,9 @@ describe("AIStarsLab API client", () => {
       if (url === "/api/aistarslab/add-default") {
         return jsonResponse({ id: "video-default-1", user_id: "system", is_system: true, category: "video", provider: "aistarslab", name: "视频默认", model: "video-line:video-model", api_key: "encrypted-response" });
       }
+      if (url === "/api/aistarslab/sync-all") {
+        return jsonResponse({ created: 2, updated: 3, total: 5, api_key: "must-not-escape" });
+      }
       throw new Error("Unexpected request: " + url);
     });
     const api = createAistarslabApi(fetcher, () => "admin-token");
@@ -63,6 +66,7 @@ describe("AIStarsLab API client", () => {
     const videoParams = await api.buildParams("video", "video-line", "video-model");
     const imageModel = await api.addDefault("image", "image-draft-key");
     const videoModel = await api.addDefault("video", "video-draft-key");
+    const sync = await api.syncAll();
 
     expect(config.imageConfig[0]).toEqual({
       channel: "image-line",
@@ -74,16 +78,18 @@ describe("AIStarsLab API client", () => {
     expect(videoParams).toEqual({ channel: "video-line", model: "video-model", label: "视频模型", lineTitle: "视频线路", params: "{}" });
     expect(imageModel).toEqual({ id: "image-default-1", category: "image", name: "图片默认", model: "image-line:image-model" });
     expect(videoModel).toEqual({ id: "video-default-1", category: "video", name: "视频默认", model: "video-line:video-model" });
-    expect(JSON.stringify([config, imageParams, videoParams, imageModel, videoModel])).not.toContain("must-not-escape");
-    expect(JSON.stringify([config, imageParams, videoParams, imageModel, videoModel])).not.toContain("encrypted-response");
+    expect(sync).toEqual({ created: 2, updated: 3, total: 5 });
+    expect(JSON.stringify([config, imageParams, videoParams, imageModel, videoModel, sync])).not.toContain("must-not-escape");
+    expect(JSON.stringify([config, imageParams, videoParams, imageModel, videoModel, sync])).not.toContain("encrypted-response");
 
-    expect(fetcher).toHaveBeenCalledTimes(5);
+    expect(fetcher).toHaveBeenCalledTimes(6);
     expect(fetcher.mock.calls.map(([url]) => String(url))).toEqual([
       "/api/aistarslab/config",
       "/api/aistarslab/build-image-params",
       "/api/aistarslab/build-params",
       "/api/aistarslab/add-image-default",
       "/api/aistarslab/add-default",
+      "/api/aistarslab/sync-all",
     ]);
     for (const [url, init] of fetcher.mock.calls) {
       expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer admin-token");
@@ -96,6 +102,9 @@ describe("AIStarsLab API client", () => {
     expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual({ channel: "video-line", model: "video-model" });
     expect(JSON.parse(String(fetcher.mock.calls[3]?.[1]?.body))).toEqual({ api_key: "image-draft-key" });
     expect(JSON.parse(String(fetcher.mock.calls[4]?.[1]?.body))).toEqual({ api_key: "video-draft-key" });
+    expect(fetcher.mock.calls[5]?.[1]?.method).toBe("POST");
+    expect(fetcher.mock.calls[5]?.[1]?.body).toBeUndefined();
+    expect(new Headers(fetcher.mock.calls[5]?.[1]?.headers).get("Content-Type")).toBeNull();
   });
 
   it("rejects wrong-category or malformed build and create success envelopes", async () => {
@@ -109,6 +118,20 @@ describe("AIStarsLab API client", () => {
 
     await expect(api.buildParams("image", "image-line", "image-model")).rejects.toMatchObject({ kind: "invalid-response" });
     await expect(api.addDefault("video", "key")).rejects.toMatchObject({ kind: "invalid-response" });
+  });
+
+  it("rejects inconsistent or unsafe AIStarsLab sync counts", async () => {
+    const replies = [
+      { created: 2, updated: 3, total: 4 },
+      { created: -1, updated: 1, total: 0 },
+      { created: Number.MAX_SAFE_INTEGER, updated: 1, total: Number.MAX_SAFE_INTEGER },
+    ];
+    const fetcher = vi.fn<AdminFetcher>(async () => jsonResponse(replies.shift()));
+    const api = createAistarslabApi(fetcher, () => "admin-token");
+
+    await expect(api.syncAll()).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(api.syncAll()).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(api.syncAll()).rejects.toMatchObject({ kind: "invalid-response" });
   });
 
   it("treats a non-200 success response as invalid instead of accepting it", async () => {

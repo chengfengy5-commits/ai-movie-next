@@ -29,6 +29,12 @@ export interface AistarslabCreatedSystemModel {
   model: string;
 }
 
+export interface AistarslabSyncResult {
+  created: number;
+  updated: number;
+  total: number;
+}
+
 export type AistarslabApiErrorKind = "network" | "timeout" | "aborted" | "http" | "invalid-response";
 
 export class AistarslabApiError extends Error {
@@ -65,6 +71,7 @@ export interface AistarslabApi {
     apiKey: string,
     signal?: AbortSignal,
   ): Promise<AistarslabCreatedSystemModel>;
+  syncAll(signal?: AbortSignal): Promise<AistarslabSyncResult>;
 }
 
 const REQUEST_TIMEOUT_MS = 20_000;
@@ -147,6 +154,17 @@ function parseCreatedModel(value: unknown, category: AistarslabModelCategory): A
     return null;
   }
   return { id, category, name, model };
+}
+
+function parseSyncResult(value: unknown): AistarslabSyncResult | null {
+  if (!isRecord(value)) return null;
+  const { created, updated, total } = value;
+  const isCount = (count: unknown): count is number => (
+    typeof count === "number" && Number.isSafeInteger(count) && count >= 0
+  );
+  if (!isCount(created) || !isCount(updated) || !isCount(total)) return null;
+  if (!Number.isSafeInteger(created + updated) || total !== created + updated) return null;
+  return { created, updated, total };
 }
 
 export function createAistarslabApi(
@@ -251,6 +269,11 @@ export function createAistarslabApi(
         await requestJson(path, "POST", { api_key: apiKey }, signal),
         category,
       );
+      if (parsed === null) throw new AistarslabApiError("invalid-response", 200);
+      return parsed;
+    },
+    async syncAll(signal) {
+      const parsed = parseSyncResult(await requestJson("/sync-all", "POST", undefined, signal));
       if (parsed === null) throw new AistarslabApiError("invalid-response", 200);
       return parsed;
     },
