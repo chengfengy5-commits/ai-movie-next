@@ -3,6 +3,8 @@ import type { Chapter } from "../../shared/api/contracts";
 import { CanvasSourceError } from "../../shared/api/canvasSources";
 import { normalizeApiError } from "../../shared/api/services";
 import { useSeriesDialogFocus } from "../series/useSeriesDialogFocus";
+import { FrameOriginalTextPanel } from "./FrameOriginalTextPanel";
+import type { FrameOriginalTextSnapshot } from "./frameOriginalTextSnapshot";
 
 export interface FrameTextSaveResult {
   status: "saved" | "unchanged" | "conflict" | "unknown";
@@ -14,6 +16,10 @@ interface FrameTextEditorProps {
   chapter: Chapter;
   position: number;
   initialText: string;
+  originalTextSnapshot?: FrameOriginalTextSnapshot;
+  userId?: string | null;
+  apiBaseUrl?: string | null;
+  isSessionCurrent?(): boolean;
   lockNotice: string | null;
   lifecycleSignal: AbortSignal;
   onClose(): void;
@@ -31,6 +37,10 @@ export function FrameTextEditor({
   chapter,
   position,
   initialText,
+  originalTextSnapshot = { kind: "missing" },
+  userId = null,
+  apiBaseUrl = null,
+  isSessionCurrent,
   lockNotice,
   lifecycleSignal,
   onClose,
@@ -44,6 +54,7 @@ export function FrameTextEditor({
   const [serverText, setServerText] = useState<string | null | undefined>(undefined);
   const [conflicted, setConflicted] = useState(false);
   const [writeUnknown, setWriteUnknown] = useState(false);
+  const [originalTextVisible, setOriginalTextVisible] = useState(true);
   const controllerRef = useRef<AbortController | null>(null);
   const focus = useSeriesDialogFocus({ active: true, canDismiss: true, onDismiss: close });
 
@@ -140,8 +151,25 @@ export function FrameTextEditor({
             <p className="eyebrow">{chapter.title || "未命名章节"} · 镜头 {position}</p>
             <h2 id="frame-text-editor-title">编辑分镜文字</h2>
           </div>
-          <button aria-label="关闭文字编辑" className="icon-button" onClick={close} type="button">×</button>
+          <div className="frame-text-editor-heading-controls">
+            {!originalTextVisible && (
+              <button className="secondary-button" onClick={() => setOriginalTextVisible(true)} type="button">
+                显示原文对照
+              </button>
+            )}
+            <button aria-label="关闭文字编辑" className="icon-button" onClick={close} type="button">×</button>
+          </div>
         </div>
+        {originalTextVisible && (
+          <FrameOriginalTextPanel
+            apiBaseUrl={apiBaseUrl}
+            isOwnerCurrent={isSessionCurrent ?? (() => !lifecycleSignal.aborted)}
+            lifecycleSignal={lifecycleSignal}
+            onHide={() => setOriginalTextVisible(false)}
+            snapshot={originalTextSnapshot}
+            userId={userId}
+          />
+        )}
         {lockNotice !== null && <p className="chapter-editing-lock" role="status">{lockNotice}</p>}
         <label className="frame-text-editor-label">
           镜头文字
