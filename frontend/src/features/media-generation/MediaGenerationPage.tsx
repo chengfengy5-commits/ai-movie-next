@@ -8,11 +8,14 @@ import {
   type MediaGenerationImageInput,
   type MediaGenerationAssetType,
   type MediaGenerationBatchAssetInput,
+  type MediaGenerationVideoInput,
+  type ImageGenerationReceipt,
   type MediaGenerationLookupExpectation,
   type MediaGenerationOperation,
   type MediaGenerationReceipt,
   type MediaGenerationRun,
   type MediaGenerationSingleTarget,
+  type VideoGenerationReceipt,
 } from "../../shared/api/mediaGeneration";
 import {
   type UserPreferences,
@@ -54,7 +57,9 @@ import {
 import { resolveQuickReferenceStyle } from "./quickReferenceStyle";
 import {
   readSingleMediaPreference,
+  readSingleMediaModePreference,
   writeSingleMediaPreference,
+  writeSingleMediaModePreference,
   type ImageSelectionPreference,
   type SingleMediaPreferenceCategory,
   type SingleMediaPreferenceMode,
@@ -271,6 +276,60 @@ interface PendingSubmission {
   readonly run: MediaGenerationRun;
   readonly signature: string;
   readonly submissionMessage: string;
+  readonly operationOwnerId: number;
+  readonly ownerKey?: string;
+  readonly recoveryUnavailable?: boolean;
+  readonly singleGroup?: SingleMediaGenerationGroup;
+  readonly singleItemIndex?: number;
+}
+
+type SingleMediaGenerationInput = MediaGenerationImageInput | MediaGenerationVideoInput;
+type SingleMediaGenerationReceipt = ImageGenerationReceipt | VideoGenerationReceipt;
+type SingleMediaGenerationStatus = "waiting" | "submitting" | "accepted" | "unknown" | "refused" | "blocked";
+
+interface SingleMediaTaskStatus {
+  readonly status: string;
+  readonly progress: number | null;
+  readonly progressMessage: string | null;
+}
+
+interface SingleMediaGenerationItem {
+  readonly index: number;
+  readonly input: SingleMediaGenerationInput;
+  status: SingleMediaGenerationStatus;
+  receipt?: SingleMediaGenerationReceipt;
+  message?: string;
+  taskStatus?: SingleMediaTaskStatus;
+  taskStatusMessage?: string | null;
+  taskStatusReading?: boolean;
+}
+
+interface SingleMediaGenerationGroup {
+  readonly mode: SingleMediaPreferenceMode;
+  readonly signature: string;
+  readonly ownerKey: string;
+  ownerServices: WorkspaceServices;
+  operationOwnerId: number;
+  run: MediaGenerationRun;
+  readonly items: SingleMediaGenerationItem[];
+}
+
+interface SingleMediaGenerationGroupView {
+  readonly mode: SingleMediaPreferenceMode;
+  readonly signature: string;
+  readonly ownerKey: string;
+  readonly ownerServices: WorkspaceServices;
+  readonly operationOwnerId: number;
+  readonly items: readonly {
+    readonly index: number;
+    readonly status: SingleMediaGenerationStatus;
+    readonly receipt?: SingleMediaGenerationReceipt;
+    readonly message?: string;
+    readonly taskStatus?: SingleMediaTaskStatus;
+    readonly taskStatusMessage?: string | null;
+    readonly taskStatusReading?: boolean;
+  }[];
+  readonly message: string | null;
 }
 
 interface SubmissionOutcome {
@@ -284,6 +343,7 @@ interface ResolvedSingleMediaPreference {
   readonly modelId: string | null;
   readonly promptId: string | null;
   readonly size: string | null;
+  readonly generationCount: number;
   readonly duration: string | null;
   readonly resolution: string | null;
   readonly warnings: readonly string[];
@@ -303,6 +363,11 @@ interface SingleMediaPreferenceCatalogSnapshot {
 }
 
 interface SingleMediaPreferenceFeedback {
+  readonly contextKey: string;
+  readonly message: string;
+}
+
+interface SingleMediaModePreferenceFeedback {
   readonly contextKey: string;
   readonly message: string;
 }
@@ -444,7 +509,15 @@ function resolveSingleMediaPreference(
     warnings.push("记住的提示词不属于当前图片/视频提示词目录；请手动重新选择。");
   }
 
-  return { modelId, promptId, size, duration, resolution, warnings };
+  return {
+    modelId,
+    promptId,
+    size,
+    generationCount: saved.generationCount ?? 1,
+    duration,
+    resolution,
+    warnings,
+  };
 }
 
 function promptsForSingleMode(mode: SingleMediaPreferenceMode, prompts: readonly CreatorPrompt[]): CreatorPrompt[] {
@@ -534,6 +607,17 @@ function receiptMessage(receipt: MediaGenerationReceipt): string {
   return `批量请求已回读，共 ${receipt.tasks.length} 项；每项仍可在“我的任务”中查看。`;
 }
 
+function singleGenerationStatusLabel(status: SingleMediaGenerationStatus): string {
+  switch (status) {
+    case "waiting": return "等待提交";
+    case "submitting": return "提交中";
+    case "accepted": return "已受理";
+    case "unknown": return "受理待确认";
+    case "refused": return "未受理";
+    case "blocked": return "因前项停止而未提交";
+  }
+}
+
 function describeFailure(error: unknown): string {
   if (error instanceof MediaGenerationError) return error.message;
   if (error instanceof MediaReferenceUploadError) return error.message;
@@ -567,10 +651,18 @@ export function MediaGenerationPage({
   const [selectedImageModelId, setSelectedImageModelId] = useState("");
   const [selectedImagePromptId, setSelectedImagePromptId] = useState("");
   const [selectedVideoPromptId, setSelectedVideoPromptId] = useState("");
+  const [singleGenerationCounts, setSingleGenerationCounts] = useState<Readonly<Record<string, number>>>({});
+  const [singleGenerationGroup, setSingleGenerationGroup] = useState<SingleMediaGenerationGroupView | null>(null);
+  const singleGenerationGroupRef = useRef<SingleMediaGenerationGroup | null>(null);
+  const singleGenerationGroupOwnerRef = useRef<number | null>(null);
+  const singleTaskStatusReadsRef = useRef(new Set<string>());
+  const [singleModePreferenceFeedback, setSingleModePreferenceFeedback] = useState<SingleMediaModePreferenceFeedback | null>(null);
   const [singlePreferenceFeedback, setSinglePreferenceFeedback] = useState<SingleMediaPreferenceFeedback | null>(null);
   const [singlePreferenceOffer, setSinglePreferenceOffer] = useState<SingleMediaPreferenceOffer | null>(null);
   const singlePreferenceCatalogRef = useRef<SingleMediaPreferenceCatalogSnapshot | null>(null);
   const editedSinglePreferenceContextsRef = useRef(new Set<string>());
+  const singleModePreferenceContextRef = useRef<string | null>(null);
+  const [pendingAction, setPendingAction] = useState(false);
   const batchSelectionsRef = useRef<BatchGenerationSelections>(emptyBatchSelections());
   const [batchSelections, setBatchSelections] = useState<BatchGenerationSelections>(batchSelectionsRef.current);
   const batchPreferenceEditsRef = useRef<BatchPreferenceEdits>(emptyBatchEdits());
@@ -634,6 +726,13 @@ export function MediaGenerationPage({
   const pendingRef = useRef<PendingSubmission | null>(null);
   const [requesting, setRequesting] = useState(false);
   const requestingRef = useRef(false);
+  const requestingOwnerRef = useRef<number | null>(null);
+  const pendingActionOwnerRef = useRef<number | null>(null);
+  const activeGenerationOperationRef = useRef<number | null>(null);
+  const generationOperationSequenceRef = useRef(0);
+  const generationControllersRef = useRef(new Set<AbortController>());
+  const activeBatchSubmissionRef = useRef<PendingSubmission | null>(null);
+  const generationScopeRef = useRef({ services, userId, sessionGeneration, apiBaseUrl: services.apiBaseUrl });
   const [outcome, setOutcome] = useState<SubmissionOutcome | null>(null);
   const acceptedReceiptContextRef = useRef<{
     readonly userId: string;
@@ -669,6 +768,32 @@ export function MediaGenerationPage({
     singlePreferenceMode,
     singlePreferenceCategory,
   ]);
+  const otherSinglePreferenceContextKey = JSON.stringify([
+    userId,
+    services.apiBaseUrl,
+    sessionGeneration,
+    singlePreferenceMode === "image" ? "video" : "image",
+    singlePreferenceCategory,
+  ]);
+  const singleModePreferenceContextKey = JSON.stringify([
+    userId,
+    services.apiBaseUrl,
+    sessionGeneration,
+    singlePreferenceCategory,
+  ]);
+  const singleOwnerContextKey = JSON.stringify([userId, services.apiBaseUrl, sessionGeneration]);
+  const singleGenerationCount = singleGenerationCounts[singlePreferenceContextKey] ?? 1;
+  const singleModeHasDraft = selectedImageModelId !== "" || selectedVideoModelId !== ""
+    || selectedImagePromptId !== "" || selectedVideoPromptId !== ""
+    || imagePrompt.trim() !== "" || videoPrompt.trim() !== ""
+    || imageSize !== "" || videoSize !== "" || videoDuration !== "" || videoResolution !== ""
+    || singleGenerationCount !== 1
+    || imageReferenceImages.trim() !== "" || videoReferenceImages.trim() !== ""
+    || videoReferenceAudios.trim() !== "" || videoReferenceVideos.trim() !== ""
+    || imageQuickReferenceImages.length > 0 || videoQuickReferenceImages.length > 0 || videoQuickReferenceAudios.length > 0
+    || referenceFiles.image !== undefined || referenceFiles.audio !== undefined || referenceFiles.video !== undefined
+    || (singlePreferenceMode !== null && (editedSinglePreferenceContextsRef.current.has(singlePreferenceContextKey)
+      || editedSinglePreferenceContextsRef.current.has(otherSinglePreferenceContextKey)));
   const selectedSeries = series.find((item) => item.id === selectedSeriesId) ?? null;
   const selectedChapter = chapters.find((item) => (
     item.id === selectedChapterId && item.series_id === selectedSeriesId
@@ -721,6 +846,7 @@ export function MediaGenerationPage({
     selectedImageModelId,
     selectedImagePromptId,
     selectedVideoPromptId,
+    singleGenerationCount,
     batchSelections,
     batchChecks,
     batchStoryboardContexts: selectedBatchStoryboardContexts.map(({ asset, context }) => ({
@@ -750,16 +876,104 @@ export function MediaGenerationPage({
     batchReferenceImages,
   });
   identityRef.current = { userId, services, sessionGeneration, signature: formSignature };
-  const displayedOutcome = outcome?.signature === formSignature ? outcome : null;
+  const displayedSingleGenerationGroup = singleGenerationGroup?.ownerKey === singleOwnerContextKey
+    ? singleGenerationGroup
+    : null;
+  const showSingleGenerationGroup = displayedSingleGenerationGroup !== null && (
+    displayedSingleGenerationGroup.items.length > 1
+    || displayedSingleGenerationGroup.signature !== formSignature
+    || (requesting && pending === null)
+    || pending?.singleGroup?.operationOwnerId === displayedSingleGenerationGroup.operationOwnerId
+    || services.getTaskReceipt !== undefined
+    || displayedSingleGenerationGroup.items.some((item) => item.taskStatus !== undefined)
+  );
+  const displayedOutcome = outcome?.signature === formSignature
+    && !(displayedSingleGenerationGroup !== null
+      && displayedSingleGenerationGroup.items.length > 1 && outcome.receipt === undefined)
+    ? outcome
+    : null;
 
   function updatePending(value: PendingSubmission | null) {
     pendingRef.current = value;
     setPending(value);
   }
 
-  function updateRequesting(value: boolean) {
-    requestingRef.current = value;
-    setRequesting(value);
+  function pendingBelongsToOperation(ownerId: number): boolean {
+    const current = pendingRef.current as PendingSubmission | null;
+    return current !== null && current.operationOwnerId === ownerId;
+  }
+
+  function beginCurrentScopeRun(): MediaGenerationRun | null {
+    const port = services.mediaGeneration;
+    if (port === undefined) return null;
+    const capturedServices = services;
+    const capturedUserId = userId;
+    const capturedSessionGeneration = sessionGeneration;
+    const capturedApiBaseUrl = services.apiBaseUrl;
+    return port.beginRun({
+      actorId: userId,
+      isContextCurrent: () => mountedRef.current
+        && identityRef.current.userId === capturedUserId
+        && identityRef.current.services === capturedServices
+        && identityRef.current.sessionGeneration === capturedSessionGeneration
+        && identityRef.current.services.apiBaseUrl === capturedApiBaseUrl,
+    });
+  }
+
+  function beginGenerationOperation(): number {
+    const ownerId = ++generationOperationSequenceRef.current;
+    activeGenerationOperationRef.current = ownerId;
+    return ownerId;
+  }
+
+  function isGenerationOperationCurrent(ownerId: number, run: MediaGenerationRun): boolean {
+    return activeGenerationOperationRef.current === ownerId && run.isCurrent();
+  }
+
+  function updateRequesting(ownerId: number, value: boolean) {
+    if (value) {
+      if (activeGenerationOperationRef.current !== ownerId) return;
+      requestingOwnerRef.current = ownerId;
+      requestingRef.current = true;
+      setRequesting(true);
+      return;
+    }
+    if (requestingOwnerRef.current !== ownerId) return;
+    requestingOwnerRef.current = null;
+    requestingRef.current = false;
+    setRequesting(false);
+  }
+
+  function beginPendingAction(ownerId: number): boolean {
+    if (activeGenerationOperationRef.current !== ownerId || pendingActionOwnerRef.current !== null) return false;
+    pendingActionOwnerRef.current = ownerId;
+    setPendingAction(true);
+    return true;
+  }
+
+  function releasePendingAction(ownerId: number) {
+    if (pendingActionOwnerRef.current !== ownerId) return;
+    pendingActionOwnerRef.current = null;
+    setPendingAction(false);
+  }
+
+  function finishGenerationOperation(ownerId: number) {
+    if (activeGenerationOperationRef.current !== ownerId) return;
+    if (pendingRef.current?.operationOwnerId === ownerId) updatePending(null);
+    if (activeBatchSubmissionRef.current?.operationOwnerId === ownerId) activeBatchSubmissionRef.current = null;
+    releasePendingAction(ownerId);
+    updateRequesting(ownerId, false);
+    activeGenerationOperationRef.current = null;
+  }
+
+  function makeGenerationController(): AbortController {
+    const controller = new AbortController();
+    generationControllersRef.current.add(controller);
+    return controller;
+  }
+
+  function releaseGenerationController(controller: AbortController) {
+    generationControllersRef.current.delete(controller);
   }
 
   function markSinglePreferenceEdited(contextKey = singlePreferenceContextKey) {
@@ -776,9 +990,13 @@ export function MediaGenerationPage({
     preference: ImageSelectionPreference | VideoSelectionPreference,
   ) {
     const scope = { apiBaseUrl: services.apiBaseUrl, userId };
+    const preferenceWithCount = {
+      ...preference,
+      generationCount: preference.generationCount ?? singleGenerationCount,
+    };
     const saved = preferenceMode === "image"
-      ? writeSingleMediaPreference(scope, "image", singlePreferenceCategory, preference as ImageSelectionPreference)
-      : writeSingleMediaPreference(scope, "video", singlePreferenceCategory, preference as VideoSelectionPreference);
+      ? writeSingleMediaPreference(scope, "image", singlePreferenceCategory, preferenceWithCount as ImageSelectionPreference)
+      : writeSingleMediaPreference(scope, "video", singlePreferenceCategory, preferenceWithCount as VideoSelectionPreference);
     setSinglePreferenceMessage(saved
       ? "已记住当前分类的生成选项。"
       : "浏览器未能保存此分类的生成选项；当前表单仍可继续使用。",
@@ -822,6 +1040,10 @@ export function MediaGenerationPage({
       if (resolved.duration !== null) setVideoDuration(resolved.duration);
       if (resolved.resolution !== null) setVideoResolution(resolved.resolution);
     }
+    setSingleGenerationCounts((current) => ({
+      ...current,
+      [singlePreferenceContextKey]: resolved.generationCount,
+    }));
 
     editedSinglePreferenceContextsRef.current.add(offer.contextKey);
     setSinglePreferenceOffer(null);
@@ -843,7 +1065,8 @@ export function MediaGenerationPage({
       const size = model === null ? "" : modelOptions(model).defaultSize;
       setSelectedImageModelId(modelId);
       setImageSize(size);
-      persistSinglePreference("image", { modelId, promptId: selectedImagePromptId, size });
+      setSingleGenerationCounts((current) => ({ ...current, [singlePreferenceContextKey]: 1 }));
+      persistSinglePreference("image", { modelId, promptId: selectedImagePromptId, size, generationCount: 1 });
       return;
     }
     const model = videoModels.find((candidate) => candidate.id === modelId) ?? null;
@@ -855,7 +1078,32 @@ export function MediaGenerationPage({
     setVideoSize(size);
     setVideoDuration(duration);
     setVideoResolution(resolution);
-    persistSinglePreference("video", { modelId, promptId: selectedVideoPromptId, size, duration, resolution });
+    setSingleGenerationCounts((current) => ({ ...current, [singlePreferenceContextKey]: 1 }));
+    persistSinglePreference("video", { modelId, promptId: selectedVideoPromptId, size, duration, resolution, generationCount: 1 });
+  }
+
+  function changeSingleGenerationCount(value: string) {
+    const next = Number(value);
+    if (!Number.isInteger(next) || next < 1 || next > 4 || singlePreferenceMode === null) return;
+    markSinglePreferenceEdited();
+    setSingleGenerationCounts((current) => ({ ...current, [singlePreferenceContextKey]: next }));
+    if (singlePreferenceMode === "image") {
+      persistSinglePreference("image", {
+        modelId: selectedImageModelId,
+        promptId: selectedImagePromptId,
+        size: imageSize,
+        generationCount: next,
+      });
+      return;
+    }
+    persistSinglePreference("video", {
+      modelId: selectedVideoModelId,
+      promptId: selectedVideoPromptId,
+      size: videoSize,
+      duration: videoDuration,
+      resolution: videoResolution,
+      generationCount: next,
+    });
   }
 
   function changeSinglePrompt(preferenceMode: SingleMediaPreferenceMode, promptId: string) {
@@ -979,12 +1227,190 @@ export function MediaGenerationPage({
     mountedRef.current = true;
     return () => {
       mountedRef.current = false;
+      generationOperationSequenceRef.current += 1;
+      activeGenerationOperationRef.current = null;
+      activeBatchSubmissionRef.current = null;
+      requestingOwnerRef.current = null;
+      pendingActionOwnerRef.current = null;
+      for (const controller of generationControllersRef.current) controller.abort();
+      generationControllersRef.current.clear();
+      singleTaskStatusReadsRef.current.clear();
       const actionController = quickReferenceActionControllerRef.current;
       quickReferenceActionControllerRef.current = null;
       quickReferenceActionRef.current = false;
       actionController?.abort();
     };
   }, []);
+
+  useEffect(() => {
+    const previous = generationScopeRef.current;
+    const identityChanged = previous.userId !== userId
+      || previous.sessionGeneration !== sessionGeneration
+      || previous.apiBaseUrl !== services.apiBaseUrl;
+    const servicesChanged = previous.services !== services;
+    if (!identityChanged && !servicesChanged) return;
+    generationScopeRef.current = { services, userId, sessionGeneration, apiBaseUrl: services.apiBaseUrl };
+    generationOperationSequenceRef.current += 1;
+    activeGenerationOperationRef.current = null;
+    for (const controller of generationControllersRef.current) controller.abort();
+    generationControllersRef.current.clear();
+    requestingOwnerRef.current = null;
+    requestingRef.current = false;
+    setRequesting(false);
+    pendingActionOwnerRef.current = null;
+    setPendingAction(false);
+    singleTaskStatusReadsRef.current.clear();
+    singleModePreferenceContextRef.current = null;
+    singlePreferenceCatalogRef.current = null;
+    editedSinglePreferenceContextsRef.current.clear();
+    if (identityChanged) {
+      pendingRef.current = null;
+      setPending(null);
+      activeBatchSubmissionRef.current = null;
+      singleGenerationGroupRef.current = null;
+      singleGenerationGroupOwnerRef.current = null;
+      setSingleGenerationGroup(null);
+      setOutcome(null);
+      return;
+    }
+
+    const previousPending = pendingRef.current;
+    const group = singleGenerationGroupRef.current ?? previousPending?.singleGroup ?? null;
+    const activeBatchSubmission = activeBatchSubmissionRef.current;
+    const needsRecoveryRun = previousPending !== null
+      || activeBatchSubmission !== null
+      || group?.items.some((item) => item.status === "submitting") === true;
+    let nextRun: MediaGenerationRun | null = null;
+    let runFailureMessage: string | null = null;
+    if (needsRecoveryRun) {
+      try {
+        nextRun = beginCurrentScopeRun();
+        if (nextRun === null) runFailureMessage = "当前服务没有媒体生成恢复入口；原请求仍保留，停止本地跟踪前不会继续提交。";
+      } catch (error) {
+        runFailureMessage = `当前服务无法建立媒体生成恢复入口：${describeFailure(error)} 原请求仍保留。`;
+      }
+    }
+
+    if (group !== null && group.ownerKey === singleOwnerContextKey) {
+      const operationOwnerId = ++generationOperationSequenceRef.current;
+      const priorRun = group.run;
+      const submittingIndex = group.items.findIndex((item) => item.status === "submitting");
+      group.ownerServices = services;
+      group.operationOwnerId = operationOwnerId;
+      if (nextRun !== null) group.run = nextRun;
+      let groupMessage = runFailureMessage;
+      let nextPending: PendingSubmission | null = null;
+      const existingGroupPending = previousPending?.singleGroup === group ? previousPending : null;
+
+      if (submittingIndex >= 0) {
+        const item = group.items[submittingIndex];
+        if (item !== undefined) {
+          item.status = "unknown";
+          item.message = "服务已更新；原提交结果未知，保留原请求供核对。";
+          stopSingleGenerationItems(group, submittingIndex + 1);
+          const operation = group.mode === "image" ? "image.single" : "video.single";
+          nextPending = {
+            operation,
+            idempotencyKey: item.input.idempotencyKey,
+            expectation: { operation, idempotencyKey: item.input.idempotencyKey },
+            run: nextRun ?? priorRun,
+            signature: group.signature,
+            submissionMessage: item.message,
+            operationOwnerId,
+            recoveryUnavailable: nextRun === null,
+            singleGroup: group,
+            singleItemIndex: submittingIndex,
+          };
+          groupMessage ??= "服务已更新；本项提交仍待确认，后续项目已停止。";
+        }
+      } else if (existingGroupPending !== null) {
+        nextPending = {
+          ...existingGroupPending,
+          run: nextRun ?? existingGroupPending.run,
+          operationOwnerId,
+          recoveryUnavailable: nextRun === null,
+          singleGroup: group,
+        };
+      } else if (activeBatchSubmission !== null) {
+        nextPending = {
+          ...activeBatchSubmission,
+          run: nextRun ?? activeBatchSubmission.run,
+          operationOwnerId,
+          recoveryUnavailable: nextRun === null,
+        };
+        activeBatchSubmissionRef.current = null;
+      }
+
+      if (nextPending !== null) {
+        activeGenerationOperationRef.current = operationOwnerId;
+        updatePending(nextPending);
+        setOutcome({
+          signature: group.signature,
+          message: runFailureMessage
+            ?? "服务已更新；本项仍待确认。请核对原操作，系统不会自动重新提交。",
+          pendingLookup: true,
+        });
+      } else if (previousPending !== null && previousPending.singleGroup === undefined) {
+        const pendingOwnerId = ++generationOperationSequenceRef.current;
+        const reboundPending = {
+          ...previousPending,
+          run: nextRun ?? previousPending.run,
+          operationOwnerId: pendingOwnerId,
+          recoveryUnavailable: nextRun === null,
+        };
+        activeGenerationOperationRef.current = pendingOwnerId;
+        updatePending(reboundPending);
+        setOutcome({
+          signature: reboundPending.signature,
+          message: runFailureMessage
+            ?? "服务已更新；本次提交仍待确认。请核对原操作，系统不会自动重新提交。",
+          pendingLookup: true,
+        });
+      } else {
+        activeGenerationOperationRef.current = null;
+        if (previousPending !== null) updatePending(null);
+      }
+      publishSingleGenerationGroup(group, groupMessage);
+      return;
+    }
+
+    if (activeBatchSubmission !== null) {
+      const operationOwnerId = ++generationOperationSequenceRef.current;
+      const reboundPending = {
+        ...activeBatchSubmission,
+        run: nextRun ?? activeBatchSubmission.run,
+        operationOwnerId,
+        recoveryUnavailable: nextRun === null,
+      };
+      activeBatchSubmissionRef.current = null;
+      activeGenerationOperationRef.current = operationOwnerId;
+      updatePending(reboundPending);
+      setOutcome({
+        signature: reboundPending.signature,
+        message: runFailureMessage
+          ?? "服务已更新；批量请求仍待确认。请核对原操作，系统不会自动重新提交。",
+        pendingLookup: true,
+      });
+    } else if (previousPending !== null) {
+      const operationOwnerId = ++generationOperationSequenceRef.current;
+      const reboundPending = {
+        ...previousPending,
+        run: nextRun ?? previousPending.run,
+        operationOwnerId,
+        recoveryUnavailable: nextRun === null,
+      };
+      activeGenerationOperationRef.current = operationOwnerId;
+      updatePending(reboundPending);
+      setOutcome({
+        signature: reboundPending.signature,
+        message: runFailureMessage
+          ?? "服务已更新；本次提交仍待确认。请核对原操作，系统不会自动重新提交。",
+        pendingLookup: true,
+      });
+    } else {
+      activeGenerationOperationRef.current = null;
+    }
+  }, [services, services.apiBaseUrl, sessionGeneration, userId]);
 
   useEffect(() => {
     batchPreferenceControllerRef.current?.abort();
@@ -1024,6 +1450,65 @@ export function MediaGenerationPage({
   }, [services, sessionGeneration, userId]);
 
   useEffect(() => {
+    if (singlePreferenceMode === null || loading || pendingRef.current !== null || requestingRef.current
+      || uploadInProgressRef.current || quickReferenceActionRef.current
+      || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current) return;
+
+    const contextKey = singleModePreferenceContextKey;
+    if (singleModePreferenceContextRef.current === contextKey) return;
+    singleModePreferenceContextRef.current = contextKey;
+
+    const read = readSingleMediaModePreference(
+      { apiBaseUrl: services.apiBaseUrl, userId },
+      singlePreferenceCategory,
+    );
+    if (read.kind === "unavailable" || read.kind === "invalid") {
+      setSingleModePreferenceFeedback({
+        contextKey,
+        message: read.kind === "unavailable"
+          ? "浏览器无法读取当前分类记住的图片/视频模式；当前模式保持不变。"
+          : "当前分类记住的图片/视频模式无效；当前模式保持不变。",
+      });
+      return;
+    }
+    if (read.kind === "found" && (read.value === "image" || read.value === "video")) {
+      if (read.value !== mode && singleModeHasDraft) {
+        setSingleModePreferenceFeedback({
+          contextKey,
+          message: "当前表单已有编辑或参考内容；为保留当前输入，暂不自动切换到此分类记住的模式。可手动选择图片或视频。",
+        });
+        return;
+      }
+      if (read.value !== mode) {
+        setMode(read.value);
+        setOutcome(null);
+      }
+      setSingleModePreferenceFeedback({
+        contextKey,
+        message: `已恢复当前分类的${read.value === "image" ? "图片" : "视频"}模式。`,
+      });
+      return;
+    }
+    setSingleModePreferenceFeedback(null);
+  }, [
+    loading,
+    mode,
+    pending,
+    requesting,
+    savingBatchPreferences,
+    savingQuickReferencePreferences,
+    services.apiBaseUrl,
+    sessionGeneration,
+    singleModePreferenceContextKey,
+    singleModeHasDraft,
+    singlePreferenceCategory,
+    singlePreferenceMode,
+    userId,
+    uploadingReference,
+    preparingQuickReference,
+  ]);
+
+  useEffect(() => {
     if (singlePreferenceMode === null || loading || catalogError !== null || !catalogReadyRef.current
       || pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
       || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
@@ -1057,6 +1542,7 @@ export function MediaGenerationPage({
           setVideoDuration("");
           setVideoResolution("");
         }
+        setSingleGenerationCounts((current) => ({ ...current, [contextKey]: 1 }));
       } else if (selectedModel !== null) {
         const options = modelOptions(selectedModel);
         if (preferenceMode === "image") {
@@ -1123,9 +1609,10 @@ export function MediaGenerationPage({
     const resolved = resolveSingleMediaPreference(preferenceMode, read.value, models, modePrompts);
     const formHasInput = preferenceMode === "image"
       ? selectedImageModelId !== "" || selectedImagePromptId !== "" || imagePrompt.trim() !== "" || imageSize !== ""
-        || imageReferenceImages.trim() !== "" || imageQuickReferenceImages.length > 0 || referenceFiles.image !== undefined
+        || singleGenerationCount !== 1 || imageReferenceImages.trim() !== ""
+        || imageQuickReferenceImages.length > 0 || referenceFiles.image !== undefined
       : selectedVideoModelId !== "" || selectedVideoPromptId !== "" || videoPrompt.trim() !== ""
-        || videoSize !== "" || videoDuration !== "" || videoResolution !== ""
+        || singleGenerationCount !== 1 || videoSize !== "" || videoDuration !== "" || videoResolution !== ""
         || videoReferenceImages.trim() !== "" || videoReferenceAudios.trim() !== "" || videoReferenceVideos.trim() !== ""
         || videoQuickReferenceImages.length > 0 || videoQuickReferenceAudios.length > 0
         || referenceFiles.image !== undefined || referenceFiles.audio !== undefined || referenceFiles.video !== undefined;
@@ -1169,6 +1656,7 @@ export function MediaGenerationPage({
     sessionGeneration,
     singlePreferenceCategory,
     singlePreferenceContextKey,
+    singleGenerationCount,
     singlePreferenceMode,
     singlePreferenceOffer,
     userId,
@@ -1519,6 +2007,19 @@ export function MediaGenerationPage({
       || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
       || savingBatchPreferencesRef.current || batchVideoActive) return;
     acceptedReceiptContextRef.current = null;
+    if (value === "image" || value === "video") {
+      const saved = writeSingleMediaModePreference(
+        { apiBaseUrl: services.apiBaseUrl, userId },
+        singlePreferenceCategory,
+        value,
+      );
+      setSingleModePreferenceFeedback({
+        contextKey: singleModePreferenceContextKey,
+        message: saved
+          ? `已记住当前分类的${value === "image" ? "图片" : "视频"}模式。`
+          : "浏览器未能保存当前分类的图片/视频模式；当前页面仍可继续使用。",
+      });
+    }
     setMode(value);
     setOutcome(null);
     setReferenceUploadStatus(null);
@@ -1531,31 +2032,377 @@ export function MediaGenerationPage({
     updatePending(null);
   };
 
+  const pendingSubmissionIsCurrent = (submission: PendingSubmission): boolean => {
+    if (!isGenerationOperationCurrent(submission.operationOwnerId, submission.run)) return false;
+    if (submission.singleGroup !== undefined) {
+      return submission.singleGroup.ownerKey === singleOwnerContextKey
+        && submission.singleGroup.ownerServices === services;
+    }
+    return submission.ownerKey === undefined
+      ? identityRef.current.signature === submission.signature
+      : submission.ownerKey === singleOwnerContextKey;
+  };
+
   const lookupPending = async (submission: PendingSubmission) => {
-    if (submission.run.isCurrent() !== true) return;
-    const controller = new AbortController();
+    const ownerId = submission.operationOwnerId;
+    if (pendingActionOwnerRef.current !== null || !pendingSubmissionIsCurrent(submission)) return;
+    if (!beginPendingAction(ownerId)) return;
+    const controller = makeGenerationController();
     try {
       const receipt = await submission.run.lookup(submission.expectation, controller.signal);
-      if (submission.run.isCurrent()) applyReceipt(submission.signature, receipt);
+      if (!pendingSubmissionIsCurrent(submission)) return;
+      if (submission.singleGroup !== undefined && submission.singleItemIndex !== undefined) {
+        if (receipt.operation !== submission.operation) {
+          throw new MediaGenerationError("invalid-response", "核对结果与原生成操作不匹配。");
+        }
+        const group = submission.singleGroup;
+        const item = group.items[submission.singleItemIndex];
+        if (item === undefined) throw new MediaGenerationError("invalid-response", "原生成项目已不在当前队列中。");
+        item.status = "accepted";
+        item.receipt = receipt as SingleMediaGenerationReceipt;
+        delete item.message;
+        publishSingleGenerationGroup(group);
+        updatePending(null);
+        releasePendingAction(ownerId);
+        if (submission.singleItemIndex + 1 < group.items.length) {
+          await submitSingleGenerationGroupFrom(group, submission.singleItemIndex + 1);
+        } else {
+          completeSingleGenerationGroup(group);
+        }
+        return;
+      }
+      if (receipt.operation !== submission.operation) {
+        throw new MediaGenerationError("invalid-response", "核对结果与原生成操作不匹配。");
+      }
+      if (submission.ownerKey !== undefined && submission.ownerKey === singleOwnerContextKey
+        && identityRef.current.signature !== submission.signature && receipt.operation === "image.batch") {
+        setOutcome({
+          signature: identityRef.current.signature,
+          receipt,
+          message: `已核对原批量请求。${receiptMessage(receipt)}`,
+        });
+      } else {
+        applyReceipt(submission.signature, receipt);
+      }
+      finishGenerationOperation(ownerId);
     } catch (error) {
+      if (!pendingSubmissionIsCurrent(submission)) return;
+      if (isUnauthorized(error)) {
+        onUnauthorized();
+        finishGenerationOperation(ownerId);
+        return;
+      }
+      const isChangedBatchForm = submission.operation === "image.batch"
+        && submission.ownerKey !== undefined
+        && identityRef.current.signature !== submission.signature;
+      setOutcome({
+        signature: isChangedBatchForm ? identityRef.current.signature : submission.signature,
+        message: `${isChangedBatchForm ? "原批量请求" : submission.submissionMessage} 尚无法核对本次提交。${describeFailure(error)} 请保留本页，稍后再次核对；不会自动重新提交。`,
+        pendingLookup: true,
+      });
+    } finally {
+      releaseGenerationController(controller);
+      releasePendingAction(ownerId);
+    }
+  };
+
+  function stopLocalSubmissionTracking(submission: PendingSubmission) {
+    if (pendingRef.current?.operationOwnerId !== submission.operationOwnerId) return;
+    updatePending(null);
+    finishGenerationOperation(submission.operationOwnerId);
+    const group = submission.singleGroup;
+    if (group !== undefined && group.ownerKey === singleOwnerContextKey) {
+      publishSingleGenerationGroup(group, "已停止本地跟踪；原提交仍待确认，已保留项目与原请求信息。可在确认服务状态后再继续操作。");
+    }
+  }
+
+  function publishSingleGenerationGroup(group: SingleMediaGenerationGroup, message: string | null = null) {
+    singleGenerationGroupRef.current = group;
+    singleGenerationGroupOwnerRef.current = group.operationOwnerId;
+    setSingleGenerationGroup({
+      mode: group.mode,
+      signature: group.signature,
+      ownerKey: group.ownerKey,
+      ownerServices: group.ownerServices,
+      operationOwnerId: group.operationOwnerId,
+      items: group.items.map(({ index, status, receipt, message: itemMessage, taskStatus, taskStatusMessage, taskStatusReading }) => ({
+        index,
+        status,
+        ...(receipt === undefined ? {} : { receipt }),
+        ...(itemMessage === undefined ? {} : { message: itemMessage }),
+        ...(taskStatus === undefined ? {} : { taskStatus }),
+        ...(taskStatusMessage === undefined ? {} : { taskStatusMessage }),
+        ...(taskStatusReading === undefined ? {} : { taskStatusReading }),
+      })),
+      message,
+    });
+  }
+
+  function updateSingleGenerationGroupItem(
+    group: SingleMediaGenerationGroupView,
+    index: number,
+    update: Partial<SingleMediaGenerationGroupView["items"][number]>,
+  ) {
+    const retainedGroup = singleGenerationGroupRef.current;
+    if (retainedGroup !== null && retainedGroup.operationOwnerId === group.operationOwnerId) {
+      const retainedItem = retainedGroup.items.find((candidate) => candidate.index === index);
+      if (retainedItem !== undefined) Object.assign(retainedItem, update);
+    }
+    setSingleGenerationGroup((current) => {
+      if (current === null || current.operationOwnerId !== group.operationOwnerId) return current;
+      return {
+        ...current,
+        items: current.items.map((item) => item.index === index ? { ...item, ...update } : item),
+      };
+    });
+  }
+
+  async function refreshSingleGenerationTaskStatus(
+    group: SingleMediaGenerationGroupView,
+    item: SingleMediaGenerationGroupView["items"][number],
+  ) {
+    const receipt = item.receipt;
+    if (receipt === undefined || item.status !== "accepted" || item.taskStatusReading) return;
+    const getTaskReceipt = group.ownerServices.getTaskReceipt;
+    if (getTaskReceipt === undefined) {
+      updateSingleGenerationGroupItem(group, item.index, { taskStatusMessage: "当前服务未接入任务状态读取。" });
+      return;
+    }
+
+    const readKey = `${group.operationOwnerId}:${item.index}`;
+    if (singleTaskStatusReadsRef.current.has(readKey)) return;
+    singleTaskStatusReadsRef.current.add(readKey);
+    const capturedServices = services;
+    const capturedUserId = userId;
+    const capturedSessionGeneration = sessionGeneration;
+    const isCurrentGroup = () => preferenceScopeIsCurrent(
+      capturedServices,
+      capturedUserId,
+      capturedSessionGeneration,
+    ) && singleGenerationGroupOwnerRef.current === group.operationOwnerId;
+    const controller = makeGenerationController();
+    updateSingleGenerationGroupItem(group, item.index, { taskStatusReading: true, taskStatusMessage: null });
+    try {
+      const task = await getTaskReceipt(receipt.taskId, controller.signal);
+      if (!isCurrentGroup()) return;
+      const expectedType = receipt.operation === "image.single" ? "image-single" : "video-single";
+      if (task.id !== receipt.taskId || task.type !== expectedType || task.messageId !== receipt.messageId) {
+        updateSingleGenerationGroupItem(group, item.index, {
+          taskStatusMessage: "任务状态与原受理回执不匹配，未显示本次状态。",
+        });
+        return;
+      }
+      updateSingleGenerationGroupItem(group, item.index, {
+        taskStatus: {
+          status: task.status,
+          progress: task.progress !== null && task.progress <= 100 ? task.progress : null,
+          progressMessage: task.progressMessage,
+        },
+        taskStatusMessage: null,
+      });
+    } catch (error) {
+      if (!isCurrentGroup()) return;
+      if (isUnauthorized(error)) onUnauthorized();
+      else updateSingleGenerationGroupItem(group, item.index, {
+        taskStatusMessage: `暂时无法读取本项任务状态。${describeFailure(error)}`,
+      });
+    } finally {
+      releaseGenerationController(controller);
+      singleTaskStatusReadsRef.current.delete(readKey);
+      if (isCurrentGroup()) updateSingleGenerationGroupItem(group, item.index, { taskStatusReading: false });
+    }
+  }
+
+  function stopSingleGenerationItems(group: SingleMediaGenerationGroup, startIndex: number) {
+    for (let index = startIndex; index < group.items.length; index += 1) {
+      const item = group.items[index];
+      if (item !== undefined && item.status === "waiting") item.status = "blocked";
+    }
+  }
+
+  async function submitSingleGenerationItem(
+    group: SingleMediaGenerationGroup,
+    item: SingleMediaGenerationItem,
+    run: MediaGenerationRun = group.run,
+  ): Promise<SingleMediaGenerationReceipt> {
+    const controller = makeGenerationController();
+    try {
+      return await (group.mode === "image"
+        ? run.submitImage(item.input as MediaGenerationImageInput, controller.signal)
+        : run.submitVideo(item.input as MediaGenerationVideoInput, controller.signal));
+    } finally {
+      releaseGenerationController(controller);
+    }
+  }
+
+  function completeSingleGenerationGroup(group: SingleMediaGenerationGroup) {
+    if (!isGenerationOperationCurrent(group.operationOwnerId, group.run)
+      || group.ownerKey !== singleOwnerContextKey || group.ownerServices !== services) return;
+    const receipts = group.items.flatMap((item) => item.receipt === undefined ? [] : [item.receipt]);
+    const message = `${receipts.length} 项${group.mode === "image" ? "图片" : "视频"}任务已按顺序受理；每项回执对应自己的原任务。`;
+    publishSingleGenerationGroup(group, message);
+    if (receipts.length === 1 && identityRef.current.signature === group.signature) {
+      applyReceipt(group.signature, receipts[0]!);
+      finishGenerationOperation(group.operationOwnerId);
+      return;
+    }
+    if (identityRef.current.signature === group.signature) {
+      acceptedReceiptContextRef.current = { userId, services, sessionGeneration, signature: group.signature };
+      setOutcome({ signature: group.signature, message });
+    }
+    finishGenerationOperation(group.operationOwnerId);
+  }
+
+  async function submitSingleGenerationGroupFrom(group: SingleMediaGenerationGroup, startIndex: number) {
+    const operationOwnerId = group.operationOwnerId;
+    const run = group.run;
+    if (!isGenerationOperationCurrent(operationOwnerId, run)
+      || group.ownerKey !== singleOwnerContextKey || group.ownerServices !== services
+      || requestingRef.current || pendingRef.current !== null) return;
+    updateRequesting(operationOwnerId, true);
+    let pendingToLookup: PendingSubmission | null = null;
+    let completed = false;
+    try {
+      for (let index = startIndex; index < group.items.length; index += 1) {
+        if (!isGenerationOperationCurrent(operationOwnerId, run)
+          || group.ownerKey !== singleOwnerContextKey || group.ownerServices !== services) return;
+        const item = group.items[index];
+        if (item === undefined) continue;
+        item.status = "submitting";
+        delete item.message;
+        publishSingleGenerationGroup(group);
+        try {
+          const receipt = await submitSingleGenerationItem(group, item, run);
+          if (!isGenerationOperationCurrent(operationOwnerId, run)
+            || group.ownerKey !== singleOwnerContextKey || group.ownerServices !== services) return;
+          if (receipt.operation !== (group.mode === "image" ? "image.single" : "video.single")) {
+            throw new MediaGenerationError("invalid-response", "生成回执与本次图片/视频操作不匹配。");
+          }
+          item.status = "accepted";
+          item.receipt = receipt;
+          publishSingleGenerationGroup(group);
+        } catch (error) {
+          if (!isGenerationOperationCurrent(operationOwnerId, run)
+            || group.ownerKey !== singleOwnerContextKey || group.ownerServices !== services) return;
+          if (isUnauthorized(error)) {
+            stopSingleGenerationItems(group, index + 1);
+            item.status = "refused";
+            item.message = describeFailure(error);
+            publishSingleGenerationGroup(group, `第 ${index + 1} 项未能继续；后续项目已停止。`);
+            onUnauthorized();
+            return;
+          }
+          stopSingleGenerationItems(group, index + 1);
+          if (error instanceof MediaGenerationError && error.kind === "unknown-outcome") {
+            item.status = "unknown";
+            item.message = describeFailure(error);
+            const operation = group.mode === "image" ? "image.single" : "video.single";
+            pendingToLookup = {
+              operation,
+              idempotencyKey: item.input.idempotencyKey,
+              expectation: { operation, idempotencyKey: item.input.idempotencyKey },
+              run,
+              signature: group.signature,
+              submissionMessage: describeFailure(error),
+              operationOwnerId,
+              singleGroup: group,
+              singleItemIndex: index,
+            };
+            updatePending(pendingToLookup);
+            setOutcome({
+              signature: group.signature,
+              message: `第 ${index + 1} 项受理状态待确认；后续项目已停止。系统只核对原操作，不会自动重新提交。`,
+              pendingLookup: true,
+            });
+            publishSingleGenerationGroup(group);
+            break;
+          }
+          item.status = "refused";
+          item.message = describeFailure(error);
+          publishSingleGenerationGroup(group, `第 ${index + 1} 项未受理；后续项目已停止。${describeFailure(error)}`);
+          setOutcome({ signature: group.signature, message: `第 ${index + 1} 项未受理；后续项目已停止。${describeFailure(error)}` });
+          return;
+        }
+      }
+      completed = pendingToLookup === null && group.items.every((item) => item.status === "accepted");
+    } finally {
+      updateRequesting(operationOwnerId, false);
+      if (!completed && pendingToLookup === null
+        && !pendingBelongsToOperation(operationOwnerId)) {
+        finishGenerationOperation(operationOwnerId);
+      }
+    }
+    if (completed) completeSingleGenerationGroup(group);
+    if (pendingToLookup !== null) await lookupPending(pendingToLookup);
+  }
+
+  const retryPendingSingleGenerationItem = async (submission: PendingSubmission) => {
+    const group = submission.singleGroup;
+    const index = submission.singleItemIndex;
+    const ownerId = submission.operationOwnerId;
+    const run = submission.run;
+    if (group === undefined || index === undefined || pendingActionOwnerRef.current !== null
+      || !isGenerationOperationCurrent(ownerId, run) || group.ownerKey !== singleOwnerContextKey
+      || group.ownerServices !== services) return;
+    const item = group.items[index];
+    if (item === undefined || item.status !== "unknown") return;
+    if (!beginPendingAction(ownerId)) return;
+    updateRequesting(ownerId, true);
+    item.status = "submitting";
+    item.message = "正按原请求与原幂等键重试本项。";
+    publishSingleGenerationGroup(group);
+    try {
+      const receipt = await submitSingleGenerationItem(group, item, run);
+      if (!isGenerationOperationCurrent(ownerId, run)
+        || group.ownerKey !== singleOwnerContextKey || group.ownerServices !== services) return;
+      if (receipt.operation !== submission.operation) {
+        throw new MediaGenerationError("invalid-response", "生成回执与原操作不匹配。");
+      }
+      item.status = "accepted";
+      item.receipt = receipt;
+      delete item.message;
+      publishSingleGenerationGroup(group);
+      updatePending(null);
+      releasePendingAction(ownerId);
+      updateRequesting(ownerId, false);
+      if (index + 1 < group.items.length) await submitSingleGenerationGroupFrom(group, index + 1);
+      else completeSingleGenerationGroup(group);
+    } catch (error) {
+      if (!isGenerationOperationCurrent(ownerId, run)
+        || group.ownerKey !== singleOwnerContextKey || group.ownerServices !== services) return;
       if (isUnauthorized(error)) {
         onUnauthorized();
         return;
       }
-      if (!submission.run.isCurrent()) return;
-      setOutcome({
-        signature: submission.signature,
-        message: `${submission.submissionMessage} 尚无法核对本次提交。${describeFailure(error)} 请保留本页，稍后再次核对；不会自动重新提交。`,
-        pendingLookup: true,
-      });
+      if (error instanceof MediaGenerationError && error.kind === "unknown-outcome") {
+        item.status = "unknown";
+        item.message = describeFailure(error);
+        setOutcome({
+          signature: group.signature,
+          message: `第 ${index + 1} 项仍待确认；仍保留原幂等键，可重新核对或在明确操作后再次按原请求重试。`,
+          pendingLookup: true,
+        });
+      } else {
+        item.status = "refused";
+        item.message = describeFailure(error);
+        stopSingleGenerationItems(group, index + 1);
+        updatePending(null);
+        setOutcome({ signature: group.signature, message: `第 ${index + 1} 项未受理；后续项目已停止。${describeFailure(error)}` });
+      }
+      publishSingleGenerationGroup(group);
+    } finally {
+      updateRequesting(ownerId, false);
+      releasePendingAction(ownerId);
+      if (!pendingBelongsToOperation(ownerId)) finishGenerationOperation(ownerId);
     }
   };
 
-  const makeRun = () => {
+  const makeRun = (allowFrozenFormChanges = false) => {
     const capturedSignature = formSignature;
     const capturedUserId = userId;
     const capturedServices = services;
     const capturedSessionGeneration = sessionGeneration;
+    const capturedApiBaseUrl = services.apiBaseUrl;
     const port = services.mediaGeneration;
     if (port === undefined) throw new MediaGenerationError("rejected", "媒体生成服务尚未接入。", 503);
     return port.beginRun({
@@ -1564,7 +2411,8 @@ export function MediaGenerationPage({
         && identityRef.current.userId === capturedUserId
         && identityRef.current.services === capturedServices
         && identityRef.current.sessionGeneration === capturedSessionGeneration
-        && identityRef.current.signature === capturedSignature,
+        && identityRef.current.services.apiBaseUrl === capturedApiBaseUrl
+        && (allowFrozenFormChanges || identityRef.current.signature === capturedSignature),
     });
   };
 
@@ -1700,118 +2548,70 @@ export function MediaGenerationPage({
     return Object.freeze({ kind: "asset_message", chapter_id: selectedChapterId, asset_type: singleAssetType, asset_id: singleAssetId });
   };
 
-  const submitImage = async () => {
-    if (pendingRef.current !== null || requestingRef.current || quickReferenceActionRef.current
-      || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
-      || selectedImageModel === null || imagePrompt.trim() === "" || singleSelectionIssue !== null) return;
-    const rawKey = crypto.randomUUID();
+  const submitSingleGenerationGroup = async (generationMode: SingleMediaPreferenceMode) => {
+    if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
+      || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
+      || savingBatchPreferencesRef.current || singlePreferenceMode !== generationMode
+      || singleSelectionIssue !== null
+      || (generationMode === "image" && (selectedImageModel === null || imagePrompt.trim() === ""))
+      || (generationMode === "video" && (selectedVideoModel === null || videoPrompt.trim() === ""))) return;
     const signature = formSignature;
     let run: MediaGenerationRun;
     try {
-      run = makeRun();
+      run = makeRun(true);
     } catch (error) {
       setOutcome({ signature, message: describeFailure(error) });
       return;
     }
-    const input: MediaGenerationImageInput = Object.freeze({
-      modelId: selectedImageModel.id,
-      prompt: imagePrompt,
-      target: singleTarget(),
-      ...(imageSize === "" ? {} : { size: imageSize }),
-      referenceImages: Object.freeze([...new Set([...imageQuickReferenceImages, ...splitReferences(imageReferenceImages)])]),
-      idempotencyKey: rawKey,
-    });
-    const controller = new AbortController();
+
+    const target = singleTarget();
+    const items: SingleMediaGenerationItem[] = generationMode === "image"
+      ? Array.from({ length: singleGenerationCount }, (_, index) => ({
+        index,
+        status: "waiting" as const,
+        input: Object.freeze({
+          modelId: selectedImageModel!.id,
+          prompt: imagePrompt,
+          target,
+          ...(imageSize === "" ? {} : { size: imageSize }),
+          referenceImages: Object.freeze([...new Set([...imageQuickReferenceImages, ...splitReferences(imageReferenceImages)])]),
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      }))
+      : Array.from({ length: singleGenerationCount }, (_, index) => ({
+        index,
+        status: "waiting" as const,
+        input: Object.freeze({
+          modelId: selectedVideoModel!.id,
+          prompt: videoPrompt,
+          target,
+          ...(videoSize === "" ? {} : { size: videoSize }),
+          ...(videoDuration === "" ? {} : { duration: Number(videoDuration) }),
+          ...(videoResolution === "" ? {} : { resolution: videoResolution }),
+          referenceImages: Object.freeze([...new Set([...videoQuickReferenceImages, ...splitReferences(videoReferenceImages)])]),
+          referenceAudios: Object.freeze([...new Set([...videoQuickReferenceAudios, ...splitReferences(videoReferenceAudios)])]),
+          referenceVideos: Object.freeze(splitReferences(videoReferenceVideos)),
+          idempotencyKey: crypto.randomUUID(),
+        }),
+      }));
+    const operationOwnerId = beginGenerationOperation();
+    const group: SingleMediaGenerationGroup = {
+      mode: generationMode,
+      signature,
+      ownerKey: singleOwnerContextKey,
+      ownerServices: services,
+      operationOwnerId,
+      run,
+      items,
+    };
+    publishSingleGenerationGroup(group);
     acceptedReceiptContextRef.current = null;
     setOutcome(null);
-    updateRequesting(true);
-    try {
-      const receipt = await run.submitImage(input, controller.signal);
-      if (run.isCurrent()) applyReceipt(signature, receipt);
-    } catch (error) {
-      if (isUnauthorized(error)) {
-        onUnauthorized();
-        return;
-      }
-      if (!run.isCurrent()) return;
-      if (error instanceof MediaGenerationError && error.kind === "unknown-outcome") {
-        const submission: PendingSubmission = {
-          operation: "image.single",
-          idempotencyKey: rawKey,
-          expectation: { operation: "image.single", idempotencyKey: rawKey },
-          run,
-          signature,
-          submissionMessage: describeFailure(error),
-        };
-        updatePending(submission);
-        setOutcome({ signature, message: `${describeFailure(error)} 提交状态待确认，正在核对本次提交；不会自动重新提交。`, pendingLookup: true });
-        await lookupPending(submission);
-        return;
-      }
-      setOutcome({ signature, message: describeFailure(error) });
-    } finally {
-      updateRequesting(false);
-    }
+    await submitSingleGenerationGroupFrom(group, 0);
   };
 
-  const submitVideo = async () => {
-    if (pendingRef.current !== null || requestingRef.current || quickReferenceActionRef.current
-      || savingQuickReferencePreferencesRef.current || savingBatchPreferencesRef.current
-      || selectedVideoModel === null || videoPrompt.trim() === "" || singleSelectionIssue !== null) return;
-    const target = singleTarget();
-    const rawKey = crypto.randomUUID();
-    const signature = formSignature;
-    let run: MediaGenerationRun;
-    try {
-      run = makeRun();
-    } catch (error) {
-      setOutcome({ signature, message: describeFailure(error) });
-      return;
-    }
-    const input = Object.freeze({
-      modelId: selectedVideoModel.id,
-      prompt: videoPrompt,
-      target,
-      ...(videoSize === "" ? {} : { size: videoSize }),
-      ...(videoDuration === "" ? {} : { duration: Number(videoDuration) }),
-      ...(videoResolution === "" ? {} : { resolution: videoResolution }),
-      referenceImages: Object.freeze([...new Set([...videoQuickReferenceImages, ...splitReferences(videoReferenceImages)])]),
-      referenceAudios: Object.freeze([...new Set([...videoQuickReferenceAudios, ...splitReferences(videoReferenceAudios)])]),
-      referenceVideos: Object.freeze(splitReferences(videoReferenceVideos)),
-      idempotencyKey: rawKey,
-    });
-    const controller = new AbortController();
-    acceptedReceiptContextRef.current = null;
-    setOutcome(null);
-    updateRequesting(true);
-    try {
-      const receipt = await run.submitVideo(input, controller.signal);
-      if (run.isCurrent()) applyReceipt(signature, receipt);
-    } catch (error) {
-      if (isUnauthorized(error)) {
-        onUnauthorized();
-        return;
-      }
-      if (!run.isCurrent()) return;
-      if (error instanceof MediaGenerationError && error.kind === "unknown-outcome") {
-        const submission: PendingSubmission = {
-          operation: "video.single",
-          idempotencyKey: rawKey,
-          expectation: { operation: "video.single", idempotencyKey: rawKey },
-          run,
-          signature,
-          submissionMessage: describeFailure(error),
-        };
-        updatePending(submission);
-        setOutcome({ signature, message: `${describeFailure(error)} 提交状态待确认，正在核对本次提交；不会自动重新提交。`, pendingLookup: true });
-        await lookupPending(submission);
-        return;
-      }
-      setOutcome({ signature, message: describeFailure(error) });
-    } finally {
-      updateRequesting(false);
-    }
-  };
+  const submitImage = () => submitSingleGenerationGroup("image");
+  const submitVideo = () => submitSingleGenerationGroup("video");
 
   const submitBatch = async () => {
     if (pendingRef.current !== null || requestingRef.current || savingBatchPreferencesRef.current
@@ -1863,35 +2663,56 @@ export function MediaGenerationPage({
       idempotencyKey: rawKey,
       batchAssets: Object.freeze(assets.map((asset) => Object.freeze({ type: asset.type, id: asset.id }))),
     };
-    const controller = new AbortController();
+    const operationOwnerId = beginGenerationOperation();
+    const submission: PendingSubmission = {
+      operation: "image.batch",
+      idempotencyKey: rawKey,
+      expectation,
+      run,
+      signature,
+      submissionMessage: "批量素材图片请求",
+      operationOwnerId,
+      ownerKey: singleOwnerContextKey,
+    };
+    activeBatchSubmissionRef.current = submission;
+    const controller = makeGenerationController();
     setOutcome(null);
-    updateRequesting(true);
+    updateRequesting(operationOwnerId, true);
     try {
       const receipt = await run.submitBatch(input, controller.signal);
-      if (run.isCurrent()) applyReceipt(signature, receipt);
+      if (isGenerationOperationCurrent(operationOwnerId, run)) {
+        if (activeBatchSubmissionRef.current?.operationOwnerId === operationOwnerId) {
+          activeBatchSubmissionRef.current = null;
+        }
+        applyReceipt(signature, receipt);
+        finishGenerationOperation(operationOwnerId);
+      }
     } catch (error) {
+      if (!isGenerationOperationCurrent(operationOwnerId, run)) return;
+      if (activeBatchSubmissionRef.current?.operationOwnerId === operationOwnerId) {
+        activeBatchSubmissionRef.current = null;
+      }
       if (isUnauthorized(error)) {
         onUnauthorized();
+        finishGenerationOperation(operationOwnerId);
         return;
       }
-      if (!run.isCurrent()) return;
       if (error instanceof MediaGenerationError && error.kind === "unknown-outcome") {
-        const submission: PendingSubmission = {
-          operation: "image.batch",
-          idempotencyKey: rawKey,
-          expectation,
-          run,
-          signature,
-          submissionMessage: describeFailure(error),
-        };
-        updatePending(submission);
+        const unknownSubmission = { ...submission, submissionMessage: describeFailure(error) };
+        updatePending(unknownSubmission);
         setOutcome({ signature, message: `${describeFailure(error)} 提交状态待确认，正在核对本次提交；不会自动重新提交。`, pendingLookup: true });
-        await lookupPending(submission);
+        await lookupPending(unknownSubmission);
         return;
       }
       setOutcome({ signature, message: describeFailure(error) });
+      finishGenerationOperation(operationOwnerId);
     } finally {
-      updateRequesting(false);
+      releaseGenerationController(controller);
+      updateRequesting(operationOwnerId, false);
+      if (activeBatchSubmissionRef.current?.operationOwnerId === operationOwnerId) {
+        activeBatchSubmissionRef.current = null;
+      }
+      if (!pendingBelongsToOperation(operationOwnerId)) finishGenerationOperation(operationOwnerId);
     }
   };
 
@@ -2404,7 +3225,7 @@ export function MediaGenerationPage({
       : !isImageMode && singleVideoReferences.length > REFERENCE_COUNT_LIMIT.video
         ? "参考视频超过5项上限，请先减少引用。"
         : null;
-  const isFrozen = pending !== null || requesting || uploadingReference || savingBatchPreferences || batchVideoActive
+  const isFrozen = pending !== null || pendingAction || requesting || uploadingReference || savingBatchPreferences || batchVideoActive
     || savingQuickReferencePreferences || preparingQuickReference;
 
   const renderReferenceUploader = (kind: MediaReferenceKind) => {
@@ -2495,6 +3316,9 @@ export function MediaGenerationPage({
             <div><p className="eyebrow">{isImageMode ? "图片生成" : "视频生成"}</p><h2>{isImageMode ? "普通图片" : "普通视频"}</h2></div>
             <span>提交前会固定模型、目标与参考素材。</span>
           </div>
+          {singleModePreferenceFeedback?.contextKey === singleModePreferenceContextKey && (
+            <p className="media-generation-note media-generation-wide" role="status">{singleModePreferenceFeedback.message}</p>
+          )}
           {singlePreferenceFeedback?.contextKey === singlePreferenceContextKey && (
             <p className="media-generation-note media-generation-wide" role="status">{singlePreferenceFeedback.message}</p>
           )}
@@ -2547,6 +3371,15 @@ export function MediaGenerationPage({
                 {videoOptions.resolutions.map((resolution) => <option key={resolution} value={resolution}>{resolution}</option>)}
               </select></label>
             )}
+
+            <label>
+              <span>生成数量</span>
+              <select disabled={isFrozen} onChange={(event) => changeSingleGenerationCount(event.target.value)} value={String(singleGenerationCount)}>
+                {[1, 2, 3, 4].map((count) => (
+                  <option key={count} value={String(count)}>{isImageMode ? `生成 ${count} 张` : `生成 ${count} 个视频`}</option>
+                ))}
+              </select>
+            </label>
 
             <label>
               <span>{isImageMode ? "图片目标" : "视频目标"}</span>
@@ -2789,7 +3622,69 @@ export function MediaGenerationPage({
       {pending !== null && (
         <div className="media-generation-alert" role="status">
           <p>提交状态尚未确认。页面保留了本次请求，请先核对状态再继续。</p>
-          <button className="secondary-button" disabled={!pending.run.isCurrent()} onClick={() => void lookupPending(pending)} type="button">重新核对提交</button>
+          {pending.singleGroup !== undefined && pending.singleItemIndex !== undefined
+            && pending.singleItemIndex + 1 < pending.singleGroup.items.length && (
+            <p>核对若确认本项已受理，后续未提交项目会按原请求继续；已受理项目不会重复提交。</p>
+          )}
+          <button className="secondary-button" disabled={pending.recoveryUnavailable || !pending.run.isCurrent() || pendingAction} onClick={() => void lookupPending(pending)} type="button">
+            {pendingAction ? "正在核对…" : "重新核对提交"}
+          </button>
+          {pending.singleGroup !== undefined && (
+            <button className="secondary-button" disabled={pending.recoveryUnavailable || !pending.run.isCurrent() || pendingAction || requesting}
+              onClick={() => void retryPendingSingleGenerationItem(pending)} type="button">
+              按原请求重试本项（保留原操作和幂等键）
+            </button>
+          )}
+          {(pending.recoveryUnavailable || !pending.run.isCurrent()) && (
+            <>
+              <p>当前没有可用的原请求核对入口；停止本地跟踪不会撤销或重新发送服务端请求。</p>
+              <button className="secondary-button" disabled={pendingAction || requesting}
+                onClick={() => stopLocalSubmissionTracking(pending)} type="button">
+                停止本地跟踪
+              </button>
+            </>
+          )}
+        </div>
+      )}
+      {showSingleGenerationGroup && displayedSingleGenerationGroup !== null && (
+        <div className="media-generation-result" role="status" aria-label={`${displayedSingleGenerationGroup.mode === "image" ? "图片" : "视频"}任务结果`}>
+          {(requesting || pending?.singleGroup?.signature === displayedSingleGenerationGroup.signature)
+            && <p>本组继续使用提交时冻结的请求；已受理项目和待确认项目会保留在这里。</p>}
+          {displayedSingleGenerationGroup.message !== null && <p>{displayedSingleGenerationGroup.message}</p>}
+          <ol>
+            {displayedSingleGenerationGroup.items.map((item) => (
+              <li key={item.index}>
+                <strong>第 {item.index + 1} 项 · {singleGenerationStatusLabel(item.status)}</strong>
+                {item.receipt !== undefined && (
+                  <>
+                    <p>
+                      {item.receipt.operation === "image.single" ? "图片" : "视频"}任务 {item.receipt.taskId}
+                      （提交回执状态：{item.receipt.status}；消息编号：{item.receipt.messageId ?? "—"}）
+                    </p>
+                    <p>
+                      {item.taskStatus === undefined
+                        ? "任务状态尚未核对。"
+                        : `任务状态：${item.taskStatus.status}${item.taskStatus.progress === null ? "" : ` · ${item.taskStatus.progress}%`}`}
+                      {item.taskStatus?.progressMessage ? ` · ${item.taskStatus.progressMessage}` : ""}
+                    </p>
+                    {item.taskStatusMessage && <p role="status">{item.taskStatusMessage}</p>}
+                    {services.getTaskReceipt === undefined
+                      ? <p>当前服务未接入任务状态读取。</p>
+                      : <button className="secondary-button" disabled={requesting || item.taskStatusReading
+                        || pending?.singleGroup?.operationOwnerId === displayedSingleGenerationGroup.operationOwnerId}
+                        onClick={() => void refreshSingleGenerationTaskStatus(displayedSingleGenerationGroup, item)} type="button">
+                        {item.taskStatusReading ? "正在读取状态…" : `刷新第 ${item.index + 1} 项任务状态`}
+                      </button>}
+                  </>
+                )}
+                {item.message !== undefined && <p>{item.message}</p>}
+              </li>
+            ))}
+          </ol>
+          {displayedSingleGenerationGroup.items.some((item) => item.receipt !== undefined)
+            && displayedOutcome?.receipt === undefined && (
+            <button className="secondary-button" onClick={onOpenTasks} type="button">查看我的任务</button>
+          )}
         </div>
       )}
       {displayedOutcome !== null && (
