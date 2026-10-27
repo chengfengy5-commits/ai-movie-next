@@ -50,6 +50,11 @@ export interface AssetFrameUsageFrameTarget extends AssetFrameUsageChapterTarget
   assetId: string;
 }
 
+export interface AssetFrameUsageWorkbenchTarget extends AssetFrameUsageChapterTarget {
+  category: AssetLibraryType;
+  assetId: string;
+}
+
 export interface AssetFrameUsagePanelProps {
   owner: AssetFrameUsageOwner;
   currentScope: AssetFrameUsageScope;
@@ -57,6 +62,7 @@ export interface AssetFrameUsagePanelProps {
   onClose(owner: AssetFrameUsageOwner): void;
   onNavigateToChapter?(target: AssetFrameUsageChapterTarget): void;
   onNavigateToFrame?(target: AssetFrameUsageFrameTarget): void;
+  onUseAsWorkbenchTarget?(target: AssetFrameUsageWorkbenchTarget): void;
   onUnauthorized(): void;
 }
 
@@ -172,12 +178,18 @@ function UsageResults({
   createFrameTarget,
   onNavigateToChapter,
   onNavigateToFrame,
+  onUseAsWorkbenchTarget,
+  assetCategory,
+  assetId,
 }: {
   projection: AssetFrameUsageProjection;
   createTarget(chapterPosition: number): AssetFrameUsageChapterTarget | null;
   createFrameTarget(chapterPosition: number, framePosition: number): AssetFrameUsageFrameTarget | null;
   onNavigateToChapter?: ((target: AssetFrameUsageChapterTarget) => void) | undefined;
   onNavigateToFrame?: ((target: AssetFrameUsageFrameTarget) => void) | undefined;
+  onUseAsWorkbenchTarget?: ((target: AssetFrameUsageWorkbenchTarget) => void) | undefined;
+  assetCategory: AssetLibraryType;
+  assetId: string;
 }) {
   if (projection.status === "unreadable") {
     return (
@@ -191,6 +203,9 @@ function UsageResults({
     return (
       <div className="asset-frame-usage-state" role="status">
         <p>当前章节快照未找到关联镜头。</p>
+        {onUseAsWorkbenchTarget !== undefined && (
+          <p>没有可核实的关联章节。请先在分镜视图中选择章节，再从五类关联素材中选择 AI 目标。</p>
+        )}
         {projection.hasUncertainReferences && <p className="asset-frame-usage-warning">部分引用无法核对。</p>}
       </div>
     );
@@ -208,6 +223,16 @@ function UsageResults({
         {projection.chapters.map((chapter) => (
           <li className="asset-frame-usage-chapter" key={chapter.position}>
             <h4>第 {chapter.position} 项 · {chapter.title}</h4>
+            {onUseAsWorkbenchTarget !== undefined && (
+              <WorkbenchAssetAction
+                assetCategory={assetCategory}
+                assetId={assetId}
+                chapterPosition={chapter.position}
+                chapterTitle={chapter.title}
+                createTarget={createTarget}
+                onUse={onUseAsWorkbenchTarget}
+              />
+            )}
             {onNavigateToChapter !== undefined && createTarget(chapter.position) !== null && (
               <button
                 className="asset-frame-usage-chapter-link"
@@ -256,6 +281,50 @@ function UsageResults({
   );
 }
 
+function WorkbenchAssetAction({
+  assetCategory,
+  assetId,
+  chapterPosition,
+  chapterTitle,
+  createTarget,
+  onUse,
+}: {
+  assetCategory: AssetLibraryType;
+  assetId: string;
+  chapterPosition: number;
+  chapterTitle: string;
+  createTarget(chapterPosition: number): AssetFrameUsageChapterTarget | null;
+  onUse(target: AssetFrameUsageWorkbenchTarget): void;
+}) {
+  const chapterTarget = createTarget(chapterPosition);
+  if (chapterTarget === null) {
+    return (
+      <p className="asset-frame-usage-warning" role="note">
+        章节身份暂无法核对；请在分镜视图中选择章节后再设为 AI 目标。
+      </p>
+    );
+  }
+
+  const target: AssetFrameUsageWorkbenchTarget = {
+    ...chapterTarget,
+    category: assetCategory,
+    assetId,
+  };
+  return (
+    <button
+      className="asset-frame-usage-chapter-link"
+      onClick={() => {
+        if (target.isCurrent()) {
+          onUse(target);
+        }
+      }}
+      type="button"
+    >
+      在 AI 中使用此素材：{chapterTitle}
+    </button>
+  );
+}
+
 export function AssetFrameUsagePanel({
   owner,
   currentScope,
@@ -263,6 +332,7 @@ export function AssetFrameUsagePanel({
   onClose,
   onNavigateToChapter,
   onNavigateToFrame,
+  onUseAsWorkbenchTarget,
   onUnauthorized,
 }: AssetFrameUsagePanelProps) {
   const boundOwner = useRef(owner).current;
@@ -471,6 +541,9 @@ export function AssetFrameUsagePanel({
           createFrameTarget={createFrameTarget}
           onNavigateToChapter={onNavigateToChapter}
           onNavigateToFrame={onNavigateToFrame}
+          onUseAsWorkbenchTarget={onUseAsWorkbenchTarget}
+          assetCategory={boundOwner.category}
+          assetId={boundOwner.asset.id}
           projection={readState.projection}
         />
       )}

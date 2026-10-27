@@ -111,6 +111,9 @@ import {
   StoryboardAssetExtractionDialog,
   type StoryboardAssetGenerationSnapshot,
 } from "./storyboard-assets/StoryboardAssetExtractionDialog";
+import { FrameResourceColumn } from "../series-workbench/FrameResourceColumn";
+import type { FrameResourceDirectories, FrameResourceDirectoryState } from "../series-workbench/frameResourceProjection";
+import type { WorkbenchSourceSelection, WorkbenchSourceTarget } from "../series-workbench/sourceIntent";
 import {
   buildChapterReorderInput,
   inspectStoryboardReferences,
@@ -133,6 +136,8 @@ interface ChapterBrowserProps {
   onNavigationConsumed?(navigationEpoch: number): void;
   onNavigationAbandoned?(navigationEpoch: number): void;
   onNavigateToAsset?(target: FrameAssetReferenceAssetTarget): void;
+  workbenchActive?: boolean;
+  onWorkbenchSource?(selection: WorkbenchSourceSelection): void;
 }
 
 export interface ChapterNavigationIntent {
@@ -840,6 +845,8 @@ export function ChapterBrowser({
   onNavigationConsumed,
   onNavigationAbandoned,
   onNavigateToAsset,
+  workbenchActive = false,
+  onWorkbenchSource,
 }: ChapterBrowserProps) {
   const [chapters, setChapters] = useState<Chapter[] | null>(null);
   const [chaptersLoading, setChaptersLoading] = useState(true);
@@ -891,6 +898,13 @@ export function ChapterBrowser({
   const selectedChapterIdRef = useRef(selectedChapterId);
   selectedChapterIdRef.current = selectedChapterId;
   const [assetResult, setAssetResult] = useState<AssetResult | null>(null);
+  const [frameResourceCatalogs, setFrameResourceCatalogs] = useState<Pick<FrameResourceDirectories, "characters" | "scenes" | "props" | "fused">>(() => ({
+    characters: { status: "loading" },
+    scenes: { status: "loading" },
+    props: { status: "loading" },
+    fused: { status: "loading" },
+  }));
+  const frameResourceCatalogGeneration = useRef(0);
   const assetResultRef = useRef<AssetResult | null>(assetResult);
   assetResultRef.current = assetResult;
   const [assetReloadKey, setAssetReloadKey] = useState(0);
@@ -1215,6 +1229,59 @@ export function ChapterBrowser({
   const currentAssetResult = selectedChapter !== null && assetResult?.chapterId === selectedChapter.id
     ? assetResult
     : null;
+  useEffect(() => {
+    if (!workbenchActive) return undefined;
+    const generation = ++frameResourceCatalogGeneration.current;
+    const controller = new AbortController();
+    let current = true;
+    const scope = { userId, services, seriesId: series.id };
+    const isCurrent = () => current
+      && !controller.signal.aborted
+      && frameResourceCatalogGeneration.current === generation
+      && sameChapterBrowserScope(activeScopeRef.current, scope);
+    setFrameResourceCatalogs({
+      characters: { status: "loading" },
+      scenes: { status: "loading" },
+      props: { status: "loading" },
+      fused: { status: "loading" },
+    });
+    const fusedRequest = services.listFusedAssets === undefined
+      ? Promise.reject(new Error("当前服务未提供融合素材目录。"))
+      : services.listFusedAssets(series.id, controller.signal);
+    void Promise.allSettled([
+      services.listCharacters(series.id, controller.signal),
+      services.listScenes(series.id, controller.signal),
+      services.listProps(series.id, controller.signal),
+      fusedRequest,
+    ]).then(([characters, scenes, props, fused]) => {
+      if (!isCurrent()) return;
+      let unauthorized = false;
+      const resultFor = <T extends { series_id: string },>(result: PromiseSettledResult<T[]>): FrameResourceDirectoryState<T> => {
+        if (result.status === "fulfilled") {
+          return { status: "ready", items: result.value.filter((item) => item.series_id === series.id) };
+        }
+        const error = normalizeApiError(result.reason);
+        if (error.status === 401) unauthorized = true;
+        return { status: "error", message: errorPresentation(error).message };
+      };
+      const next = {
+        characters: resultFor(characters),
+        scenes: resultFor(scenes),
+        props: resultFor(props),
+        fused: resultFor(fused),
+      };
+      if (unauthorized) {
+        unauthorizedHandlerRef.current();
+        return;
+      }
+      setFrameResourceCatalogs(next);
+    });
+    return () => {
+      current = false;
+      controller.abort();
+      if (frameResourceCatalogGeneration.current === generation) frameResourceCatalogGeneration.current += 1;
+    };
+  }, [services, series.id, userId, workbenchActive]);
   useEffect(() => {
     const owner = storyboardAssetExtractionDialogRef.current;
     if (owner !== null && !isStoryboardAssetExtractionOwnerCurrent(owner)) {
@@ -5881,7 +5948,7 @@ export function ChapterBrowser({
                               )}
                             </div>
                           </div>
-                          <div className="storyboard-frame-body">
+                          <div className={workbenchActive ? "storyboard-frame-body workbench-frame-body" : "storyboard-frame-body"}>
                             <div className="storyboard-image-wrap">
                               {imageAvailable ? (
                                 <img
@@ -5981,6 +6048,63 @@ export function ChapterBrowser({
                                 <p className="frame-media-note">当前没有可安全展示的原图。</p>
                               )}
                             </div>
+                            {workbenchActive && sourceFrame !== undefined && selectedChapter !== null && (
+                              <FrameResourceColumn
+                                apiBaseUrl={services.apiBaseUrl}
+                                chapterFrames={frames}
+                                chapterId={selectedChapter.id}
+                                directories={{
+                                  storyboard: currentAssetResult?.status === "ready"
+                                    ? { status: "ready", items: currentAssetResult.assets }
+                                    : currentAssetResult?.status === "error"
+                                      ? { status: "error", message: errorPresentation(currentAssetResult.error).message }
+                                      : { status: "loading" },
+                                  ...frameResourceCatalogs,
+                                }}
+                                frame={sourceFrame}
+                                frameIndex={frame.position - 1}
+                                onSelect={(target: WorkbenchSourceTarget) => {
+                                  const chapter = selectedChapter;
+                                  if (!workbenchActive || onWorkbenchSource === undefined || chapter === null) return;
+                                  const scope = { userId, services, seriesId: series.id };
+                                  const sourceFrame = chapter.content?.[frame.position - 1];
+                                  const chaptersSnapshot = chapters;
+                                  const catalogSnapshot = frameResourceCatalogs;
+                                  const assetSnapshot = currentAssetResult;
+                                  const chapterGeneration = chapterRequestGeneration.current;
+                                  const assetGeneration = assetRequestGeneration.current;
+                                  const resourceGeneration = frameResourceCatalogGeneration.current;
+                                  const selection: WorkbenchSourceSelection = {
+                                    seriesId: series.id,
+                                    chapterId: chapter.id,
+                                    target,
+                                    isCurrent: () => {
+                                      const directory = chapterDirectoryRef.current;
+                                      const currentFrame = chapter.content?.[frame.position - 1];
+                                      return workbenchActive
+                                        && sameChapterBrowserScope(activeScopeRef.current, scope)
+                                        && sameChapterBrowserScope(directory.scope, scope)
+                                        && directory.requestGeneration === chapterGeneration
+                                        && directory.chapters === chaptersSnapshot
+                                        && chaptersSnapshot?.filter((item) => item.id === chapter.id).length === 1
+                                        && chaptersSnapshot?.find((item) => item.id === chapter.id) === chapter
+                                        && selectedChapterIdRef.current === chapter.id
+                                        && chapterRequestGeneration.current === chapterGeneration
+                                        && assetRequestGeneration.current === assetGeneration
+                                        && frameResourceCatalogGeneration.current === resourceGeneration
+                                        && selectedChapter === chapter
+                                        && currentFrame === sourceFrame
+                                        && (target.kind === "chapter" || target.chapterId === chapter.id)
+                                        && (target.kind !== "frame" || storyboardFrameId(currentFrame) === target.storyboardAssetId)
+                                        && assetResultRef.current === assetSnapshot
+                                        && frameResourceCatalogs === catalogSnapshot;
+                                    },
+                                  };
+                                  onWorkbenchSource(selection);
+                                }}
+                                seriesId={series.id}
+                              />
+                            )}
                           </div>
                         </article>
                       );

@@ -21,6 +21,7 @@ import {
   type AssetFrameUsageChapterTarget,
   type AssetFrameUsageFrameTarget,
   type AssetFrameUsageOwner,
+  type AssetFrameUsageWorkbenchTarget,
 } from "./AssetFrameUsagePanel";
 import { AssetReplacementDialog } from "./replacement/AssetReplacementDialog";
 import {
@@ -501,6 +502,7 @@ export interface AssetLibraryProps {
   onUnauthorized(): void;
   onViewChapter?(target: AssetFrameUsageChapterTarget): void;
   onViewFrame?(target: AssetFrameUsageFrameTarget): void;
+  onUseAsWorkbenchTarget?(target: AssetFrameUsageWorkbenchTarget): void;
   navigationIntent?: AssetNavigationIntent | null;
   generationHistoryPort?: AssetGenerationHistoryPort | undefined;
   onNavigationConsumed?(navigationEpoch: number): void;
@@ -515,6 +517,7 @@ export function AssetLibrary({
   onUnauthorized,
   onViewChapter,
   onViewFrame,
+  onUseAsWorkbenchTarget,
   navigationIntent = null,
   generationHistoryPort,
   onNavigationConsumed,
@@ -2558,6 +2561,22 @@ export function AssetLibrary({
                   return;
                 }
                 onViewFrame(target);
+              },
+            }
+            : {})}
+          {...(series.can_enter === true && onUseAsWorkbenchTarget !== undefined
+            ? {
+              onUseAsWorkbenchTarget: (target: AssetFrameUsageWorkbenchTarget) => {
+                if (
+                  !isCurrentUsageOwner(visibleUsageOwner)
+                  || target.seriesId !== series.id
+                  || target.category !== visibleUsageOwner.category
+                  || target.assetId !== visibleUsageOwner.asset.id
+                  || !target.isCurrent()
+                ) {
+                  return;
+                }
+                onUseAsWorkbenchTarget(target);
               },
             }
             : {})}

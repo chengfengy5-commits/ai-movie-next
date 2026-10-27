@@ -1,4 +1,4 @@
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset } from "../../shared/api/contracts";
@@ -6,6 +6,7 @@ import type { CreatorPrompt } from "../../shared/api/creatorSettings";
 import type { ChatAssistantMessage } from "../../shared/api/chatAssistant";
 import { createApiServices, type WorkspaceServices } from "../../shared/api/services";
 import type { StoryboardModelChoice } from "../storyboard-generation/contracts";
+import type { WorkbenchSourceIntent } from "../series-workbench/sourceIntent";
 import { ChatAssistantPage, type ChatAssistantSourceIntent } from "./ChatAssistantPage";
 import {
   chatCategoryPreferenceKey,
@@ -318,7 +319,12 @@ function toWireMessage(row: ChatAssistantMessage): Record<string, unknown> {
 function renderPage(
   services: WorkspaceServices,
   onNavigateSource = vi.fn<(target: ChatAssistantSourceIntent) => void>(),
-  identity: { readonly userId?: string; readonly sessionGeneration?: number; readonly series?: Series } = {},
+  identity: {
+    readonly userId?: string;
+    readonly sessionGeneration?: number;
+    readonly series?: Series;
+    readonly workbenchSourceIntent?: WorkbenchSourceIntent | null;
+  } = {},
 ) {
   const onUnauthorized = vi.fn();
   const onBack = vi.fn();
@@ -334,6 +340,7 @@ function renderPage(
       onUnauthorized={onUnauthorized}
       onBack={onBack}
       onNavigateSource={onNavigateSource}
+      workbenchSourceIntent={nextIdentity.workbenchSourceIntent ?? null}
     />
   );
   const rendered = render(renderWithServices(services));
@@ -417,6 +424,360 @@ describe("ChatAssistantPage", () => {
     expect(fixture.streamBody?.messages).toMatchObject([
       { role: "user", content: "继续目标镜头" },
     ]);
+  });
+
+  it("applies a workbench frame source only after matching it to fresh chapter and asset directories", async () => {
+    const fixture = setupFixture({
+      chapters: [chapterWithStableFrames],
+      storyboards: [storyboardAsset("board-952-first", 0), storyboardAsset("board-952-target", 1)],
+    });
+    const isCurrent = vi.fn(() => true);
+    const intent: WorkbenchSourceIntent = {
+      actorId: "actor-952",
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      services: fixture.services,
+      sessionGeneration: 1,
+      navigationEpoch: 17,
+      seriesId: series.id,
+      chapterId: chapter.id,
+      target: { kind: "frame", chapterId: chapter.id, storyboardAssetId: "board-952-target" },
+      isCurrent,
+    };
+
+    renderPage(fixture.services, vi.fn(), { workbenchSourceIntent: intent });
+
+    await waitFor(() => expect(screen.getByLabelText("会话目标")).toHaveValue("frame:1"));
+    expect(isCurrent).toHaveBeenCalled();
+    await waitFor(() => expect(fixture.calls.some((call) => call.method === "GET"
+      && call.url.pathname.endsWith("/chat-messages")
+      && call.url.searchParams.get("frame_index") === "1")).toBe(true));
+    const historyRead = fixture.calls.find((call) => call.method === "GET"
+      && call.url.pathname.endsWith("/chat-messages")
+      && call.url.searchParams.get("frame_index") === "1");
+    expect(historyRead).toBeDefined();
+    expect(fixture.calls.filter((call) => call.method === "POST" && call.url.pathname.endsWith("/chat-messages")))
+      .toHaveLength(0);
+  });
+
+  it("applies a newly created chapter after an independent fresh chapter and directory read", async () => {
+    const user = userEvent.setup();
+    const candidateChapter: Chapter = {
+      ...alternateChapter,
+      content: [{ description: "新建章节镜头", storyboard: ["board-new-chapter-1117"] }],
+    };
+    const candidateStoryboard = storyboardAsset("board-new-chapter-1117", 0, candidateChapter.id);
+    const currentStoryboards = [storyboardAsset("board-952-first", 0), storyboardAsset("board-952-target", 1)];
+    const fixture = setupFixture({ chapters: [chapterWithStableFrames], storyboards: currentStoryboards });
+    let chapterReadCount = 0;
+    fixture.services = {
+      ...fixture.services,
+      listChapters: vi.fn(async () => {
+        chapterReadCount += 1;
+        return chapterReadCount === 1 ? [chapterWithStableFrames] : [chapterWithStableFrames, candidateChapter];
+      }),
+      listStoryboardAssets: vi.fn(async (_seriesId, chapterId) => (
+        chapterId === candidateChapter.id ? [candidateStoryboard] : currentStoryboards
+      )),
+    };
+    const rendered = renderPage(fixture.services);
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(chapterWithStableFrames.id));
+    await user.type(screen.getByLabelText("发送给 AI 助手"), "保留当前草稿");
+
+    const intent: WorkbenchSourceIntent = {
+      actorId: "actor-952",
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      services: fixture.services,
+      sessionGeneration: 1,
+      navigationEpoch: 211,
+      seriesId: series.id,
+      chapterId: candidateChapter.id,
+      target: { kind: "frame", chapterId: candidateChapter.id, storyboardAssetId: candidateStoryboard.id },
+      isCurrent: () => true,
+    };
+    rendered.rerenderWithServices(fixture.services, { workbenchSourceIntent: intent });
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("章节")).toHaveValue(candidateChapter.id);
+      expect(screen.getByLabelText("会话目标")).toHaveValue("frame:0");
+    });
+    expect(chapterReadCount).toBe(2);
+    expect(screen.getByLabelText("发送给 AI 助手")).toHaveValue("保留当前草稿");
+    expect(fixture.calls.some((call) => call.method === "GET"
+      && call.url.pathname.includes(`/chapters/${candidateChapter.id}/chat-messages`)
+      && call.url.searchParams.get("frame_index") === "0")).toBe(true);
+  });
+
+  it("refreshes same-index history when a stable same-chapter frame moves during workbench source application", async () => {
+    const initialChapter: Chapter = {
+      ...chapter,
+      content: [
+        { description: "稳定目标", storyboard: ["board-same-target-1117"] },
+        { description: "另一镜", storyboard: ["board-same-other-1117"] },
+      ],
+    };
+    const refreshedChapter: Chapter = {
+      ...initialChapter,
+      content: [
+        { description: "另一镜", storyboard: ["board-same-other-1117"] },
+        { description: "稳定目标", storyboard: ["board-same-target-1117"] },
+      ],
+      updated_at: "2026-10-28T00:00:00Z",
+    };
+    const firstTargetDirectory = storyboardAsset("board-same-target-1117", 0, initialChapter.id);
+    const secondTargetDirectory = storyboardAsset("board-same-target-1117", 1, initialChapter.id);
+    const firstOtherDirectory = storyboardAsset("board-same-other-1117", 1, initialChapter.id);
+    const secondOtherDirectory = storyboardAsset("board-same-other-1117", 0, initialChapter.id);
+    const oldFrameHistory = message({
+      id: "same-index-history-before-reorder-1117",
+      chapterId: initialChapter.id,
+      frameIndex: 1,
+      role: "user",
+      content: "旧顺序中镜头B的会话",
+    });
+    const newFrameHistory = message({
+      id: "same-index-history-after-reorder-1117",
+      chapterId: initialChapter.id,
+      frameIndex: 1,
+      role: "user",
+      content: "新顺序中镜头A的会话",
+    });
+    const fixture = setupFixture({
+      chapters: [initialChapter],
+      storyboards: [firstTargetDirectory, firstOtherDirectory],
+      initialMessages: [oldFrameHistory],
+    });
+    expect(writeChatContextPreference({
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      userId: "actor-952",
+      seriesId: series.id,
+    }, { kind: "frame", chapterId: initialChapter.id, storyboardAssetId: firstOtherDirectory.id })).toBe("saved");
+    const originalFetcher = fixture.fetcher.getMockImplementation();
+    if (originalFetcher === undefined) throw new Error("fixture fetcher has no implementation");
+    let resolveOldHistory!: (response: Response) => void;
+    const oldHistoryResponse = new Promise<Response>((resolve) => { resolveOldHistory = resolve; });
+    let frameHistoryReads = 0;
+    fixture.fetcher.mockImplementation(async (input, init) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/chat-messages")
+        && (init?.method ?? "GET") === "GET"
+        && url.searchParams.get("frame_index") === "1") {
+        frameHistoryReads += 1;
+        await originalFetcher(input, init);
+        return frameHistoryReads === 1
+          ? oldHistoryResponse
+          : Response.json([toWireMessage(newFrameHistory)]);
+      }
+      return originalFetcher(input, init);
+    });
+    let chapterReadCount = 0;
+    let storyboardReadCount = 0;
+    fixture.services = {
+      ...fixture.services,
+      listChapters: vi.fn(async () => {
+        chapterReadCount += 1;
+        return chapterReadCount === 1 ? [initialChapter] : [refreshedChapter];
+      }),
+      listStoryboardAssets: vi.fn(async () => {
+        storyboardReadCount += 1;
+        return storyboardReadCount === 1
+          ? [firstTargetDirectory, firstOtherDirectory]
+          : [secondOtherDirectory, secondTargetDirectory];
+      }),
+    };
+    const intent: WorkbenchSourceIntent = {
+      actorId: "actor-952",
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      services: fixture.services,
+      sessionGeneration: 1,
+      navigationEpoch: 212,
+      seriesId: series.id,
+      chapterId: initialChapter.id,
+      target: { kind: "frame", chapterId: initialChapter.id, storyboardAssetId: firstTargetDirectory.id },
+      isCurrent: () => true,
+    };
+    const rendered = renderPage(fixture.services);
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(initialChapter.id));
+    await waitFor(() => expect(frameHistoryReads).toBe(1));
+    rendered.rerenderWithServices(fixture.services, { workbenchSourceIntent: intent });
+
+    await screen.findByText("新顺序中镜头A的会话");
+    expect(screen.getByLabelText("会话目标")).toHaveValue("frame:1");
+    expect(chapterReadCount).toBe(2);
+    expect(storyboardReadCount).toBe(2);
+    expect(frameHistoryReads).toBe(2);
+    expect(fixture.calls.some((call) => call.method === "GET"
+      && call.url.pathname.includes(`/chapters/${initialChapter.id}/chat-messages`)
+      && call.url.searchParams.get("frame_index") === "1")).toBe(true);
+    await act(async () => {
+      resolveOldHistory(Response.json([toWireMessage(oldFrameHistory)]));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(screen.getByText("新顺序中镜头A的会话")).toBeInTheDocument();
+    expect(screen.queryByText("旧顺序中镜头B的会话")).not.toBeInTheDocument();
+  });
+
+  it.each(["missing candidate chapter", "rejected candidate directory"] as const)(
+    "keeps the current chapter, target, and draft when a cross-chapter source has a %s",
+    async (failure) => {
+      const user = userEvent.setup();
+      const candidateChapter: Chapter = {
+        ...alternateChapter,
+        content: [{ description: "候选镜头", storyboard: ["board-952-candidate"] }],
+      };
+      const candidateStoryboard = storyboardAsset("board-952-candidate", 0, candidateChapter.id);
+      const fixture = setupFixture({
+        chapters: [chapterWithStableFrames, candidateChapter],
+        storyboards: [storyboardAsset("board-952-first", 0), storyboardAsset("board-952-target", 1)],
+      });
+      let chapterReads = 0;
+      const originalListStoryboardAssets = fixture.services.listStoryboardAssets;
+      fixture.services = {
+        ...fixture.services,
+        listChapters: vi.fn(async () => {
+          chapterReads += 1;
+          return failure === "missing candidate chapter" && chapterReads > 1
+            ? [chapterWithStableFrames]
+            : [chapterWithStableFrames, candidateChapter];
+        }),
+        listStoryboardAssets: vi.fn(async (seriesId, chapterId, signal) => {
+          if (failure === "rejected candidate directory" && chapterId === candidateChapter.id) {
+            throw new Error("candidate storyboard directory unavailable");
+          }
+          if (chapterId === chapterWithStableFrames.id) {
+            return originalListStoryboardAssets(seriesId, chapterId, signal);
+          }
+          return [candidateStoryboard];
+        }),
+      };
+      expect(writeChatContextPreference({
+        apiBaseUrl: fixture.services.apiBaseUrl,
+        userId: "actor-952",
+        seriesId: series.id,
+      }, { kind: "frame", chapterId: chapterWithStableFrames.id, storyboardAssetId: "board-952-target" })).toBe("saved");
+      const rendered = renderPage(fixture.services);
+      const chapterSelect = await screen.findByLabelText("章节");
+      await waitFor(() => expect(chapterSelect).toHaveValue(chapterWithStableFrames.id));
+      await waitFor(() => expect(screen.getByLabelText("会话目标")).toHaveValue("frame:1"));
+      await user.type(screen.getByLabelText("发送给 AI 助手"), "保留原来的聊天草稿");
+
+      const intent: WorkbenchSourceIntent = {
+        actorId: "actor-952",
+        apiBaseUrl: fixture.services.apiBaseUrl,
+        services: fixture.services,
+        sessionGeneration: 1,
+        navigationEpoch: failure === "missing candidate chapter" ? 201 : 202,
+        seriesId: series.id,
+        chapterId: candidateChapter.id,
+        target: { kind: "frame", chapterId: candidateChapter.id, storyboardAssetId: candidateStoryboard.id },
+        isCurrent: () => true,
+      };
+      rendered.rerenderWithServices(fixture.services, { workbenchSourceIntent: intent });
+
+      await screen.findByText(/当前聊天章节、目标和草稿保持不变/u);
+      expect(screen.getByLabelText("章节")).toHaveValue(chapterWithStableFrames.id);
+      expect(screen.getByLabelText("会话目标")).toHaveValue("frame:1");
+      expect(screen.getByLabelText("发送给 AI 助手")).toHaveValue("保留原来的聊天草稿");
+      expect(fixture.calls.filter((call) => call.method === "GET" && call.url.pathname.endsWith("/chat-messages")
+        && call.url.pathname.includes(candidateChapter.id))).toHaveLength(0);
+    },
+  );
+
+  it("uses the freshly verified frame order after a candidate chapter was reordered", async () => {
+    const staleCandidateChapter: Chapter = {
+      ...alternateChapter,
+      content: [
+        { description: "稳定目标", storyboard: ["board-stable-target-1117"] },
+        { description: "另一镜", storyboard: ["board-other-1117"] },
+      ],
+    };
+    const freshCandidateChapter: Chapter = {
+      ...staleCandidateChapter,
+      content: [
+        { description: "另一镜", storyboard: ["board-other-1117"] },
+        { description: "稳定目标", storyboard: ["board-stable-target-1117"] },
+      ],
+      updated_at: "2026-10-28T00:00:00Z",
+    };
+    const stableTarget = storyboardAsset("board-stable-target-1117", 1, alternateChapter.id);
+    const otherBoard = storyboardAsset("board-other-1117", 0, alternateChapter.id);
+    const fixture = setupFixture({ chapters: [chapter, staleCandidateChapter] });
+    let chapterReadCount = 0;
+    fixture.services = {
+      ...fixture.services,
+      listChapters: vi.fn(async () => {
+        chapterReadCount += 1;
+        return chapterReadCount === 1 ? [chapter, staleCandidateChapter] : [chapter, freshCandidateChapter];
+      }),
+      listStoryboardAssets: vi.fn(async (_seriesId, chapterId) => chapterId === alternateChapter.id
+        ? [otherBoard, stableTarget]
+        : []),
+    };
+    const intent: WorkbenchSourceIntent = {
+      actorId: "actor-952",
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      services: fixture.services,
+      sessionGeneration: 1,
+      navigationEpoch: 203,
+      seriesId: series.id,
+      chapterId: alternateChapter.id,
+      target: { kind: "frame", chapterId: alternateChapter.id, storyboardAssetId: stableTarget.id },
+      isCurrent: () => true,
+    };
+
+    renderPage(fixture.services, undefined, { workbenchSourceIntent: intent });
+
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(alternateChapter.id));
+    await waitFor(() => expect(screen.getByLabelText("会话目标")).toHaveValue("frame:1"));
+    expect(fixture.calls.some((call) => call.method === "GET"
+      && call.url.pathname.includes(`/chapters/${alternateChapter.id}/chat-messages`)
+      && call.url.searchParams.get("frame_index") === "1")).toBe(true);
+    expect(fixture.calls.some((call) => call.method === "GET"
+      && call.url.pathname.includes(`/chapters/${alternateChapter.id}/chat-messages`)
+      && call.url.searchParams.get("frame_index") === "0")).toBe(false);
+  });
+
+  it("applies a workbench asset source only after matching its verified chapter and directory", async () => {
+    const asset: Character = {
+      id: "character-asset-source-952",
+      series_id: series.id,
+      name: "左侧选中角色",
+      gender: null,
+      age: null,
+      role: null,
+      appearance: null,
+      description: null,
+      image_url: null,
+      audio_url: null,
+      voice_ref: null,
+      aliases: null,
+      canonical_key: null,
+      created_at: "2026-10-26T00:00:00Z",
+      updated_at: "2026-10-26T00:00:00Z",
+    };
+    const chapterWithAsset = {
+      ...chapter,
+      content: [{ description: "关联镜头", character: [asset.id] }],
+    };
+    const fixture = setupFixture({ chapters: [chapterWithAsset], characters: [asset] });
+    const intent: WorkbenchSourceIntent = {
+      actorId: "actor-952",
+      apiBaseUrl: fixture.services.apiBaseUrl,
+      services: fixture.services,
+      sessionGeneration: 1,
+      navigationEpoch: 18,
+      seriesId: series.id,
+      chapterId: chapterWithAsset.id,
+      target: { kind: "asset", chapterId: chapterWithAsset.id, category: "characters", assetId: asset.id },
+      isCurrent: () => true,
+    };
+
+    renderPage(fixture.services, vi.fn(), { workbenchSourceIntent: intent });
+
+    await waitFor(() => expect(screen.getByLabelText("会话目标")).toHaveValue(`asset:character:${asset.id}`));
+    expect(await screen.findByText("已将左侧选择应用为当前聊天目标。正在读取对应会话。"))
+      .toBeInTheDocument();
+    expect(fixture.calls.filter((call) => call.method === "POST" && call.url.pathname.endsWith("/chat-messages")))
+      .toHaveLength(0);
   });
 
   it("does not restore another actor or API scope", async () => {
