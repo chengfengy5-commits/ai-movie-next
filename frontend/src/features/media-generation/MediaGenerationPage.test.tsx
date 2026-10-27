@@ -8,8 +8,17 @@ import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "..
 import type { UserPreferences, UserPreferencesPort } from "../../shared/api/userPreferences";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { MediaGenerationPage } from "./MediaGenerationPage";
+import {
+  readSingleMediaPreference,
+  singleMediaPreferenceKey,
+  writeSingleMediaPreference,
+} from "./mediaSelectionPreferences";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+  window.localStorage.clear();
+});
 
 function creatorSettings(): CreatorSettingsServicePort {
   const imageModel: CreatorModel = {
@@ -56,8 +65,17 @@ function creatorSettings(): CreatorSettingsServicePort {
     is_system: false,
     user_id: "actor-926",
   };
+  const videoPrompt: CreatorPrompt = {
+    ...prompt,
+    id: "video-prompt-926",
+    category: "video-design",
+    name: "视频提示词",
+    system_prompt: "保持镜头运动连贯",
+    user_prompt: "生成自然的镜头延展",
+  };
   const prompts: CreatorPrompt[] = [
     prompt,
+    videoPrompt,
     { ...prompt, id: "image-prompt-scene-926", category: "scene-design", name: "场景提示词" },
     { ...prompt, id: "image-prompt-prop-926", category: "prop-design", name: "道具提示词" },
     { ...prompt, id: "image-prompt-storyboard-926", category: "storyboard-design", name: "分镜提示词" },
@@ -212,6 +230,38 @@ function storyboardFixture(): StoryboardAsset {
 }
 
 describe("MediaGenerationPage", () => {
+  it("isolates local single-media selections by account, API, mode, and target category", () => {
+    const storage = window.localStorage;
+    const scope = { apiBaseUrl: "https://api.example.test/api", userId: "actor-media-pref" };
+    const imagePreference = { modelId: "image-model", promptId: "image-prompt", size: "16:9" };
+    const videoPreference = {
+      modelId: "video-model",
+      promptId: "video-prompt",
+      size: "16:9",
+      duration: "10",
+      resolution: "1080p",
+    };
+
+    expect(writeSingleMediaPreference(scope, "image", "frame", imagePreference, storage)).toBe(true);
+    expect(writeSingleMediaPreference(scope, "video", "frame", videoPreference, storage)).toBe(true);
+    expect(readSingleMediaPreference(scope, "image", "frame", storage)).toEqual({ kind: "found", value: imagePreference });
+    expect(readSingleMediaPreference(scope, "video", "frame", storage)).toEqual({ kind: "found", value: videoPreference });
+    expect(readSingleMediaPreference(scope, "image", "general", storage)).toEqual({ kind: "missing" });
+    expect(readSingleMediaPreference({ ...scope, userId: "another-actor" }, "image", "frame", storage))
+      .toEqual({ kind: "missing" });
+    expect(readSingleMediaPreference({ ...scope, apiBaseUrl: "https://other.example.test/api" }, "image", "frame", storage))
+      .toEqual({ kind: "missing" });
+    expect(singleMediaPreferenceKey(scope, "image", "frame"))
+      .not.toBe(singleMediaPreferenceKey(scope, "video", "frame"));
+
+    const unavailable = {
+      getItem: () => { throw new Error("storage unavailable"); },
+      setItem: () => { throw new Error("storage unavailable"); },
+    } as unknown as Storage;
+    expect(readSingleMediaPreference(scope, "image", "frame", unavailable)).toEqual({ kind: "unavailable" });
+    expect(writeSingleMediaPreference(scope, "image", "frame", imagePreference, unavailable)).toBe(false);
+  });
+
   it("submits a normal image to the selected storyboard message and links it to My Tasks", async () => {
     const user = userEvent.setup();
     const series = seriesFixture();
@@ -239,6 +289,16 @@ describe("MediaGenerationPage", () => {
       listScenes: vi.fn(async () => []),
       listProps: vi.fn(async () => []),
     };
+    expect(writeSingleMediaPreference({ apiBaseUrl: services.apiBaseUrl, userId: "actor-926" }, "image", "frame", {
+      modelId: "image-model-926",
+      promptId: "image-prompt-926",
+      size: "1:1",
+    })).toBe(true);
+    const originalSetItem = Storage.prototype.setItem;
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation((key, value) => {
+      if (key.startsWith("haoai:media-generation-selection:v1:")) throw new Error("storage unavailable");
+      originalSetItem.call(window.localStorage, key, value);
+    });
 
     render(
       <MediaGenerationPage
@@ -251,9 +311,15 @@ describe("MediaGenerationPage", () => {
     );
 
     await user.click(screen.getByRole("button", { name: "普通图片" }));
-    await user.selectOptions(await screen.findByLabelText("图片模型"), "image-model-926");
-    await user.selectOptions(screen.getByLabelText("提示词目录"), "image-prompt-926");
     await user.selectOptions(screen.getByLabelText("图片目标"), "frame_message");
+    await waitFor(() => {
+      expect(screen.getByLabelText("图片模型")).toHaveValue("image-model-926");
+      expect(screen.getByLabelText("提示词目录")).toHaveValue("image-prompt-926");
+      expect(screen.getByLabelText("图片尺寸")).toHaveValue("1:1");
+    });
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("保持设定一致\n\n细节清晰");
+    await user.selectOptions(screen.getByLabelText("图片尺寸"), "16:9");
+    expect(await screen.findByText("浏览器未能保存此分类的生成选项；当前表单仍可继续使用。")).toBeInTheDocument();
     await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
     await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
     await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
@@ -271,7 +337,7 @@ describe("MediaGenerationPage", () => {
       modelId: "image-model-926",
       prompt: "保持设定一致\n\n细节清晰",
       target: { kind: "frame_message", chapter_id: chapter.id, storyboard_asset_id: "storyboard-926" },
-      size: "1:1",
+      size: "16:9",
       referenceImages: [
         "https://example.test/ref-a.png",
         "https://example.test/ref-b.png",
@@ -344,6 +410,13 @@ describe("MediaGenerationPage", () => {
       listScenes: vi.fn(async () => []),
       listProps: vi.fn(async () => []),
     };
+    expect(writeSingleMediaPreference({ apiBaseUrl: services.apiBaseUrl, userId: "actor-926" }, "video", "storyboard", {
+      modelId: "video-model-926",
+      promptId: "video-prompt-926",
+      size: "16:9",
+      duration: "10",
+      resolution: "720p",
+    })).toBe(true);
 
     render(
       <MediaGenerationPage
@@ -355,13 +428,19 @@ describe("MediaGenerationPage", () => {
       />,
     );
 
-    await user.selectOptions(await screen.findByLabelText("视频模型"), "video-model-926");
-    await user.type(screen.getByLabelText("视频提示词"), "雨巷分镜延展镜头");
     await user.selectOptions(screen.getByLabelText("视频目标"), "asset_message");
     await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
     await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
     await user.selectOptions(await screen.findByLabelText("素材类型"), "storyboard");
     await user.selectOptions(await screen.findByLabelText("目标素材"), "storyboard-926");
+    await waitFor(() => {
+      expect(screen.getByLabelText("视频模型")).toHaveValue("video-model-926");
+      expect(screen.getByLabelText("提示词目录")).toHaveValue("video-prompt-926");
+      expect(screen.getByLabelText("画面比例")).toHaveValue("16:9");
+      expect(screen.getByLabelText("时长（秒）")).toHaveValue("10");
+      expect(screen.getByLabelText("分辨率")).toHaveValue("720p");
+    });
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("保持镜头运动连贯\n\n生成自然的镜头延展");
     expect(screen.getByRole("option", { name: "第 2 镜 · 雨巷转场镜头" })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "提交视频任务" }));
 
@@ -372,6 +451,147 @@ describe("MediaGenerationPage", () => {
       chapter_id: chapter.id,
       asset_type: "storyboard",
       asset_id: "storyboard-926",
+    });
+    expect(submitVideo.mock.calls[0]![0]).toMatchObject({
+      modelId: "video-model-926",
+      prompt: "保持镜头运动连贯\n\n生成自然的镜头延展",
+      size: "16:9",
+      duration: 10,
+      resolution: "720p",
+    });
+  });
+
+  it("keeps an in-flight video request stable when refreshed options no longer include its duration", async () => {
+    const user = userEvent.setup();
+    let finishSubmission: ((value: Awaited<ReturnType<MediaGenerationRun["submitVideo"]>>) => void) | undefined;
+    const submitVideo = vi.fn<MediaGenerationRun["submitVideo"]>(() => new Promise((resolve) => {
+      finishSubmission = resolve;
+    }));
+    const baseCatalog = creatorSettings();
+    let videoCatalogReads = 0;
+    const catalogA: CreatorSettingsServicePort = {
+      ...baseCatalog,
+      listModels: vi.fn(async (category, signal) => {
+        const models = await baseCatalog.listModels(category, signal);
+        if (category !== "video") return models;
+        videoCatalogReads += 1;
+        if (videoCatalogReads < 2) return models;
+        return models.map((model) => model.id === "video-model-926"
+          ? {
+            ...model,
+            params: JSON.stringify({
+              image_size: { enabled: true, default: "16:9", options: ["16:9"] },
+              duration: { enabled: true, default: 5, options: [5] },
+              resolution: { enabled: true, default: "720p", options: ["720p"] },
+            }),
+          }
+          : model);
+      }),
+    };
+    const servicesA: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: catalogA,
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), submitVideo),
+    };
+    const servicesB: WorkspaceServices = {
+      ...servicesA,
+      creatorSettings: creatorSettings(),
+    };
+    const props = { userId: "actor-926", sessionGeneration: 4, onUnauthorized: vi.fn(), onOpenTasks: vi.fn() };
+    const { rerender } = render(<MediaGenerationPage services={servicesA} {...props} />);
+
+    await user.selectOptions(await screen.findByLabelText("视频模型"), "video-model-926");
+    await user.selectOptions(screen.getByLabelText("时长（秒）"), "10");
+    await user.selectOptions(screen.getByLabelText("提示词目录"), "video-prompt-926");
+    await user.click(screen.getByRole("button", { name: "提交视频任务" }));
+    await waitFor(() => expect(submitVideo).toHaveBeenCalledOnce());
+    expect(submitVideo.mock.calls[0]![0].duration).toBe(10);
+
+    rerender(<MediaGenerationPage services={servicesB} {...props} />);
+    await waitFor(() => expect(screen.queryByText("正在读取剧集、模型和提示词目录…")).not.toBeInTheDocument());
+    rerender(<MediaGenerationPage services={servicesA} {...props} />);
+    await waitFor(() => expect(videoCatalogReads).toBe(2));
+    await waitFor(() => expect(screen.queryByText("正在读取剧集、模型和提示词目录…")).not.toBeInTheDocument());
+
+    finishSubmission?.({
+      operation: "video.single",
+      submissionId: "video-submission-frozen",
+      taskId: "video-task-frozen",
+      messageId: "video-message-frozen",
+      status: "queued",
+      quotedAmount: 3,
+      billingStatus: "charged",
+    });
+    await screen.findByText(/视频任务已受理/u);
+    rerender(<MediaGenerationPage services={servicesA} {...props} />);
+    expect(screen.getByText(/视频任务已受理/u)).toBeInTheDocument();
+    expect(submitVideo).toHaveBeenCalledOnce();
+    expect(submitVideo.mock.calls[0]![0].duration).toBe(10);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.click(screen.getByRole("button", { name: "普通视频" }));
+    expect(await screen.findByText("所选时长已不受当前模型支持，请重新选择。", { selector: "p" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "提交视频任务" })).toBeDisabled();
+    expect(submitVideo).toHaveBeenCalledOnce();
+  });
+
+  it("keeps a manual prompt until saved options are explicitly applied and preserves it for a blank saved prompt", async () => {
+    const user = userEvent.setup();
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const series = seriesFixture();
+    const chapter = chapterFixture();
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => ({
+      operation: "image.single",
+      submissionId: "manual-media-pref-submission",
+      taskId: "manual-media-pref-task",
+      messageId: "manual-media-pref-message",
+      status: "queued",
+      quotedAmount: 1,
+      billingStatus: "charged",
+    }));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    expect(writeSingleMediaPreference({ apiBaseUrl: services.apiBaseUrl, userId: "actor-926" }, "image", "frame", {
+      modelId: "image-model-scene-926",
+      promptId: "",
+      size: "unsupported-size",
+    })).toBe(true);
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await user.type(screen.getByLabelText("图片提示词"), "保留手工描述");
+    await user.selectOptions(screen.getByLabelText("图片目标"), "frame_message");
+    const applyButton = await screen.findByRole("button", { name: "应用已记住的图片选项" });
+    expect(screen.getByLabelText("图片模型")).toHaveValue("");
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("保留手工描述");
+
+    await user.click(applyButton);
+    expect(screen.getByLabelText("图片模型")).toHaveValue("image-model-scene-926");
+    expect(screen.getByLabelText("提示词目录")).toHaveValue("");
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("保留手工描述");
+    expect(screen.getByLabelText("图片尺寸")).toHaveValue("2:3");
+    expect(await screen.findByText(/记住的尺寸已不受当前模型支持/u)).toBeInTheDocument();
+    expect(confirm).not.toHaveBeenCalled();
+
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
+    await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+    await screen.findByText(/图片任务已受理/u);
+    expect(submitImage.mock.calls[0]![0]).toMatchObject({
+      modelId: "image-model-scene-926",
+      prompt: "保留手工描述",
+      size: "2:3",
     });
   });
 
@@ -740,6 +960,11 @@ describe("MediaGenerationPage", () => {
       listScenes: vi.fn(async () => []),
       listProps: vi.fn(async () => []),
     };
+    expect(writeSingleMediaPreference({ apiBaseUrl: services.apiBaseUrl, userId: "actor-926" }, "image", "frame", {
+      modelId: "image-model-scene-926",
+      promptId: "image-prompt-scene-926",
+      size: "2:3",
+    })).toBe(true);
     render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
       onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
 
@@ -762,6 +987,8 @@ describe("MediaGenerationPage", () => {
     await user.click(screen.getByRole("button", { name: "普通图片" }));
     await user.selectOptions(screen.getByLabelText("图片模型"), "image-model-926");
     await user.selectOptions(screen.getByLabelText("图片目标"), "frame_message");
+    await screen.findByRole("button", { name: "应用已记住的图片选项" });
+    expect(screen.getByLabelText("图片模型")).toHaveValue("image-model-926");
     await user.selectOptions(screen.getByLabelText("剧集"), "series-926");
     await user.selectOptions(await screen.findByLabelText("章节"), "chapter-926");
     await user.selectOptions(await screen.findByLabelText("分镜目标"), "storyboard-926");
