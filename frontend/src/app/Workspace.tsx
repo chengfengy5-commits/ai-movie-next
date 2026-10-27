@@ -794,6 +794,7 @@ function Dashboard() {
               navigationIntent={assetNavigationIntent}
               onViewChapter={acceptAssetChapterTarget}
               onViewFrame={acceptAssetFrameTarget}
+              generationHistoryPort={services.assetGenerationHistory}
               series={selectedSeries}
               services={services}
               userId={state.user.id}

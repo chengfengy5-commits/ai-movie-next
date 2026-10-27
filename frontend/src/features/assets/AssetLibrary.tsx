@@ -7,6 +7,7 @@ import type {
   Scene,
   Series,
 } from "../../shared/api/contracts";
+import type { AssetGenerationHistoryPort } from "../../shared/api/assetGenerationHistory";
 import type { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import { AssetMaintenanceDialog } from "./maintenance/AssetMaintenanceDialog";
@@ -31,6 +32,7 @@ import {
   CharacterAudioDialog,
   type CharacterAudioAttempt,
 } from "./media/CharacterAudioDialog";
+import { AssetGenerationHistoryDialog } from "./media/AssetGenerationHistoryDialog";
 import type {
   AssetImageDirectory,
   AssetImageUploadRun,
@@ -159,6 +161,16 @@ interface CharacterAudioRequest {
   openEpoch: number;
 }
 
+interface AssetGenerationHistoryRequest {
+  id: number;
+  scope: LibraryScope;
+  category: AssetLibraryType;
+  asset: AssetRecord;
+  directoryResult: ScopedAssetResult;
+  port: AssetGenerationHistoryPort;
+  openEpoch: number;
+}
+
 const assetTypes: Array<{ id: AssetLibraryType; label: string }> = [
   { id: "characters", label: "角色" },
   { id: "scenes", label: "场景" },
@@ -246,6 +258,14 @@ function assetName(type: AssetLibraryType, item: AssetRecord): string {
   return value.trim() === "" ? fallback : value;
 }
 
+function generationHistoryAssetType(category: AssetLibraryType): "character" | "scene" | "prop" {
+  switch (category) {
+    case "characters": return "character";
+    case "scenes": return "scene";
+    case "props": return "prop";
+  }
+}
+
 function hasValidCategoryName(type: AssetLibraryType, item: AssetRecord): boolean {
   if (type === "scenes") {
     return "title" in item && typeof item.title === "string";
@@ -323,6 +343,8 @@ function AssetCard({
   replacementUnavailable,
   onUploadImage,
   imageUploadUnavailable,
+  onGenerationHistory,
+  generationHistoryUnavailable,
   onCharacterAudio,
   characterAudioUnavailable,
   onEdit,
@@ -343,6 +365,8 @@ function AssetCard({
   replacementUnavailable?: string | undefined;
   onUploadImage?: (() => void) | undefined;
   imageUploadUnavailable?: string | undefined;
+  onGenerationHistory?: (() => void) | undefined;
+  generationHistoryUnavailable?: string | undefined;
   onCharacterAudio?: (() => void) | undefined;
   characterAudioUnavailable?: string | undefined;
   onEdit?: (() => void) | undefined;
@@ -422,6 +446,12 @@ function AssetCard({
           </button>
           {imageUploadUnavailable !== undefined && <small role="note">{imageUploadUnavailable}</small>}
         </div>
+        <div className="asset-card-generation-history-action">
+          <button className="secondary-button" disabled={onGenerationHistory === undefined} onClick={onGenerationHistory} type="button">
+            生成历史
+          </button>
+          {generationHistoryUnavailable !== undefined && <small role="note">{generationHistoryUnavailable}</small>}
+        </div>
         {character !== null && (
           <div className="asset-card-character-audio-action">
             <button className="secondary-button" disabled={onCharacterAudio === undefined} onClick={onCharacterAudio} type="button">
@@ -450,6 +480,7 @@ export interface AssetLibraryProps {
   onViewChapter?(target: AssetFrameUsageChapterTarget): void;
   onViewFrame?(target: AssetFrameUsageFrameTarget): void;
   navigationIntent?: AssetNavigationIntent | null;
+  generationHistoryPort?: AssetGenerationHistoryPort | undefined;
   onNavigationConsumed?(navigationEpoch: number): void;
   onNavigationAbandoned?(navigationEpoch: number): void;
 }
@@ -463,6 +494,7 @@ export function AssetLibrary({
   onViewChapter,
   onViewFrame,
   navigationIntent = null,
+  generationHistoryPort,
   onNavigationConsumed,
   onNavigationAbandoned,
 }: AssetLibraryProps) {
@@ -514,6 +546,10 @@ export function AssetLibrary({
   const characterAudioRequestIdRef = useRef(0);
   const characterAudioAttemptIdRef = useRef(0);
   const [characterAudioIssue, setCharacterAudioIssue] = useState<string | null>(null);
+  const [generationHistoryRequest, setGenerationHistoryRequest] = useState<AssetGenerationHistoryRequest | null>(null);
+  const generationHistoryRequestRef = useRef(generationHistoryRequest);
+  generationHistoryRequestRef.current = generationHistoryRequest;
+  const generationHistoryRequestIdRef = useRef(0);
   const [pendingLocateAsset, setPendingLocateAsset] = useState<{
     assetId: string;
     scope: LibraryScope;
@@ -616,6 +652,8 @@ export function AssetLibrary({
   if (previousScope.userId !== userId || previousScope.services !== services || previousScope.seriesId !== series.id) {
     invalidateActiveImageUpload();
     invalidateActiveCharacterAudio();
+    generationHistoryRequestRef.current = null;
+    setGenerationHistoryRequest(null);
     libraryScopeRef.current = { userId, services, seriesId: series.id, generation: previousScope.generation + 1 };
     directoryRequestGenerationRef.current += 1;
     searchGenerationRef.current += 1;
@@ -873,6 +911,8 @@ export function AssetLibrary({
     directoryRequestGenerationRef.current += 1;
     invalidateActiveImageUpload();
     invalidateActiveCharacterAudio();
+    generationHistoryRequestRef.current = null;
+    setGenerationHistoryRequest(null);
     managementRequestRef.current = null;
     invalidatedManagementRequestRef.current = null;
     setManagementRequest(null);
@@ -1148,6 +1188,80 @@ export function AssetLibrary({
       && resultRef.current.result.type === "characters"
       && directoryRequestGenerationRef.current === activeRequest.directoryResult.requestGeneration
       && hasUniqueUsageIdentity(resultRef.current.result.items, activeRequest.asset, series.id);
+  }
+
+  function isCurrentGenerationHistory(request: AssetGenerationHistoryRequest): boolean {
+    const activeRequest = generationHistoryRequestRef.current;
+    const activeResult = resultRef.current;
+    return activeRequest === request
+      && request.openEpoch === openEpochRef.current
+      && request.scope === libraryScopeRef.current
+      && request.scope.userId === userId
+      && request.scope.services === services
+      && request.scope.seriesId === series.id
+      && request.category === selectedTypeRef.current
+      && request.port === generationHistoryPort
+      && series.can_enter !== false
+      && activeResult === request.directoryResult
+      && activeResult.result.status === "ready"
+      && activeResult.result.type === request.category
+      && directoryRequestGenerationRef.current === request.directoryResult.requestGeneration
+      && hasValidCategoryName(request.category, request.asset)
+      && hasUniqueUsageIdentity(activeResult.result.items, request.asset, series.id);
+  }
+
+  function closeGenerationHistory(request: AssetGenerationHistoryRequest): void {
+    if (generationHistoryRequestRef.current !== request) return;
+    generationHistoryRequestRef.current = null;
+    setGenerationHistoryRequest(null);
+    openEpochRef.current += 1;
+  }
+
+  function openGenerationHistory(
+    category: AssetLibraryType,
+    item: AssetRecord,
+    directoryItems: AssetRecord[],
+  ): void {
+    const activeResult = resultRef.current;
+    const port = generationHistoryPort;
+    if (
+      series.can_enter === false
+      || port === undefined
+      || category !== selectedTypeRef.current
+      || activeResult === null
+      || activeResult.scope !== libraryScope
+      || activeResult.result.status !== "ready"
+      || activeResult.result.type !== category
+      || libraryScopeRef.current !== libraryScope
+      || directoryRequestGenerationRef.current !== activeResult.requestGeneration
+      || !hasValidCategoryName(category, item)
+      || !hasUniqueUsageIdentity(directoryItems, item, series.id)
+    ) {
+      return;
+    }
+
+    invalidateActiveImageUpload();
+    invalidateActiveCharacterAudio();
+    invalidateUsage();
+    managementRequestRef.current = null;
+    invalidatedManagementRequestRef.current = null;
+    setManagementRequest(null);
+    maintenanceRequestRef.current = null;
+    setMaintenanceRequest(null);
+    activeReplacementIdRef.current = null;
+    setActiveReplacementId(null);
+    const openEpoch = ++openEpochRef.current;
+    const request: AssetGenerationHistoryRequest = {
+      id: ++generationHistoryRequestIdRef.current,
+      scope: libraryScope,
+      category,
+      asset: item,
+      directoryResult: activeResult,
+      port,
+      openEpoch,
+    };
+    generationHistoryRequestRef.current = request;
+    setGenerationHistoryRequest(request);
   }
 
   function openImageUpload(
@@ -1715,6 +1829,8 @@ export function AssetLibrary({
   function reloadCurrentType(): number {
     invalidateActiveImageUpload();
     invalidateActiveCharacterAudio();
+    generationHistoryRequestRef.current = null;
+    setGenerationHistoryRequest(null);
     const nextReloadVersion = reloadVersionRef.current + 1;
     reloadVersionRef.current = nextReloadVersion;
     directoryRequestGenerationRef.current += 1;
@@ -1747,6 +1863,8 @@ export function AssetLibrary({
   function goBack() {
     invalidateActiveImageUpload();
     invalidateActiveCharacterAudio();
+    generationHistoryRequestRef.current = null;
+    setGenerationHistoryRequest(null);
     abandonNavigationIntent();
     invalidateUsage();
     invalidatedManagementRequestRef.current = null;
@@ -1793,6 +1911,13 @@ export function AssetLibrary({
             : services.characterAudio === undefined
               ? services.mode === "demo" ? "演示模式暂未接入角色音频服务。" : "当前服务暂未接入角色音频接口。"
               : undefined;
+    const generationHistoryUnavailable = !identityIsUnique
+      ? "素材身份暂无法核对，不能读取生成历史。"
+      : series.can_enter === false
+        ? "当前账号不能进入此剧集，不能读取生成历史。"
+        : generationHistoryPort === undefined
+          ? services.mode === "demo" ? "演示模式暂未接入生成历史服务。" : "当前服务暂未接入生成历史接口。"
+          : undefined;
     return (
       <AssetCard
         apiBaseUrl={services.apiBaseUrl}
@@ -1825,6 +1950,10 @@ export function AssetLibrary({
         replacementUnavailable={replacementUnavailable}
         onUploadImage={imageUploadUnavailable === undefined ? () => openImageUpload(category, item, items) : undefined}
         imageUploadUnavailable={imageUploadUnavailable}
+        onGenerationHistory={generationHistoryUnavailable === undefined
+          ? () => openGenerationHistory(category, item, items)
+          : undefined}
+        generationHistoryUnavailable={generationHistoryUnavailable}
         onCharacterAudio={category === "characters" && characterAudioUnavailable === undefined
           ? () => openCharacterAudio(item as Character, items as Character[])
           : undefined}
@@ -1912,6 +2041,14 @@ export function AssetLibrary({
       setManagementRequest(null);
     }
   }, [libraryScope, managementRequest]);
+
+  useEffect(() => {
+    if (generationHistoryRequest !== null && !isCurrentGenerationHistory(generationHistoryRequest)) {
+      generationHistoryRequestRef.current = null;
+      setGenerationHistoryRequest(null);
+      openEpochRef.current += 1;
+    }
+  }, [currentResult, generationHistoryPort, generationHistoryRequest, libraryScope, selectedType, series.can_enter, series.id, services, userId]);
 
   useLayoutEffect(() => {
     const intent = effectiveNavigationIntent;
@@ -2357,6 +2494,29 @@ export function AssetLibrary({
           seriesName={series.name}
         />
       ))}
+      {generationHistoryRequest !== null
+        && generationHistoryRequest.scope === libraryScope
+        && generationHistoryRequest.category === selectedType
+        && generationHistoryRequest.port === generationHistoryPort
+        && isCurrentGenerationHistory(generationHistoryRequest) && (
+        <AssetGenerationHistoryDialog
+          actorId={userId}
+          apiBaseUrl={services.apiBaseUrl}
+          assetId={generationHistoryRequest.asset.id}
+          assetName={assetName(generationHistoryRequest.category, generationHistoryRequest.asset)}
+          assetType={generationHistoryAssetType(generationHistoryRequest.category)}
+          isCurrent={() => isCurrentGenerationHistory(generationHistoryRequest)}
+          key={generationHistoryRequest.id}
+          listChapters={services.listChapters}
+          onClose={() => closeGenerationHistory(generationHistoryRequest)}
+          onUnauthorized={() => {
+            if (isCurrentGenerationHistory(generationHistoryRequest)) unauthorizedHandlerRef.current();
+          }}
+          port={generationHistoryRequest.port}
+          seriesId={series.id}
+          seriesName={series.name}
+        />
+      )}
     </section>
   );
 }
