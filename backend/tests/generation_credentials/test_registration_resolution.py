@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import uuid
-from dataclasses import replace
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -24,7 +24,10 @@ from haoai_backend.generation_credentials.application import (
     check_credential_registry_readiness,
 )
 from haoai_backend.generation_credentials.persistence import metadata as registry_metadata
-from haoai_backend.generation_credentials.persistence import RegistryReadRepository
+from haoai_backend.generation_credentials.persistence import (
+    CallerSessionBindingCaptureStore,
+    RegistryReadRepository,
+)
 from haoai_backend.generation_credentials.domain import (
     CredentialCrypto,
     CredentialScope,
@@ -1191,3 +1194,102 @@ def service_table_versions():
     from haoai_backend.generation_credentials.persistence import credential_versions
 
     return credential_versions
+
+
+def test_binding_capture_adapter_keeps_caller_session_and_uses_secret_free_projections(
+    tmp_path: Path,
+) -> None:
+    engine, session_factory, scope, authority, crypto, record = _registered_fixture(tmp_path)
+    registry = _registry(authority, (record,), crypto, session_factory)
+    attempt = _register_attempt(authority, scope, record)
+    with session_factory() as session:
+        staged = registry.stage_register_owned_config(
+            session,
+            _actor(),
+            MODEL_ID,
+            attempt,
+        )
+        assert isinstance(staged, RegistrationStaged)
+        session.commit()
+
+    mapped = orm_registry()
+
+    class PendingUser:
+        pass
+
+    mapped.map_imperatively(PendingUser, users)
+    pending = PendingUser(
+        id="10000000-0000-4000-8000-000000000097",
+        username="pending-capture",
+        email="pending-capture@example.test",
+        hashed_password="fixture",
+        is_superuser=False,
+        membership_type="free",
+        created_at=datetime(2026, 10, 12),
+    )
+    statements: list[str] = []
+    events = {"flushes": 0, "commits": 0, "rollbacks": 0}
+
+    def record_statement(_connection, _cursor, statement, _parameters, _context, _many):
+        statements.append(statement.lower())
+
+    try:
+        with session_factory() as session:
+            transaction = session.begin()
+            transaction_identity = session.get_transaction()
+            session.add(pending)
+            event.listen(
+                session,
+                "before_flush",
+                lambda *_: events.__setitem__("flushes", events["flushes"] + 1),
+            )
+            event.listen(
+                session,
+                "after_commit",
+                lambda *_: events.__setitem__("commits", events["commits"] + 1),
+            )
+            event.listen(
+                session,
+                "after_rollback",
+                lambda *_: events.__setitem__("rollbacks", events["rollbacks"] + 1),
+            )
+            event.listen(engine, "before_cursor_execute", record_statement)
+            adapter = CallerSessionBindingCaptureStore(session)
+
+            def read_capture_rows():
+                assert session.autoflush is False
+                return (
+                    adapter.lock_config_identity(scope),
+                    adapter.lock_binding_for_capture(scope),
+                    adapter.read_capture_version(BINDING_ID, 1),
+                    adapter.read_capture_versions(BINDING_ID),
+                    adapter.find_capture_principal(PRINCIPAL_ID),
+                )
+
+            config, binding, head, versions, principal = adapter.without_autoflush(
+                read_capture_rows
+            )
+            event.remove(engine, "before_cursor_execute", record_statement)
+
+            assert config is not None
+            assert binding is not None
+            assert head is not None
+            assert versions and principal is not None
+            assert session.autoflush is True
+            assert pending in session.new
+            assert session.get_transaction() is transaction_identity
+            assert session.in_transaction()
+            assert events == {"flushes": 0, "commits": 0, "rollbacks": 0}
+            assert "api_key" not in " ".join(statements)
+            assert "ciphertext" not in " ".join(statements)
+            assert "nonce" not in " ".join(statements)
+            assert "record_id" not in statements[-1]
+            assert "ciphertext" not in head and "nonce" not in head
+            assert "ciphertext" not in versions[0] and "nonce" not in versions[0]
+            assert "record_id" not in principal
+            assert "api_key" not in {item.name for item in fields(config)}
+
+            session.rollback()
+            assert events == {"flushes": 0, "commits": 0, "rollbacks": 1}
+    finally:
+        engine.dispose()

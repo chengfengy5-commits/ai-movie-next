@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable, TypeVar, cast
 
 from sqlalchemy import (
     Boolean,
@@ -32,6 +32,12 @@ from haoai_backend.authentication.tables import users
 from haoai_backend.generation_catalog.tables import model_configs, system_models
 
 from .domain import CredentialScope, PreparedPayload
+from .binding_capture_ports import (
+    BindingCaptureBinding,
+    BindingCapturePrincipal,
+    BindingCaptureVersion,
+    LegacyConfigIdentityFacts,
+)
 from .payload_application import stage_prepared_payload
 from .payload_ports import (
     PayloadBindingSnapshot,
@@ -42,6 +48,7 @@ from .payload_ports import (
 
 
 metadata = MetaData()
+_Result = TypeVar("_Result")
 
 credential_principals = Table(
     "generation_credential_principals",
@@ -285,18 +292,6 @@ class LegacyConfigFacts:
     active: bool
 
 
-@dataclass(frozen=True, slots=True)
-class LegacyConfigIdentityFacts:
-    """Endpoint identity read without selecting the legacy API-key column."""
-
-    scope: CredentialScope
-    category: str
-    provider: str
-    model: str | None
-    base_url: str | None
-    active: bool
-
-
 class RegistryReadRepository:
     """Fresh Core projections only; all writes enlist in the supplied Session."""
 
@@ -476,6 +471,27 @@ class RegistryReadRepository:
         ).mappings().first()
         return dict(row) if row is not None else None
 
+    def lock_binding_for_capture(
+        self,
+        scope: CredentialScope,
+    ) -> BindingCaptureBinding | None:
+        row = self._session.execute(
+            select(
+                credential_bindings.c.binding_id,
+                credential_bindings.c.revision,
+                credential_bindings.c.current_version,
+                credential_bindings.c.enabled,
+            )
+            .where(
+                credential_bindings.c.source == scope.source,
+                credential_bindings.c.row_id == scope.row_id,
+                credential_bindings.c.owner_or_system == scope.owner_or_system,
+                credential_bindings.c.provider == scope.provider,
+            )
+            .with_for_update()
+        ).mappings().first()
+        return cast(BindingCaptureBinding, dict(row)) if row is not None else None
+
     def read_version(self, binding_id: str, version: int) -> dict[str, Any] | None:
         row = self._session.execute(
             select(credential_versions).where(
@@ -492,6 +508,81 @@ class RegistryReadRepository:
             .order_by(credential_versions.c.binding_version)
         ).mappings().all()
         return tuple(dict(row) for row in rows)
+
+    def read_capture_version(
+        self,
+        binding_id: str,
+        version: int,
+    ) -> BindingCaptureVersion | None:
+        row = self._session.execute(
+            select(*self._binding_capture_version_columns())
+            .where(
+                credential_versions.c.binding_id == binding_id,
+                credential_versions.c.binding_version == version,
+            )
+        ).mappings().first()
+        return cast(BindingCaptureVersion, dict(row)) if row is not None else None
+
+    def read_capture_versions(
+        self,
+        binding_id: str,
+    ) -> tuple[BindingCaptureVersion, ...]:
+        rows = self._session.execute(
+            select(*self._binding_capture_version_columns())
+            .where(credential_versions.c.binding_id == binding_id)
+            .order_by(credential_versions.c.binding_version)
+        ).mappings().all()
+        return tuple(cast(BindingCaptureVersion, dict(row)) for row in rows)
+
+    @staticmethod
+    def _binding_capture_version_columns() -> tuple[Column[Any], ...]:
+        return (
+            credential_versions.c.binding_id,
+            credential_versions.c.binding_version,
+            credential_versions.c.source,
+            credential_versions.c.row_id,
+            credential_versions.c.owner_or_system,
+            credential_versions.c.provider,
+            credential_versions.c.principal_id,
+            credential_versions.c.issuer_namespace,
+            credential_versions.c.stable_account_subject,
+            credential_versions.c.key_generation,
+            credential_versions.c.attempt_key_generation,
+            credential_versions.c.record_id,
+            credential_versions.c.protected_record_id,
+            credential_versions.c.evidence_ref,
+            credential_versions.c.evidence_version,
+            credential_versions.c.endpoint_origin,
+            credential_versions.c.api_base_path,
+            credential_versions.c.allowed_content_paths,
+            credential_versions.c.endpoint_policy_version,
+            credential_versions.c.version_kind,
+            credential_versions.c.predecessor_version,
+            credential_versions.c.expected_revision,
+            credential_versions.c.rotation_proof_ref,
+            credential_versions.c.guard_key_id,
+            credential_versions.c.secret_consistency_guard,
+            credential_versions.c.server_attempt_id,
+            credential_versions.c.actor_id,
+            credential_versions.c.operation,
+            credential_versions.c.proof_key_id,
+            credential_versions.c.command_proof,
+        )
+
+    def find_capture_principal(
+        self,
+        principal_id: str,
+    ) -> BindingCapturePrincipal | None:
+        row = self._session.execute(
+            select(
+                credential_principals.c.source_state,
+                credential_principals.c.provider,
+                credential_principals.c.owner_scope,
+                credential_principals.c.issuer_namespace,
+                credential_principals.c.stable_account_subject,
+            ).where(credential_principals.c.principal_id == principal_id)
+        ).mappings().first()
+        return cast(BindingCapturePrincipal, dict(row)) if row is not None else None
 
     def find_payload(self, actor_id: str, operation: str, attempt_id: str) -> dict[str, Any] | None:
         row = self._session.execute(
@@ -676,3 +767,46 @@ class _CallerSessionPreparedPayloadStore:
             )
         except SQLAlchemyError:
             raise PreparedPayloadStoreError from None
+
+
+class CallerSessionBindingCaptureStore:
+    """Adapt narrow capture reads to the original caller-owned Session."""
+
+    def __init__(self, session: Session) -> None:
+        self._session = session
+        self._repository = RegistryReadRepository(session)
+
+    def without_autoflush(self, operation: Callable[[], _Result]) -> _Result:
+        with self._session.no_autoflush:
+            return operation()
+
+    def lock_config_identity(
+        self,
+        scope: CredentialScope,
+    ) -> LegacyConfigIdentityFacts | None:
+        return self._repository.lock_config_identity(scope)
+
+    def lock_binding_for_capture(
+        self,
+        scope: CredentialScope,
+    ) -> BindingCaptureBinding | None:
+        return self._repository.lock_binding_for_capture(scope)
+
+    def read_capture_version(
+        self,
+        binding_id: str,
+        version: int,
+    ) -> BindingCaptureVersion | None:
+        return self._repository.read_capture_version(binding_id, version)
+
+    def read_capture_versions(
+        self,
+        binding_id: str,
+    ) -> tuple[BindingCaptureVersion, ...]:
+        return self._repository.read_capture_versions(binding_id)
+
+    def find_capture_principal(
+        self,
+        principal_id: str,
+    ) -> BindingCapturePrincipal | None:
+        return self._repository.find_capture_principal(principal_id)
