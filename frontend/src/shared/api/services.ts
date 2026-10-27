@@ -21,6 +21,8 @@ import { createMediaGenerationHttpPort } from "./mediaGenerationHttp";
 import type { MediaGenerationPort } from "./mediaGeneration";
 import { createMediaReferenceUploadHttpPort } from "./mediaReferenceUploadHttp";
 import type { MediaReferenceUploadPort } from "./mediaReferenceUpload";
+import { createFusedGenerationHttp } from "./fusedGenerationHttp";
+import type { FusedGenerationPort } from "./fusedGeneration";
 import { createAssetGenerationHistoryHttpPort } from "./assetGenerationHistoryHttp";
 import type { AssetGenerationHistoryPort } from "./assetGenerationHistory";
 import { createChatAssistantHttpPort } from "./chatAssistantHttp";
@@ -253,6 +255,7 @@ export interface WorkspaceServices {
   readonly canvasGenerationApplications?: CanvasGenerationApplicationsPort;
   readonly canvasImageGeneration?: CanvasImageGenerationPort;
   readonly mediaGeneration?: MediaGenerationPort;
+  readonly fusedGeneration?: FusedGenerationPort;
   readonly mediaReferenceUpload?: MediaReferenceUploadPort;
   readonly chatAssistant?: ChatAssistantPort;
   readonly canvasOwnedImage?: CanvasOwnedImagePort;
@@ -2135,6 +2138,7 @@ type ApiEndpoint =
   | "scenes"
   | "props"
   | "fusedAssets"
+  | "fusedGenerate"
   | "updateFusedAsset"
   | "deleteFusedAsset"
   | "createCharacter"
@@ -2492,6 +2496,9 @@ function apiRequestDefinition(
       method: endpoint === "updateFusedAsset" ? "PUT" : "DELETE",
       expectedStatus: endpoint === "updateFusedAsset" ? 200 : 204,
     };
+  }
+  if (endpoint === "fusedGenerate") {
+    return { path: "/fused-assets/generate", method: "POST", expectedStatus: 200 };
   }
 
   const seriesId = encodeApiPathId(identifiers?.seriesId, "剧集");
@@ -3142,6 +3149,10 @@ export function createApiServices(
       fetcher,
       timeoutMs,
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    fusedGeneration: createFusedGenerationHttp(async (input, signal) => {
+      const token = requireApiToken(storage);
+      return requestForCurrentApiSession("fusedGenerate", token, signal, input);
     }),
     mediaReferenceUpload: createMediaReferenceUploadHttpPort(apiBaseUrl, {
       storage,
