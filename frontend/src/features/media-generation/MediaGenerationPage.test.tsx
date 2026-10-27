@@ -7,6 +7,7 @@ import { MediaGenerationError, type MediaGenerationPort, type MediaGenerationRun
 import type { MediaReferenceUploadPort, MediaReferenceUploadRun } from "../../shared/api/mediaReferenceUpload";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
 import type { UserPreferences, UserPreferencesPort } from "../../shared/api/userPreferences";
+import { unsupportedTaskHistoryTruth } from "../../shared/api/taskDetails";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { MediaGenerationPage } from "./MediaGenerationPage";
 import type { WorkbenchSourceIntent } from "../series-workbench/sourceIntent";
@@ -1083,6 +1084,7 @@ describe("MediaGenerationPage", () => {
       externalProvider: null,
       createdAt: null,
       updatedAt: null,
+      historyTruth: unsupportedTaskHistoryTruth(),
     }));
     const services: WorkspaceServices = {
       ...createDemoServices(window.localStorage),

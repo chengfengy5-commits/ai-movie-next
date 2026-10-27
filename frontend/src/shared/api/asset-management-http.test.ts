@@ -203,6 +203,99 @@ describe("asset management API services", () => {
     await expect(services.getTaskReceipt?.("task-demo-01", aborted.signal)).rejects.toMatchObject({ kind: "aborted" });
   });
 
+  it("parses history truth from the existing owner task receipt HTTP service", async () => {
+    const wireReceipt = {
+      id: "task-17",
+      type: "image.single",
+      message_id: "message-17",
+      status: "failed",
+      result: "result snapshot",
+      billing_status: "unbilled",
+      quoted_amount: 0,
+      progress: 100,
+      progress_message: null,
+      external_task_id: null,
+      external_provider: null,
+      created_at: "2026-10-15T08:00:00Z",
+      updated_at: "2026-10-15T08:01:00Z",
+      history_truth: {
+        version: 1,
+        source: {
+          status: "registered",
+          source: "billing_units.operation_and_step_graph_version",
+          unit_count: 1,
+          registered_unit_count: 1,
+          operations: ["image.single"],
+          conflicts: [],
+        },
+        worker: {
+          status: "expired_lease",
+          source: "ai_tasks.worker_lease_and_recovery_status",
+          recovery_status: "reconciling",
+          freshness: "lease_expired",
+          lease_until: "2026-10-15T07:00:00Z",
+          task_updated_at: "2026-10-15T07:01:00Z",
+          evaluated_at: "2026-10-15T08:00:00Z",
+        },
+        provider: {
+          status: "unknown",
+          source: "external_submissions_and_linked_result_evidence",
+          unit_count: 1,
+          verified_unit_count: 0,
+          known_failure_unit_count: 0,
+          unknown_unit_count: 1,
+          unsupported_unit_count: 0,
+          units: [{
+            operation: "image.single",
+            graph_version: "image-single-v1",
+            status: "unknown",
+            unit_result_status: "failed",
+            step_statuses: ["failed"],
+            submission_statuses: ["failed"],
+            providers: ["openai"],
+            provider_evidence_count: 0,
+            timing: "unknown",
+            timely_evidence_count: 0,
+            late_evidence_count: 0,
+            unknown_timing_count: 0,
+            observed_at: null,
+            has_unverified_failed_submission: true,
+          }],
+        },
+        local_disposition: {
+          status: "unknown",
+          source_coverage: ["ai_tasks", "billing_units"],
+          unit_count: 1,
+          observations: [],
+        },
+        billing_scope: {
+          unit_count: 1,
+          legacy_quote_scope: "single_unit",
+          aggregated: false,
+        },
+      },
+    };
+    const { requests, services } = servicesWithResponses([jsonResponse(wireReceipt)]);
+
+    const receipt = await services.getTaskReceipt?.("task-17", signal());
+
+    expect(receipt).toMatchObject({
+      id: "task-17",
+      quotedAmount: 0,
+      historyTruth: {
+        source: { status: "registered", operations: ["image.single"] },
+        worker: { status: "expired_lease", recoveryStatus: "reconciling" },
+        provider: {
+          status: "unknown",
+          units: [{ status: "unknown", hasUnverifiedFailedSubmission: true }],
+        },
+      },
+    });
+    expect(requests.map(({ method, pathname, body }) => [method, pathname, body])).toEqual([
+      ["GET", "/api/chat/tasks?task_id=task-17", undefined],
+    ]);
+  });
+
   it("keeps malformed demo task request data visible as raw text", async () => {
     const storage = new MemoryStorage();
     const services = createDemoServices(storage);

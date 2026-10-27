@@ -5,7 +5,13 @@ import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, User } f
 import { ApiError } from "../../shared/api/errors";
 import type { WorkspaceServices } from "../../shared/api/services";
 import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../../shared/api/myTasks";
-import type { TaskReceipt, TaskRequestRecord } from "../../shared/api/taskDetails";
+import {
+  parseTaskReceipt,
+  unsupportedTaskHistoryTruth,
+  type TaskHistoryTruth,
+  type TaskReceipt,
+  type TaskRequestRecord,
+} from "../../shared/api/taskDetails";
 import { MyTasksPage } from "./MyTasksPage";
 
 const user: User = {
@@ -260,7 +266,11 @@ describe("read-only task page", () => {
   });
 });
 
-function detailReceipt(id: string, result: unknown = "完整结果全文"): TaskReceipt {
+function detailReceipt(
+  id: string,
+  result: unknown = "完整结果全文",
+  historyTruth: TaskHistoryTruth = unsupportedTaskHistoryTruth(),
+): TaskReceipt {
   return {
     id,
     type: "storyboard",
@@ -275,6 +285,7 @@ function detailReceipt(id: string, result: unknown = "完整结果全文"): Task
     externalProvider: null,
     createdAt: "2026-10-15T08:00:00Z",
     updatedAt: "2026-10-15T08:01:00Z",
+    historyTruth,
   };
 }
 
@@ -357,6 +368,100 @@ describe("my task details", () => {
 
     await userEvents.keyboard("{Escape}");
     await waitFor(() => expect(document.activeElement).toBe(opener));
+  });
+
+  it("renders parsed history evidence in the mounted task detail without inferring provider failure", async () => {
+    const userEvents = userEvent.setup();
+    const wireReceipt = {
+      id: "task-one",
+      type: "image.single",
+      message_id: "message-task-one",
+      status: "failed",
+      result: "legacy result",
+      billing_status: "unbilled",
+      quoted_amount: 0,
+      progress: 100,
+      progress_message: null,
+      external_task_id: null,
+      external_provider: null,
+      created_at: "2026-10-15T08:00:00Z",
+      updated_at: "2026-10-15T08:01:00Z",
+      history_truth: {
+        version: 1,
+        source: {
+          status: "unknown",
+          source: "billing_units.operation_and_step_graph_version",
+          unit_count: 1,
+          registered_unit_count: 1,
+          operations: ["image.single"],
+          conflicts: ["intent_graph_mismatch"],
+        },
+        worker: {
+          status: "expired_lease",
+          source: "ai_tasks.worker_lease_and_recovery_status",
+          recovery_status: "reconciling",
+          freshness: "lease_expired",
+          lease_until: "2026-10-15T07:00:00Z",
+          task_updated_at: "2026-10-15T07:01:00Z",
+          evaluated_at: "2026-10-15T08:00:00Z",
+        },
+        provider: {
+          status: "unknown",
+          source: "external_submissions_and_linked_result_evidence",
+          unit_count: 1,
+          verified_unit_count: 0,
+          known_failure_unit_count: 0,
+          unknown_unit_count: 1,
+          unsupported_unit_count: 0,
+          units: [{
+            operation: "image.single",
+            graph_version: "image-single-v1",
+            status: "unknown",
+            unit_result_status: "failed",
+            step_statuses: ["failed"],
+            submission_statuses: ["failed"],
+            providers: ["openai"],
+            provider_evidence_count: 0,
+            timing: "unknown",
+            timely_evidence_count: 0,
+            late_evidence_count: 0,
+            unknown_timing_count: 0,
+            observed_at: null,
+            has_unverified_failed_submission: true,
+          }],
+        },
+        local_disposition: {
+          status: "observed",
+          source_coverage: ["ai_tasks", "billing_units"],
+          unit_count: 1,
+          observations: [{
+            status: "deadline_elapsed_unsettled",
+            source: "billing_units.deadline_at_and_result_status",
+            recorded_at: "2026-10-15T07:00:00Z",
+            reason: null,
+            phase: null,
+          }],
+        },
+        billing_scope: {
+          unit_count: 1,
+          legacy_quote_scope: "single_unit",
+          aggregated: false,
+        },
+      },
+    };
+    const listMyTasks = vi.fn(async () => page(1, [task("task-one")]));
+    const getTaskReceipt = vi.fn(async (taskId: string) => parseTaskReceipt(wireReceipt, taskId));
+    renderPage(servicesWithDetails(listMyTasks, { getTaskReceipt }));
+
+    await userEvents.click(await screen.findByRole("button", { name: "查看详情：图片" }));
+
+    expect(await screen.findByText("任务来源未知 · 1 个计费单元")).toBeInTheDocument();
+    expect(screen.getByText("已接受提交意图与计费单元任务图不一致")).toBeInTheDocument();
+    expect(screen.getByText("Worker 租约已过期")).toBeInTheDocument();
+    expect(screen.getByText("Provider 结果未知 · 覆盖 0/1 个单元")).toBeInTheDocument();
+    expect(screen.getByText(/提交记录为失败，但缺少独立有效的 Provider 失败证据/)).toBeInTheDocument();
+    expect(screen.getByText(/执行期限已过，单元仍记录为待处理或未知/)).toBeInTheDocument();
+    expect(within(screen.getByRole("region", { name: "结果与费用记录" })).getByText("0 积分")).toBeInTheDocument();
   });
 
   it("keeps the receipt visible when membership blocks only the request record", async () => {

@@ -17,6 +17,7 @@ from .errors import (
     TaskObservationNotFound,
     TaskObservationUnavailable,
 )
+from .history_truth import build_task_history_truth
 from .ports import TaskObservationReader, TaskReceiptReader, TaskRow
 
 _BATCH_WIRE_TYPE_BY_ASSET_TYPE = {
@@ -44,6 +45,12 @@ def build_task_receipt(
     """Project the task and its chronologically first billing unit."""
     task_id = _value(task, "id")
     unit = reader.first_billing_unit(task_id)
+    history_loader = getattr(reader, "load_task_history_facts", None)
+    history_facts = (
+        history_loader(_value(task, "user_id"), task_id)
+        if callable(history_loader)
+        else None
+    )
     if unit is None:
         billing_status = _value(task, "billing_status")
         quoted_amount = _value(task, "credit_cost")
@@ -65,6 +72,7 @@ def build_task_receipt(
         "external_provider": _value(task, "external_provider"),
         "created_at": _isoformat(_value(task, "created_at")),
         "updated_at": _isoformat(_value(task, "updated_at")),
+        "history_truth": build_task_history_truth(task, history_facts),
     }
 
 

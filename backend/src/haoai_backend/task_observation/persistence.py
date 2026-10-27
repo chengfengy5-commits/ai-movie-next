@@ -18,6 +18,7 @@ from haoai_backend.generation_core.base_schema import TaskSubmissionRow
 
 from .domain import TeamMembershipRecord
 from .errors import TaskObservationIntegrityError
+from .history_truth_persistence import load_task_history_facts
 from .payload import has_frame_optimize_registration_hint
 from .ports import TaskObservationUnitOfWork, UnitOfWorkFactory
 from .tables import (
@@ -230,6 +231,13 @@ class SqlAlchemyTaskObservationUnitOfWork(TaskObservationUnitOfWork):
             select(billing_units).where(billing_units.c.task_id == task_id)
         )
         return _row_mapping(result.mappings().one_or_none())
+
+    def load_task_history_facts(self, actor_id: str, task_id: str) -> dict[str, Any]:
+        return load_task_history_facts(
+            self._session,
+            owner_id=actor_id,
+            task_id=task_id,
+        )
 
     def load_original_batch_receipt(
         self, actor_id: str, raw_key: str
