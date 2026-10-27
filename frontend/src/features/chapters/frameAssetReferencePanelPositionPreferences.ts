@@ -1,11 +1,19 @@
-export interface FrameAssetReferencePanelPosition {
+export interface FramePanelPosition {
   readonly left: number;
   readonly top: number;
 }
 
-export interface FrameAssetReferencePanelPositionScope {
+export type FramePanelKind = "frame-assets" | "frame-original";
+
+export interface FramePanelPositionScope {
   readonly userId: string;
   readonly apiBaseUrl: string;
+  readonly panelKind: FramePanelKind;
+}
+
+export type FrameAssetReferencePanelPosition = FramePanelPosition;
+
+export interface FrameAssetReferencePanelPositionScope extends FramePanelPositionScope {
   readonly panelKind: "frame-assets";
 }
 
@@ -19,49 +27,65 @@ export interface FrameAssetReferenceViewportSize {
   readonly height: number;
 }
 
-export type FrameAssetReferencePanelPositionReadResult =
-  | { readonly kind: "stored"; readonly position: FrameAssetReferencePanelPosition }
+export type FramePanelPositionReadResult =
+  | { readonly kind: "stored"; readonly position: FramePanelPosition }
   | { readonly kind: "missing" | "unavailable" | "invalid-scope" };
 
-export type FrameAssetReferencePanelPositionWriteResult =
+export type FramePanelPositionWriteResult =
   | "saved"
   | "unavailable"
   | "invalid-scope"
   | "invalid-position";
 
-export type FrameAssetReferencePanelPositionStorage = Pick<Storage, "getItem" | "setItem">;
+export type FramePanelPositionStorage = Pick<Storage, "getItem" | "setItem">;
+
+export type FrameAssetReferencePanelPositionReadResult = FramePanelPositionReadResult;
+export type FrameAssetReferencePanelPositionWriteResult = FramePanelPositionWriteResult;
+export type FrameAssetReferencePanelPositionStorage = FramePanelPositionStorage;
 
 const STORAGE_KEY_PREFIX = "haoai.frame-asset-reference-panel-position.v1";
-const PANEL_KIND = "frame-assets" as const;
-const DEFAULT_RIGHT_OFFSET = 400;
-const DEFAULT_TOP_OFFSET = 60;
+const ORIGINAL_TEXT_STORAGE_KEY_PREFIX = "haoai.frame-original-reference-panel-position.v1";
 const VIEWPORT_GUTTER = 20;
+
+export function createFramePanelPositionScope(
+  userId: string | null | undefined,
+  apiBaseUrl: string | null | undefined,
+  panelKind: FramePanelKind,
+): FramePanelPositionScope | null {
+  if (typeof userId !== "string" || userId.trim() === ""
+    || typeof apiBaseUrl !== "string" || apiBaseUrl.trim() === "") {
+    return null;
+  }
+  return { userId, apiBaseUrl, panelKind };
+}
 
 export function createFrameAssetReferencePanelPositionScope(
   userId: string | null | undefined,
   apiBaseUrl: string | null | undefined,
 ): FrameAssetReferencePanelPositionScope | null {
-  if (typeof userId !== "string" || userId.trim() === ""
-    || typeof apiBaseUrl !== "string" || apiBaseUrl.trim() === "") {
-    return null;
-  }
-  return { userId, apiBaseUrl, panelKind: PANEL_KIND };
+  const scope = createFramePanelPositionScope(userId, apiBaseUrl, "frame-assets");
+  return scope === null ? null : { ...scope, panelKind: "frame-assets" };
 }
 
-function storageKey(scope: FrameAssetReferencePanelPositionScope): string | null {
-  if (scope.panelKind !== PANEL_KIND
+function storageKey(scope: FramePanelPositionScope): string | null {
+  const prefix = scope.panelKind === "frame-assets"
+    ? STORAGE_KEY_PREFIX
+    : scope.panelKind === "frame-original"
+      ? ORIGINAL_TEXT_STORAGE_KEY_PREFIX
+      : null;
+  if (prefix === null
     || typeof scope.userId !== "string" || scope.userId.trim() === ""
     || typeof scope.apiBaseUrl !== "string" || scope.apiBaseUrl.trim() === "") {
     return null;
   }
-  return `${STORAGE_KEY_PREFIX}:${encodeURIComponent(JSON.stringify([
+  return `${prefix}:${encodeURIComponent(JSON.stringify([
     scope.userId,
     scope.apiBaseUrl,
     scope.panelKind,
   ]))}`;
 }
 
-function browserStorage(): FrameAssetReferencePanelPositionStorage | null {
+function browserStorage(): FramePanelPositionStorage | null {
   try {
     return typeof window === "undefined" ? null : window.localStorage;
   } catch {
@@ -70,12 +94,12 @@ function browserStorage(): FrameAssetReferencePanelPositionStorage | null {
 }
 
 function resolveStorage(
-  storage: FrameAssetReferencePanelPositionStorage | null | undefined,
-): FrameAssetReferencePanelPositionStorage | null {
+  storage: FramePanelPositionStorage | null | undefined,
+): FramePanelPositionStorage | null {
   return storage === undefined ? browserStorage() : storage;
 }
 
-function isPosition(value: unknown): value is FrameAssetReferencePanelPosition {
+function isPosition(value: unknown): value is FramePanelPosition {
   if (value === null || typeof value !== "object") return false;
   const position = value as Record<string, unknown>;
   return typeof position.left === "number"
@@ -86,10 +110,10 @@ function isPosition(value: unknown): value is FrameAssetReferencePanelPosition {
     && position.top >= 0;
 }
 
-export function readFrameAssetReferencePanelPosition(
-  scope: FrameAssetReferencePanelPositionScope,
-  storage?: FrameAssetReferencePanelPositionStorage | null,
-): FrameAssetReferencePanelPositionReadResult {
+export function readFramePanelPosition(
+  scope: FramePanelPositionScope,
+  storage?: FramePanelPositionStorage | null,
+): FramePanelPositionReadResult {
   const key = storageKey(scope);
   if (key === null) return { kind: "invalid-scope" };
   const source = resolveStorage(storage);
@@ -113,11 +137,11 @@ export function readFrameAssetReferencePanelPosition(
   }
 }
 
-export function writeFrameAssetReferencePanelPosition(
-  scope: FrameAssetReferencePanelPositionScope,
-  position: FrameAssetReferencePanelPosition,
-  storage?: FrameAssetReferencePanelPositionStorage | null,
-): FrameAssetReferencePanelPositionWriteResult {
+export function writeFramePanelPosition(
+  scope: FramePanelPositionScope,
+  position: FramePanelPosition,
+  storage?: FramePanelPositionStorage | null,
+): FramePanelPositionWriteResult {
   const key = storageKey(scope);
   if (key === null) return "invalid-scope";
   if (!isPosition(position)) return "invalid-position";
@@ -132,11 +156,11 @@ export function writeFrameAssetReferencePanelPosition(
   }
 }
 
-export function clampFrameAssetReferencePanelPosition(
-  position: FrameAssetReferencePanelPosition,
+export function clampFramePanelPosition(
+  position: FramePanelPosition,
   panel: FrameAssetReferencePanelSize,
   viewport: FrameAssetReferenceViewportSize,
-): FrameAssetReferencePanelPosition {
+): FramePanelPosition {
   const maximumLeft = Math.max(VIEWPORT_GUTTER, viewport.width - panel.width - VIEWPORT_GUTTER);
   const maximumTop = Math.max(VIEWPORT_GUTTER, viewport.height - panel.height - VIEWPORT_GUTTER);
   return {
@@ -145,16 +169,48 @@ export function clampFrameAssetReferencePanelPosition(
   };
 }
 
-export function defaultFrameAssetReferencePanelPosition(
+export function defaultFramePanelPosition(
   panel: FrameAssetReferencePanelSize,
   viewport: FrameAssetReferenceViewportSize,
-): FrameAssetReferencePanelPosition {
-  return clampFrameAssetReferencePanelPosition(
+  rightOffset: number,
+  top: number,
+): FramePanelPosition {
+  return clampFramePanelPosition(
     {
-      left: viewport.width - DEFAULT_RIGHT_OFFSET - panel.width,
-      top: DEFAULT_TOP_OFFSET,
+      left: viewport.width - rightOffset - panel.width,
+      top,
     },
     panel,
     viewport,
   );
+}
+
+export function readFrameAssetReferencePanelPosition(
+  scope: FrameAssetReferencePanelPositionScope,
+  storage?: FrameAssetReferencePanelPositionStorage | null,
+): FrameAssetReferencePanelPositionReadResult {
+  return readFramePanelPosition(scope, storage);
+}
+
+export function writeFrameAssetReferencePanelPosition(
+  scope: FrameAssetReferencePanelPositionScope,
+  position: FrameAssetReferencePanelPosition,
+  storage?: FrameAssetReferencePanelPositionStorage | null,
+): FrameAssetReferencePanelPositionWriteResult {
+  return writeFramePanelPosition(scope, position, storage);
+}
+
+export function clampFrameAssetReferencePanelPosition(
+  position: FrameAssetReferencePanelPosition,
+  panel: FrameAssetReferencePanelSize,
+  viewport: FrameAssetReferenceViewportSize,
+): FrameAssetReferencePanelPosition {
+  return clampFramePanelPosition(position, panel, viewport);
+}
+
+export function defaultFrameAssetReferencePanelPosition(
+  panel: FrameAssetReferencePanelSize,
+  viewport: FrameAssetReferenceViewportSize,
+): FrameAssetReferencePanelPosition {
+  return defaultFramePanelPosition(panel, viewport, 400, 60);
 }

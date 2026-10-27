@@ -82,6 +82,7 @@ import { ChapterManagementDialog, type ChapterManagementAction } from "./Chapter
 import { CanvasWorkspace } from "../canvas/CanvasWorkspace";
 import { ChapterOrderDialog } from "./ChapterOrderDialog";
 import { FrameTextEditor, type FrameTextSaveResult } from "./FrameTextEditor";
+import { captureFrameOriginalTextSnapshot, type FrameOriginalTextSnapshot } from "./frameOriginalTextSnapshot";
 import { FrameReviewDialog, type FrameReviewSourceCheck } from "./FrameReviewDialog";
 import type { FrameReviewResult } from "../../shared/api/frameReview";
 import { FrameOptimizeDialog, type FrameOptimizeAssetNames, type FrameOptimizeSourceCheck, type FrameOptimizeSourceSnapshot } from "./FrameOptimizeDialog";
@@ -206,6 +207,7 @@ interface ChapterEditLockOwner {
 interface FrameTextEditorContext extends ChapterEditLockOwner {
   position: number;
   initialText: string;
+  originalTextSnapshot: FrameOriginalTextSnapshot;
 }
 
 interface FrameReviewDialogOwner {
@@ -2975,6 +2977,16 @@ export function ChapterBrowser({
       && matches[0]?.series_id === owner.scope.seriesId;
   }
 
+  function isFrameEditorSessionCurrent(owner: FrameTextEditorContext): boolean {
+    const current = frameTextEditorRef.current;
+    return current !== null
+      && current.lifecycleController === owner.lifecycleController
+      && !owner.lifecycleController.signal.aborted
+      && sameChapterBrowserScope(current.scope, activeScopeRef.current)
+      && current.requestGeneration === chapterRequestGeneration.current
+      && selectedChapterIdRef.current === current.chapter.id;
+  }
+
   function refreshFrameEditorBase(
     owner: FrameTextEditorContext,
     directory: Chapter[],
@@ -3085,6 +3097,7 @@ export function ChapterBrowser({
       chapter: selectedChapter,
       position,
       initialText,
+      originalTextSnapshot: captureFrameOriginalTextSnapshot(selectedChapter, position),
       requestGeneration: directory.requestGeneration,
       lifecycleController: controller,
       newlyAcquiredLock: false,
@@ -5830,7 +5843,11 @@ export function ChapterBrowser({
           key={`${frameTextEditor.scope.userId}:${frameTextEditor.scope.seriesId}:${frameTextEditor.chapter.id}:${frameTextEditor.position}:${frameTextEditor.requestGeneration}`}
           chapter={frameTextEditor.chapter}
           initialText={frameTextEditor.initialText}
+          originalTextSnapshot={frameTextEditor.originalTextSnapshot}
           lifecycleSignal={frameTextEditor.lifecycleController.signal}
+          userId={frameTextEditor.scope.userId}
+          apiBaseUrl={frameTextEditor.scope.services.apiBaseUrl}
+          isSessionCurrent={() => isFrameEditorSessionCurrent(frameTextEditor)}
           lockNotice={frameTextEditor.lockNotice}
           onClose={() => closeFrameTextEditor(frameTextEditor)}
           onSave={saveFrameText}

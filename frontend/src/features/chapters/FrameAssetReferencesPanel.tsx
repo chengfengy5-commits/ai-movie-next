@@ -1,10 +1,9 @@
 import {
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type PointerEvent as ReactPointerEvent,
 } from "react";
 import type {
   Chapter,
@@ -27,17 +26,7 @@ import {
   writeFrameAssetReferenceScrollTop,
   type FrameAssetReferenceScrollScope,
 } from "./frameAssetReferenceScrollPreferences";
-import {
-  clampFrameAssetReferencePanelPosition,
-  createFrameAssetReferencePanelPositionScope,
-  defaultFrameAssetReferencePanelPosition,
-  readFrameAssetReferencePanelPosition,
-  writeFrameAssetReferencePanelPosition,
-  type FrameAssetReferencePanelPosition,
-  type FrameAssetReferencePanelPositionScope,
-  type FrameAssetReferencePanelSize,
-  type FrameAssetReferenceViewportSize,
-} from "./frameAssetReferencePanelPositionPreferences";
+import { useFloatingPanelPosition } from "./useFloatingPanelPosition";
 
 export interface FrameAssetReferenceOwner {
   userId: string;
@@ -80,22 +69,6 @@ interface ScheduledScrollRestore {
   scrollTop: number;
   frameId: number;
 }
-
-interface ActivePanelDrag {
-  owner: FrameAssetReferenceOwner;
-  openEpoch: number;
-  pointerId: number;
-  startX: number;
-  startY: number;
-  originPosition: FrameAssetReferencePanelPosition;
-  captureTarget: HTMLButtonElement;
-}
-
-type PanelPresentation = "inline" | "floating";
-
-const FLOATING_PANEL_BREAKPOINT = 768;
-const FLOATING_PANEL_WIDTH = 360;
-const FLOATING_PANEL_HEIGHT_FALLBACK = 320;
 
 const assetCategories: Array<{ id: FrameAssetReferenceCategory; label: string }> = [
   { id: "characters", label: "角色" },
@@ -273,22 +246,29 @@ export function FrameAssetReferencesPanel({
   const scrollRestoreRef = useRef<ScheduledScrollRestore | null>(null);
   const manualScrollGenerationRef = useRef(0);
   const [scrollPreferenceFeedback, setScrollPreferenceFeedback] = useState<string | null>(null);
-  const panelElementRef = useRef<HTMLElement | null>(null);
-  const dragHandleRef = useRef<HTMLButtonElement | null>(null);
-  const panelDragRef = useRef<ActivePanelDrag | null>(null);
-  const [panelPresentation, setPanelPresentation] = useState<PanelPresentation>("inline");
-  const [desiredFloatingPosition, setDesiredFloatingPosition] = useState<FrameAssetReferencePanelPosition | null>(null);
-  const [visibleFloatingPosition, setVisibleFloatingPosition] = useState<FrameAssetReferencePanelPosition | null>(null);
-  const [positionFeedback, setPositionFeedback] = useState<string | null>(null);
-  const [viewportSize, setViewportSize] = useState<FrameAssetReferenceViewportSize>(() => ({
-    width: typeof window === "undefined" ? 1024 : window.innerWidth,
-    height: typeof window === "undefined" ? 768 : window.innerHeight,
-  }));
-  const positionRestoredForFloatRef = useRef(false);
-  const panelPresentationRef = useRef(panelPresentation);
-  panelPresentationRef.current = panelPresentation;
-  const isSmallViewport = viewportSize.width <= FLOATING_PANEL_BREAKPOINT;
-  const floatingModeActive = panelPresentation === "floating" && !isSmallViewport;
+  const floatingRemeasureKey = useMemo(
+    () => ({ readState, selectedCategory, scrollPreferenceFeedback, scopeInvalidated }),
+    [readState, selectedCategory, scrollPreferenceFeedback, scopeInvalidated],
+  );
+  const floatingPosition = useFloatingPanelPosition({
+    panelKind: "frame-assets",
+    userId: boundOwner.userId,
+    apiBaseUrl: boundOwner.services.apiBaseUrl,
+    ownerToken: boundOwner,
+    isOwnerCurrent: () => isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch),
+    initialPresentation: "inline",
+    defaultRightOffset: 400,
+    defaultTop: 60,
+    remeasureKey: floatingRemeasureKey,
+  });
+  const { isSmallViewport, presentation: panelPresentation, floatingActive: floatingModeActive } = floatingPosition;
+  const positionFeedback = floatingPosition.positionNotice === "read-unavailable"
+    ? "浏览器未能读取已保存位置；已使用默认位置，可继续移动。"
+    : floatingPosition.positionNotice === "write-unavailable"
+      ? "浏览器未能记住浮窗位置；仍可继续使用和移动。"
+      : floatingPosition.positionNotice === "invalid-scope"
+        ? "当前账号或接口身份不完整，浮窗仍可使用，但位置不会记住。"
+        : null;
   const unauthorizedCallback = useRef(onUnauthorized);
   unauthorizedCallback.current = onUnauthorized;
 
@@ -305,231 +285,6 @@ export function FrameAssetReferencesPanel({
       && !scopeInvalidatedRef.current
       && sameScope(boundOwner, currentScopeRef.current);
   }
-
-  function panelPositionScope(): FrameAssetReferencePanelPositionScope | null {
-    if (!isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) return null;
-    return createFrameAssetReferencePanelPositionScope(boundOwner.userId, boundOwner.services.apiBaseUrl);
-  }
-
-  function measuredPanelSize(): FrameAssetReferencePanelSize {
-    const rect = panelElementRef.current?.getBoundingClientRect();
-    return {
-      width: rect !== undefined && rect.width > 0 ? rect.width : FLOATING_PANEL_WIDTH,
-      height: rect !== undefined && rect.height > 0 ? rect.height : FLOATING_PANEL_HEIGHT_FALLBACK,
-    };
-  }
-
-  function clampPanelPosition(position: FrameAssetReferencePanelPosition): FrameAssetReferencePanelPosition {
-    return clampFrameAssetReferencePanelPosition(position, measuredPanelSize(), viewportSize);
-  }
-
-  function cancelPanelDrag(restorePreview = true): void {
-    const active = panelDragRef.current;
-    if (active === null) return;
-    panelDragRef.current = null;
-    if (restorePreview && isCurrentPanelPositionOwner(active.owner, active.openEpoch)) {
-      setVisibleFloatingPosition(clampPanelPosition(active.originPosition));
-    }
-    try {
-      if (active.captureTarget.hasPointerCapture(active.pointerId)) {
-        active.captureTarget.releasePointerCapture(active.pointerId);
-      }
-    } catch {
-      // Pointer capture can already be lost when the owner or viewport changes.
-    }
-  }
-
-  function saveExplicitPanelPosition(position: FrameAssetReferencePanelPosition): void {
-    if (!isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) return;
-    const scope = panelPositionScope();
-    if (scope === null) {
-      setPositionFeedback("当前账号或接口身份不完整，浮窗仍可使用，但位置不会记住。");
-      return;
-    }
-    const result = writeFrameAssetReferencePanelPosition(scope, position);
-    setPositionFeedback(result === "saved"
-      ? null
-      : result === "unavailable"
-        ? "浏览器未能记住浮窗位置；仍可继续使用和移动。"
-        : "当前账号或接口身份不完整，浮窗仍可使用，但位置不会记住。");
-  }
-
-  function requestFloatingPresentation(): void {
-    if (isSmallViewport || !isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) return;
-    cancelPanelDrag();
-    positionRestoredForFloatRef.current = false;
-    setPositionFeedback(null);
-    setPanelPresentation("floating");
-  }
-
-  function returnToInlinePresentation(): void {
-    cancelPanelDrag();
-    setPanelPresentation("inline");
-    setPositionFeedback(null);
-  }
-
-  function resetFloatingPosition(): void {
-    cancelPanelDrag(false);
-    if (!floatingModeActive || !isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) return;
-    const reset = defaultFrameAssetReferencePanelPosition(measuredPanelSize(), viewportSize);
-    setDesiredFloatingPosition(reset);
-    setVisibleFloatingPosition(reset);
-    saveExplicitPanelPosition(reset);
-  }
-
-  function beginPanelDrag(event: ReactPointerEvent<HTMLButtonElement>): void {
-    if (!floatingModeActive || event.button !== 0
-      || !isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) return;
-    event.preventDefault();
-    cancelPanelDrag(false);
-    const rect = panelElementRef.current?.getBoundingClientRect();
-    const originPosition = visibleFloatingPosition ?? {
-      left: Math.max(20, rect?.left ?? 20),
-      top: Math.max(20, rect?.top ?? 60),
-    };
-    const active: ActivePanelDrag = {
-      owner: boundOwner,
-      openEpoch: boundOwner.openEpoch,
-      pointerId: event.pointerId,
-      startX: event.clientX,
-      startY: event.clientY,
-      originPosition,
-      captureTarget: event.currentTarget,
-    };
-    panelDragRef.current = active;
-    try {
-      event.currentTarget.setPointerCapture(event.pointerId);
-    } catch {
-      // The drag still follows pointer events when capture is unavailable.
-    }
-  }
-
-  function movePanelDrag(event: ReactPointerEvent<HTMLButtonElement>): void {
-    const active = panelDragRef.current;
-    if (active === null || active.pointerId !== event.pointerId) return;
-    if (!floatingModeActive || !isCurrentPanelPositionOwner(active.owner, active.openEpoch)) {
-      cancelPanelDrag();
-      return;
-    }
-    event.preventDefault();
-    setVisibleFloatingPosition(clampPanelPosition({
-      left: active.originPosition.left + event.clientX - active.startX,
-      top: active.originPosition.top + event.clientY - active.startY,
-    }));
-  }
-
-  function finishPanelDrag(event: ReactPointerEvent<HTMLButtonElement>): void {
-    const active = panelDragRef.current;
-    if (active === null || active.pointerId !== event.pointerId) return;
-    if (!floatingModeActive || !isCurrentPanelPositionOwner(active.owner, active.openEpoch)) {
-      cancelPanelDrag();
-      return;
-    }
-    const next = clampPanelPosition({
-      left: active.originPosition.left + event.clientX - active.startX,
-      top: active.originPosition.top + event.clientY - active.startY,
-    });
-    panelDragRef.current = null;
-    try {
-      if (active.captureTarget.hasPointerCapture(active.pointerId)) {
-        active.captureTarget.releasePointerCapture(active.pointerId);
-      }
-    } catch {
-      // The browser may release capture before delivering pointerup.
-    }
-    setDesiredFloatingPosition(next);
-    setVisibleFloatingPosition(next);
-    saveExplicitPanelPosition(next);
-  }
-
-  function cancelPanelDragEvent(event: ReactPointerEvent<HTMLButtonElement>): void {
-    if (panelDragRef.current?.pointerId === event.pointerId) cancelPanelDrag();
-  }
-
-  function movePanelWithKeyboard(event: ReactKeyboardEvent<HTMLButtonElement>): void {
-    if (!floatingModeActive || !isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) return;
-    const step = event.shiftKey ? 1 : 16;
-    const offsets: Record<string, { left: number; top: number }> = {
-      ArrowLeft: { left: -step, top: 0 },
-      ArrowRight: { left: step, top: 0 },
-      ArrowUp: { left: 0, top: -step },
-      ArrowDown: { left: 0, top: step },
-    };
-    const offset = offsets[event.key];
-    if (offset === undefined) return;
-    event.preventDefault();
-    cancelPanelDrag(false);
-    const current = visibleFloatingPosition
-      ?? defaultFrameAssetReferencePanelPosition(measuredPanelSize(), viewportSize);
-    const next = clampPanelPosition({ left: current.left + offset.left, top: current.top + offset.top });
-    setDesiredFloatingPosition(next);
-    setVisibleFloatingPosition(next);
-    saveExplicitPanelPosition(next);
-  }
-
-  useEffect(() => {
-    function handleViewportResize(): void {
-      const next = { width: window.innerWidth, height: window.innerHeight };
-      if (next.width <= FLOATING_PANEL_BREAKPOINT) {
-        cancelPanelDrag();
-        if (panelPresentationRef.current === "floating") {
-          setPositionFeedback("小屏幕下浮窗暂时显示在镜头内，桌面位置已保留。");
-        }
-      } else {
-        setPositionFeedback((current) => (
-          current === "小屏幕下浮窗暂时显示在镜头内，桌面位置已保留。" ? null : current
-        ));
-      }
-      setViewportSize(next);
-    }
-
-    window.addEventListener("resize", handleViewportResize);
-    return () => window.removeEventListener("resize", handleViewportResize);
-  }, []);
-
-  useLayoutEffect(() => {
-    if (!floatingModeActive || scopeInvalidated || !isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) {
-      if (scopeInvalidated || !isCurrentPanelPositionOwner(boundOwner, boundOwner.openEpoch)) cancelPanelDrag();
-      return;
-    }
-    const panel = panelElementRef.current;
-    if (panel === null) return;
-    const size = measuredPanelSize();
-    let desired: FrameAssetReferencePanelPosition | null = null;
-    if (!positionRestoredForFloatRef.current) {
-      positionRestoredForFloatRef.current = true;
-      const scope = panelPositionScope();
-      if (scope === null) {
-        setPositionFeedback("当前账号或接口身份不完整，浮窗仍可使用，但位置不会记住。");
-      } else {
-        const stored = readFrameAssetReferencePanelPosition(scope);
-        if (stored.kind === "stored") {
-          desired = stored.position;
-        } else if (stored.kind === "unavailable") {
-          setPositionFeedback("浏览器未能读取已保存位置；已使用默认位置，可继续移动。");
-        }
-      }
-      desired ??= desiredFloatingPosition ?? defaultFrameAssetReferencePanelPosition(size, viewportSize);
-      setDesiredFloatingPosition(desired);
-    } else if (desiredFloatingPosition !== null) {
-      desired = desiredFloatingPosition;
-    }
-    if (desired !== null) {
-      const clamped = clampFrameAssetReferencePanelPosition(desired, size, viewportSize);
-      if (clamped.left !== visibleFloatingPosition?.left || clamped.top !== visibleFloatingPosition?.top) {
-        setVisibleFloatingPosition(clamped);
-      }
-    }
-  }, [
-    floatingModeActive,
-    desiredFloatingPosition,
-    positionFeedback,
-    readState,
-    scopeInvalidated,
-    scrollPreferenceFeedback,
-    selectedCategory,
-    viewportSize,
-  ]);
 
   function scrollPreferenceScope(category: FrameAssetReferenceCategory): FrameAssetReferenceScrollScope | null {
     const storyboardId = uniqueStoryboardFrameId(boundOwner.chapter, boundOwner.frame);
@@ -607,7 +362,7 @@ export function FrameAssetReferencesPanel({
   useEffect(() => () => {
     saveCurrentScrollPosition();
     cancelScrollRestore();
-    cancelPanelDrag();
+    floatingPosition.cancelDrag();
     invalidateRead();
   }, []);
 
@@ -757,7 +512,7 @@ export function FrameAssetReferencesPanel({
     }
     saveCurrentScrollPosition();
     cancelScrollRestore();
-    cancelPanelDrag();
+    floatingPosition.cancelDrag();
     scopeInvalidatedRef.current = true;
     invalidateRead();
     setScopeInvalidated(true);
@@ -851,9 +606,9 @@ export function FrameAssetReferencesPanel({
       className={floatingModeActive
         ? "frame-asset-references-panel is-floating"
         : "frame-asset-references-panel"}
-      ref={panelElementRef}
-      style={floatingModeActive && visibleFloatingPosition !== null
-        ? { left: visibleFloatingPosition.left, top: visibleFloatingPosition.top, right: "auto" }
+      ref={floatingPosition.panelRef}
+      style={floatingModeActive && floatingPosition.visiblePosition !== null
+        ? { left: floatingPosition.visiblePosition.left, top: floatingPosition.visiblePosition.top, right: "auto" }
         : undefined}
     >
       <header className="frame-asset-references-heading">
@@ -869,7 +624,7 @@ export function FrameAssetReferencesPanel({
             </span>
           )}
           {!isSmallViewport && panelPresentation === "inline" && (
-            <button className="secondary-button" onClick={requestFloatingPresentation} type="button">
+            <button className="secondary-button" onClick={floatingPosition.requestFloating} type="button">
               浮动查看
             </button>
           )}
@@ -878,21 +633,21 @@ export function FrameAssetReferencesPanel({
               <button
                 aria-label="拖动关联素材浮窗；也可按方向键移动"
                 className="secondary-button frame-asset-reference-drag-handle"
-                onKeyDown={movePanelWithKeyboard}
-                onLostPointerCapture={cancelPanelDragEvent}
-                onPointerCancel={cancelPanelDragEvent}
-                onPointerDown={beginPanelDrag}
-                onPointerMove={movePanelDrag}
-                onPointerUp={finishPanelDrag}
-                ref={dragHandleRef}
+                onKeyDown={floatingPosition.moveWithKeyboard}
+                onLostPointerCapture={floatingPosition.cancelDragEvent}
+                onPointerCancel={floatingPosition.cancelDragEvent}
+                onPointerDown={floatingPosition.beginDrag}
+                onPointerMove={floatingPosition.moveDrag}
+                onPointerUp={floatingPosition.finishDrag}
+                ref={floatingPosition.dragHandleRef}
                 type="button"
               >
                 <span aria-hidden="true">⠿</span> 拖动窗口
               </button>
-              <button className="text-button" onClick={resetFloatingPosition} type="button">
+              <button className="text-button" onClick={floatingPosition.resetPosition} type="button">
                 恢复默认位置
               </button>
-              <button className="secondary-button" onClick={returnToInlinePresentation} type="button">
+              <button className="secondary-button" onClick={floatingPosition.returnInline} type="button">
                 回到镜头内
               </button>
             </>

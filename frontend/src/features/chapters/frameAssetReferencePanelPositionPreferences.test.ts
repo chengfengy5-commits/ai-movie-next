@@ -2,8 +2,12 @@ import { describe, expect, it, vi } from "vitest";
 import {
   clampFrameAssetReferencePanelPosition,
   createFrameAssetReferencePanelPositionScope,
+  createFramePanelPositionScope,
   defaultFrameAssetReferencePanelPosition,
+  defaultFramePanelPosition,
+  readFramePanelPosition,
   readFrameAssetReferencePanelPosition,
+  writeFramePanelPosition,
   writeFrameAssetReferencePanelPosition,
   type FrameAssetReferencePanelPositionScope,
   type FrameAssetReferencePanelPositionStorage,
@@ -45,6 +49,46 @@ describe("frame asset reference panel position preferences", () => {
       kind: "stored",
       position: { left: 240, top: 60 },
     });
+  });
+
+  it("keeps the original-text panel namespace separate from the existing asset panel key", () => {
+    const storage = memoryStorage();
+    const assets = createFrameAssetReferencePanelPositionScope("position-user", "http://127.0.0.1:4175/api");
+    const original = createFramePanelPositionScope("position-user", "http://127.0.0.1:4175/api", "frame-original");
+    expect(assets).not.toBeNull();
+    expect(original).not.toBeNull();
+    if (assets === null || original === null) throw new Error("Both current scopes should be valid.");
+
+    expect(writeFrameAssetReferencePanelPosition(assets, { left: 700, top: 80 }, storage)).toBe("saved");
+    expect(readFramePanelPosition(original, storage)).toEqual({ kind: "missing" });
+    expect(writeFramePanelPosition(original, { left: 1020, top: 60 }, storage)).toBe("saved");
+    expect(storage.records.size).toBe(2);
+    const expectedAssetKey = `haoai.frame-asset-reference-panel-position.v1:${encodeURIComponent(JSON.stringify([
+      "position-user",
+      "http://127.0.0.1:4175/api",
+      "frame-assets",
+    ]))}`;
+    expect(storage.records.has(expectedAssetKey)).toBe(true);
+    expect(Array.from(storage.records.keys())).toEqual(expect.arrayContaining([
+      expect.stringMatching(/^haoai\.frame-asset-reference-panel-position\.v1:/),
+      expect.stringMatching(/^haoai\.frame-original-reference-panel-position\.v1:/),
+    ]));
+    expect(readFrameAssetReferencePanelPosition(assets, storage)).toEqual({
+      kind: "stored",
+      position: { left: 700, top: 80 },
+    });
+    expect(readFramePanelPosition(original, storage)).toEqual({
+      kind: "stored",
+      position: { left: 1020, top: 60 },
+    });
+    expect(readFramePanelPosition(createFramePanelPositionScope(
+      "another-user", original.apiBaseUrl, "frame-original",
+    )!, storage)).toEqual({ kind: "missing" });
+    expect(readFramePanelPosition(createFramePanelPositionScope(
+      original.userId, "http://127.0.0.1:4176/api", "frame-original",
+    )!, storage)).toEqual({ kind: "missing" });
+    expect(defaultFramePanelPosition({ width: 360, height: 300 }, { width: 1400, height: 900 }, 20, 60))
+      .toEqual({ left: 1020, top: 60 });
   });
 
   it("rejects missing scopes and malformed, negative, or non-finite coordinates", () => {

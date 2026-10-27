@@ -132,6 +132,12 @@
   flex-wrap: wrap;
 }
 
+.frame-text-editor-heading-controls {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
 @media (max-width: 600px) {
   .chapter-order-item {
     grid-template-columns: 28px minmax(0, 1fr);

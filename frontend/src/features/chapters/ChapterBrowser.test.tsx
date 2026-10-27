@@ -326,6 +326,26 @@ function renderBrowser(
   return { ...view, onBack, onUnauthorized };
 }
 
+function clearOriginalTextPanelPositions(): void {
+  const prefix = "haoai.frame-original-reference-panel-position.v1:";
+  for (const key of Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))) {
+    if (key?.startsWith(prefix)) localStorage.removeItem(key);
+  }
+}
+
+function stubPointerCapture(element: HTMLElement) {
+  const captured = new Set<number>();
+  const setPointerCapture = vi.fn((pointerId: number) => { captured.add(pointerId); });
+  const hasPointerCapture = vi.fn((pointerId: number) => captured.has(pointerId));
+  const releasePointerCapture = vi.fn((pointerId: number) => { captured.delete(pointerId); });
+  Object.defineProperties(element, {
+    setPointerCapture: { configurable: true, value: setPointerCapture },
+    hasPointerCapture: { configurable: true, value: hasPointerCapture },
+    releasePointerCapture: { configurable: true, value: releasePointerCapture },
+  });
+  return { setPointerCapture, hasPointerCapture, releasePointerCapture };
+}
+
 async function prepareSceneAssetDialog(
   selectedSeries: Series = series,
   preparePlan = true,
@@ -625,6 +645,7 @@ function makeFrameStructureServices(initialChapter: Chapter, resumeFrameId: stri
 describe("read-only chapter browser", () => {
   afterEach(() => {
     cleanup();
+    clearOriginalTextPanelPositions();
     personalNotesBridge.onLocateResume = null;
     personalNotesBridge.onResumeInvalidated = null;
     personalNotesBridge.lastTarget = null;
@@ -4171,6 +4192,201 @@ describe("read-only chapter browser", () => {
       }],
     }, expect.any(AbortSignal));
     await waitFor(() => expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument());
+  });
+
+  it("keeps the opening original-text snapshot separate from the draft after a conflict read", async () => {
+    clearOriginalTextPanelPositions();
+    const user = userEvent.setup();
+    const current = chapter("chapter-original-reference-conflict", "原文快照章节", [{
+      text: "打开前正文",
+      original_text: "<b>打开时原文</b>\n第二行",
+      storyboard: ["original-reference-frame"],
+    }]);
+    const { services, updateChapter, setCurrentChapters } = makeServices(
+      [current], { [current.id]: [asset("original-reference-frame", current.id)] }, false, true,
+    );
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "原文快照章节 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const dialogElement = await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    const dialog = within(dialogElement);
+    const textbox = dialog.getByRole("textbox", { name: "镜头文字" });
+    const originalPanel = await screen.findByRole("region", { name: "打开时原文" });
+    expect(originalPanel.querySelector("pre")?.textContent).toBe("<b>打开时原文</b>\n第二行");
+    expect(originalPanel.querySelector("b")).toBeNull();
+    expect(dialog.getByRole("button", { name: "拖动原文对照浮窗；也可按方向键移动" })).toBeInTheDocument();
+    expect(dialogElement.contains(originalPanel)).toBe(true);
+    await user.clear(textbox);
+    await user.type(textbox, "仍在编辑的草稿");
+
+    setCurrentChapters([chapter("chapter-original-reference-conflict", "原文快照章节", [{
+      text: "服务器当前正文",
+      original_text: "冲突后重新读取的原文",
+      storyboard: ["original-reference-frame"],
+    }])]);
+    await user.click(dialog.getByRole("button", { name: "保存文字" }));
+
+    const serverValue = screen.getByRole("region", { name: "服务器当前镜头文字" });
+    expect(within(serverValue).getByText("服务器当前正文")).toBeInTheDocument();
+    expect(screen.getByRole("region", { name: "打开时原文" })).toBe(originalPanel);
+    expect(originalPanel.querySelector("pre")?.textContent).toBe("<b>打开时原文</b>\n第二行");
+    expect(originalPanel).not.toHaveTextContent("冲突后重新读取的原文");
+    expect(dialog.getByRole("textbox", { name: "镜头文字" })).toBe(textbox);
+    expect(textbox).toHaveValue("仍在编辑的草稿");
+    expect(updateChapter).not.toHaveBeenCalled();
+    const savedOriginalValues = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .filter((key): key is string => key?.startsWith("haoai.frame-original-reference-panel-position.v1:") === true)
+      .map((key) => localStorage.getItem(key) ?? "");
+    expect(savedOriginalValues.join("\n")).not.toContain("打开时原文");
+    expect(savedOriginalValues.join("\n")).not.toContain("仍在编辑的草稿");
+  });
+
+  it("keeps the editor and pending save mounted while hiding, floating, and reopening the original panel", async () => {
+    clearOriginalTextPanelPositions();
+    const user = userEvent.setup();
+    const current = chapter("chapter-original-reference-session", "原文会话章节", [{
+      text: "编辑前正文",
+      original_text: "会话原文",
+      storyboard: ["original-reference-session-frame"],
+    }]);
+    const pendingWrite = deferred<Chapter>();
+    const { services, updateChapter, listChapters, setCurrentChapters } = makeServices(
+      [current], { [current.id]: [asset("original-reference-session-frame", current.id)] }, false, true,
+    );
+    const editorView = renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "原文会话章节 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const dialogElement = await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    const dialog = within(dialogElement);
+    const textbox = dialog.getByRole("textbox", { name: "镜头文字" });
+    await user.clear(textbox);
+    await user.type(textbox, "保留的草稿");
+    const firstPanel = await screen.findByRole("region", { name: "打开时原文" });
+    await user.click(within(firstPanel).getByRole("button", { name: "隐藏对照" }));
+    expect(screen.queryByRole("region", { name: "打开时原文" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "编辑分镜文字" })).toBe(dialogElement);
+    expect(dialog.getByRole("textbox", { name: "镜头文字" })).toBe(textbox);
+    await user.click(dialog.getByRole("button", { name: "显示原文对照" }));
+    const panel = await screen.findByRole("region", { name: "打开时原文" });
+    expect(dialogElement.contains(panel)).toBe(true);
+    expect(dialog.getByRole("textbox", { name: "镜头文字" })).toBe(textbox);
+
+    const dragHandle = within(panel).getByRole("button", { name: "拖动原文对照浮窗；也可按方向键移动" });
+    const capture = stubPointerCapture(dragHandle);
+    fireEvent.pointerDown(dragHandle, { pointerId: 13, button: 0, clientX: 20, clientY: 20 });
+    fireEvent.pointerMove(dragHandle, { pointerId: 13, clientX: 60, clientY: 50 });
+    fireEvent.pointerUp(dragHandle, { pointerId: 13, clientX: 60, clientY: 50 });
+    expect(capture.setPointerCapture).toHaveBeenCalledOnce();
+    expect(capture.releasePointerCapture).toHaveBeenCalledOnce();
+    const savedKeys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .filter((key): key is string => key?.startsWith("haoai.frame-original-reference-panel-position.v1:") === true);
+    expect(savedKeys).toHaveLength(1);
+    const savedPosition = JSON.parse(localStorage.getItem(savedKeys[0]!) ?? "null") as Record<string, unknown>;
+    expect(Object.keys(savedPosition).sort()).toEqual(["left", "top"]);
+    expect(typeof savedPosition.left).toBe("number");
+    expect(typeof savedPosition.top).toBe("number");
+    expect(localStorage.getItem(savedKeys[0]!)).not.toContain("会话原文");
+    expect(localStorage.getItem(savedKeys[0]!)).not.toContain("保留的草稿");
+
+    const savedLeft = panel.style.left;
+    const savedTop = panel.style.top;
+    await user.click(within(panel).getByRole("button", { name: "隐藏对照" }));
+    expect(screen.queryByRole("region", { name: "打开时原文" })).not.toBeInTheDocument();
+    expect(screen.getByRole("dialog", { name: "编辑分镜文字" })).toBe(dialogElement);
+    await user.click(dialog.getByRole("button", { name: "显示原文对照" }));
+    const reopenedPanel = await screen.findByRole("region", { name: "打开时原文" });
+    expect(reopenedPanel.style.left).toBe(savedLeft);
+    expect(reopenedPanel.style.top).toBe(savedTop);
+    expect(dialog.getByRole("textbox", { name: "镜头文字" })).toBe(textbox);
+
+    await user.click(within(reopenedPanel).getByRole("button", { name: "放回编辑器内" }));
+    expect(reopenedPanel).not.toHaveClass("is-floating");
+    await user.click(within(reopenedPanel).getByRole("button", { name: "浮动查看" }));
+    expect(reopenedPanel).toHaveClass("is-floating");
+    expect(dialog.getByRole("textbox", { name: "镜头文字" })).toBe(textbox);
+
+    updateChapter.mockImplementationOnce(async (seriesId, chapterId, update) => {
+      const saved = { ...current, ...(chapterId === current.id && seriesId === series.id ? update : {}) };
+      setCurrentChapters([saved]);
+      return pendingWrite.promise;
+    });
+    await user.click(dialog.getByRole("button", { name: "保存文字" }));
+    await waitFor(() => expect(updateChapter).toHaveBeenCalledTimes(1));
+    const readsWhileSaving = listChapters.mock.calls.length;
+    expect(textbox).toBeDisabled();
+    await user.click(within(reopenedPanel).getByRole("button", { name: "放回编辑器内" }));
+    await user.click(within(reopenedPanel).getByRole("button", { name: "浮动查看" }));
+    expect(dialog.getByRole("textbox", { name: "镜头文字" })).toBe(textbox);
+    expect(textbox).toBeDisabled();
+    expect(textbox).toHaveValue("保留的草稿");
+    expect(listChapters).toHaveBeenCalledTimes(readsWhileSaving);
+
+    await act(async () => {
+      pendingWrite.resolve({ ...current, content: [{ text: "保留的草稿", original_text: "会话原文", storyboard: ["original-reference-session-frame"] }] });
+      await pendingWrite.promise;
+    });
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument());
+    expect(editorView.container.querySelector(".frame-original-text-panel")).toBeNull();
+  });
+
+  it("releases a pending original-panel drag when the editor scope changes", async () => {
+    clearOriginalTextPanelPositions();
+    const user = userEvent.setup();
+    const current = chapter("chapter-original-reference-stale-drag", "原文拖动章节", [{
+      text: "正文",
+      original_text: "只读原文",
+      storyboard: ["original-reference-stale-frame"],
+    }]);
+    const { services, updateChapter } = makeServices(
+      [current], { [current.id]: [asset("original-reference-stale-frame", current.id)] }, false, true,
+    );
+    const view = renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "原文拖动章节 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    const panel = await screen.findByRole("region", { name: "打开时原文" });
+    const handle = within(panel).getByRole("button", { name: "拖动原文对照浮窗；也可按方向键移动" });
+    const capture = stubPointerCapture(handle);
+    fireEvent.pointerDown(handle, { pointerId: 21, button: 0, clientX: 5, clientY: 5 });
+    fireEvent.pointerMove(handle, { pointerId: 21, clientX: 45, clientY: 45 });
+
+    const nextServices = { ...services, apiBaseUrl: "http://127.0.0.1:4176/api" };
+    view.rerender(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        series={series}
+        services={nextServices}
+        userId="demo-user"
+      />,
+    );
+    expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).not.toBeInTheDocument();
+    fireEvent.pointerUp(handle, { pointerId: 21, clientX: 90, clientY: 90 });
+    expect(capture.releasePointerCapture).toHaveBeenCalledOnce();
+    expect(updateChapter).not.toHaveBeenCalled();
+    const savedKeys = Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))
+      .filter((key): key is string => key?.startsWith("haoai.frame-original-reference-panel-position.v1:") === true);
+    expect(savedKeys).toHaveLength(0);
+  });
+
+  it.each([
+    { label: "missing", frame: { text: "不能替代原文" }, message: "打开编辑器时，本镜头没有原文记录。" },
+    { label: "unrecognized", frame: { text: "不能替代原文", original_text: { value: "unknown" } }, message: "打开编辑器时的原文内容无法识别。" },
+  ])("shows $label original text without substituting the editable text", async ({ label, frame: sourceFrame, message }) => {
+    const user = userEvent.setup();
+    const current = chapter(`chapter-original-reference-${label}`, "原文结构章节", [sourceFrame as NonNullable<Chapter["content"]>[number]]);
+    const { services } = makeServices(
+      [current], { [current.id]: [asset("original-reference-frame", current.id)] }, false, true,
+    );
+    renderBrowser(services);
+
+    const article = await screen.findByRole("article", { name: "原文结构章节 · 镜头 1" });
+    await user.click(within(article).getByRole("button", { name: "编辑文字" }));
+    const dialog = within(await screen.findByRole("dialog", { name: "编辑分镜文字" }));
+    expect(await screen.findByText(message)).toBeInTheDocument();
+    expect(dialog.getByRole("textbox", { name: "镜头文字" })).toHaveValue("不能替代原文");
   });
 
   it.each(["missing", "null"] as const)("does not write when an empty editor keeps %s frame text unchanged", async (kind) => {
