@@ -1,6 +1,6 @@
 # HaoAI-next 完整剩余工作清单与排期
 
-更新日期：2026-10-26（北京时间）
+更新日期：2026-10-27（北京时间）
 
 本文依据已确认的 main 基线、历史开发分支和已接受收据校准完整剩余范围。它是唯一的迁移清单，不是新的架构设计，也不代表整站功能已验收。
 
@@ -9,12 +9,12 @@
 本文原始范围基线为 main@9df03f0c083236b9b4bb18b722ad95fd9839a144（110 收据确认当时远端精确一致）；102 源码分析基线仍为 backend 5ca522cdc20ec2843fef48cd0d9a68f8ee128c78。102、104、110、113、116 的历史范围与证据归属保留；会员、系统配置、后台和早期全量检查等历史收据仍按各自源码时点解释。功能整合基线为 `e094224e7751ba92c25d22fe17d51e89bb15a264`；Root收据395确认该批整合后 main 与 AI 分支远端均精确指向该提交。e094整合团队管理13个方法、团队剧集协作7个方法及 frame.review 后端链。Root406确认V02移动topbar CSS与清单回写已推送至 main@`2d3ed579e739a2027db05b7681e3796142a2b0da`。其后 main 已整合 reporting 源码、hidden CSS 与 frame.review AI 分镜复核；Root469 收据所记录的 main@`d11dc51e31df3bc8ab3c5f1f3066c854bb56a6e4`及功能分支 tip `f249fd15fdd64782c1eb17d374abe94bd308c738`仍按各自历史时点解释。Root518 确认素材整理十路径已从功能分支 tip `cea87f69c02005ba806289279cc8882c666e852e` 普通合并并推送至 main@`43b10ec9b8c254bc14bc0a036869a115d5757683`。在该历史记录时点，U05.4 的开发与接线为 C/C，V=P、A=U；受影响前端测试、TSC与生产构建已通过，HTTP、GUI与E2E验收仍待补。下文较早的分支未合入状态均保留为当时记录；最新记录区分新增源码、分层验证与尚未完成范围。102 的完整分析文件为 haoai-next-current-full-remaining-inventory-102.json，116 为 haoai-next-root-development-continuation-116.json。两者及原始验收收据均在任务证据目录，本文不改动它们。
 
 Root849时点记录的已发布功能基线为 main@`69c715105ea0f7e8337b446d3844f53f4a9a041b`；Root849已将feature `89e077c3a0c27f24d2811da5669caa6fed530541` 发布至main并确认fresh remote精确一致。feature工作树干净，main已跟踪文件与暂存区干净，8个受保护未跟踪文件保留。上一发布基线为Root851的canvas legacy revision修复：feature `dea08354eed0cd962da860791d1fbd910af015ef`、main `fd4d72854ba4c10d9b41a7a9ae4d6797c685fcaa`。此前Root839发布的后台worker执行容量消费者feature为`270994d95e7b00fe1b675640407fa53d0464281d`、main为`184376c80086954c82ef5f7b612fc67fadfb4cf5`；更早基线仍按各自收据对应的历史状态解释。该段计数及范围按对应历史时点校准，不改写此前各收据对应的历史状态。
-Root859时点的整合基线为 main@`59ff56eba55e9131f20667a35b44e3c83b84e6e6`，fresh remote 精确一致；其中包含 Root859 发布的 C856 feature `2674441d419a9810e30e2a2423718fe063b75b47`，以及 Root873 发布的 F870 feature `660e173fcb2416560ef8d61cae2e43898805158d`（当时 main@`661ea2ddc1a55e57aef03d5baf1a469a95cdaa7b`）。该段为对应发布时点记录；后续发布和当前进度见文末2026-10-26记录，历史收据仍按各自源码快照解释。
-本次清单最新发布基线为 main@`9521baea0429f5762ae9033fca91c4687cd362c3`（Root991发布）；Root963、965、968、972、974、976六批媒体与聊天入口切片及其对应验证层次见文末历史记录，985、988、991的最新发布记录随后追加。A01–A39原义务清单仍以只读的102分析快照和原规范为准。
+Root859时点的整合基线为 main@`59ff56eba55e9131f20667a35b44e3c83b84e6e6`，fresh remote 精确一致；其中包含 Root859 发布的 C856 feature `2674441d419a9810e30e2a2423718fe063b75b47`，以及 Root873 发布的 F870 feature `660e173fcb2416560ef8d61cae2e43898805158d`（当时 main@`661ea2ddc1a55e57aef03d5baf1a469a95cdaa7b`）。该段为对应发布时点记录；之后各次发布和最新进度见文末按日期追加的记录，历史收据仍按各自源码快照解释。
+Root991时点的发布基线为 main@`9521baea0429f5762ae9033fca91c4687cd362c3`；Root963、965、968、972、974、976六批媒体与聊天入口切片及其对应验证层次见历史记录，985、988、991的发布记录随后追加。截至2026-10-27，当前发布基线为 main@`094ca7cfd8d44265ff433b846351264d5c51b0dd`；H994、F997、H1006、C1003、H1012、F1009 的范围和分层证据见文末最新记录。A01–A39原义务清单仍以只读的102分析快照和原规范为准。
 
 固定旧源共有 248 个显式 method/path 声明；backend385 收据中的 create_app registry 为 250 个方法、36 个参数项，旧声明已登记差集为0。这里证明路由登记，不证明请求行为、完整实现、端到端运行或浏览器接受。固定旧后台有 9 个资源、23 个资源视图；当前 React 侧 23/23 个旧资源视图均已实现并接入源码，浏览器全面验收仍未完成。登录和仪表盘独立于这 23 个资源视图。用户积分、用户积分编辑、积分流水 3 个扩展视图单独计算，不冲抵这 23 个旧资源视图。
 
-清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。U12.5 与 U12.7 又各完成一行开发和接线后为27、24、51。e094将 U03.1、U03.2、U03.3 各一行的开发与接线义务并入主线，计数为24、21、51；U03.4 闭合一行开发和接线后为23、20、51；U05.2闭合一行开发和接线后，计数为22、19、51；随后 U05.4 再闭合一行开发和接线义务，该时点为21、18、51；U01.3 闭合开发后，该时点为20、18、51；U08.3 两个导出入口的开发和接线义务完成后，该历史时点为19、17、51，验证/接受仍为51。Root976 发布后，U06.1完成一行开发和一行接线义务，U09.2完成一行开发义务但不额外扣减接线动作，最新去重计数为17行开发、16行接线、51行验证/接受。U12.6 的worker容量消费者已接入；其它配置消费者仍待逐项落实。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
+清单采用彼此独立且有重叠的计数：12 类工作流、51 个 UI 交付行。102 初始快照统计 33 行有开发动作、28 行有接线动作、51 行有验证或接受动作；116 覆盖 U11.2 后为 32、28、51。U12.8/U12.9 完成两行开发和接线后为 30、26、51；U12.6 再闭合开发动作后为 29、26、51。U12.5 与 U12.7 又各完成一行开发和接线后为27、24、51。e094将 U03.1、U03.2、U03.3 各一行的开发与接线义务并入主线，计数为24、21、51；U03.4 闭合一行开发和接线后为23、20、51；U05.2闭合一行开发和接线后，计数为22、19、51；随后 U05.4 再闭合一行开发和接线义务，该时点为21、18、51；U01.3 闭合开发后，该时点为20、18、51；U08.3 两个导出入口的开发和接线义务完成后，该历史时点为19、17、51，验证/接受仍为51。Root976 发布后，U06.1完成一行开发和一行接线义务，U09.2完成一行开发义务但不额外扣减接线动作，当前去重计数仍为17行开发、16行接线、51行验证/接受。U12.6 的worker容量和CORS消费者已接入；`frontend_url`此前已由应用通过SMTP服务读取，不属于本批新增接线。原 action 统计按 ui_workflows[].deliverables[].remaining_actions.kind 对各交付行逐行去重后计数；非 C 单元格数不是原 action 统计；局部验收不减少 51 行各自的验证/接受义务。生成原始义务 A01–A39 共 39 项、附加规范义务 6 项、原规范修复子例引用 30 项、后台 9 个资源/23 个视图另行计数。这些分母彼此重叠，不相加，也不用于推算完成百分比。特别是 A01–A39 整项完整矩阵接受数为 0；这不表示相关组件为零，已有组件、接线和局部证据仍按下表分别保留。
 
 ## 历史画布来源后端交付（2026-10-24）
 
@@ -28,7 +28,7 @@ Root659在15路径完整复核后发现并修复了宽松旧JSON解析导致假�
 
 存储源码基线为 `d26910f24fffc0d22d8ab32a172a1e0dd9e3b9b4`；Root579 核对时，main、`codex/asset-image-upload-556` 及 `origin/main`、`origin/codex/asset-image-upload-556` 均精确指向该提交。该批将非 core 的 `backend.server` host/CLI 接到显式 R2 配置、原 R2 adapter 与同一 `create_app`；鉴权和业务共用同一 Session factory。原始 `create_app` 的默认 `storage=None` 保持不变，缺少配置时存储能力仍诚实不可用；这不是默认启用全部能力的启动器。
 
-U05.5 当前为 P/P、V=P、A=U：三类素材卡片已提供 image-only 上传入口，按 fresh 目录 GET、一次 multipart 上传、明确确认前再次 GET、一次仅写 `image_url` 的 PUT、独立 GET 回读执行；保留原 run/token 身份与迟到 401 防护、unknown/ACK 区分、关窗历史及旧写资格失效，并提供受保护 proxy/Blob 预览与回收、焦点管理和 StrictMode 重放恢复。存储侧的 host/CLI 显式装配已接入主线，但原始 `create_app` 仍默认 `storage=None`，缺少配置时存储能力不可用。音视频、OSS 重试、生成历史、其他媒体引用链以及真实 R2 行为和浏览器验收仍待，本行整体义务尚未闭合。
+U05.5 当前为 P/P、V=P、A=U：三类素材卡片已提供 image-only 上传入口，按 fresh 目录 GET、一次 multipart 上传、明确确认前再次 GET、一次仅写 `image_url` 的 PUT、独立 GET 回读执行；保留原 run/token 身份与迟到 401 防护、unknown/ACK 区分、关窗历史及旧写资格失效，并提供受保护 proxy/Blob 预览与回收、焦点管理和 StrictMode 重放恢复。素材历史浏览、转存POST、对原消息`content`的PUT与独立GET回读、删除、分页和按需预览已接入；M01非阻断反馈仍待处理，adoption未做。存储侧的host/CLI显式装配及OSS重试已接入，但原始`create_app`仍默认`storage=None`，缺少配置时存储能力不可用。其余音视频与媒体引用链、真实R2行为和浏览器验收仍待，本行整体义务尚未闭合。
 
 U08.2 仍为 P/P、V=P、A=U：canonical 视频队列（含视频自带声音）、连续播放、失败重试、protected 上传的 Bearer→Blob URL 与清理、会话目录隔离已接入 main。RCP539-01～06 已经 539-03 源码复核关闭，但这不代表实际浏览器解码或可听播放验收；独立音轨、E2E 不在本批，导出另属 U08.3。开发/接线/验证动作计数保持 21/18/51。用户当前只暂缓 E2E，其他工作按需要继续开发、单测、类型检查和源码复核。
 
@@ -126,7 +126,7 @@ H846为当前批次中已受理且`image.single`状态为`completed`的任务增
 
 Root847的H846-FEEDBACK-01复核实际发现缺少owned结果服务时，入口错误只显示在底层Canvas、回执仍留在前景；合成RED确认后，局部反馈修复在回执modal内显示安全错误且不发owned结果GET、不放宽原guard。作者130项完整测试早于末尾receipt/form消息清理；随后TSC-05通过。Root848对最终组合冻结14个前端文件442项通过，并通过TypeScript检查与Vite生产构建，作为最新一致快照证据。实现和验证限于源码、受控HTTP与jsdom，不证明真实Provider/Worker/R2/PostgreSQL、真实浏览器/E2E或部署；首个真实生成到owned候选并手动应用的端到端接受仍未完成。
 
-U07.1–U07.3未整行关闭；U07.4仍为P/P、V=P、A=U。当前React生成表单已有模型、prompt、可选提示词模板、按模型配置的尺寸、生成数量、顺序多次`image.single`及参考图选择/本地多图上传；参考候选遵循目标自身和双向相邻图的旧行为，并在准备后随body/key冻结，unknown只按原key显式核对或重试。该接线有受控HTTP/jsdom验证，不等于真实Provider/R2或浏览器端到端接受。H829提供已受理图片任务的只读有界状态观察；H846新增本轮completed任务的显式结果入口，按原`task_id`筛选当前已加载owned候选，用户手动翻页/刷新并手动触发既有P5应用；unknown sibling仍拦截，任务completed不等于owned候选ready/eligible，不匹配时不回退到其它任务结果。真实Provider/Worker/R2生成到owned候选并应用的端到端验收、完整Canvas目标锁/CAS及PG矩阵、生产DB migration/backfill、真实浏览器和用户暂缓的E2E/部署接受仍待。旧Canvas视频节点的UI实际上也是图片生成，不应将U07.4写成必须新增`video.single`；其他原host provider及视频/批量host仍待接入。统一用户任务并发准入已由Root825发布，细节见下节；这只按任务数核算批量准入，不代表批量host已完成，媒体传输2槽也不替代用户上限。Root842已用两个物理连接和事务barrier验证U07.3限定的legacy revision交错；这不覆盖完整Canvas目标锁/CAS矩阵、其他family并发或生产混布。U05.5仍P/P；角色音频维护只是局部交付，视频、OSS重试、生成历史、其他媒体引用及真实存储验证仍待。U06.6为P/P、V=P、A=U，不代表新增TTS/voice库或完整旧音频工作流已迁完。U08.4成片范围待明确；A01–A39完整矩阵接受数仍为0，A39仍为`OFFLINE_PENDING`，51项验证/接受行不变。动作计数保持19/17/51；不据此推算整体完成度或ETA。
+U07.1–U07.3未整行关闭；U07.4仍为P/P、V=P、A=U。当前React生成表单已有模型、prompt、可选提示词模板、按模型配置的尺寸、生成数量、顺序多次`image.single`及参考图选择/本地多图上传；参考候选遵循目标自身和双向相邻图的旧行为，并在准备后随body/key冻结，unknown只按原key显式核对或重试。该接线有受控HTTP/jsdom验证，不等于真实Provider/R2或浏览器端到端接受。H829提供已受理图片任务的只读有界状态观察；H846新增本轮completed任务的显式结果入口，按原`task_id`筛选当前已加载owned候选，用户手动翻页/刷新并手动触发既有P5应用；unknown sibling仍拦截，任务completed不等于owned候选ready/eligible，不匹配时不回退到其它任务结果。真实Provider/Worker/R2生成到owned候选并应用的端到端验收、完整Canvas目标锁/CAS及PG矩阵、生产DB migration/backfill、真实浏览器和用户暂缓的E2E/部署接受仍待。旧Canvas视频节点的UI实际上也是图片生成，不应将U07.4写成必须新增`video.single`；其他原host provider及视频/批量host仍待接入。统一用户任务并发准入已由Root825发布，细节见下节；这只按任务数核算批量准入，不代表批量host已完成，媒体传输2槽也不替代用户上限。Root842已用两个物理连接和事务barrier验证U07.3限定的legacy revision交错；这不覆盖完整Canvas目标锁/CAS矩阵、其他family并发或生产混布。U05.5仍P/P；角色音频维护只是局部交付，C1003历史浏览/转存/原消息更新已接，视频与其他媒体引用、M01反馈/adoption及真实存储验证仍待。U06.6为P/P、V=P、A=U，不代表新增TTS/voice库或完整旧音频工作流已迁完。U08.4成片范围待明确；A01–A39完整矩阵接受数仍为0，A39仍为`OFFLINE_PENDING`，51项验证/接受行不变。去重动作计数保持17/16/51；不据此推算整体完成度或ETA。
 
 ### 统一用户任务并发准入（821，Root825发布）
 
@@ -188,7 +188,7 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 | U05.2 | 孤立项、重复项、忽略/取消忽略和合并 | C | C | V=P / A=U；素材维护 UI/API 已随十路径整合至 main@43b10ec；owned HTTP 五类维护路由×角色/场景/道具三类与 SQLite 检查通过，GUI 为部分通过 | 集中补齐 fault/unknown、独立 merge POST 计数与无自动重试、403/scope 切换、完整焦点路径及权限/媒体/认可保全；用户当前只暂缓 E2E，必要开发与单元/类型/源码检查继续，最终验收待补。 |
 | U05.3 | 融合素材查看/编辑/删除与生成 | P | P | V=P / A=U；Root985发布React融合素材列表、预览、重命名、删除及移动入口；Root983发布删除时同事务清理章节引用。融合生成runtime仍为None，持久执行图、任务回读和生成UI未接入 | 接通独立融合生成runtime、持久执行图与任务/结果回读，再完成生成UI及失败状态；本行保持未闭合，真实provider另行验收。 |
 | U05.4 | 跨章节素材替换 | C | C | V=P / A=U；素材卡片、逐章影响预览与选择、再次读取核对/明确确认、串行单次 POST、独立 GET 核对、逐章 ACK/unknown/未发送状态及显式只读恢复已接入；5 个受影响前端测试文件 134 项、TSC 和生产构建通过 | 补 HTTP、GUI 与 E2E 验收，并继续核对权限、媒体与认可保全；用户当前暂缓 E2E。 |
-| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | P | V=P / A=U；d26910f 存储源码基线已在 main。图片侧已将 image-only 三类素材卡片入口接入 main，完成 fresh 目录 GET→multipart 上传→确认前 GET→仅 image_url PUT→独立 GET；含原 run/token 与迟到 401 防护、unknown/ACK、关窗历史与旧资格失效、受保护 proxy/Blob 预览回收、焦点及 StrictMode 恢复。560-03 复核关闭 AIMG560-01～09；前端四文件 89 项通过、TSC与Root561生产构建通过。后端非 core host/CLI 已接显式 R2 配置→原 adapter→同一 create_app，鉴权/业务共用 Session factory；raw create_app 默认 `storage=None` 不变，缺配置时存储能力不可用。Root577 定向后端 155 项通过，registry 250 方法/36 参数 exact，multipart 0.0.32 隔离 overlay；角色素材卡片音频上传/试听/明确保存音频URL与音色描述、null移除字段已接现有API，Root702复核，Root703-02冻结10个文件219项及TSC/生产构建通过。此音频链不证明浏览器解码、完整音视频流程或真实R2/PG/HTTP验收；视频、生成历史、其他媒体引用链仍待。Root991已将`POST /api/upload/retry-oss`接入完整R2配置host，使用pinned public fetcher与托管origin map；4项作者focused覆盖合成SQLite、fake DNS/HTTP/S3及图片/音频/视频MIME样例，Root复用结果、未重复跑测试。只证明host转存与托管URL短路，真实网络/R2未测。 | 完成音视频、生成历史及其他媒体引用链；接上素材历史旁的转存动作，并在转存成功后对原消息`content`执行PUT及独立GET回读；补真实R2配置和浏览器验收。 |
+| U05.5 | 图片/音频/视频上传、OSS 重试、生成历史和媒体引用 | P | P | V=P / A=U；d26910f 存储源码基线已在 main。图片侧已将 image-only 三类素材卡片入口接入 main，完成 fresh 目录 GET→multipart 上传→确认前 GET→仅 image_url PUT→独立 GET；含原 run/token 与迟到 401 防护、unknown/ACK、关窗历史与旧资格失效、受保护 proxy/Blob 预览回收、焦点及 StrictMode 恢复。560-03 复核关闭 AIMG560-01～09；前端四文件 89 项通过、TSC与Root561生产构建通过。后端非 core host/CLI 已接显式 R2 配置→原 adapter→同一 create_app，鉴权/业务共用 Session factory；raw create_app 默认 `storage=None` 不变，缺配置时存储能力不可用。Root577 定向后端 155 项通过，registry 250 方法/36 参数 exact，multipart 0.0.32 隔离 overlay；角色素材卡片音频上传/试听/明确保存音频URL与音色描述、null移除字段已接现有API，Root702复核，Root703-02冻结10个文件219项及TSC/生产构建通过。此音频链不证明浏览器解码、完整音视频流程或真实R2/PG/HTTP验收；视频和其他媒体引用链仍待。Root991已将`POST /api/upload/retry-oss`接入完整R2配置host，使用pinned public fetcher与托管origin map；4项作者focused覆盖合成SQLite、fake DNS/HTTP/S3及图片/音频/视频MIME样例，Root复用结果、未重复跑测试。C1003已接入历史列表/筛选与按需预览、转存POST、原消息`content` PUT及独立GET回读和删除分页；8项作者focused、TSC与Vite 275模块构建通过。M01反馈仍为非阻断待办，adoption未做。真实网络/R2/浏览器验收仍待。 | 继续完成音视频与其他媒体引用链；处理M01非阻断反馈并完成adoption；补真实R2配置和浏览器验收。 |
 
 ### U06 AI 助手、生成、提取、Worker 与恢复
 
@@ -217,7 +217,7 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 | U08.1 | 粗剪排序、纳入/排除和保存 | C | C | V=P / A=P；Erough 历史 fixture 覆盖 8 类、双用户/409/未知回读 | 补当前真实 Target API/SQL、多用户保存及源修改联动；保留已验编辑器事实。 |
 | U08.2 | 视频/音频预览与连续试看 | P | P | V=P / A=U；canonical视频队列（含视频自带声音）、连续播放、失败重试、protected上传Bearer→Blob URL与清理、会话目录隔离已接入main@`d1b047fbc93da0626401fa0e7ce8535b9b798d1b`；Root552合并后受影响门禁与TSC/生产构建通过，539-03源码复核PASS并关闭RCP539-01～06。实际浏览器解码/可听播放未验证；独立音轨、E2E不在本批，完整导出另属U08.3。本行仅部分完成，未闭合全部义务。 | 补实际浏览器解码/可听播放验收与独立音轨；E2E按用户暂缓安排后补；导出按U08.3单独推进。 |
 | U08.3 | 保存粗剪的素材批量导出与下载 | C | C | V=P / A=U；章节逐镜选择与已保存粗剪两个真实Workspace入口均已接入，共用冻结导出清单、sealed session transport、同源受保护/公开匿名字节读取、逐项状态与目录/浏览器sink；Root678/679冻结12个前端测试文件325项通过，TypeScript检查和Vite生产构建通过，Root680中文提交推送至当时main@`a00c6e07021c17949e938e1d4f367c476b9b231e`。证据限受控fetch/jsdom/fakeFS，不证明真实浏览器、磁盘落地或E2E | 补真实浏览器与文件落地验收；继续明确U08.4单成片目标与范围，素材逐项下载不计作单个成片。 |
-| U08.4 | 成片/实际输出交付 | U | M | V=U / A=U；既有材料仅证明素材导出，没有证明合成为单个成片 | 明确目标产物并核对旧入口；若需成片，补媒体合成/音频/输出和恢复链，不能把素材下载称为成片。 |
+| U08.4 | 成片/实际输出交付 | U | M | V=U / A=U；当前证据是逐项媒体导出，未证明生成单个MP4成片或已确定成片目标 | 明确目标产物并核对旧入口；若需成片，补媒体合成/音频/输出和恢复链，不能把素材下载称为成片。 |
 
 ### U09 制作缺项、便签、镜头认可和续作位置
 
@@ -241,7 +241,7 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 | --- | --- | --- | --- | --- | --- |
 | U11.1 | 个人/系统模型与提示词 CRUD、复制、排序 | C | C | V=P / A=U；CreatorSettingsPage 和独立 port 的读写/排序已接入 | 用当前真实 API 覆盖系统/个人权限、脏稿、未知写入及排序冲突；不把连接测试等后续动作重算成 CRUD 缺失。 |
 | U11.2 | 会员、套餐/联系说明、兑换及父页余额更新 | C | C | V=P / A=P；9df 已提交推送，97-02 finding 闭合；83 文件/1248 tests、TSC/build 全绿；113 两账户真实 SQL/HTTP 浏览器主路径通过 | 保留双账号拒绝重复码、简介保存回读、键盘返回/重开、390px 无横向溢出等证据；脏离开确认已弹出但取消因工具超时未证，密码提交及网络/重启浏览器变体待验，不能记为账户全完成。 |
-| U11.3 | 模型连接测试、系统/个人转换、额度和账户偏好 | P | P | V=P / A=U；Root988发布显式密钥连接测试UI及实际POST接线；连接测试动作不触发模型/密钥保存，响应消息脱敏，既有显式模型保存仍可保存配置密钥。此处不代表外部provider账户验收 | F995模型转换、配额和旧账户偏好消费仍待接线与验证；补权限、旧请求隔离及真实外部余额的独立验收。 |
+| U11.3 | 模型连接测试、系统/个人转换、额度和账户偏好 | P | P | V=P / A=U；Root988显式密钥连接测试UI/POST已接；F997系统/个人模型转换、H994四类型批量偏好、F1009额度监控页已接。当前收据为局部focused/TSC/Vite，连接测试不触发模型/密钥保存，也不证明真实外部额度查询 | 保留系统/个人转换和批量偏好的权限、隔离与完整验收；接额度账户CRUD、probe、PAT及quick_ref等偏好消费者；真实上游未调用，账户/余额验收仍待。 |
 
 ### U12 管理后台资源与运营配置
 
@@ -252,7 +252,7 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 | U12.3 | 系统提示词 list/create/edit/delete | C | C | V=P / A=U；旧 3 个视图及删除均已接入源码 | 验分类、原文保全、系统权限和真实 API 浏览器行为。 |
 | U12.4 | 用户管理、积分/流水及关联记录 | C | C | V=P / A=U；旧用户 3 视图已接入源码；积分/流水/关联记录是额外扩展读取 | 验管理员自删、外键、未知写入与用户隔离；关联记录只读不等于旧全局剧集/任务资源。 |
 | U12.5 | 后台剧集 3 视图和全局任务 1 视图 | C | C | V=P / A=U；剧集功能与只读 TaskList 已接入。232/233 为剧集局部 HTTP/GUI 证据，233 不是全量浏览器验收；移动 CSS 在 c8f 修复后仍待 GUI 复验。全局任务列表真实 HTTP/浏览器验收仍待。 | 补 TaskList 的真实 HTTP/owned SQL 与浏览器验收，覆盖筛选、服务端分页/排序、当前 query 全量 CSV、身份隔离和迟到导出；剧集补移动视觉复验与剩余全流程/权限验收。 |
-| U12.6 | 系统配置 list/edit | C | P | V=P / A=P；32b3 已提交页面、19 字段、真实 API 与 host 接线；194 源码复核、196 前端门禁、201 真实 HTTP/owned SQL 通过，209 局部 GUI 及独立 SQL 已证 | 页面与 API 接线已完成；worker_max_concurrency运行时消费者已接入：启用worker的lifespan中仅读取该字段一次，并在单个app进程内供已启用worker共享；worker关闭时不读，不热更新。其它配置消费者（如CORS/frontend_url）仍待逐项接线，不能由保存metadata推断其已生效。补脏离开取消保稿、in-flight/unknown/cross-session GUI；移动CSS已源码修复但尚待新GUI复验。 |
+| U12.6 | 系统配置 list/edit | C | P | V=P / A=P；32b3 已提交页面、19 字段、真实 API 与 host 接线；194 源码复核、196 前端门禁、201 真实 HTTP/owned SQL 通过，209 局部 GUI 及独立 SQL 已证 | 页面与API接线已完成；`worker_max_concurrency`在启用worker的lifespan中仅读取一次并由单个app进程内已启用worker共享，不热更新；H1006已接入启动时读取的CORS消费者，DB非空有效值优先、非法值关闭CORS。`frontend_url`此前已由`app.py`注入`smtp_delivery.frontend_base_url`并由SMTP application/persistence读取`system_configs`，不是本次新增接线。其余配置字段消费者仍需逐项核对，不能由保存metadata推断生效。补脏离开取消保稿、in-flight/unknown/cross-session GUI；移动CSS已源码修复但尚待新GUI复验。 |
 | U12.7 | SMTP 账户 list/create/edit/delete、启停和计数 | C | C | V=P / A=U；SMTP 账户管理前端与 host 已接入并由 78a4d9f 推送；真实 HTTP/owned SQL、浏览器 CRUD 尚未验收，未证明真实 SMTP 发送 | 补列表和 CRUD 的真实 HTTP/owned SQL 及浏览器验收，覆盖密钥保留/替换与未知退出；发送行为仍归 U01.3，secret 不回显，真实邮件另需适用授权。 |
 | U12.8 | 兑换码列表/筛选/导出/批量创建/删除 | C | C | V=P / A=P；129-02/03 与 148 源码复核完成；137 owned HTTP/SQL 覆盖后台方法、鉴权及 used/expired/unused 删除，144 桌面浏览器已验列表/创建 | 补验筛选、导出和 GUI 删除；CSV 下载工具超时未证，移动端及 unknown/in-flight/cross-session 浏览器负例仍待；137 的 API 删除不等于 GUI 删除，生成至用户兑换/账本闭环另待。 |
 | U12.9 | 套餐 CRUD、启停、分类与排序 | C | C | V=P / A=P；129-02/03 与 148 源码复核完成；137 owned HTTP/SQL 覆盖管理 CRUD/公开读取，144 桌面浏览器已验列表、创建、编辑及 0/null/false 保存回读 | 继续补停用显示/排序及未知、在途、跨会话等浏览器负例；不虚构真实支付。 |
@@ -272,17 +272,17 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 | B-ADMIN | 后台 API 家族已有，React 登录、仪表盘和 23/23 个旧资源视图均已实现并接入源码 | 完成全面浏览器、真实 HTTP/SQL 与跨会话/未知结果验收；剧集已有局部验收，TaskList 与 SMTP 真实 HTTP/浏览器仍待。3 个积分扩展视图独立。 |
 | B-GENERATION | 六入口准入、合同、凭据、图/计费；image.single受限runtime与recovery/due、文本SSE、两步分镜局部浏览器证据，frame.review 后端链/React单镜头入口，以及frame.optimize显式host/React批量入口已接 | 完整Group/event N6、其它family worker、媒体生成与其余AI入口仍待；metadata/准入/claim和局部到期修复不能替代完整producer/consumer或A01–A39接受。 |
 | B-INTEGRATIONS | DB/provider/storage/quota/download/SMTP ports 与部分 adapter 已存在 | 补本地组合根和真实 caller；逐项区分 owned fake/loopback 与外部账号验收。 |
-| B-ARCH | 扫描 106 个 domain/application 文件；多数模块使用 port/UoW 边界 | 收口 aistarslab application 直连 persistence/provider、generation_credentials application 直连 SQLAlchemy/concrete repository 的边界，同时保留现有同事务/主体约束。 |
+| B-ARCH | 扫描 106 个 domain/application 文件；多数模块使用 port/UoW 边界 | H1012已完成aistarslab application直连persistence/provider的ports分层；generation_credentials application直连SQLAlchemy/concrete repository仍待收口，并保留现有同事务/主体约束。 |
 
 | 集成 | 当前证据 | 后续工作/边界 |
 | --- | --- | --- |
 | INT-LOCAL-COMPOSITION | create_app 显式配置，lifespan 可拥有 image-single service；frame.review各边界也采用显式依赖注入；没有全特性 launcher 证据 | 建可复现的全特性本地组合根，明确 DB/auth/providers/media ports、readiness 和 shutdown；不依赖旧 app/env 自动发现或隐式建表。 |
 | INT-DB | SQLAlchemy UoW、generation migration/readiness、credential migration 和 scoped owned PG 收据存在 | image.single 到期 recovery/due 的owned PG范围见E181/E185；frame.review I07的五类owned PG范围由PG392确认通过并清理。两者不覆盖完整服务/PG重启或真实数据库，不连接或写真实数据库。 |
 | INT-PROVIDERS | 部分真实 transport adapter 和显式 ports 已有 | 完成剩余 adapter、loopback/fake 协议、原 credential principal/snapshot 绑定及配置消费者；实际账号/付费调用另授权。 |
-| INT-STORAGE | 非 core 的 `backend.server` host/CLI 已消费显式 R2 配置，装配原 R2 adapter 并交给同一 `create_app`；鉴权与业务共用 Session factory。原始 `create_app` 默认 `storage=None`，缺显式配置时存储能力不可用。Root577 的 155 项定向合成 SQLite/fake SDK/in-process ASGI 检查通过，registry 250 方法/36 参数 exact，使用隔离 multipart 0.0.32；P2-576-01～03 已关闭。Root991另接入完整R2配置下的OSS重试pinned fetcher和managed-origin短路，4个focused结果来自合成SQLite/fake DNS/HTTP/S3。 | 接入融合生成runtime与MediaStore组合；完成素材历史转存后的原message PUT/回读，以及其余音视频和媒体引用消费者；补真实配置下的R2验收。本批host测试不证明真实R2、PG、HTTP listener、部署或浏览器结果。 |
+| INT-STORAGE | 非 core 的 `backend.server` host/CLI 已消费显式 R2 配置，装配原 R2 adapter 并交给同一 `create_app`；鉴权与业务共用 Session factory。原始 `create_app` 默认 `storage=None`，缺显式配置时存储能力不可用。Root577 的 155 项定向合成 SQLite/fake SDK/in-process ASGI 检查通过，registry 250 方法/36 参数 exact，使用隔离 multipart 0.0.32；P2-576-01～03 已关闭。Root991另接入完整R2配置下的OSS重试pinned fetcher和managed-origin短路，4个focused结果来自合成SQLite/fake DNS/HTTP/S3。C1003已接入媒体历史分页、按需预览、转存POST、原message `content` PUT及独立GET回读与删除分页。 | 接入融合生成runtime与MediaStore组合；完成其余音视频和媒体引用消费者、M01反馈及adoption；补真实配置下的R2验收。本批host/前端focused测试不证明真实R2、PG、HTTP listener、部署或浏览器结果。 |
 | INT-SMTP | 651已将SMTP adapter接到同一host、验证码与重置密码；Root650定向288项及owned TLS SMTP sink验证通过。655邮箱回执恢复经Root654前端74项、类型和构建通过 | 补账户管理的当前完整HTTP/owned SQL与浏览器验收；真实邮箱交付需适用授权，owned sink不是外部邮箱接受。旧后台密码返回合同未在本批改为服务端脱敏，前端不回填秘密。 |
-| INT-QUOTA | provider quota/balance transports 与连接测试组件已有；F988已接入显式密钥连接测试UI和POST | 继续接入Creator Settings系统/个人模型转换、配额及旧账户偏好消费；owned transport仅提供本地focused证据，真实余额查询另授权。 |
-| INT-DOWNLOAD | 兼容GET禁用路径和批量URL解析接口已有identity resolver；固定旧R2兼容签名函数也原样返回URL，signed不是权限或下载成功证明 | 接实际字节读取、章内视频选择与保存粗剪导出队列、文件命名/顺序/取消/重试及落地回执；受保护同源与匿名公开媒体分开读取。素材逐文件下载不等于U08.4单个成片。 |
+| INT-QUOTA | provider quota/balance transports 与连接测试组件已有；F988已接入显式密钥连接测试UI和POST；F997系统/个人模型转换、H994批量偏好和F1009额度监控页已接入 | 补额度账户CRUD、probe、PAT及quick_ref等偏好消费者；owned transport和受控页面不代表真实上游余额查询或账户接受。 |
+| INT-DOWNLOAD | U08.3已接入章节逐镜与已保存粗剪两个导出入口、实际字节读取和逐项导出队列；受保护同源与匿名公开媒体分开读取。固定旧R2兼容签名函数仍只返回URL，signed不是权限或下载成功证明。 | 补真实浏览器与文件落地验收，并覆盖尚未验证的异常、取消和重试反馈；素材逐项下载不等于U08.4单个成片。 |
 | INT-ARCHITECTURE | 106 个应用/领域文件已有静态 import 盘点 | 修复上述直接 persistence/provider 边界，并复核现有职责与同事务约束。 |
 
 ## Generation 原义务、附加义务与证据引用
@@ -573,9 +573,9 @@ C947本段记录 `codex/image-batch-host-947` 的实现与作者验证范围：`
 
 上述分支证据限于各自源码快照上的受控/合成用例和源码/构建检查；媒体与聊天 host 显式接线但默认关闭。没有真实Provider、R2、生产数据库、真实浏览器、E2E或部署接受。U06.1 与 U09.2 的实现和接线源动作已闭合；当前动作数为17行开发、16行接线、51行验证/接受。该减量来自U06.1各一项开发/接线与U09.2一项开发动作；虽然U09.2表格为C/C，不再额外扣接线动作。HaoAI三attempt组、异步执行/恢复、其余Provider family、N6及完整AI生成金融矩阵仍待；U06.3、U06.5及其它family不因这些子批整行关闭。A01–A39完整矩阵接受数仍为0，A39仍为`OFFLINE_PENDING`；51个UI交付ID的既有顺序未变。用户要求测试以本次改动及直接影响范围为主，E2E继续暂缓。
 
-## 最近三批融合素材、模型连接与 OSS 重试 host 发布记录（2026-10-26）
+## 历史进展：融合素材、模型连接与 OSS 重试 host 发布（截至2026-10-26）
 
-本节更新至 Root991 发布的 main@`9521baea0429f5762ae9033fca91c4687cd362c3`。每批仅记录对应功能提交、复用的快照证据和未完成边界，不合并测试数量。
+本节记录截至 Root991 发布的 main@`9521baea0429f5762ae9033fca91c4687cd362c3`。每批仅记录对应功能提交、复用的快照证据和未完成边界，不合并测试数量；此处当时状态不覆盖文末2026-10-27校准。
 
 | 批次 | feature → main | 已复核与验证层次 |
 | --- | --- | --- |
@@ -583,4 +583,21 @@ C947本段记录 `codex/image-batch-host-947` 的实现与作者验证范围：`
 | F988 模型连接测试 UI | `c06c3a56cebfa10fb14a47f1cf1b91721ef7b4ee` → `248a43ebf3f4c78df98a7d3366ebcbe178493af8` | 显式输入密钥的连接测试UI及实际POST已接；连接测试动作不触发模型/密钥保存且响应消息脱敏，既有显式模型保存仍可保存配置密钥。2项focused、TSC与Vite 270模块构建通过；不代表外部provider账户验收。 |
 | C991 OSS 重试 host | `38d30b8d9e614211bba5efc6e3dd62d01b8b3aa9` → `9521baea0429f5762ae9033fca91c4687cd362c3` | 完整R2配置下接入pinned public fetcher与managed-origin短路。4项作者focused覆盖合成SQLite、fake DNS/HTTP/S3和图片/音频/视频MIME样例；Root复用结果、没有重复跑测试。真实网络和真实R2未测。 |
 
-本次校订后，U05.3与U11.3均为P/P、V=P/A=U，但两行均未整体关闭；U05.3仍缺融合生成runtime、持久执行图、任务回读和生成UI，U11.3仍缺F995模型转换、配额与旧账户偏好消费。U05.5的OSS重试host已接入，但历史旁的转存动作及对原消息`content` PUT/独立回读尚未接入。当前重叠计数保持17行开发、16行接线、51行验证/接受；51个有序UI ID顺序不变。A01–A39整项接受数仍为0，A39仍为`OFFLINE_PENDING`，E2E继续暂缓；不推算百分比或ETA。
+截至2026-10-26，U05.3与U11.3均为P/P、V=P/A=U但未整行关闭；当时仍缺F995模型转换、配额和偏好消费，以及素材历史旁的转存和原消息`content` PUT/独立回读。当前这些事项按2026-10-27状态校准见下节；17/16/51、A01–A39接受数0、A39 `OFFLINE_PENDING`和E2E暂缓状态保持。不推算百分比或ETA。
+
+## 近期切片与当前状态校准（2026-10-27）
+
+当前发布基线为 main@`094ca7cfd8d44265ff433b846351264d5c51b0dd`。下表逐批保留源码提交与原有验证口径；各项覆盖范围可能重叠，测试数量不相加。受控HTTP、SQLite、fake transport、TSC和Vite证据不表示真实Provider、上游服务、生产数据库、R2、浏览器/E2E或部署验收。
+
+| 批次 | feature → main | 本批交付与证据 |
+| --- | --- | --- |
+| H994 批量生成偏好 | `3f36ce4` → `5a32970` | 四类型分别记住model/prompt/size并用于每项payload；6项focused，TSC与Vite 271模块构建通过。 |
+| F997 系统/个人模型转换 | `d24978d` → `b93071e` | 真实目录转换接线；3项focused，TSC与Vite 271模块构建通过。 |
+| H1006 CORS消费者 | `7182511` → `bee2860` | 配置读取接入CLI实际ASGI入口；7项focused、保留2条warning。未测试真实HTTP部署。 |
+| C1003 素材历史操作 | `ef7cbaf` → `71f1a7b` | 历史浏览/转存POST/原消息content PUT和独立GET、删除、分页与按需预览；8项focused，TSC与Vite 275模块构建通过。M01反馈为非阻断待办，adoption未做。 |
+| H1012 aistarslab ports分层 | `62366e1` → `40892cf` | application改为依赖persistence/provider ports；7项通过，保留73条warning。 |
+| F1009 provider quota monitor | `6a46872` → `094ca7c` | quota监控界面切片；2项focused（每个测试文件1项），另有页面24项未选中；TSC与Vite 278模块构建通过。没有调用真实上游。 |
+
+状态仍按整行和接受义务分层：U11.3保持P/P、V=P/A=U；转换、批量偏好和quota monitor已有局部实现，额度账户CRUD/probe/PAT、quick_ref等偏好消费者与完整账户验收仍待。U05.5保持P/P、V=P/A=U；C1003历史操作已接，M01反馈与adoption、其余音视频/媒体引用链、真实R2和浏览器验收仍待。U12.6的CORS消费者已接入，`frontend_url`此前已由`app.py`向`smtp_delivery.frontend_base_url`注入，SMTP application/persistence读取`system_configs.frontend_url`；这不是H1006新增功能。B-ARCH的aistarslab application persistence/provider ports边界已完成，generation_credentials application的直接SQLAlchemy/concrete repository依赖仍待。U08.4目标尚待明确；目前是逐项媒体导出，没有单个成片MP4产物证据，也不将提问视为产物选择。
+
+总体口径保持不变：当前去重后为17行开发、16行接线、51行验证/接受义务；全部51个有序UI ID保留。A01–A39整项完整接受数仍为0，A39仍为`OFFLINE_PENDING`；端到端用户验收继续暂缓。
