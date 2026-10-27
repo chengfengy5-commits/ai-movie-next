@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FusedAsset, Series } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import { FusedGenerationPanel } from "./FusedGenerationPanel";
 import "./fusedAssets.css";
 
 interface FusedAssetsPageProps {
@@ -154,6 +155,7 @@ export function FusedAssetsPage({
   const [draftName, setDraftName] = useState("");
   const [feedback, setFeedback] = useState<MutationFeedback | null>(null);
   const [failedImages, setFailedImages] = useState<ReadonlySet<string>>(() => new Set());
+  const [generationActive, setGenerationActive] = useState(false);
   const scopeRef = useRef<PageScope>({
     services,
     seriesId: series.id,
@@ -170,7 +172,19 @@ export function FusedAssetsPage({
   const readControllerRef = useRef<AbortController | null>(null);
   const readGenerationRef = useRef(0);
   const activeWriteRef = useRef<ActiveWrite | null>(null);
+  const generationActiveRef = useRef(false);
   const loadErrorScopeRef = useRef<PageScope | null>(null);
+
+  function publishActivity(): void {
+    activityChangeRef.current?.((activeWriteRef.current !== null && !activeWriteRef.current.stopped)
+      || generationActiveRef.current);
+  }
+
+  function handleGenerationActivity(active: boolean): void {
+    generationActiveRef.current = active;
+    setGenerationActive(active);
+    publishActivity();
+  }
 
   const isCurrentScope = useCallback((scope: PageScope, signal?: AbortSignal): boolean => (
     mountedRef.current
@@ -247,8 +261,10 @@ export function FusedAssetsPage({
       mountedRef.current = false;
       if (activeWriteRef.current !== null) {
         activeWriteRef.current.stopped = true;
-        activityChangeRef.current?.(false);
       }
+      activeWriteRef.current = null;
+      generationActiveRef.current = false;
+      activityChangeRef.current?.(false);
       for (const activeController of controllersRef.current) activeController.abort();
       controllersRef.current.clear();
       readControllerRef.current = null;
@@ -283,7 +299,7 @@ export function FusedAssetsPage({
   }
 
   function beginRename(asset: FusedAsset): void {
-    if (activeWriteRef.current !== null || services.updateFusedAsset === undefined) return;
+    if (activeWriteRef.current !== null || generationActiveRef.current || services.updateFusedAsset === undefined) return;
     setEditingAssetId(asset.id);
     setDraftName(asset.name);
     setFeedback(null);
@@ -294,7 +310,7 @@ export function FusedAssetsPage({
     if (activeWrite === null || activeWrite.stopped) return;
     activeWrite.stopped = true;
     activeWrite.controller.abort();
-    activityChangeRef.current?.(false);
+    publishActivity();
     setFeedback({
       scope: activeWrite.scope,
       assetId: activeWrite.assetId,
@@ -306,7 +322,7 @@ export function FusedAssetsPage({
   async function saveRename(asset: FusedAsset): Promise<void> {
     const update = services.updateFusedAsset;
     const name = draftName.trim();
-    if (update === undefined || activeWriteRef.current !== null) return;
+    if (update === undefined || activeWriteRef.current !== null || generationActiveRef.current) return;
     if (name === "") {
       setFeedback({ scope: scopeRef.current, assetId: asset.id, kind: "failure", message: "名称不能为空。" });
       return;
@@ -316,7 +332,7 @@ export function FusedAssetsPage({
     const controller = startController();
     const activeWrite: ActiveWrite = { scope, assetId: asset.id, controller, stopped: false };
     activeWriteRef.current = activeWrite;
-    activityChangeRef.current?.(true);
+    publishActivity();
     setFeedback({ scope, assetId: asset.id, kind: "saving", message: "正在保存名称…" });
 
     try {
@@ -367,14 +383,14 @@ export function FusedAssetsPage({
       finishController(controller);
       if (activeWriteRef.current === activeWrite) {
         activeWriteRef.current = null;
-        if (isCurrentScope(scope)) activityChangeRef.current?.(false);
+        if (isCurrentScope(scope)) publishActivity();
       }
     }
   }
 
   async function deleteAsset(asset: FusedAsset): Promise<void> {
     const remove = services.deleteFusedAsset;
-    if (remove === undefined || activeWriteRef.current !== null) return;
+    if (remove === undefined || activeWriteRef.current !== null || generationActiveRef.current) return;
     if (!window.confirm(
       `删除“${displayName(asset)}”？系统会同时清理本剧集中对此融合素材的引用；如果相关章节无法安全读取或内容已变化，删除会被拒绝。此操作无法撤销。`,
     )) return;
@@ -383,7 +399,7 @@ export function FusedAssetsPage({
     const controller = startController();
     const activeWrite: ActiveWrite = { scope, assetId: asset.id, controller, stopped: false };
     activeWriteRef.current = activeWrite;
-    activityChangeRef.current?.(true);
+    publishActivity();
     setFeedback({ scope, assetId: asset.id, kind: "saving", message: "正在删除，并核对当前剧集目录…" });
 
     try {
@@ -434,12 +450,12 @@ export function FusedAssetsPage({
       finishController(controller);
       if (activeWriteRef.current === activeWrite) {
         activeWriteRef.current = null;
-        if (isCurrentScope(scope)) activityChangeRef.current?.(false);
+        if (isCurrentScope(scope)) publishActivity();
       }
     }
   }
 
-  const isWriting = activeWriteRef.current !== null;
+  const isWriting = activeWriteRef.current !== null || generationActive;
   const visibleAssets = loadedScope !== null && sameScope(loadedScope, scopeRef.current) ? assets : [];
   const visibleLoadError = loadErrorScopeRef.current !== null
     && sameScope(loadErrorScopeRef.current, scopeRef.current)
@@ -460,10 +476,10 @@ export function FusedAssetsPage({
         <div>
           <p className="eyebrow">剧集素材</p>
           <h1>{series.name} · 融合素材</h1>
-          <p>查看本剧集已保存的融合素材与生成状态，并管理素材名称和删除。这里不会发起生成或费用请求。</p>
+          <p>查看本剧集已保存的融合素材与生成状态，并管理素材名称、删除或显式提交新的融合生成任务。</p>
         </div>
         <div className="fused-assets-actions">
-          {isWriting && (
+          {activeWriteRef.current !== null && !activeWriteRef.current.stopped && (
             <button className="text-button" onClick={stopLocalTracking} type="button">
               停止本地跟踪
             </button>
@@ -488,6 +504,16 @@ export function FusedAssetsPage({
           {directoryFeedback.message}
         </p>
       )}
+      <FusedGenerationPanel
+        blocked={activeWriteRef.current !== null}
+        onActivityChange={handleGenerationActivity}
+        onRefreshAssets={refreshDirectory}
+        onUnauthorized={onUnauthorized}
+        seriesId={series.id}
+        services={services}
+        sessionGeneration={sessionGeneration}
+        userId={userId}
+      />
       {visibleLoading && visibleAssets.length === 0 && <p className="fused-assets-state" role="status">正在加载融合素材…</p>}
       {!visibleLoading && visibleLoadError === null && visibleAssets.length === 0 && (
         <p className="fused-assets-state">当前剧集还没有融合素材。</p>
