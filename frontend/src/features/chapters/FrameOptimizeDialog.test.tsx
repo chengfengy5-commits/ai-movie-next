@@ -13,6 +13,11 @@ import type {
 import type { WorkspaceServices } from "../../shared/api/services";
 import type { FrameOptimizeSourceCheck } from "./FrameOptimizeDialog";
 import { FrameOptimizeDialog } from "./FrameOptimizeDialog";
+import {
+  frameOptimizeConcurrencyPreferenceKey,
+  readFrameOptimizeConcurrencyPreference,
+  writeFrameOptimizeConcurrencyPreference,
+} from "./frameOptimizeConcurrencyPreference";
 
 const chapter: Chapter = {
   id: "chapter-dialog-test",
@@ -99,7 +104,7 @@ const partialStatus: FrameOptimizeTaskStatus = {
   result: { partial: [{ index: 0, optimized_text: "优化后的镜头文字" }], error: "one_item_failed" },
 };
 
-function makeServices(overrides: Partial<FrameOptimizeServicePort> = {}) {
+function makeServices(overrides: Partial<FrameOptimizeServicePort> = {}, apiBaseUrl: string | null = null) {
   const creatorSettings: Pick<CreatorSettingsServicePort, "listModels" | "listPrompts"> = {
     listModels: vi.fn(async () => [model]),
     listPrompts: vi.fn(async () => []),
@@ -113,6 +118,7 @@ function makeServices(overrides: Partial<FrameOptimizeServicePort> = {}) {
     ...overrides,
   };
   const services = {
+    apiBaseUrl,
     frameOptimize,
     creatorSettings,
     getTaskRequest: vi.fn(async (taskId: string) => ({
@@ -173,6 +179,103 @@ afterEach(() => {
 });
 
 describe("FrameOptimizeDialog", () => {
+  it("restores concurrency only from the matching account and API scope and keeps it in the submit request", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "https://api.example.test/api";
+    const userId = "user-concurrency-preference";
+    const scope = { apiBaseUrl, userId };
+    const preferenceKey = frameOptimizeConcurrencyPreferenceKey(scope);
+    window.localStorage.clear();
+    window.localStorage.setItem("batch_optimize_concurrency", "9");
+
+    const { frameOptimize, services } = makeServices({}, apiBaseUrl);
+    const firstView = renderDialog(services, {}, userId);
+    let dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    let concurrencyInput = await dialog.findByRole("spinbutton", { name: "并发设置（3–10）" });
+    expect(concurrencyInput).toHaveValue(5);
+    await user.clear(concurrencyInput);
+    await user.type(concurrencyInput, "7");
+    expect(concurrencyInput).toHaveValue(7);
+    expect(window.localStorage.getItem(preferenceKey)).toBe("7");
+    await user.click(dialog.getByRole("button", { name: "关闭" }));
+    expect(firstView.onClose).toHaveBeenCalledOnce();
+    firstView.unmount();
+
+    const otherAccountView = renderDialog(services, {}, "another-user");
+    const otherAccountDialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    expect(await otherAccountDialog.findByRole("spinbutton", { name: "并发设置（3–10）" })).toHaveValue(5);
+    otherAccountView.unmount();
+
+    const otherApi = "https://other.example.test/api";
+    const otherApiServices = makeServices({}, otherApi).services;
+    const otherApiView = renderDialog(otherApiServices, {}, userId);
+    const otherApiDialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    expect(await otherApiDialog.findByRole("spinbutton", { name: "并发设置（3–10）" })).toHaveValue(5);
+    otherApiView.unmount();
+
+    const reopenView = renderDialog(services, {}, userId);
+    dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    expect(await dialog.findByRole("spinbutton", { name: "并发设置（3–10）" })).toHaveValue(7);
+    await user.click(dialog.getByRole("button", { name: "全选可定位分镜" }));
+    await user.click(dialog.getByRole("button", { name: "提交优化" }));
+    await waitFor(() => expect(frameOptimize.submit).toHaveBeenCalledOnce());
+    expect(frameOptimize.submit).toHaveBeenCalledWith(expect.objectContaining({ concurrency: 7 }), expect.any(AbortSignal));
+    reopenView.unmount();
+    window.localStorage.clear();
+  });
+
+  it("keeps the current concurrency usable when browser storage rejects a preference write", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "https://api.example.test/api";
+    const { frameOptimize, services } = makeServices({}, apiBaseUrl);
+    const originalSetItem = window.localStorage.setItem;
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation((key, value) => {
+      if (key.startsWith("haoai:frame-optimize-concurrency:v1:")) throw new Error("storage disabled");
+      originalSetItem.call(window.localStorage, key, value);
+    });
+    const view = renderDialog(services, {}, "user-storage-disabled");
+    const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
+    const concurrencyInput = await dialog.findByRole("spinbutton", { name: "并发设置（3–10）" });
+    await user.clear(concurrencyInput);
+    await user.type(concurrencyInput, "8");
+    expect(concurrencyInput).toHaveValue(8);
+    expect(await dialog.findByText("浏览器未能保存并发偏好；当前值仍可用于本次优化。", { selector: "p" })).toBeInTheDocument();
+    await user.click(dialog.getByRole("button", { name: "全选可定位分镜" }));
+    await user.click(dialog.getByRole("button", { name: "提交优化" }));
+    await waitFor(() => expect(frameOptimize.submit).toHaveBeenCalledOnce());
+    expect(frameOptimize.submit).toHaveBeenCalledWith(expect.objectContaining({ concurrency: 8 }), expect.any(AbortSignal));
+    view.unmount();
+    setItem.mockRestore();
+  });
+
+  it("keeps saved-value recovery bounded and tolerates unavailable or malformed local storage", () => {
+    const scope = { apiBaseUrl: "https://api.example.test/api", userId: "user-pref-helper" };
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+    };
+    const key = frameOptimizeConcurrencyPreferenceKey(scope);
+
+    expect(readFrameOptimizeConcurrencyPreference(scope, storage)).toBe(5);
+    expect(writeFrameOptimizeConcurrencyPreference(scope, 7, storage)).toBe(true);
+    expect(readFrameOptimizeConcurrencyPreference(scope, storage)).toBe(7);
+    values.set(key, "11");
+    expect(readFrameOptimizeConcurrencyPreference(scope, storage)).toBe(10);
+    values.set(key, "2");
+    expect(readFrameOptimizeConcurrencyPreference(scope, storage)).toBe(3);
+    values.set(key, "not-json");
+    expect(readFrameOptimizeConcurrencyPreference(scope, storage)).toBe(5);
+
+    const unavailable = {
+      getItem: () => { throw new Error("storage disabled"); },
+      setItem: () => { throw new Error("storage disabled"); },
+    };
+    expect(readFrameOptimizeConcurrencyPreference(scope, unavailable)).toBe(5);
+    expect(writeFrameOptimizeConcurrencyPreference(scope, 8, unavailable)).toBe(false);
+    expect(writeFrameOptimizeConcurrencyPreference(scope, 2, storage)).toBe(false);
+  });
+
   it("does not offer original restore until the first running-task lookup confirms an empty chapter", async () => {
     const user = userEvent.setup();
     const pendingRunning = deferred<null>();
@@ -330,12 +433,19 @@ describe("FrameOptimizeDialog", () => {
   });
 
   it("reattaches only after checking task type, chapter, request shape, and current stable frame", async () => {
+    const apiBaseUrl = "https://api.example.test/api";
+    const userId = "user-dialog-reattach";
+    window.localStorage.clear();
+    window.localStorage.setItem(
+      frameOptimizeConcurrencyPreferenceKey({ apiBaseUrl, userId }),
+      "7",
+    );
     const { frameOptimize, services } = makeServices({
       getRunning: vi.fn(async () => ({
         task_id: "optimize-task-1", status: "processing", progress: 35, progress_message: "处理中", created_at: null,
       })),
       getTaskStatus: vi.fn(async () => ({ ...partialStatus, status: "completed" })),
-    });
+    }, apiBaseUrl);
     const getTaskRequest = vi.fn(async (taskId: string) => ({
       id: taskId,
       type: "batch-optimize",
@@ -348,11 +458,20 @@ describe("FrameOptimizeDialog", () => {
       request: { ...registeredRequest, prompt_id: null },
     }));
     (services as unknown as { getTaskRequest: typeof getTaskRequest }).getTaskRequest = getTaskRequest;
-    renderDialog(services, {}, "user-dialog-reattach");
+    const verify = vi.fn(async () => ({ status: "verified" as const, message: "任务来源已核对。" }));
+    renderDialog(services, { verify }, userId);
     const dialog = within(await screen.findByRole("dialog", { name: "批量优化分镜" }));
     expect(await dialog.findByText(/已核对章节 chapter-dialog-test 的 frame.optimize 登记请求/)).toBeInTheDocument();
     await waitFor(() => expect(frameOptimize.getTaskStatus).toHaveBeenCalledWith("optimize-task-1", expect.any(AbortSignal)));
+    await waitFor(() => expect(verify).toHaveBeenCalledOnce());
+    expect(verify).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ concurrency: 5 }),
+      expect.any(AbortSignal),
+    );
     expect(frameOptimize.submit).not.toHaveBeenCalled();
+    expect(readFrameOptimizeConcurrencyPreference({ apiBaseUrl, userId })).toBe(7);
+    window.localStorage.clear();
   });
 
   it("keeps reading a verified running task when the current capability is disabled", async () => {
