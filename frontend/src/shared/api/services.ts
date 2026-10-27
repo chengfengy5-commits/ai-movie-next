@@ -21,6 +21,8 @@ import { createMediaGenerationHttpPort } from "./mediaGenerationHttp";
 import type { MediaGenerationPort } from "./mediaGeneration";
 import { createMediaReferenceUploadHttpPort } from "./mediaReferenceUploadHttp";
 import type { MediaReferenceUploadPort } from "./mediaReferenceUpload";
+import { createAssetGenerationHistoryHttpPort } from "./assetGenerationHistoryHttp";
+import type { AssetGenerationHistoryPort } from "./assetGenerationHistory";
 import { createChatAssistantHttpPort } from "./chatAssistantHttp";
 import type { ChatAssistantPort } from "./chatAssistant";
 import { createCanvasOwnedImageHttpPort } from "./canvasOwnedImageHttp";
@@ -237,6 +239,7 @@ export interface WorkspaceServices {
   readonly assetMaintenance?: AssetMaintenanceServicePort;
   readonly assetReplacement?: AssetReplacementPort;
   readonly assetImageUpload?: AssetImageUploadPort;
+  readonly assetGenerationHistory?: AssetGenerationHistoryPort;
   readonly characterAudio?: CharacterAudioPort;
   readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
@@ -3116,6 +3119,12 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     assetImageUpload: createAssetImageUploadHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    assetGenerationHistory: createAssetGenerationHistoryHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,
