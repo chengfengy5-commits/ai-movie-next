@@ -33,6 +33,7 @@ export interface StartMediaExportOptions {
   readonly sink: MediaExportSink;
   readonly signal?: AbortSignal;
   readonly onItem?: (item: MediaExportQueueItem) => void;
+  readonly onSaved?: (item: MediaExportQueueItem) => void;
   readonly onUnauthorized?: (error: MediaExportReaderError) => void;
 }
 
@@ -520,6 +521,13 @@ export function startMediaExport(
             media,
             { signal: controller.signal, isCurrent: options.transport.isCurrent },
           );
+          if (result.kind === "saved") {
+            try {
+              options.onSaved?.(cloneItem(results[index]!, "saved", null, finalFilename));
+            } catch {
+              // A local record failure must not change the sink result or the export run.
+            }
+          }
           emit(index, result.kind === "saved" ? "saved" : "download-started", null, finalFilename);
         } catch (error) {
           const unauthorized = reportCurrentUnauthorized(error);
