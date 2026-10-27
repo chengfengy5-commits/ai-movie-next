@@ -184,6 +184,95 @@
   padding-left: 1.5rem;
 }
 
+.storyboard-script-comparison {
+  min-width: 0;
+  padding: 12px;
+  border: 1px solid var(--line, #d8dee8);
+  border-radius: 0.75rem;
+  background: var(--surface, #fff);
+  color: var(--ink-700, #384250);
+}
+
+.storyboard-script-comparison.is-floating {
+  position: fixed;
+  z-index: 1201;
+  top: 60px;
+  right: 20px;
+  left: auto;
+  width: min(360px, calc(100vw - 40px));
+  max-width: calc(100vw - 40px);
+  max-height: min(70vh, 560px);
+  overflow: auto;
+  overscroll-behavior: contain;
+  box-shadow: 0 12px 36px rgb(26 48 39 / 23%);
+}
+
+.storyboard-script-comparison-heading,
+.storyboard-script-comparison-controls {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 0.4rem;
+}
+
+.storyboard-script-comparison-heading h3,
+.storyboard-script-comparison-heading .eyebrow {
+  margin: 0;
+}
+
+.storyboard-script-comparison-heading h3 {
+  color: var(--ink-900, #202938);
+  font-size: 0.95rem;
+}
+
+.storyboard-script-comparison-controls {
+  justify-content: flex-end;
+}
+
+.storyboard-script-comparison-controls > span,
+.storyboard-script-comparison-notice {
+  color: var(--ink-600, #5b6573);
+  font-size: 0.8rem;
+}
+
+.storyboard-script-comparison-drag-handle {
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+
+.storyboard-script-comparison-drag-handle:active {
+  cursor: grabbing;
+}
+
+.storyboard-script-comparison-content {
+  max-height: min(48vh, 420px);
+  margin-top: 0.65rem;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  line-height: 1.65;
+}
+
+.storyboard-script-comparison-notice {
+  margin: 0.5rem 0 0;
+}
+
+@media (max-width: 768px) {
+  .storyboard-script-comparison.is-floating {
+    position: static;
+    top: auto;
+    right: auto;
+    left: auto;
+    width: auto;
+    max-width: none;
+    max-height: none;
+    overflow: visible;
+    box-shadow: none;
+  }
+}
+
 .storyboard-asset-plan-frames li {
   display: flex;
   gap: 0.75rem;

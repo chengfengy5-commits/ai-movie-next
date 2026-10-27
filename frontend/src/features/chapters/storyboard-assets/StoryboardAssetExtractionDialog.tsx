@@ -27,6 +27,7 @@ import {
 } from "../../../shared/api/storyboardAssetGeneration";
 import { normalizeApiError } from "../../../shared/api/services";
 import { stripFrameOptimizeShotMarkers } from "../frameOptimizeContent";
+import { useFloatingPanelPosition } from "../useFloatingPanelPosition";
 import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
 import "./storyboardAssetExtraction.css";
 
@@ -47,8 +48,15 @@ interface CandidateDraft {
 
 type WorkflowStep = "select" | "edit" | "review" | "unknown";
 
+interface ScriptComparisonSelection {
+  readonly snapshotVersion: number;
+  readonly frameIndex: number;
+  readonly frame: StoryboardFrame;
+}
+
 interface StoryboardAssetExtractionDialogProps {
   services: Pick<WorkspaceServices, "storyboardAssetGeneration">;
+  apiBaseUrl?: string | null;
   snapshot: StoryboardAssetGenerationSnapshot;
   userId: string;
   seriesId: string;
@@ -257,6 +265,7 @@ function planItemDescription(item: StoryboardAssetPlanItem): string {
 
 export function StoryboardAssetExtractionDialog({
   services,
+  apiBaseUrl,
   snapshot: initialSnapshot,
   userId,
   seriesId,
@@ -269,6 +278,13 @@ export function StoryboardAssetExtractionDialog({
 }: StoryboardAssetExtractionDialogProps) {
   const generation = services.storyboardAssetGeneration;
   const [snapshot, setSnapshot] = useState(initialSnapshot);
+  const snapshotRef = useRef(initialSnapshot);
+  snapshotRef.current = snapshot;
+  const snapshotVersionRef = useRef(0);
+  const [snapshotVersion, setSnapshotVersion] = useState(0);
+  const [scriptSelection, setScriptSelection] = useState<ScriptComparisonSelection | null>(null);
+  const scriptSelectionRef = useRef(scriptSelection);
+  scriptSelectionRef.current = scriptSelection;
   const [kind, setKind] = useState<StoryboardAssetKind>("character");
   const [modelId, setModelId] = useState(initialSnapshot.models[0]?.id ?? "");
   const [promptId, setPromptId] = useState("");
@@ -326,6 +342,36 @@ export function StoryboardAssetExtractionDialog({
   const hasSelectedText = selectedTexts.some((text) => text !== null && text.trim() !== "");
   const candidates = drafts.map((draft) => draft.value);
   const activeCandidates = candidates.filter((candidate) => candidate.keep);
+  const selectedScriptFrame = scriptSelection !== null
+    && scriptSelection.snapshotVersion === snapshotVersion
+    && snapshot.chapter.content?.[scriptSelection.frameIndex] === scriptSelection.frame
+    ? scriptSelection.frame
+    : null;
+  const scriptText = selectedScriptFrame !== null && typeof selectedScriptFrame.text === "string"
+    ? selectedScriptFrame.text
+    : null;
+  const scriptPosition = useFloatingPanelPosition({
+    panelKind: "extract-script",
+    userId,
+    apiBaseUrl,
+    ownerToken: scriptSelection,
+    lifecycleSignal,
+    isOwnerCurrent: () => {
+      const selection = scriptSelectionRef.current;
+      const currentSnapshot = snapshotRef.current;
+      return selection !== null
+        && selection.snapshotVersion === snapshotVersionRef.current
+        && currentSnapshot.chapter.series_id === seriesId
+        && currentSnapshot.chapter.content?.[selection.frameIndex] === selection.frame
+        && mounted.current
+        && isCurrentRef.current()
+        && !lifecycleSignal.aborted;
+    },
+    initialPresentation: "floating",
+    defaultRightOffset: 20,
+    defaultTop: 60,
+    remeasureKey: `${snapshotVersion}:${scriptSelection?.frameIndex ?? "closed"}:${scriptText ?? ""}`,
+  });
 
   useEffect(() => {
     mounted.current = true;
@@ -384,6 +430,9 @@ export function StoryboardAssetExtractionDialog({
     try {
       const fresh = await refreshSourceRef.current(controller.signal);
       if (!current() || controller.signal.aborted) return;
+      snapshotVersionRef.current += 1;
+      setSnapshotVersion(snapshotVersionRef.current);
+      setScriptSelection(null);
       setSnapshot(fresh);
       await action(fresh, controller.signal);
     } catch (cause) {
@@ -836,8 +885,7 @@ export function StoryboardAssetExtractionDialog({
             <div className="storyboard-asset-unknown" role="alert">
               <strong>保存结果尚未确认</strong>
               <p>{message}</p>
-              <button type="button" className="secondary-button" onClick={() => void runStep("正在重新读取章节与素材库…", async (source) => {
-                setSnapshot(source);
+              <button type="button" className="secondary-button" onClick={() => void runStep("正在重新读取章节与素材库…", async () => {
                 setMessage("真源已重新读取。此前保存回执仍未知，请人工核对当前章节和素材库；本窗口不会重发保存请求。" );
               })} disabled={busy}>重新读取真源</button>
             </div>
@@ -859,6 +907,11 @@ export function StoryboardAssetExtractionDialog({
                 busy={busy || step === "unknown"}
                 onChange={(entry) => setAppearanceAt(slot, entry)}
                 onRejudge={() => void judgeFrames([frameIndex], false)}
+                onShowScript={() => {
+                  const frame = snapshot.chapter.content?.[frameIndex];
+                  if (frame === undefined || !current()) return;
+                  setScriptSelection({ snapshotVersion, frameIndex, frame });
+                }}
               />
             ))}
           </div>
@@ -902,6 +955,74 @@ export function StoryboardAssetExtractionDialog({
               </button>
             </section>
           )}
+        </section>
+      )}
+
+      {selectedScriptFrame !== null && scriptSelection !== null && (
+        <section
+          aria-labelledby="storyboard-script-comparison-title"
+          className={scriptPosition.floatingActive
+            ? "storyboard-script-comparison is-floating"
+            : "storyboard-script-comparison"}
+          ref={scriptPosition.panelRef}
+          style={scriptPosition.floatingActive && scriptPosition.visiblePosition !== null
+            ? { left: scriptPosition.visiblePosition.left, top: scriptPosition.visiblePosition.top, right: "auto" }
+            : undefined}
+        >
+          <header className="storyboard-script-comparison-heading">
+            <div>
+              <p className="eyebrow">提取确认对照</p>
+              <h3 id="storyboard-script-comparison-title">镜头 {scriptSelection.frameIndex + 1} 剧本</h3>
+            </div>
+            <div className="storyboard-script-comparison-controls">
+              {scriptPosition.isSmallViewport && scriptPosition.presentation === "floating" && (
+                <span role="status">小屏幕下显示在窗口内，桌面位置已保留。</span>
+              )}
+              {!scriptPosition.isSmallViewport && scriptPosition.presentation === "inline" && (
+                <button className="secondary-button" onClick={scriptPosition.requestFloating} type="button">浮动查看</button>
+              )}
+              {scriptPosition.floatingActive && (
+                <>
+                  <button
+                    aria-label="拖动剧本对照窗口；也可按方向键移动"
+                    className="secondary-button storyboard-script-comparison-drag-handle"
+                    onKeyDown={scriptPosition.moveWithKeyboard}
+                    onLostPointerCapture={scriptPosition.cancelDragEvent}
+                    onPointerCancel={scriptPosition.cancelDragEvent}
+                    onPointerDown={scriptPosition.beginDrag}
+                    onPointerMove={scriptPosition.moveDrag}
+                    onPointerUp={scriptPosition.finishDrag}
+                    ref={scriptPosition.dragHandleRef}
+                    type="button"
+                  >
+                    <span aria-hidden="true">⠿</span> 拖动窗口
+                  </button>
+                  <button className="text-button" onClick={scriptPosition.resetPosition} type="button">恢复默认位置</button>
+                  <button className="secondary-button" onClick={scriptPosition.returnInline} type="button">放回窗口内</button>
+                </>
+              )}
+              <button className="text-button" onClick={() => {
+                scriptPosition.cancelDrag();
+                setScriptSelection(null);
+              }} type="button">关闭对照</button>
+            </div>
+          </header>
+          {scriptPosition.positionNotice !== null && (
+            <p role="status" className="storyboard-script-comparison-notice">
+              {scriptPosition.positionNotice === "invalid-scope"
+                ? "当前账号或接口身份不完整，仍可查看剧本，但不会记住位置。"
+                : scriptPosition.positionNotice === "read-unavailable"
+                  ? "浏览器未能读取剧本对照位置，已使用默认位置。"
+                  : "浏览器未能记住剧本对照位置；仍可继续使用和移动。"}
+            </p>
+          )}
+          <div
+            aria-label={`镜头 ${scriptSelection.frameIndex + 1} 的当前剧本`}
+            className="storyboard-script-comparison-content"
+            role="region"
+          >
+            {scriptText === null ? "当前镜头没有可识别的剧本文字。" : scriptText}
+          </div>
         </section>
       )}
 
@@ -981,6 +1102,7 @@ interface AppearanceEditorProps {
   busy: boolean;
   onChange(entry: StoryboardAssetAppearance): void;
   onRejudge(): void;
+  onShowScript(): void;
 }
 
 function AppearanceEditor({
@@ -993,6 +1115,7 @@ function AppearanceEditor({
   busy,
   onChange,
   onRejudge,
+  onShowScript,
 }: AppearanceEditorProps) {
   const options = candidates.filter((draft) => draft.value.keep);
   const originalNames = originalBindingNames(snapshot, kind, frameIndex);
@@ -1008,6 +1131,7 @@ function AppearanceEditor({
     return (
       <article className="storyboard-asset-appearance" aria-label={`镜头 ${frameIndex + 1} 出场绑定`}>
         <div><strong>镜头 {frameIndex + 1}</strong><p>{text || "（无文字）"}</p></div>
+        <button className="text-button" disabled={busy} onClick={onShowScript} type="button">查看此镜头剧本</button>
         <p className="storyboard-asset-current-binding">{appearance === null ? `未判定，保留原绑定：${currentLabels}` : `当前确认：${currentLabels}`}</p>
         <label>
           场景绑定（单选）
@@ -1029,6 +1153,7 @@ function AppearanceEditor({
   return (
     <article className="storyboard-asset-appearance" aria-label={`镜头 ${frameIndex + 1} 出场绑定`}>
       <div><strong>镜头 {frameIndex + 1}</strong><p>{text || "（无文字）"}</p></div>
+      <button className="text-button" disabled={busy} onClick={onShowScript} type="button">查看此镜头剧本</button>
       <p className="storyboard-asset-current-binding">{appearance === null ? `未判定，保留原绑定：${currentLabels}` : `当前确认：${currentLabels}`}</p>
       {appearance === null && <button type="button" className="text-button" onClick={() => onChange([])} disabled={busy}>手工编辑并清空此镜绑定</button>}
       <fieldset>

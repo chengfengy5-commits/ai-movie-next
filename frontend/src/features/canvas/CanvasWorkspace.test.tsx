@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { StrictMode } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, createEvent, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Series } from "../../shared/api/contracts";
@@ -392,6 +392,47 @@ describe("CanvasWorkspace", () => {
     expect((screen.getByLabelText("视频 1") as HTMLElement).style.left).toBe("2300px");
     expect((screen.getByLabelText("视频 2") as HTMLElement).style.left).toBe("2600px");
     expect(reopened.container.querySelector("path.is-manual")).not.toBeNull();
+  });
+
+  it("closes a legacy frame editor during a pending save and ignores its late child response", async () => {
+    let rejectPendingWrite: ((cause: Error) => void) | null = null;
+    const snapshot = mediaSnapshot("a".repeat(64), "/uploads/preview.png");
+    const sourcePort: CanvasSourcePort = {
+      read: vi.fn(async () => snapshot),
+      write: vi.fn<CanvasSourcePort["write"]>((_chapterId, _frozen, _command, _signal) => {
+        return new Promise<CanvasSourceWriteReceipt>((_resolve, reject) => {
+          rejectPendingWrite = reject;
+        });
+      }),
+    };
+    const workspace = setup(undefined, false, document, sourcePort);
+    await screen.findByText("含重复视频 URL 的镜头");
+    fireEvent.click(screen.getByLabelText("分镜 1"));
+    fireEvent.click(screen.getByRole("button", { name: "编辑分镜文字" }));
+    const editor = await screen.findByRole("dialog", { name: "编辑分镜文字" });
+    const textbox = within(editor).getByLabelText("镜头文字");
+    const leftArrow = createEvent.keyDown(textbox, { key: "ArrowLeft", ctrlKey: true, cancelable: true });
+    fireEvent(textbox, leftArrow);
+    expect(leftArrow.defaultPrevented).toBe(false);
+
+    fireEvent.change(textbox, { target: { value: "等待写入的分镜文字" } });
+    fireEvent.click(within(editor).getByRole("button", { name: "保存文字" }));
+    await waitFor(() => expect(sourcePort.write).toHaveBeenCalledOnce());
+    const readsBeforeLateResponse = vi.mocked(sourcePort.read).mock.calls.length;
+
+    fireEvent.click(within(editor).getByRole("button", { name: "取消" }));
+    await waitFor(() => expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).toBeNull());
+    expect(vi.mocked(sourcePort.write).mock.calls[0]?.[3].aborted).toBe(true);
+    expect(workspace.onClose).not.toHaveBeenCalled();
+
+    await act(async () => {
+      rejectPendingWrite?.(new ApiError("aborted", "Editor closed while the source write was pending."));
+    });
+    expect(screen.queryByRole("dialog", { name: "编辑分镜文字" })).toBeNull();
+    expect(screen.getByText(/写入结果尚未确认/)).toBeInTheDocument();
+    expect(vi.mocked(sourcePort.read).mock.calls).toHaveLength(readsBeforeLateResponse);
+    expect(sourcePort.write).toHaveBeenCalledOnce();
+    expect(workspace.onUnauthorized).not.toHaveBeenCalled();
   });
 
   it.each([

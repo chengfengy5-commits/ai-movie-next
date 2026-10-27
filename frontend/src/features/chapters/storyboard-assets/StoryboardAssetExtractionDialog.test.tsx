@@ -225,6 +225,69 @@ function makeServices() {
 afterEach(cleanup);
 
 describe("StoryboardAssetExtractionDialog", () => {
+  it("shows the exact current frame text for extraction review and clears it after snapshot refresh without changing the plan payload", async () => {
+    const user = userEvent.setup();
+    const base = snapshot("character");
+    const source: StoryboardAssetGenerationSnapshot = {
+      ...base,
+      chapter: {
+        ...base.chapter,
+        content: [
+          { text: "剧本正文第一行\n<b>原样文本</b>", original_text: "不得显示的打开原文" },
+          { text: "第二镜剧本", original_text: "第二镜原文" },
+          { text: "第三镜剧本" },
+        ],
+      },
+    };
+    const freshSource: StoryboardAssetGenerationSnapshot = {
+      ...source,
+      chapter: { ...source.chapter, content: source.chapter.content?.map((frame) => ({ ...frame })) ?? null },
+    };
+    const { generation, streamSave } = makeServices();
+    const services: Pick<WorkspaceServices, "storyboardAssetGeneration"> = { storyboardAssetGeneration: generation };
+    const refreshSource = vi.fn(async () => freshSource);
+    render(
+      <StoryboardAssetExtractionDialog
+        apiBaseUrl="https://api.example.invalid"
+        services={services}
+        snapshot={source}
+        userId={userId}
+        seriesId={seriesId}
+        lifecycleSignal={new AbortController().signal}
+        isCurrent={() => true}
+        refreshSource={refreshSource}
+        executeConfirmedSave={vi.fn(async () => undefined)}
+        onClose={vi.fn()}
+        onUnauthorized={vi.fn()}
+      />,
+    );
+
+    const dialog = within(screen.getByRole("dialog", { name: "提取并确认素材" }));
+    await user.click(dialog.getByRole("checkbox", { name: "选择镜头 3" }));
+    await user.click(dialog.getByRole("button", { name: "提取角色" }));
+    await screen.findByRole("heading", { name: "编辑角色候选" });
+    await user.click(dialog.getByRole("button", { name: "判断出场并继续" }));
+    await screen.findByRole("heading", { name: "逐镜出场与绑定" });
+    const firstFrame = within(dialog.getByRole("article", { name: "镜头 1 出场绑定" }));
+    await user.click(firstFrame.getByRole("button", { name: "查看此镜头剧本" }));
+    const comparison = await dialog.findByRole("region", { name: "镜头 1 的当前剧本" });
+    expect(comparison.textContent).toBe("剧本正文第一行\n<b>原样文本</b>");
+    expect(comparison).not.toHaveTextContent("不得显示的打开原文");
+    expect(comparison.parentElement).toHaveClass("is-floating");
+
+    await user.click(dialog.getByRole("button", { name: "生成 dry-run 保存计划" }));
+    await screen.findByRole("heading", { name: /保存计划/ });
+    expect(dialog.queryByRole("region", { name: "镜头 1 的当前剧本" })).not.toBeInTheDocument();
+    expect(refreshSource).toHaveBeenCalledTimes(3);
+    expect(streamSave).toHaveBeenCalledTimes(1);
+    expect(streamSave.mock.calls[0]?.[1]).toMatchObject({
+      chapter_id: chapterId,
+      expected_content: freshSource.chapter.content,
+      target_frames: [0, 1],
+      dry_run: true,
+    });
+  });
+
   it.each(testCases)("completes the $kind candidate, per-frame plan, and confirmation workflow", async ({ kind, label }) => {
     const user = userEvent.setup();
     const source = snapshot(kind);

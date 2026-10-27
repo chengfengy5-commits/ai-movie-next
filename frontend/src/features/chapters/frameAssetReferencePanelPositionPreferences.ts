@@ -3,7 +3,7 @@ export interface FramePanelPosition {
   readonly top: number;
 }
 
-export type FramePanelKind = "frame-assets" | "frame-original";
+export type FramePanelKind = "frame-assets" | "frame-original" | "extract-script";
 
 export interface FramePanelPositionScope {
   readonly userId: string;
@@ -45,6 +45,7 @@ export type FrameAssetReferencePanelPositionStorage = FramePanelPositionStorage;
 
 const STORAGE_KEY_PREFIX = "haoai.frame-asset-reference-panel-position.v1";
 const ORIGINAL_TEXT_STORAGE_KEY_PREFIX = "haoai.frame-original-reference-panel-position.v1";
+const EXTRACT_SCRIPT_STORAGE_KEY_PREFIX = "haoai.frame-extract-script-panel-position.v1";
 const VIEWPORT_GUTTER = 20;
 
 export function createFramePanelPositionScope(
@@ -72,7 +73,9 @@ function storageKey(scope: FramePanelPositionScope): string | null {
     ? STORAGE_KEY_PREFIX
     : scope.panelKind === "frame-original"
       ? ORIGINAL_TEXT_STORAGE_KEY_PREFIX
-      : null;
+      : scope.panelKind === "extract-script"
+        ? EXTRACT_SCRIPT_STORAGE_KEY_PREFIX
+        : null;
   if (prefix === null
     || typeof scope.userId !== "string" || scope.userId.trim() === ""
     || typeof scope.apiBaseUrl !== "string" || scope.apiBaseUrl.trim() === "") {
