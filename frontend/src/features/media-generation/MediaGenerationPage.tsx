@@ -17,6 +17,15 @@ import {
   type UserPreferencesPort,
 } from "../../shared/api/userPreferences";
 import {
+  BATCH_CHECK_FIELDS,
+  collectBatchStoryboardContext,
+  defaultBatchGenerationChecks,
+  mergeBatchReferenceImages,
+  restoreBatchGenerationChecks,
+  type BatchCheckField,
+  type BatchGenerationChecks,
+} from "./batchStoryboardContext";
+import {
   MediaReferenceUploadError,
   type MediaReferenceKind,
 } from "../../shared/api/mediaReferenceUpload";
@@ -139,9 +148,16 @@ function mergeBatchPreferenceEdits(
   preferences: UserPreferences,
   selections: BatchGenerationSelections,
   edits: BatchPreferenceEdits,
+  checks: BatchGenerationChecks,
+  checkEdits: ReadonlySet<BatchCheckField>,
 ): Record<string, unknown> {
   const savedBatch = record(preferences.batch_gen_prefs) ?? {};
   const nextBatch: Record<string, unknown> = { ...savedBatch };
+  if (checkEdits.size > 0) {
+    const nextChecks: Record<string, unknown> = { ...(record(savedBatch.checks) ?? {}) };
+    for (const field of checkEdits) nextChecks[field] = checks[field];
+    nextBatch.checks = nextChecks;
+  }
   for (const type of BATCH_ASSET_TYPES) {
     if (edits[type].size === 0) continue;
     const savedType = record(savedBatch[type]) ?? {};
@@ -158,15 +174,20 @@ function batchPreferenceEditsMatch(
   preferences: UserPreferences,
   selections: BatchGenerationSelections,
   edits: BatchPreferenceEdits,
+  checks: BatchGenerationChecks,
+  checkEdits: ReadonlySet<BatchCheckField>,
 ): boolean {
   const savedBatch = record(preferences.batch_gen_prefs);
   if (savedBatch === null) return false;
-  return BATCH_ASSET_TYPES.every((type) => {
+  const selectionEditsMatch = BATCH_ASSET_TYPES.every((type) => {
     const savedType = record(savedBatch[type]);
     return [...edits[type]].every((field) => (
       savedType?.[BATCH_PREFERENCE_KEYS[field]] === selections[type][field]
     ));
   });
+  const savedChecks = record(savedBatch.checks);
+  const checkEditsMatch = [...checkEdits].every((field) => savedChecks?.[field] === checks[field]);
+  return selectionEditsMatch && checkEditsMatch;
 }
 
 const ASSET_TYPE_LABELS: Record<MediaGenerationAssetType, string> = {
@@ -339,6 +360,9 @@ export function MediaGenerationPage({
   const [selectedChapterId, setSelectedChapterId] = useState("");
   const [storyboardAssets, setStoryboardAssets] = useState<StoryboardAsset[]>([]);
   const [assetChoices, setAssetChoices] = useState<AssetChoice[]>([]);
+  const [characterAssets, setCharacterAssets] = useState<Character[]>([]);
+  const [sceneAssets, setSceneAssets] = useState<Scene[]>([]);
+  const [propAssets, setPropAssets] = useState<Prop[]>([]);
   const [videoModels, setVideoModels] = useState<CreatorModel[]>([]);
   const [imageModels, setImageModels] = useState<CreatorModel[]>([]);
   const [prompts, setPrompts] = useState<CreatorPrompt[]>([]);
@@ -349,6 +373,9 @@ export function MediaGenerationPage({
   const batchSelectionsRef = useRef<BatchGenerationSelections>(emptyBatchSelections());
   const [batchSelections, setBatchSelections] = useState<BatchGenerationSelections>(batchSelectionsRef.current);
   const batchPreferenceEditsRef = useRef<BatchPreferenceEdits>(emptyBatchEdits());
+  const batchChecksRef = useRef<BatchGenerationChecks>(defaultBatchGenerationChecks());
+  const [batchChecks, setBatchChecks] = useState<BatchGenerationChecks>(batchChecksRef.current);
+  const batchCheckEditsRef = useRef(new Set<BatchCheckField>());
   const [batchPreferenceWarnings, setBatchPreferenceWarnings] = useState<BatchPreferenceWarnings>(emptyBatchWarnings());
   const [batchPreferenceMessage, setBatchPreferenceMessage] = useState<string | null>(null);
   const [batchPreferenceLoading, setBatchPreferenceLoading] = useState(false);
@@ -397,6 +424,9 @@ export function MediaGenerationPage({
   const selectedVideoModel = videoModels.find((model) => model.id === selectedVideoModelId) ?? null;
   const selectedImageModel = imageModels.find((model) => model.id === selectedImageModelId) ?? null;
   const selectedSeries = series.find((item) => item.id === selectedSeriesId) ?? null;
+  const selectedChapter = chapters.find((item) => (
+    item.id === selectedChapterId && item.series_id === selectedSeriesId
+  )) ?? null;
   const videoOptions = useMemo(() => modelOptions(selectedVideoModel), [selectedVideoModel]);
   const imageOptions = useMemo(() => modelOptions(selectedImageModel), [selectedImageModel]);
   const sortedChapters = useMemo(() => [...chapters].sort((left, right) => left.order - right.order), [chapters]);
@@ -405,6 +435,38 @@ export function MediaGenerationPage({
     const asset = assetChoices.find((choice) => `${choice.type}:${choice.id}` === key);
     return asset === undefined ? [] : [asset];
   });
+  const publicBatchReferences = splitReferences(batchReferenceImages);
+  const selectedBatchStoryboardContexts = selectedBatchAssets
+    .filter((asset) => asset.type === "storyboard")
+    .map((asset) => ({
+      asset,
+      context: collectBatchStoryboardContext({
+        storyboardId: asset.id,
+        fallbackDescription: asset.description || asset.name,
+        chapterContent: selectedChapter?.content ?? null,
+        characters: characterAssets,
+        scenes: sceneAssets,
+        props: propAssets,
+        checks: batchChecks,
+        publicReferences: publicBatchReferences,
+      }),
+    }));
+  const batchStoryboardContextByKey = new Map(selectedBatchStoryboardContexts.map(({ asset, context }) => [
+    `${asset.type}:${asset.id}`,
+    context,
+  ]));
+  const batchReferenceIssues = [
+    ...selectedBatchStoryboardContexts.flatMap(({ asset, context }) => (
+      context.missingNames.length === 0
+        ? []
+        : [`${asset.label}缺少引用图片：${context.missingNames.join("、")}。`]
+    )),
+    ...selectedBatchAssets.flatMap((asset) => {
+      const context = batchStoryboardContextByKey.get(`${asset.type}:${asset.id}`);
+      const referenceCount = context?.referenceImages.length ?? mergeBatchReferenceImages(publicBatchReferences).length;
+      return referenceCount > 64 ? [`${asset.label}的参考图片超过64项上限，请减少公共或关联图片。`] : [];
+    }),
+  ];
   const formSignature = JSON.stringify({
     mode,
     selectedSeriesId,
@@ -414,6 +476,13 @@ export function MediaGenerationPage({
     selectedImagePromptId,
     selectedVideoPromptId,
     batchSelections,
+    batchChecks,
+    batchStoryboardContexts: selectedBatchStoryboardContexts.map(({ asset, context }) => ({
+      assetId: asset.id,
+      description: context.description,
+      referenceImages: context.referenceImages,
+      missingNames: context.missingNames,
+    })),
     imagePrompt,
     videoPrompt,
     videoSize,
@@ -468,6 +537,14 @@ export function MediaGenerationPage({
     setBatchPreferenceMessage(null);
   }
 
+  function updateBatchCheck(field: BatchCheckField, checked: boolean) {
+    const next = { ...batchChecksRef.current, [field]: checked };
+    batchChecksRef.current = next;
+    setBatchChecks(next);
+    batchCheckEditsRef.current.add(field);
+    setBatchPreferenceMessage(null);
+  }
+
   function preferenceScopeIsCurrent(
     capturedServices: WorkspaceServices,
     capturedUserId: string,
@@ -493,6 +570,9 @@ export function MediaGenerationPage({
     batchSelectionsRef.current = emptyBatchSelections();
     setBatchSelections(batchSelectionsRef.current);
     batchPreferenceEditsRef.current = emptyBatchEdits();
+    batchChecksRef.current = defaultBatchGenerationChecks();
+    setBatchChecks(batchChecksRef.current);
+    batchCheckEditsRef.current = new Set();
     setBatchPreferenceWarnings(emptyBatchWarnings());
     setBatchPreferenceMessage(null);
     setBatchPreferenceLoading(false);
@@ -577,6 +657,13 @@ export function MediaGenerationPage({
         setBatchPreferenceMessage("账户中还没有保存批量生成选项。修改后可点击“记住批量选项”。");
         return;
       }
+      const savedChecks = restoreBatchGenerationChecks(savedBatch.checks);
+      const nextChecks = { ...batchChecksRef.current };
+      for (const field of BATCH_CHECK_FIELDS) {
+        if (!batchCheckEditsRef.current.has(field)) nextChecks[field] = savedChecks[field];
+      }
+      batchChecksRef.current = nextChecks;
+      setBatchChecks(nextChecks);
       const nextWarnings = emptyBatchWarnings();
       const nextSelections = { ...batchSelectionsRef.current };
       const edits = batchPreferenceEditsRef.current;
@@ -672,6 +759,11 @@ export function MediaGenerationPage({
     if (selectedSeriesId === "") {
       setChapters([]);
       setSelectedChapterId("");
+      setStoryboardAssets([]);
+      setAssetChoices([]);
+      setCharacterAssets([]);
+      setSceneAssets([]);
+      setPropAssets([]);
       return;
     }
     const controller = new AbortController();
@@ -681,6 +773,9 @@ export function MediaGenerationPage({
     setSelectedChapterId("");
     setStoryboardAssets([]);
     setAssetChoices([]);
+    setCharacterAssets([]);
+    setSceneAssets([]);
+    setPropAssets([]);
     setSelectedBatchKeys([]);
     void services.listChapters(selectedSeriesId, controller.signal).then((result) => {
       if (current && !controller.signal.aborted) setChapters(result);
@@ -702,7 +797,11 @@ export function MediaGenerationPage({
     if (selectedSeriesId === "" || selectedChapterId === "") {
       setStoryboardAssets([]);
       setAssetChoices([]);
+      setCharacterAssets([]);
+      setSceneAssets([]);
+      setPropAssets([]);
       setDirectoryError(null);
+      setDirectoryLoading(false);
       return;
     }
     const controller = new AbortController();
@@ -710,6 +809,11 @@ export function MediaGenerationPage({
     setDirectoryLoading(true);
     setDirectoryError(null);
     setSelectedBatchKeys([]);
+    setStoryboardAssets([]);
+    setAssetChoices([]);
+    setCharacterAssets([]);
+    setSceneAssets([]);
+    setPropAssets([]);
     void Promise.all([
       services.listStoryboardAssets(selectedSeriesId, selectedChapterId, controller.signal),
       services.listCharacters(selectedSeriesId, controller.signal),
@@ -717,12 +821,21 @@ export function MediaGenerationPage({
       services.listProps(selectedSeriesId, controller.signal),
     ]).then(([frames, characters, scenes, props]) => {
       if (!current || controller.signal.aborted) return;
-      setStoryboardAssets(frames.filter((item) => item.chapter_id === selectedChapterId));
+      const currentFrames = frames.filter((item) => (
+        item.series_id === selectedSeriesId && item.chapter_id === selectedChapterId
+      ));
+      const currentCharacters = characters.filter((item) => item.series_id === selectedSeriesId);
+      const currentScenes = scenes.filter((item) => item.series_id === selectedSeriesId);
+      const currentProps = props.filter((item) => item.series_id === selectedSeriesId);
+      setStoryboardAssets(currentFrames);
+      setCharacterAssets(currentCharacters);
+      setSceneAssets(currentScenes);
+      setPropAssets(currentProps);
       setAssetChoices([
-        ...libraryChoices("storyboard", frames.filter((item) => item.chapter_id === selectedChapterId)),
-        ...libraryChoices("character", characters),
-        ...libraryChoices("scene", scenes),
-        ...libraryChoices("prop", props),
+        ...libraryChoices("storyboard", currentFrames),
+        ...libraryChoices("character", currentCharacters),
+        ...libraryChoices("scene", currentScenes),
+        ...libraryChoices("prop", currentProps),
       ]);
     }).catch((error: unknown) => {
       if (!current || controller.signal.aborted) return;
@@ -730,6 +843,9 @@ export function MediaGenerationPage({
       else setDirectoryError(describeFailure(error));
       setStoryboardAssets([]);
       setAssetChoices([]);
+      setCharacterAssets([]);
+      setSceneAssets([]);
+      setPropAssets([]);
     }).finally(() => {
       if (current && !controller.signal.aborted) setDirectoryLoading(false);
     });
@@ -1029,7 +1145,8 @@ export function MediaGenerationPage({
 
   const submitBatch = async () => {
     if (pendingRef.current !== null || requestingRef.current || savingBatchPreferencesRef.current
-      || selectedSeries === null || selectedChapterId === ""
+      || selectedSeries === null || selectedChapter === null || selectedChapterId === ""
+      || directoryLoading || directoryError !== null || batchReferenceIssues.length > 0
       || selectedBatchAssets.length < 1 || selectedBatchAssets.length > 64
       || selectedBatchAssets.some((asset) => batchSelectionError(
         asset.type,
@@ -1052,20 +1169,23 @@ export function MediaGenerationPage({
       setOutcome({ signature, message: describeFailure(error) });
       return;
     }
-    const references = Object.freeze(splitReferences(batchReferenceImages));
     const frozenSelections = Object.freeze(Object.fromEntries(BATCH_ASSET_TYPES.map((type) => (
       [type, Object.freeze({ ...batchSelectionsRef.current[type] })]
     ))) as BatchGenerationSelections);
-    const assets: readonly MediaGenerationBatchAssetInput[] = Object.freeze(selectedBatchAssets.map((asset) => Object.freeze({
-      type: asset.type,
-      id: asset.id,
-      name: asset.name,
-      description: asset.description,
-      modelId: frozenSelections[asset.type].modelId,
-      promptId: frozenSelections[asset.type].promptId,
-      ...(frozenSelections[asset.type].size === "" ? {} : { size: frozenSelections[asset.type].size }),
-      referenceImages: references,
-    })));
+    const assets: readonly MediaGenerationBatchAssetInput[] = Object.freeze(selectedBatchAssets.map((asset) => {
+      const context = batchStoryboardContextByKey.get(`${asset.type}:${asset.id}`);
+      const references = context?.referenceImages ?? mergeBatchReferenceImages(publicBatchReferences);
+      return Object.freeze({
+        type: asset.type,
+        id: asset.id,
+        name: asset.name,
+        description: context?.description ?? asset.description,
+        modelId: frozenSelections[asset.type].modelId,
+        promptId: frozenSelections[asset.type].promptId,
+        ...(frozenSelections[asset.type].size === "" ? {} : { size: frozenSelections[asset.type].size }),
+        referenceImages: Object.freeze([...references]),
+      });
+    }));
     const input = Object.freeze({ chapterId: selectedChapterId, assets, idempotencyKey: rawKey });
     const expectation: MediaGenerationLookupExpectation = {
       operation: "image.batch",
@@ -1111,7 +1231,8 @@ export function MediaGenerationPage({
     for (const type of BATCH_ASSET_TYPES) {
       edits[type] = new Set(batchPreferenceEditsRef.current[type]);
     }
-    if (!BATCH_ASSET_TYPES.some((type) => edits[type].size > 0)) {
+    const checkEdits = new Set(batchCheckEditsRef.current);
+    if (!BATCH_ASSET_TYPES.some((type) => edits[type].size > 0) && checkEdits.size === 0) {
       setBatchPreferenceMessage("没有需要保存的批量选项修改。");
       return;
     }
@@ -1119,6 +1240,7 @@ export function MediaGenerationPage({
     const selections = Object.freeze(Object.fromEntries(BATCH_ASSET_TYPES.map((type) => (
       [type, Object.freeze({ ...batchSelectionsRef.current[type] })]
     ))) as BatchGenerationSelections);
+    const checks = Object.freeze({ ...batchChecksRef.current });
     const capturedServices = services;
     const capturedUserId = userId;
     const capturedSessionGeneration = sessionGeneration;
@@ -1143,6 +1265,9 @@ export function MediaGenerationPage({
           }
         }
       }
+      for (const field of checkEdits) {
+        if (batchChecksRef.current[field] === checks[field]) batchCheckEditsRef.current.delete(field);
+      }
     };
 
     try {
@@ -1157,7 +1282,7 @@ export function MediaGenerationPage({
       }
       if (!isCurrentSave()) return;
 
-      const update = mergeBatchPreferenceEdits(currentPreferences, selections, edits);
+      const update = mergeBatchPreferenceEdits(currentPreferences, selections, edits, checks, checkEdits);
       try {
         const receipt = await port.update(update, controller.signal);
         if (!isCurrentSave()) return;
@@ -1187,7 +1312,7 @@ export function MediaGenerationPage({
         try {
           const latestPreferences = await port.get(controller.signal);
           if (!isCurrentSave()) return;
-          if (batchPreferenceEditsMatch(latestPreferences, selections, edits)) {
+          if (batchPreferenceEditsMatch(latestPreferences, selections, edits, checks, checkEdits)) {
             clearSavedEdits();
             setBatchPreferenceMessage("保存请求没有直接回执；只读核对发现账户偏好已包含本次修改。");
           } else {
@@ -1232,13 +1357,15 @@ export function MediaGenerationPage({
     prompt.category === BATCH_PROMPT_CATEGORIES[type]
   ));
   const selectedBatchTypes = new Set(selectedBatchAssets.map((asset) => asset.type));
-  const batchSubmissionBlocked = [...selectedBatchTypes].some((type) => batchSelectionError(
+  const batchSubmissionBlocked = directoryLoading || directoryError !== null || batchReferenceIssues.length > 0
+    || [...selectedBatchTypes].some((type) => batchSelectionError(
     type,
     batchSelections[type],
     imageModels,
     prompts,
   ) !== null || batchPreferenceWarningBlocksSubmission(type, batchSelections[type], batchPreferenceWarnings, imageModels));
-  const hasBatchPreferenceEdits = BATCH_ASSET_TYPES.some((type) => batchPreferenceEditsRef.current[type].size > 0);
+  const hasBatchPreferenceEdits = batchCheckEditsRef.current.size > 0
+    || BATCH_ASSET_TYPES.some((type) => batchPreferenceEditsRef.current[type].size > 0);
   const currentImagePromptOptions = prompts.filter((prompt) => IMAGE_PROMPT_CATEGORIES.has(prompt.category));
   const currentVideoPromptOptions = prompts.filter((prompt) => prompt.category === "video-design");
   const isImageMode = mode === "image";
@@ -1454,6 +1581,16 @@ export function MediaGenerationPage({
               <option value="">选择章节</option>
               {sortedChapters.map((chapter) => <option key={chapter.id} value={chapter.id}>{chapter.title}</option>)}
             </select></label>
+            <fieldset className="media-generation-batch-type media-generation-wide" disabled={isFrozen}>
+              <legend>分镜引用检查</legend>
+              <p className="media-generation-note">仅控制已选分镜所引用资产的缺图检查与自动参考图；不会移除已选角色、场景或道具任务。</p>
+              {BATCH_CHECK_FIELDS.map((field) => (
+                <label key={field}>
+                  <input checked={batchChecks[field]} onChange={(event) => updateBatchCheck(field, event.target.checked)} type="checkbox" />
+                  <span>检查{ASSET_TYPE_LABELS[field]}图片</span>
+                </label>
+              ))}
+            </fieldset>
             {BATCH_ASSET_TYPES.map((type) => {
               const selection = batchSelections[type];
               const model = imageModels.find((candidate) => candidate.id === selection.modelId) ?? null;
@@ -1494,6 +1631,7 @@ export function MediaGenerationPage({
           {chapterError !== null && <p className="media-generation-alert" role="alert">章节读取失败：{chapterError}</p>}
           {directoryError !== null && <p className="media-generation-alert" role="alert">章节素材读取失败：{directoryError}</p>}
           {selectedChapterId !== "" && directoryLoading && <p role="status">正在读取当前章节素材…</p>}
+          {batchReferenceIssues.map((issue) => <p className="media-generation-alert" key={issue} role="alert">{issue}</p>)}
           {selectedChapterId !== "" && !directoryLoading && directoryError === null && (
             <fieldset className="media-generation-assets" disabled={isFrozen}>
               <legend>选择生成素材 · {selectedBatchAssets.length}/64</legend>

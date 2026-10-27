@@ -387,8 +387,19 @@ describe("MediaGenerationPage", () => {
     }));
     const onOpenTasks = vi.fn();
     const series = seriesFixture();
-    const chapter = chapterFixture();
-    const scene = { id: "scene-926", series_id: series.id, title: "雨巷", description: "青石路面", image_url: null, aliases: null, canonical_key: null, created_at: "2026-10-20T00:00:00Z", updated_at: "2026-10-20T00:00:00Z" };
+    const sharedReference = "https://cdn.example.test/shared-reference.png";
+    const chapter = {
+      ...chapterFixture(),
+      content: [{
+        storyboard: ["storyboard-926"],
+        character: ["character-926"],
+        scene: ["scene-926"],
+        prop: ["missing-prop-926"],
+        text: "章节分镜正文优先",
+      }],
+    };
+    const scene = { id: "scene-926", series_id: series.id, title: "雨巷", description: "青石路面", image_url: sharedReference, aliases: null, canonical_key: null, created_at: "2026-10-20T00:00:00Z", updated_at: "2026-10-20T00:00:00Z" };
+    const character = { ...characterFixture(), image_url: sharedReference };
     const preferences = userPreferencesPort({
       another_preference: { keep: true },
       batch_gen_prefs: {
@@ -396,7 +407,7 @@ describe("MediaGenerationPage", () => {
         scene: { model: "image-model-926", prompt: "image-prompt-scene-926", size: "16:9", custom_scene_field: "keep-scene" },
         prop: { model: "removed-model", prompt: "removed-prompt", size: "64:64", custom_prop_field: "keep-prop" },
         storyboard: { model: "image-model-scene-926", prompt: "image-prompt-storyboard-926", size: "2:3" },
-        checks: { character: false, scene: true, prop: false, keep_unknown: "keep-check" },
+        checks: { character: true, scene: true, prop: false, keep_unknown: "keep-check" },
         extension: { keep: "unknown-batch-field" },
       },
     });
@@ -410,7 +421,7 @@ describe("MediaGenerationPage", () => {
       listSeries: vi.fn(async () => [series]),
       listChapters: vi.fn(async () => [chapter]),
       listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
-      listCharacters: vi.fn(async () => [characterFixture()]),
+      listCharacters: vi.fn(async () => [character]),
       listScenes: vi.fn(async () => [scene]),
       listProps: vi.fn(async () => []),
     };
@@ -428,6 +439,7 @@ describe("MediaGenerationPage", () => {
     await screen.findByText("已读取账户批量选项；部分保存值在当前目录中不可用，请重新选择后保存。");
     await user.selectOptions(screen.getByLabelText("剧集"), series.id);
     await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
+    await user.type(screen.getByLabelText("公共参考图片 URL（每行一项）"), sharedReference);
     expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-scene-926");
     expect(screen.getByLabelText("角色图片尺寸")).toHaveValue("4:3");
     expect(screen.getByLabelText("场景模型")).toHaveValue("image-model-926");
@@ -470,7 +482,7 @@ describe("MediaGenerationPage", () => {
       scene: { model: "image-model-scene-926", prompt: "image-prompt-scene-926", size: "4:3", custom_scene_field: "keep-scene" },
       prop: { model: "removed-model", prompt: "removed-prompt", size: "64:64", custom_prop_field: "keep-prop" },
       storyboard: { model: "image-model-926", prompt: "image-prompt-storyboard-926", size: "1:1" },
-      checks: { character: false, scene: true, prop: false, keep_unknown: "keep-check" },
+      checks: { character: true, scene: true, prop: false, keep_unknown: "keep-check" },
       extension: { keep: "unknown-batch-field" },
     });
     const assetChoices = await screen.findByRole("group", { name: /选择生成素材/ });
@@ -483,10 +495,13 @@ describe("MediaGenerationPage", () => {
     expect(submitBatch).toHaveBeenCalledTimes(1);
     const submitted = submitBatch.mock.calls[0]![0];
     expect(submitted).toMatchObject({ chapterId: chapter.id, assets: [
-      { type: "storyboard", id: "storyboard-926", name: "雨巷转场镜头", description: "石板路上的中景转场", modelId: "image-model-926", promptId: "image-prompt-storyboard-926", size: "1:1" },
+      { type: "storyboard", id: "storyboard-926", name: "雨巷转场镜头", description: "章节分镜正文优先\n\n【角色资产对照】\n图片1 = 林舟\n\n【场景资产对照】\n图片1 = 雨巷", modelId: "image-model-926", promptId: "image-prompt-storyboard-926", size: "1:1", referenceImages: [sharedReference] },
       { type: "scene", id: "scene-926", modelId: "image-model-scene-926", promptId: "image-prompt-scene-926", size: "4:3" },
       { type: "character", id: "character-926", modelId: "image-model-926", promptId: "", size: "16:9" },
     ] });
+    expect(submitted.assets[1]!.referenceImages).toEqual([sharedReference]);
+    expect(submitted.assets[2]!.referenceImages).toEqual([sharedReference]);
+    expect(submitted.assets[0]!.description).not.toContain("missing-prop-926");
     expect(submitted.idempotencyKey).toEqual(expect.any(String));
 
     await user.click(screen.getByRole("button", { name: "查看我的任务" }));
@@ -515,6 +530,7 @@ describe("MediaGenerationPage", () => {
     const preferencesB = userPreferencesPort({
       batch_gen_prefs: {
         character: { model: "image-model-926", prompt: "image-prompt-926", size: "1:1" },
+        checks: { character: true },
       },
     });
     const services: WorkspaceServices = {
@@ -533,6 +549,7 @@ describe("MediaGenerationPage", () => {
     const { rerender } = render(<MediaGenerationPage {...props} />);
 
     await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await user.click(await screen.findByLabelText("检查角色图片"));
     await user.selectOptions(await screen.findByLabelText("角色模型"), "image-model-scene-926");
     await user.selectOptions(screen.getByLabelText("剧集"), "series-926");
     await user.selectOptions(await screen.findByLabelText("章节"), "chapter-926");
@@ -557,6 +574,7 @@ describe("MediaGenerationPage", () => {
       scene: { model: "image-model-scene-926", prompt: "image-prompt-scene-926", size: "4:3" },
     } });
     await waitFor(() => expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-scene-926"));
+    expect(screen.getByLabelText("检查角色图片")).not.toBeChecked();
     expect(screen.getByLabelText("场景模型")).toHaveValue("image-model-926");
     expect(screen.getByText(acceptedMessage)).toBeInTheDocument();
     expect(frozenInput.assets[0]).toMatchObject({ modelId: "image-model-scene-926", size: "2:3" });
@@ -570,10 +588,110 @@ describe("MediaGenerationPage", () => {
     await screen.findByText("已读取账户中保存的批量选项。修改后可点击“记住批量选项”。");
     expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-926");
     expect(screen.getByLabelText("角色图片尺寸")).toHaveValue("1:1");
+    expect(screen.getByLabelText("检查角色图片")).toBeChecked();
     finishStalePreferences?.({ batch_gen_prefs: {
       character: { model: "image-model-scene-926", prompt: "image-prompt-character-926", size: "4:3" },
+      checks: { character: false },
     } });
     await waitFor(() => expect(screen.getByLabelText("角色模型")).toHaveValue("image-model-926"));
     expect(screen.getByLabelText("角色图片尺寸")).toHaveValue("1:1");
+    expect(screen.getByLabelText("检查角色图片")).toBeChecked();
+  });
+
+  it("does not use another series image to satisfy a storyboard check and keeps selected tasks when disabled", async () => {
+    const user = userEvent.setup();
+    const submitBatch = vi.fn<MediaGenerationRun["submitBatch"]>(async () => ({ operation: "image.batch", tasks: [] }));
+    const series = seriesFixture();
+    const chapter = {
+      ...chapterFixture(),
+      content: [{ storyboard: ["storyboard-926"], character: ["character-926"], text: "分镜原文" }],
+    };
+    const currentCharacter = characterFixture();
+    const foreignCharacter = {
+      ...currentCharacter,
+      series_id: "other-series",
+      image_url: "https://other-series.example.test/character.png",
+    };
+    const scene = {
+      id: "scene-926", series_id: series.id, title: "雨巷", description: "青石路面", image_url: null,
+      aliases: null, canonical_key: null, created_at: "2026-10-20T00:00:00Z", updated_at: "2026-10-20T00:00:00Z",
+    };
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(submitBatch),
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [storyboardFixture()]),
+      listCharacters: vi.fn(async () => [foreignCharacter, currentCharacter]),
+      listScenes: vi.fn(async () => [scene]),
+      listProps: vi.fn(async () => []),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
+    const assetChoices = await screen.findByRole("group", { name: /选择生成素材/ });
+    await user.click(within(assetChoices).getByRole("checkbox", { name: /第 2 镜 · 雨巷转场镜头/ }));
+    await user.click(within(assetChoices).getByRole("checkbox", { name: /林舟/ }));
+    await user.click(within(assetChoices).getByRole("checkbox", { name: /雨巷场景/ }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("缺少引用图片：林舟");
+    expect(screen.getByRole("button", { name: "提交 3 项批量任务" })).toBeDisabled();
+    expect(submitBatch).not.toHaveBeenCalled();
+
+    await user.click(screen.getByLabelText("检查角色图片"));
+    await waitFor(() => expect(screen.queryByRole("alert")).not.toBeInTheDocument());
+    await user.click(screen.getByRole("button", { name: "提交 3 项批量任务" }));
+    await screen.findByText(/批量请求已回读/);
+    expect(submitBatch).toHaveBeenCalledOnce();
+    const submittedAssets = submitBatch.mock.calls[0]![0].assets;
+    expect(submittedAssets.map(({ type, id }) => [type, id])).toEqual([
+      ["storyboard", "storyboard-926"],
+      ["character", "character-926"],
+      ["scene", "scene-926"],
+    ]);
+    expect(submittedAssets[0]!.description).toBe("分镜原文");
+    expect(submittedAssets[0]!.referenceImages).toEqual([]);
+  });
+
+  it("saves only edited checks and preserves unknown preference fields after an uncertain write", async () => {
+    const user = userEvent.setup();
+    const stored: UserPreferences = {
+      batch_gen_prefs: {
+        checks: { character: false, keep_unknown: "preserve" },
+        extension: { nested: true },
+      },
+      another_preference: { keep: true },
+    };
+    const get = vi.fn(async () => JSON.parse(JSON.stringify(stored)) as UserPreferences);
+    const update = vi.fn(async (_patch: UserPreferences) => { throw new Error("write result unknown"); });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] }))),
+      userPreferences: { get, update },
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={4}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: "批量素材生图" }));
+    await screen.findByText("已读取账户中保存的批量选项。修改后可点击“记住批量选项”。");
+    expect(screen.getByLabelText("检查角色图片")).not.toBeChecked();
+    expect(screen.getByLabelText("检查场景图片")).toBeChecked();
+    expect(screen.getByLabelText("检查道具图片")).toBeChecked();
+    await user.click(screen.getByLabelText("检查场景图片"));
+    await user.click(screen.getByRole("button", { name: "记住批量选项" }));
+
+    await screen.findByText("保存结果仍未确认；已只读核对账户偏好，本页保留修改且不会自动重试。");
+    expect(update).toHaveBeenCalledOnce();
+    expect(update.mock.calls[0]![0]).toEqual({ batch_gen_prefs: {
+      checks: { character: false, keep_unknown: "preserve", scene: false },
+      extension: { nested: true },
+    } });
+    expect(get).toHaveBeenCalledTimes(3);
+    expect(screen.getByLabelText("检查场景图片")).not.toBeChecked();
   });
 });
