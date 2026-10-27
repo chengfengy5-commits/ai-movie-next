@@ -248,6 +248,8 @@ def test_haoai_attempt_group_is_required_with_three_optional_independent_steps()
     assert len(plan.tasks) == len(plan.units) == 1
     assert plan.attempt_group.required is True
     assert plan.attempt_group.max_retries == 2
+    assert plan.attempt_group.original_payload_digest == item.request_digest
+    assert plan.attempt_group.original_payload_digest != plan.tasks[0].payload_digest
     assert plan.attempt_group.step_ids == (
         "stable-step-0",
         "stable-step-1",

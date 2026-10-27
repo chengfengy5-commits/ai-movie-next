@@ -570,7 +570,7 @@ def test_video_worker_creates_queries_original_id_and_stores_video(
         runtime.shutdown("test_complete")
 
 
-@pytest.mark.parametrize("provider", ("xai", "manxiaobai"))
+@pytest.mark.parametrize("provider", ("xai", "manxiaobai", "haoai"))
 @pytest.mark.parametrize("reference_kind", ("reference_audios", "reference_videos"))
 def test_unsupported_video_references_are_refused_before_admission(
     provider: str,

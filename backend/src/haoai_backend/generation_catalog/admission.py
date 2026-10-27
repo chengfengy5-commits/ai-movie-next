@@ -566,7 +566,7 @@ def _validate_reference_policy(
                 or len(item.reference_videos) > 5
             ):
                 raise CatalogError("AIStarsLab reference count exceeds its provider limits")
-        elif route in {"xai", "manxiaobai"} and (
+        elif route in {"xai", "manxiaobai", "haoai"} and (
             item.reference_audios or item.reference_videos
         ):
             raise CatalogError(
