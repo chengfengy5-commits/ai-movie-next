@@ -1,5 +1,4 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ChangeEvent } from "react";
-import { isSafeCoverUrl } from "../../shared/api/config";
 import type {
   AssetLibraryType,
   Character,
@@ -8,7 +7,7 @@ import type {
   Series,
 } from "../../shared/api/contracts";
 import type { AssetGenerationHistoryPort } from "../../shared/api/assetGenerationHistory";
-import type { ApiError } from "../../shared/api/errors";
+import { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import { AssetMaintenanceDialog } from "./maintenance/AssetMaintenanceDialog";
 import {
@@ -32,7 +31,10 @@ import {
   CharacterAudioDialog,
   type CharacterAudioAttempt,
 } from "./media/CharacterAudioDialog";
-import { AssetGenerationHistoryDialog } from "./media/AssetGenerationHistoryDialog";
+import {
+  AssetGenerationHistoryDialog,
+  type AssetGenerationHistoryImageAdoptionPort,
+} from "./media/AssetGenerationHistoryDialog";
 import type {
   AssetImageDirectory,
   AssetImageUploadRun,
@@ -307,6 +309,26 @@ function assetSearchLabel(type: AssetLibraryType): string {
   }
 }
 
+function assetImageUrl(imageUrl: string | null, apiBaseUrl: string): string | null {
+  if (imageUrl === null || imageUrl === "" || imageUrl !== imageUrl.trim() || /[\u0000-\u0020\\]/u.test(imageUrl)) {
+    return null;
+  }
+  try {
+    const api = new URL(apiBaseUrl);
+    const image = new URL(imageUrl, api);
+    if (
+      image.username !== ""
+      || image.password !== ""
+      || (image.protocol !== "http:" && image.protocol !== "https:")
+    ) return null;
+
+    if (image.origin === api.origin) return image.href;
+    return image.protocol === "https:" && /^https:\/\//iu.test(imageUrl) ? image.href : null;
+  } catch {
+    return null;
+  }
+}
+
 function AssetImage({
   item,
   name,
@@ -320,7 +342,7 @@ function AssetImage({
   failed: boolean;
   onError(): void;
 }) {
-  const imageUrl = apiBaseUrl === null ? null : isSafeCoverUrl(item.image_url, apiBaseUrl);
+  const imageUrl = apiBaseUrl === null ? null : assetImageUrl(item.image_url, apiBaseUrl);
   if (imageUrl === null || failed) {
     return (
       <div className="asset-image-placeholder" aria-label={name + "没有可显示的本地图片"} role="img">
@@ -329,7 +351,7 @@ function AssetImage({
       </div>
     );
   }
-  return <img alt={name + "图片"} loading="lazy" onError={onError} src={imageUrl} />;
+  return <img alt={name + "图片"} loading="lazy" onError={onError} referrerPolicy="no-referrer" src={imageUrl} />;
 }
 
 function AssetCard({
@@ -1208,6 +1230,174 @@ export function AssetLibrary({
       && directoryRequestGenerationRef.current === request.directoryResult.requestGeneration
       && hasValidCategoryName(request.category, request.asset)
       && hasUniqueUsageIdentity(activeResult.result.items, request.asset, series.id);
+  }
+
+  function readGenerationHistoryAssets(
+    category: AssetLibraryType,
+    signal: AbortSignal,
+  ): Promise<AssetRecord[]> {
+    switch (category) {
+      case "characters": return services.listCharacters(series.id, signal);
+      case "scenes": return services.listScenes(series.id, signal);
+      case "props": return services.listProps(series.id, signal);
+    }
+  }
+
+  function publishGenerationHistoryAssets(
+    request: AssetGenerationHistoryRequest,
+    items: AssetRecord[],
+  ): AssetRecord | null {
+    if (!isCurrentGenerationHistory(request)) return null;
+    const matches = items.filter((item) => item.id === request.asset.id);
+    const target = matches[0];
+    if (matches.length !== 1 || target === undefined
+      || target.series_id !== request.scope.seriesId
+      || !hasValidCategoryName(request.category, target)
+      || !hasUniqueUsageIdentity(items, target, request.scope.seriesId)) {
+      return null;
+    }
+
+    let ready: AssetReadyResult;
+    switch (request.category) {
+      case "characters":
+        ready = { type: "characters", status: "ready", items: items as Character[] };
+        break;
+      case "scenes":
+        ready = { type: "scenes", status: "ready", items: items as Scene[] };
+        break;
+      case "props":
+        ready = { type: "props", status: "ready", items: items as Prop[] };
+        break;
+    }
+    const nextResult: ScopedAssetResult = {
+      ...request.directoryResult,
+      result: ready,
+    };
+    request.asset = target;
+    request.directoryResult = nextResult;
+    cache.current.set(request.category, ready);
+    resultRef.current = nextResult;
+    setResult(nextResult);
+    return target;
+  }
+
+  function generationHistoryImageAdoptionPort(
+    request: AssetGenerationHistoryRequest,
+  ): AssetGenerationHistoryImageAdoptionPort | undefined {
+    const supportsUpdate = request.category === "characters"
+      ? services.updateCharacter !== undefined
+      : request.category === "scenes"
+        ? services.updateScene !== undefined
+        : services.updateProp !== undefined;
+    if (!supportsUpdate) return undefined;
+
+    const isOperationCurrent = (
+      signal: AbortSignal,
+      isHistoryCurrent: () => boolean,
+    ) => !signal.aborted
+      && isHistoryCurrent()
+      && series.can_enter !== false
+      && isCurrentGenerationHistory(request);
+
+    const listFresh = async (
+      signal: AbortSignal,
+      isHistoryCurrent: () => boolean,
+    ): Promise<AssetRecord[] | null> => {
+      if (!isOperationCurrent(signal, isHistoryCurrent)) return null;
+      const items = await readGenerationHistoryAssets(request.category, signal);
+      if (!isOperationCurrent(signal, isHistoryCurrent)) return null;
+      return items;
+    };
+
+    const findUniqueTarget = (items: AssetRecord[]): AssetRecord | null => {
+      const matches = items.filter((item) => item.id === request.asset.id);
+      const target = matches[0];
+      return matches.length === 1
+        && target !== undefined
+        && target.series_id === request.scope.seriesId
+        && hasValidCategoryName(request.category, target)
+        && hasUniqueUsageIdentity(items, target, request.scope.seriesId)
+        ? target
+        : null;
+    };
+
+    const updateImage = async (imageUrl: string, signal: AbortSignal): Promise<void> => {
+      switch (request.category) {
+        case "characters": {
+          const update = services.updateCharacter;
+          if (update === undefined) throw new Error("角色图片更新接口不可用。");
+          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: imageUrl }, signal);
+          return;
+        }
+        case "scenes": {
+          const update = services.updateScene;
+          if (update === undefined) throw new Error("场景图片更新接口不可用。");
+          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: imageUrl }, signal);
+          return;
+        }
+        case "props": {
+          const update = services.updateProp;
+          if (update === undefined) throw new Error("道具图片更新接口不可用。");
+          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: imageUrl }, signal);
+        }
+      }
+    };
+
+    const definitelyRejected = (error: unknown): boolean => error instanceof ApiError
+      && error.kind === "http"
+      && error.status !== null
+      && error.status >= 400
+      && error.status < 500
+      && error.status !== 408;
+
+    return {
+      async inspect(signal, isHistoryCurrent) {
+        const items = await listFresh(signal, isHistoryCurrent);
+        if (items === null) return { status: "not-current" };
+        const target = findUniqueTarget(items);
+        if (target === null) return { status: "conflict" };
+        const expectedImageUrl = request.asset.image_url;
+        publishGenerationHistoryAssets(request, items);
+        if (target.image_url !== expectedImageUrl) return { status: "conflict" };
+        return { status: "ready", imageUrl: target.image_url };
+      },
+      async apply(input, isHistoryCurrent) {
+        const items = await listFresh(input.signal, isHistoryCurrent);
+        if (items === null) return "not-current";
+        const target = findUniqueTarget(items);
+        if (target === null) return "conflict";
+        if (target.image_url !== input.expectedImageUrl) {
+          publishGenerationHistoryAssets(request, items);
+          return target.image_url === input.imageUrl ? "already-applied" : "conflict";
+        }
+        if (target.image_url === input.imageUrl) {
+          publishGenerationHistoryAssets(request, items);
+          return "already-applied";
+        }
+        if (!isOperationCurrent(input.signal, isHistoryCurrent)) return "not-current";
+
+        try {
+          await updateImage(input.imageUrl, input.signal);
+        } catch (error) {
+          if (!isOperationCurrent(input.signal, isHistoryCurrent)) return "not-current";
+          if (definitelyRejected(error)) throw error;
+        }
+
+        let updatedItems: AssetRecord[];
+        try {
+          const freshItems = await listFresh(input.signal, isHistoryCurrent);
+          if (freshItems === null) return "not-current";
+          updatedItems = freshItems;
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 401) throw error;
+          if (!isOperationCurrent(input.signal, isHistoryCurrent)) return "not-current";
+          return "unknown";
+        }
+        const updatedTarget = publishGenerationHistoryAssets(request, updatedItems);
+        if (updatedTarget === null) return "unknown";
+        return updatedTarget.image_url === input.imageUrl ? "applied" : "unknown";
+      },
+    };
   }
 
   function closeGenerationHistory(request: AssetGenerationHistoryRequest): void {
@@ -2512,6 +2702,7 @@ export function AssetLibrary({
           onUnauthorized={() => {
             if (isCurrentGenerationHistory(generationHistoryRequest)) unauthorizedHandlerRef.current();
           }}
+          imageAdoptionPort={generationHistoryImageAdoptionPort(generationHistoryRequest)}
           port={generationHistoryRequest.port}
           seriesId={series.id}
           seriesName={series.name}

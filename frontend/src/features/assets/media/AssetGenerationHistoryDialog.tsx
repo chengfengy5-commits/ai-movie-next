@@ -14,6 +14,29 @@ import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
 
 import "./assetGenerationHistory.css";
 
+export type AssetGenerationHistoryImageAdoptionInspection =
+  | { readonly status: "ready"; readonly imageUrl: string | null }
+  | { readonly status: "conflict" }
+  | { readonly status: "not-current" };
+
+export type AssetGenerationHistoryImageAdoptionOutcome =
+  | "applied"
+  | "already-applied"
+  | "conflict"
+  | "unknown"
+  | "not-current";
+
+export interface AssetGenerationHistoryImageAdoptionPort {
+  inspect(
+    signal: AbortSignal,
+    isOperationCurrent: () => boolean,
+  ): Promise<AssetGenerationHistoryImageAdoptionInspection>;
+  apply(
+    input: { readonly expectedImageUrl: string | null; readonly imageUrl: string; readonly signal: AbortSignal },
+    isOperationCurrent: () => boolean,
+  ): Promise<AssetGenerationHistoryImageAdoptionOutcome>;
+}
+
 interface AssetGenerationHistoryDialogProps {
   actorId: string;
   assetId: string;
@@ -24,6 +47,7 @@ interface AssetGenerationHistoryDialogProps {
   onClose(): void;
   onUnauthorized(): void;
   port: AssetGenerationHistoryPort;
+  imageAdoptionPort?: AssetGenerationHistoryImageAdoptionPort | undefined;
   seriesId: string;
   seriesName: string;
   isCurrent(): boolean;
@@ -56,6 +80,12 @@ type HistoryState =
 type ActionNotice =
   | { readonly messageId: string; readonly kind: "transferring"; readonly message: string }
   | { readonly messageId: string; readonly kind: "unknown" | "error" | "success"; readonly message: string };
+
+interface ImageAdoptionConfirmation {
+  readonly messageId: string;
+  readonly imageUrl: string;
+  readonly expectedImageUrl: string | null;
+}
 
 interface ActiveTransfer {
   readonly messageId: string;
@@ -300,6 +330,7 @@ export function AssetGenerationHistoryDialog({
   onClose,
   onUnauthorized,
   port,
+  imageAdoptionPort,
   seriesId,
   seriesName,
   isCurrent,
@@ -314,6 +345,7 @@ export function AssetGenerationHistoryDialog({
   const [historyState, setHistoryState] = useState<HistoryState>({ status: "idle" });
   const [actionNotice, setActionNotice] = useState<ActionNotice | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<string | null>(null);
+  const [imageAdoptionConfirmation, setImageAdoptionConfirmation] = useState<ImageAdoptionConfirmation | null>(null);
   const [busyMessageId, setBusyMessageId] = useState<string | null>(null);
   const parentCurrentRef = useRef(isCurrent);
   parentCurrentRef.current = isCurrent;
@@ -367,6 +399,7 @@ export function AssetGenerationHistoryDialog({
 
   useEffect(() => {
     setDeleteConfirmation(null);
+    setImageAdoptionConfirmation(null);
     setHistoryPage(0);
     setActivePreviewMessageId(null);
     if (selectedChapterId === "") {
@@ -680,6 +713,101 @@ export function AssetGenerationHistoryDialog({
     }
   }
 
+  async function prepareImageAdoption(entry: HistoryEntry): Promise<void> {
+    if (mode !== "image" || entry.mediaRoute === null || imageAdoptionPort === undefined
+      || !beginAction(entry.message.id) || currentHistory === null) return;
+    const run = currentHistory.run;
+    const messageId = entry.message.id;
+    const controller = createController();
+    actionControllerRef.current = controller;
+    try {
+      const original = await verifyOriginal(run, entry);
+      if (original === null || !matchesLoadedEntry(run, entry)) {
+        if (selectedContextIsCurrent(run)) {
+          setActionNotice({ messageId, kind: "error", message: "原消息已变化或身份无法唯一核对，未准备替换素材图。" });
+        }
+        return;
+      }
+      const inspection = await imageAdoptionPort.inspect(controller.signal, () => matchesLoadedEntry(run, entry));
+      if (!matchesLoadedEntry(run, entry) || inspection.status === "not-current") return;
+      if (inspection.status === "conflict") {
+        setActionNotice({ messageId, kind: "error", message: "当前素材身份或图片已变化，请重新打开历史后操作。" });
+        return;
+      }
+      setImageAdoptionConfirmation({
+        messageId,
+        imageUrl: original.content,
+        expectedImageUrl: inspection.imageUrl,
+      });
+      setActionNotice({
+        messageId,
+        kind: "success",
+        message: inspection.imageUrl === null
+          ? "已核对原生成记录和当前素材。确认后会再次读取并保存这张图片。"
+          : "已核对原生成记录和当前素材。确认后会再次读取并替换当前图片。",
+      });
+    } catch (error) {
+      if (!matchesLoadedEntry(run, entry)) return;
+      if (unauthorized(error)) unauthorizedRef.current();
+      setActionNotice({ messageId, kind: "error", message: errorMessage(error, "read") });
+    } finally {
+      endAction(messageId);
+      if (actionControllerRef.current === controller) actionControllerRef.current = null;
+      releaseController(controller);
+    }
+  }
+
+  async function confirmImageAdoption(entry: HistoryEntry): Promise<void> {
+    const confirmation = imageAdoptionConfirmation;
+    if (mode !== "image" || entry.mediaRoute === null || imageAdoptionPort === undefined
+      || confirmation?.messageId !== entry.message.id
+      || !beginAction(entry.message.id) || currentHistory === null) return;
+    const run = currentHistory.run;
+    const messageId = entry.message.id;
+    const controller = createController();
+    actionControllerRef.current = controller;
+    try {
+      const original = await verifyOriginal(run, entry);
+      if (original === null || original.content !== confirmation.imageUrl || !matchesLoadedEntry(run, entry)) {
+        if (selectedContextIsCurrent(run)) {
+          setImageAdoptionConfirmation(null);
+          setActionNotice({ messageId, kind: "error", message: "原生成记录已变化，未修改素材图片。" });
+        }
+        return;
+      }
+      const outcome = await imageAdoptionPort.apply({
+        expectedImageUrl: confirmation.expectedImageUrl,
+        imageUrl: original.content,
+        signal: controller.signal,
+      }, () => matchesLoadedEntry(run, entry));
+      if (!matchesLoadedEntry(run, entry) || outcome === "not-current") return;
+      setImageAdoptionConfirmation(null);
+      switch (outcome) {
+        case "applied":
+          setActionNotice({ messageId, kind: "success", message: "素材图片已保存，并由独立目录读取确认。" });
+          break;
+        case "already-applied":
+          setActionNotice({ messageId, kind: "success", message: "当前素材图片已是这张图片，目录读取已确认。" });
+          break;
+        case "conflict":
+          setActionNotice({ messageId, kind: "error", message: "当前素材图片已变化，未覆盖新图片。请重新打开历史后确认。" });
+          break;
+        case "unknown":
+          setActionNotice({ messageId, kind: "unknown", message: "保存请求已发出但结果未知；已停止自动操作，请只读核对素材目录。" });
+          break;
+      }
+    } catch (error) {
+      if (!matchesLoadedEntry(run, entry)) return;
+      if (unauthorized(error)) unauthorizedRef.current();
+      setImageAdoptionConfirmation(null);
+      setActionNotice({ messageId, kind: "error", message: errorMessage(error, "write") });
+    } finally {
+      endAction(messageId);
+      if (actionControllerRef.current === controller) actionControllerRef.current = null;
+      releaseController(controller);
+    }
+  }
+
   function stopTransferWait(messageId: string): void {
     const active = transferRef.current;
     if (active?.messageId !== messageId) return;
@@ -690,12 +818,14 @@ export function AssetGenerationHistoryDialog({
   function refreshHistory(): void {
     if (busyMessageId !== null) return;
     setActionNotice(null);
+    setImageAdoptionConfirmation(null);
     setHistoryRefresh((value) => value + 1);
   }
 
   function changeHistoryPage(page: number): void {
     if (busyMessageId !== null || page < 0 || page >= pageCount || page === currentPage) return;
     setActivePreviewMessageId(null);
+    setImageAdoptionConfirmation(null);
     setHistoryPage(page);
   }
 
@@ -872,6 +1002,16 @@ export function AssetGenerationHistoryDialog({
                       <p className="asset-generation-history-time">{displayTime(entry.message.created_at)}</p>
                       {isMedia && (
                         <div className="asset-generation-history-actions">
+                          {mode === "image" && imageAdoptionPort !== undefined && (
+                            <button
+                              className="secondary-button"
+                              disabled={busyMessageId !== null}
+                              onClick={() => void prepareImageAdoption(entry)}
+                              type="button"
+                            >
+                              设为{assetType === "character" ? "角色图" : assetType === "scene" ? "场景图" : "道具图"}
+                            </button>
+                          )}
                           <button
                             className="secondary-button"
                             disabled={busyMessageId !== null}
@@ -899,6 +1039,34 @@ export function AssetGenerationHistoryDialog({
                               删除
                             </button>
                           )}
+                        </div>
+                      )}
+                      {imageAdoptionConfirmation?.messageId === messageId && (
+                        <div className="asset-generation-history-confirm" role="group" aria-label="确认设置素材图片">
+                          <span>
+                            {imageAdoptionConfirmation.expectedImageUrl === null
+                              ? "将这张图片设为当前素材图。"
+                              : "将用这张生成图片替换当前素材图。"}
+                          </span>
+                          <button
+                            className="primary-button"
+                            disabled={busyMessageId !== null}
+                            onClick={() => void confirmImageAdoption(entry)}
+                            type="button"
+                          >
+                            确认设为{assetType === "character" ? "角色图" : assetType === "scene" ? "场景图" : "道具图"}
+                          </button>
+                          <button
+                            className="secondary-button"
+                            disabled={busyMessageId !== null}
+                            onClick={() => {
+                              setImageAdoptionConfirmation(null);
+                              setActionNotice(null);
+                            }}
+                            type="button"
+                          >
+                            取消
+                          </button>
                         </div>
                       )}
                       {notice !== null && (
