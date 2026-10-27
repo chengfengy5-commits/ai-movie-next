@@ -28,6 +28,7 @@ import {
   type ChatContextPreferenceFailure,
 } from "./chatContextPreferences";
 import { ChatAssistantSplitPane } from "./ChatAssistantSplitPane";
+import type { WorkbenchSourceIntent } from "../series-workbench/sourceIntent";
 import "./chatAssistant.css";
 
 const PENDING_LOCATOR_PREFIX = "haoai.chat-assistant.pending.v1";
@@ -79,6 +80,14 @@ interface ChatAssistantPageProps {
   onUnauthorized(): void;
   onBack(): void;
   onNavigateSource(target: ChatAssistantSourceIntent): void;
+  readonly workbenchSourceIntent?: WorkbenchSourceIntent | null;
+}
+
+interface RequestedWorkbenchSource {
+  readonly intent: WorkbenchSourceIntent;
+  readonly interactionVersion: number;
+  readonly needsConfirmation: boolean;
+  readonly confirmed: boolean;
 }
 
 export type ChatAssistantSourceIntent =
@@ -100,6 +109,19 @@ interface AssetChoice {
   readonly type: ChatAssistantAssetType;
   readonly id: string;
   readonly name: string;
+}
+
+function preferenceForWorkbenchTarget(intent: WorkbenchSourceIntent): ChatContextPreference | null {
+  const target = intent.target;
+  if (target.kind === "chapter") return { kind: "chapter", chapterId: target.chapterId };
+  if (target.kind === "frame") {
+    return { kind: "frame", chapterId: target.chapterId, storyboardAssetId: target.storyboardAssetId };
+  }
+  if (target.category === "fused") return null;
+  const assetType: ChatAssistantAssetType = target.category === "characters" ? "character"
+    : target.category === "scenes" ? "scene"
+      : target.category === "props" ? "prop" : "storyboard";
+  return { kind: "asset", chapterId: target.chapterId, assetType, assetId: target.assetId };
 }
 
 function chatSettings(services: WorkspaceServices): CreatorSettingsServicePort | undefined {
@@ -289,6 +311,7 @@ export function ChatAssistantPage({
   onUnauthorized,
   onBack,
   onNavigateSource,
+  workbenchSourceIntent = null,
 }: ChatAssistantPageProps) {
   const [chapters, setChapters] = useState<Chapter[]>([]);
   const [chapterId, setChapterId] = useState("");
@@ -304,6 +327,7 @@ export function ChatAssistantPage({
   const [enableThinking, setEnableThinking] = useState(false);
   const [draft, setDraft] = useState("");
   const [snapshot, setSnapshot] = useState<HistorySnapshot | null>(null);
+  const [historyRefreshRevision, setHistoryRefreshRevision] = useState(0);
   const [historyLoading, setHistoryLoading] = useState(false);
   const [directoryLoading, setDirectoryLoading] = useState(false);
   const [catalogLoading, setCatalogLoading] = useState(true);
@@ -313,6 +337,7 @@ export function ChatAssistantPage({
   const [directoryError, setDirectoryError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
   const [pending, setPending] = useState<PendingOperation | null>(null);
+  const [requestedWorkbenchSource, setRequestedWorkbenchSource] = useState<RequestedWorkbenchSource | null>(null);
   const [streamPreview, setStreamPreview] = useState("");
   const [streamNotice, setStreamNotice] = useState<string | null>(null);
   const [messageNotice, setMessageNotice] = useState<string | null>(null);
@@ -328,6 +353,7 @@ export function ChatAssistantPage({
   const operationBusyRef = useRef(false);
   const operationGenerationRef = useRef(0);
   const restoredLocatorRef = useRef<string | null>(null);
+  const lastWorkbenchIntentEpochRef = useRef<number | null>(null);
   const contextRestoreGenerationRef = useRef(0);
   const contextInteractionVersionRef = useRef(0);
   const pendingContextRestoreRef = useRef<PendingContextRestore | null>(null);
@@ -712,6 +738,164 @@ export function ChatAssistantPage({
   ]);
 
   useEffect(() => {
+    const intent = workbenchSourceIntent;
+    if (intent === null || lastWorkbenchIntentEpochRef.current === intent.navigationEpoch) return;
+    lastWorkbenchIntentEpochRef.current = intent.navigationEpoch;
+    if (intent.actorId !== userId || intent.services !== services || intent.apiBaseUrl !== services.apiBaseUrl
+      || intent.sessionGeneration !== sessionGeneration || intent.seriesId !== series.id || !intent.isCurrent()) {
+      setMessageNotice("左侧来源已变化，聊天目标没有更新。请重新选择来源。");
+      return;
+    }
+    setRequestedWorkbenchSource({
+      intent,
+      interactionVersion: contextInteractionVersionRef.current,
+      needsConfirmation: pending !== null || sending,
+      confirmed: false,
+    });
+  }, [pending, sending, series.id, services, sessionGeneration, userId, workbenchSourceIntent]);
+
+  useEffect(() => {
+    const request = requestedWorkbenchSource;
+    if (request === null) return;
+    if (!request.intent.isCurrent()) {
+      setRequestedWorkbenchSource(null);
+      setMessageNotice("左侧来源已失效，当前聊天目标保持不变。");
+      return;
+    }
+    if (request.interactionVersion !== contextInteractionVersionRef.current) {
+      setRequestedWorkbenchSource(null);
+      setMessageNotice("你已手动编辑聊天上下文，保留当前选择。需要时可重新点选左侧来源。");
+      return;
+    }
+    if (pending !== null || sending) {
+      if (!request.needsConfirmation) {
+        setRequestedWorkbenchSource({ ...request, needsConfirmation: true });
+      }
+      return;
+    }
+    if (request.needsConfirmation && !request.confirmed) return;
+    if (catalogLoading || !contextPreferenceReady) return;
+    const preference = preferenceForWorkbenchTarget(request.intent);
+    if (preference === null) {
+      setRequestedWorkbenchSource(null);
+      setMessageNotice("融合素材不能作为聊天目标；当前上下文保持不变。");
+      return;
+    }
+    const applyResolvedSource = (
+      result: ReturnType<typeof resolveChatContextPreference>,
+      candidateSnapshot?: {
+        readonly chapters: Chapter[];
+        readonly directories?: {
+          readonly storyboards: StoryboardAsset[];
+          readonly characters: Character[];
+          readonly scenes: Scene[];
+          readonly props: Prop[];
+        };
+      },
+    ) => {
+      if (result.status !== "resolved") {
+        setRequestedWorkbenchSource(null);
+        setMessageNotice(`左侧来源无法在最新目录中唯一核对（${contextPreferenceFailureMessage(result.reason, false)}）；当前上下文保持不变。`);
+        return;
+      }
+      if (candidateSnapshot !== undefined) {
+        setChapters(candidateSnapshot.chapters);
+        if (candidateSnapshot.directories !== undefined) {
+          setStoryboards(candidateSnapshot.directories.storyboards);
+          setCharacters(candidateSnapshot.directories.characters);
+          setScenes(candidateSnapshot.directories.scenes);
+          setProps(candidateSnapshot.directories.props);
+          setDirectoryError(null);
+          setDirectoryLoading(false);
+          setDirectoryReadyFor({
+            key: JSON.stringify([contextPreferenceContextKey, request.intent.chapterId]),
+            services,
+          });
+        }
+      }
+      setChapterId(request.intent.chapterId);
+      setTargetKey(result.targetKey);
+      setHistoryRefreshRevision((revision) => revision + 1);
+      persistContextPreference(result.preference);
+      setRequestedWorkbenchSource(null);
+      setMessageNotice("已将左侧选择应用为当前聊天目标。正在读取对应会话。");
+    };
+
+    const controller = new AbortController();
+    let active = true;
+    const isCandidateCurrent = () => active
+      && !controller.signal.aborted
+      && request.intent.isCurrent()
+      && request.interactionVersion === contextInteractionVersionRef.current
+      && contextIdentityRef.current === contextPreferenceContextKey;
+    setMessageNotice("正在独立核对左侧聊天来源；核对期间保留当前章节和目标。");
+    const candidateDirectories = preference.kind === "chapter"
+      ? Promise.resolve(null)
+      : Promise.all([
+        services.listStoryboardAssets(series.id, request.intent.chapterId, controller.signal),
+        services.listCharacters(series.id, controller.signal),
+        services.listScenes(series.id, controller.signal),
+        services.listProps(series.id, controller.signal),
+      ]);
+    void Promise.all([
+      services.listChapters(series.id, controller.signal),
+      candidateDirectories,
+    ]).then(([candidateChapters, resolvedDirectories]) => {
+      if (!isCandidateCurrent()) return;
+      const candidateChapterMatches = candidateChapters.filter((candidate) => (
+        candidate.id === request.intent.chapterId && candidate.series_id === series.id
+      ));
+      if (candidateChapterMatches.length !== 1) {
+        setRequestedWorkbenchSource(null);
+        setMessageNotice(candidateChapterMatches.length === 0
+          ? "左侧目标章节已不在最新剧集目录中；当前聊天章节、目标和草稿保持不变。"
+          : "左侧目标章节编号不唯一；当前聊天章节、目标和草稿保持不变。");
+        return;
+      }
+      const directories = resolvedDirectories === null
+        ? undefined
+        : {
+          storyboards: resolvedDirectories[0],
+          characters: resolvedDirectories[1],
+          scenes: resolvedDirectories[2],
+          props: resolvedDirectories[3],
+        };
+      const result = resolveChatContextPreference(
+        preference,
+        candidateChapters,
+        series.id,
+        directories?.storyboards ?? [],
+        directories?.characters ?? [],
+        directories?.scenes ?? [],
+        directories?.props ?? [],
+      );
+      applyResolvedSource(result, {
+        chapters: candidateChapters,
+        ...(directories === undefined ? {} : { directories }),
+      });
+    }).catch((error: unknown) => {
+      if (!isCandidateCurrent()) return;
+      const normalized = normalizeApiError(error);
+      if (normalized.status === 401) unauthorizedHandlerRef.current();
+      setRequestedWorkbenchSource(null);
+      setMessageNotice(`左侧目标目录核对失败（${normalized.detail ?? normalized.message}）；当前聊天章节、目标和草稿保持不变。`);
+    });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [
+    contextPreferenceReady,
+    contextPreferenceContextKey,
+    catalogLoading,
+    pending,
+    requestedWorkbenchSource,
+    sending,
+    series.id,
+    services,
+  ]);
+
+  useEffect(() => {
     if (!contextPreferenceReady || target === null || services.chatAssistant === undefined || series.can_enter !== true) {
       setSnapshot(null);
       setHistoryLoading(false);
@@ -742,7 +926,7 @@ export function ChatAssistantPage({
       setHistoryLoading(false);
     });
     return () => { current = false; controller.abort(); };
-  }, [contextPreferenceReady, identitySignature, services, series.can_enter, target, targetSignature, userId]);
+  }, [contextPreferenceReady, historyRefreshRevision, identitySignature, services, series.can_enter, target, targetSignature, userId]);
 
   useEffect(() => {
     if (currentLocator === null || !chapters.some((chapter) => chapter.id === currentLocator.target.chapterId)) return;
@@ -869,6 +1053,7 @@ export function ChatAssistantPage({
 
   function recordContextInteraction() {
     contextInteractionVersionRef.current += 1;
+    setRequestedWorkbenchSource(null);
     if (pendingContextRestoreRef.current !== null) {
       pendingContextRestoreRef.current = null;
       setContextPreferenceReadyFor(contextPreferenceContextKey);
@@ -1455,6 +1640,22 @@ export function ChatAssistantPage({
 
             {streamNotice !== null && <p className="chat-assistant-note" role="status">{streamNotice}</p>}
             {messageNotice !== null && <p className="chat-assistant-note" role="status">{messageNotice}</p>}
+            {requestedWorkbenchSource !== null && (
+              <section className="chat-assistant-pending" aria-label="待应用的左侧来源">
+                <p role="status">{pending !== null || sending
+                  ? "当前聊天操作仍在进行。原目标与回执保持不变；左侧新来源已暂存。"
+                  : requestedWorkbenchSource.needsConfirmation && !requestedWorkbenchSource.confirmed
+                    ? "原聊天操作已结束。请确认后再应用刚才选择的左侧来源。"
+                    : "正在核对左侧来源与最新章节目录…"}</p>
+                {requestedWorkbenchSource.needsConfirmation && !requestedWorkbenchSource.confirmed
+                  && pending === null && !sending && (
+                  <button className="secondary-button" onClick={() => setRequestedWorkbenchSource((current) => (
+                    current === null ? null : { ...current, confirmed: true }
+                  ))} type="button">应用左侧来源</button>
+                )}
+                <button className="text-button" onClick={() => setRequestedWorkbenchSource(null)} type="button">保留当前聊天目标</button>
+              </section>
+            )}
 
             <form className="chat-assistant-composer" onSubmit={(event) => { event.preventDefault(); void submitMessage(); }}>
               <label>

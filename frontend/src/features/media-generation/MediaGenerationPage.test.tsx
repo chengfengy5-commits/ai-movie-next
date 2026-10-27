@@ -1,4 +1,4 @@
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Series, StoryboardAsset } from "../../shared/api/contracts";
@@ -9,6 +9,7 @@ import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "..
 import type { UserPreferences, UserPreferencesPort } from "../../shared/api/userPreferences";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
 import { MediaGenerationPage } from "./MediaGenerationPage";
+import type { WorkbenchSourceIntent } from "../series-workbench/sourceIntent";
 import {
   readSingleMediaModePreference,
   readSingleMediaPreference,
@@ -374,6 +375,439 @@ describe("MediaGenerationPage", () => {
     expect(screen.getByLabelText("视频提示词")).toHaveValue("目录加载时输入的内容");
   });
 
+  it("applies a workbench frame source only after matching fresh chapter and storyboard data", async () => {
+    const series = seriesFixture();
+    const storyboard = { ...storyboardFixture(), frame_index: 0 };
+    const chapter: Chapter = {
+      ...chapterFixture(),
+      content: [{ text: "镜头正文", storyboard: [storyboard.id] }],
+    };
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      apiBaseUrl: "https://api.example.test/api",
+      creatorSettings: creatorSettings(),
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => [storyboard]),
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const isCurrent = vi.fn(() => true);
+    const workbenchSourceIntent: WorkbenchSourceIntent = {
+      actorId: "actor-926",
+      apiBaseUrl: services.apiBaseUrl,
+      services,
+      sessionGeneration: 5,
+      navigationEpoch: 21,
+      seriesId: series.id,
+      chapterId: chapter.id,
+      target: { kind: "frame", chapterId: chapter.id, storyboardAssetId: storyboard.id },
+      isCurrent,
+    };
+    render(<MediaGenerationPage services={services} userId="actor-926" sessionGeneration={5}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} workbenchSourceIntent={workbenchSourceIntent} />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("视频目标")).toHaveValue("frame_message");
+      expect(screen.getByLabelText("分镜目标")).toHaveValue(storyboard.id);
+    });
+    expect(isCurrent).toHaveBeenCalled();
+    expect(await screen.findByText("已将左侧选择应用为媒体目标；提交时仍会重新核对当前目录。"))
+      .toBeInTheDocument();
+  });
+
+  it.each(["no selected series", "another selected series"] as const)(
+    "applies a cross-series frame source from the same verified chapter and directory snapshot (%s)",
+    async (startingContext) => {
+      const user = userEvent.setup();
+      const currentSeries = seriesFixture();
+      const candidateSeries: Series = { ...currentSeries, id: "series-candidate-926", name: "候选剧集" };
+      const currentChapter = chapterFixture();
+      const candidateChapter: Chapter = {
+        ...chapterFixture(),
+        id: "chapter-candidate-926",
+        series_id: candidateSeries.id,
+        title: "候选章节",
+        content: [{ text: "候选正文", storyboard: ["storyboard-candidate-926"] }],
+      };
+      const currentStoryboard = { ...storyboardFixture(), frame_index: 0 };
+      const candidateStoryboard = {
+        ...storyboardFixture(),
+        id: "storyboard-candidate-926",
+        series_id: candidateSeries.id,
+        chapter_id: candidateChapter.id,
+        frame_index: 0,
+      };
+      const services: WorkspaceServices = {
+        ...createDemoServices(window.localStorage),
+        apiBaseUrl: "https://api.example.test/api",
+        creatorSettings: creatorSettings(),
+        listSeries: vi.fn(async () => [currentSeries, candidateSeries]),
+        listChapters: vi.fn(async (seriesId: string) => seriesId === candidateSeries.id
+          ? [candidateChapter]
+          : [currentChapter]),
+        listStoryboardAssets: vi.fn(async (_seriesId: string, chapterId: string) => chapterId === candidateChapter.id
+          ? [candidateStoryboard]
+          : [currentStoryboard]),
+        listCharacters: vi.fn(async () => []),
+        listScenes: vi.fn(async () => []),
+        listProps: vi.fn(async () => []),
+      };
+      const props = {
+        services,
+        userId: "actor-cross-series-926",
+        sessionGeneration: 1,
+        onUnauthorized: vi.fn(),
+        onOpenTasks: vi.fn(),
+        workbenchSourceIntent: null as WorkbenchSourceIntent | null,
+      };
+      const rendered = render(<MediaGenerationPage {...props} />);
+      await user.click(await screen.findByRole("button", { name: "普通视频" }));
+      if (startingContext === "another selected series") {
+        await user.selectOptions(screen.getByLabelText("视频目标"), "frame_message");
+        await user.selectOptions(await screen.findByLabelText("剧集"), currentSeries.id);
+        await user.selectOptions(await screen.findByLabelText("章节"), currentChapter.id);
+      }
+      await user.type(screen.getByLabelText("视频提示词"), "跨剧集应用仍保留本页提示词");
+      const workbenchSourceIntent: WorkbenchSourceIntent = {
+        actorId: "actor-cross-series-926",
+        apiBaseUrl: services.apiBaseUrl,
+        services,
+        sessionGeneration: 1,
+        navigationEpoch: startingContext === "no selected series" ? 73 : 74,
+        seriesId: candidateSeries.id,
+        chapterId: candidateChapter.id,
+        target: { kind: "frame", chapterId: candidateChapter.id, storyboardAssetId: candidateStoryboard.id },
+        isCurrent: () => true,
+      };
+      rendered.rerender(<MediaGenerationPage {...props} workbenchSourceIntent={workbenchSourceIntent} />);
+
+      await waitFor(() => expect(screen.getByLabelText("剧集")).toHaveValue(candidateSeries.id));
+      expect(screen.getByLabelText("章节")).toHaveValue(candidateChapter.id);
+      expect(screen.getByLabelText("视频目标")).toHaveValue("frame_message");
+      expect(screen.getByLabelText("分镜目标")).toHaveValue(candidateStoryboard.id);
+      expect(screen.getByLabelText("视频提示词")).toHaveValue("跨剧集应用仍保留本页提示词");
+      expect(await screen.findByText("已将左侧选择应用为媒体目标；提交时仍会重新核对当前目录。"))
+        .toBeInTheDocument();
+    },
+  );
+
+  it("admits a workbench source from a newly created series after refreshing the series catalog", async () => {
+    const user = userEvent.setup();
+    const existingSeries = seriesFixture();
+    const newSeries: Series = { ...existingSeries, id: "series-created-after-mount-1117", name: "新建剧集" };
+    const candidateChapter: Chapter = {
+      ...chapterFixture(),
+      id: "chapter-created-after-mount-1117",
+      series_id: newSeries.id,
+      title: "新建剧集章节",
+      content: [{ text: "新建分镜", storyboard: ["board-created-after-mount-1117"] }],
+    };
+    const candidateStoryboard = {
+      ...storyboardFixture(),
+      id: "board-created-after-mount-1117",
+      series_id: newSeries.id,
+      chapter_id: candidateChapter.id,
+      frame_index: 0,
+    };
+    let seriesReadCount = 0;
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      apiBaseUrl: "https://api.example.test/api",
+      creatorSettings: creatorSettings(),
+      listSeries: vi.fn(async () => {
+        seriesReadCount += 1;
+        return seriesReadCount === 1 ? [existingSeries] : [existingSeries, newSeries];
+      }),
+      listChapters: vi.fn(async (seriesId: string) => (
+        seriesId === newSeries.id ? [candidateChapter] : []
+      )),
+      listStoryboardAssets: vi.fn(async (_seriesId: string, chapterId: string) => (
+        chapterId === candidateChapter.id ? [candidateStoryboard] : []
+      )),
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const props = {
+      services,
+      userId: "actor-new-series-1117",
+      sessionGeneration: 1,
+      onUnauthorized: vi.fn(),
+      onOpenTasks: vi.fn(),
+      workbenchSourceIntent: null as WorkbenchSourceIntent | null,
+    };
+    const rendered = render(<MediaGenerationPage {...props} />);
+    await user.click(await screen.findByRole("button", { name: "普通视频" }));
+    await user.type(screen.getByLabelText("视频提示词"), "新剧集来源保留当前提示词");
+    const intent: WorkbenchSourceIntent = {
+      actorId: props.userId,
+      apiBaseUrl: services.apiBaseUrl,
+      services,
+      sessionGeneration: 1,
+      navigationEpoch: 117,
+      seriesId: newSeries.id,
+      chapterId: candidateChapter.id,
+      target: { kind: "frame", chapterId: candidateChapter.id, storyboardAssetId: candidateStoryboard.id },
+      isCurrent: () => true,
+    };
+    rendered.rerender(<MediaGenerationPage {...props} workbenchSourceIntent={intent} />);
+
+    await waitFor(() => {
+      expect(screen.getByLabelText("剧集")).toHaveValue(newSeries.id);
+      expect(screen.getByLabelText("章节")).toHaveValue(candidateChapter.id);
+      expect(screen.getByLabelText("分镜目标")).toHaveValue(candidateStoryboard.id);
+    });
+    expect(seriesReadCount).toBe(2);
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("新剧集来源保留当前提示词");
+  });
+
+  it("keeps the current media target and prompt when a cross-chapter candidate directory is rejected", async () => {
+    const user = userEvent.setup();
+    const series = seriesFixture();
+    const currentStoryboard = { ...storyboardFixture(), id: "storyboard-current-1117", frame_index: 0 };
+    const candidateChapter: Chapter = {
+      ...chapterFixture(),
+      id: "chapter-candidate-1117",
+      title: "候选章节",
+      content: [{ text: "候选镜头", storyboard: ["storyboard-candidate-1117"] }],
+    };
+    const currentChapter: Chapter = {
+      ...chapterFixture(),
+      content: [{ text: "当前镜头", storyboard: [currentStoryboard.id] }],
+    };
+    const candidateStoryboard = {
+      ...storyboardFixture(),
+      id: "storyboard-candidate-1117",
+      chapter_id: candidateChapter.id,
+      frame_index: 0,
+    };
+    const listStoryboardAssets = vi.fn(async (_seriesId: string, chapterId: string) => {
+      if (chapterId === candidateChapter.id) throw new Error("candidate directory unavailable");
+      return [currentStoryboard];
+    });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      apiBaseUrl: "https://api.example.test/api",
+      creatorSettings: creatorSettings(),
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [currentChapter, candidateChapter]),
+      listStoryboardAssets,
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const props = {
+      services,
+      userId: "actor-1117",
+      sessionGeneration: 1,
+      onUnauthorized: vi.fn(),
+      onOpenTasks: vi.fn(),
+      workbenchSourceIntent: null as WorkbenchSourceIntent | null,
+    };
+    const rendered = render(<MediaGenerationPage {...props} />);
+
+    await user.click(await screen.findByRole("button", { name: "普通视频" }));
+    await user.selectOptions(screen.getByLabelText("视频目标"), "frame_message");
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), currentChapter.id);
+    await user.selectOptions(await screen.findByLabelText("分镜目标"), currentStoryboard.id);
+    await user.type(screen.getByLabelText("视频提示词"), "当前媒体草稿继续保留");
+    await waitFor(() => expect(screen.getByLabelText("分镜目标")).toHaveValue(currentStoryboard.id));
+
+    const workbenchSourceIntent: WorkbenchSourceIntent = {
+      actorId: "actor-1117",
+      apiBaseUrl: services.apiBaseUrl,
+      services,
+      sessionGeneration: 1,
+      navigationEpoch: 71,
+      seriesId: series.id,
+      chapterId: candidateChapter.id,
+      target: { kind: "frame", chapterId: candidateChapter.id, storyboardAssetId: candidateStoryboard.id },
+      isCurrent: () => true,
+    };
+    rendered.rerender(<MediaGenerationPage {...props} workbenchSourceIntent={workbenchSourceIntent} />);
+
+    await screen.findByText(/左侧目标目录核对失败/u);
+    expect(screen.queryByText(/正在独立核对左侧媒体来源/u)).not.toBeInTheDocument();
+    expect(screen.getByLabelText("剧集")).toHaveValue(series.id);
+    expect(screen.getByLabelText("章节")).toHaveValue(currentChapter.id);
+    expect(screen.getByLabelText("视频目标")).toHaveValue("frame_message");
+    expect(screen.getByLabelText("分镜目标")).toHaveValue(currentStoryboard.id);
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("当前媒体草稿继续保留");
+    expect(listStoryboardAssets).toHaveBeenCalledWith(series.id, candidateChapter.id, expect.any(AbortSignal));
+  });
+
+  it("ignores a late cross-chapter candidate after the user manually chooses another chapter", async () => {
+    const user = userEvent.setup();
+    const series = seriesFixture();
+    const currentStoryboard = { ...storyboardFixture(), id: "storyboard-current-late-1117", frame_index: 0 };
+    const currentChapter: Chapter = {
+      ...chapterFixture(),
+      content: [{ text: "当前镜头", storyboard: [currentStoryboard.id] }],
+    };
+    const candidateChapter: Chapter = {
+      ...chapterFixture(),
+      id: "chapter-candidate-late-1117",
+      title: "候选章节",
+      content: [{ text: "候选镜头", storyboard: ["storyboard-candidate-late-1117"] }],
+    };
+    const manuallyChosenChapter: Chapter = {
+      ...chapterFixture(),
+      id: "chapter-manual-late-1117",
+      title: "手动选择章节",
+      content: [{ text: "手动镜头", storyboard: ["storyboard-manual-late-1117"] }],
+    };
+    const candidateStoryboard = {
+      ...storyboardFixture(),
+      id: "storyboard-candidate-late-1117",
+      chapter_id: candidateChapter.id,
+      frame_index: 0,
+    };
+    let releaseCandidate!: (assets: StoryboardAsset[]) => void;
+    const candidateDirectory = new Promise<StoryboardAsset[]>((resolve) => { releaseCandidate = resolve; });
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      apiBaseUrl: "https://api.example.test/api",
+      creatorSettings: creatorSettings(),
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [currentChapter, candidateChapter, manuallyChosenChapter]),
+      listStoryboardAssets: vi.fn(async (_seriesId: string, chapterId: string) => {
+        if (chapterId === candidateChapter.id) return candidateDirectory;
+        if (chapterId === currentChapter.id) return [currentStoryboard];
+        return [];
+      }),
+      listCharacters: vi.fn(async () => []),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const props = {
+      services,
+      userId: "actor-1117-late",
+      sessionGeneration: 1,
+      onUnauthorized: vi.fn(),
+      onOpenTasks: vi.fn(),
+      workbenchSourceIntent: null as WorkbenchSourceIntent | null,
+    };
+    const rendered = render(<MediaGenerationPage {...props} />);
+    await user.click(await screen.findByRole("button", { name: "普通视频" }));
+    await user.selectOptions(screen.getByLabelText("视频目标"), "frame_message");
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), currentChapter.id);
+    await user.selectOptions(await screen.findByLabelText("分镜目标"), currentStoryboard.id);
+    await user.type(screen.getByLabelText("视频提示词"), "保留用户后来修改的上下文");
+
+    const workbenchSourceIntent: WorkbenchSourceIntent = {
+      actorId: "actor-1117-late",
+      apiBaseUrl: services.apiBaseUrl,
+      services,
+      sessionGeneration: 1,
+      navigationEpoch: 72,
+      seriesId: series.id,
+      chapterId: candidateChapter.id,
+      target: { kind: "frame", chapterId: candidateChapter.id, storyboardAssetId: candidateStoryboard.id },
+      isCurrent: () => true,
+    };
+    rendered.rerender(<MediaGenerationPage {...props} workbenchSourceIntent={workbenchSourceIntent} />);
+    await screen.findByText(/正在独立核对左侧媒体来源/u);
+    await user.selectOptions(screen.getByLabelText("章节"), manuallyChosenChapter.id);
+    await waitFor(() => expect(screen.getByLabelText("章节")).toHaveValue(manuallyChosenChapter.id));
+
+    await act(async () => {
+      releaseCandidate([candidateStoryboard]);
+      await candidateDirectory;
+    });
+    expect(screen.getByLabelText("章节")).toHaveValue(manuallyChosenChapter.id);
+    expect(screen.getByLabelText("视频目标")).toHaveValue("frame_message");
+    expect(screen.getByLabelText("分镜目标")).toHaveValue("");
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("保留用户后来修改的上下文");
+    expect(screen.queryByText("已将左侧选择应用为媒体目标；提交时仍会重新核对当前目录。"))
+      .not.toBeInTheDocument();
+  });
+
+  it("keeps an admitted media request unchanged and defers a new asset source until explicit application", async () => {
+    const user = userEvent.setup();
+    const series = seriesFixture();
+    const chapter = {
+      ...chapterFixture(),
+      content: [{ character: ["character-926", "character-selected-926"] }],
+    };
+    const selectedCharacter = { ...characterFixture(), id: "character-selected-926", name: "左侧选中角色" };
+    let releaseSubmit: ((receipt: Awaited<ReturnType<MediaGenerationRun["submitVideo"]>>) => void) | undefined;
+    const submitVideo = vi.fn<MediaGenerationRun["submitVideo"]>(() => new Promise((resolve) => {
+      releaseSubmit = resolve;
+    }));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      apiBaseUrl: "https://api.example.test/api",
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), submitVideo),
+      listSeries: vi.fn(async () => [series]),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => []),
+      listCharacters: vi.fn(async () => [characterFixture(), selectedCharacter]),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    const assetIntent: WorkbenchSourceIntent = {
+      actorId: "actor-926",
+      apiBaseUrl: services.apiBaseUrl,
+      services,
+      sessionGeneration: 1,
+      navigationEpoch: 33,
+      seriesId: series.id,
+      chapterId: chapter.id,
+      target: { kind: "asset", chapterId: chapter.id, category: "characters", assetId: selectedCharacter.id },
+      isCurrent: () => true,
+    };
+    const props = {
+      services,
+      userId: "actor-926",
+      sessionGeneration: 1,
+      onUnauthorized: vi.fn(),
+      onOpenTasks: vi.fn(),
+      workbenchSourceIntent: null,
+    };
+    const { rerender } = render(<MediaGenerationPage {...props} />);
+
+    await user.selectOptions(screen.getByLabelText("视频目标"), "asset_message");
+    await user.selectOptions(await screen.findByLabelText("剧集"), series.id);
+    await user.selectOptions(await screen.findByLabelText("章节"), chapter.id);
+    await user.selectOptions(await screen.findByLabelText("素材类型"), "character");
+    await user.selectOptions(await screen.findByLabelText("目标素材"), "character-926");
+    await user.selectOptions(await screen.findByLabelText("视频模型"), "video-model-926");
+    await user.type(screen.getByLabelText("视频提示词"), "原请求正文不可被新来源改写");
+    await user.click(screen.getByRole("button", { name: "提交视频任务" }));
+    await waitFor(() => expect(submitVideo).toHaveBeenCalledOnce());
+
+    rerender(<MediaGenerationPage {...props} workbenchSourceIntent={assetIntent} />);
+    expect(await screen.findByText("媒体操作仍在进行。原目标、请求和回执保持不变；左侧新来源已暂存。"))
+      .toBeInTheDocument();
+    expect(screen.getByLabelText("目标素材")).toHaveValue("character-926");
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("原请求正文不可被新来源改写");
+    expect(screen.queryByRole("button", { name: "应用左侧来源" })).not.toBeInTheDocument();
+    expect(submitVideo).toHaveBeenCalledOnce();
+    expect(submitVideo.mock.calls[0]?.[0]).toMatchObject({
+      prompt: "原请求正文不可被新来源改写",
+      target: { kind: "asset_message", asset_id: "character-926" },
+    });
+
+    releaseSubmit?.({
+      operation: "video.single",
+      submissionId: "deferred-asset-source-submission",
+      taskId: "deferred-asset-source-task",
+      messageId: "deferred-asset-source-message",
+      status: "queued",
+      quotedAmount: 3,
+      billingStatus: "charged",
+    });
+    await user.click(await screen.findByRole("button", { name: "应用左侧来源" }));
+    await waitFor(() => expect(screen.getByLabelText("目标素材")).toHaveValue(selectedCharacter.id));
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("原请求正文不可被新来源改写");
+    expect(submitVideo).toHaveBeenCalledOnce();
+  });
+
   it("submits a normal image to the selected storyboard message and links it to My Tasks", async () => {
     const user = userEvent.setup();
     const series = seriesFixture();
@@ -560,6 +994,64 @@ describe("MediaGenerationPage", () => {
       },
     ]);
     expect(screen.getAllByText(/消息编号：—/u)).toHaveLength(2);
+  });
+
+  it("keeps accepted image and video receipts with their own mode when switching tools", async () => {
+    const user = userEvent.setup();
+    const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => ({
+      operation: "image.single",
+      submissionId: "mode-switch-image-submission",
+      taskId: "mode-switch-image-task",
+      messageId: "mode-switch-image-message",
+      status: "queued",
+      quotedAmount: 1,
+      billingStatus: "charged",
+    }));
+    const submitVideo = vi.fn<MediaGenerationRun["submitVideo"]>(async () => ({
+      operation: "video.single",
+      submissionId: "mode-switch-video-submission",
+      taskId: "mode-switch-video-task",
+      messageId: "mode-switch-video-message",
+      status: "queued",
+      quotedAmount: 1,
+      billingStatus: "charged",
+    }));
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      creatorSettings: creatorSettings(),
+      mediaGeneration: generationPort(
+        vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })),
+        submitVideo,
+        submitImage,
+      ),
+    };
+    render(<MediaGenerationPage services={services} userId="actor-mode-receipts-1116" sessionGeneration={1}
+      onUnauthorized={vi.fn()} onOpenTasks={vi.fn()} />);
+
+    await waitFor(() => expect(screen.getByLabelText("视频模型")).toBeEnabled());
+    await user.selectOptions(screen.getByLabelText("视频模型"), "video-model-926");
+    await user.type(screen.getByLabelText("视频提示词"), "独立视频回执正文");
+    await user.click(screen.getByRole("button", { name: "提交视频任务" }));
+    expect((await screen.findAllByText(/mode-switch-video-task/u)).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    await waitFor(() => expect(screen.getByLabelText("图片模型")).toBeEnabled());
+    await user.selectOptions(screen.getByLabelText("图片模型"), "image-model-926");
+    await user.type(screen.getByLabelText("图片提示词"), "独立图片回执正文");
+    await user.click(screen.getByRole("button", { name: "提交图片任务" }));
+    expect((await screen.findAllByText(/mode-switch-image-task/u)).length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole("button", { name: "普通视频" }));
+    expect((await screen.findAllByText(/mode-switch-video-task/u)).length).toBeGreaterThan(0);
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("独立视频回执正文");
+    expect(submitVideo).toHaveBeenCalledTimes(1);
+    expect(submitImage).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: "普通图片" }));
+    expect((await screen.findAllByText(/mode-switch-image-task/u)).length).toBeGreaterThan(0);
+    expect(screen.getByLabelText("图片提示词")).toHaveValue("独立图片回执正文");
+    expect(submitVideo).toHaveBeenCalledTimes(1);
+    expect(submitImage).toHaveBeenCalledTimes(1);
   });
 
   it("refreshes each accepted task only when its receipt identity matches, including a null message id", async () => {

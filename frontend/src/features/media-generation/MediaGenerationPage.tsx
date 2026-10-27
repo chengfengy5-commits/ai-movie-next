@@ -36,6 +36,7 @@ import {
 } from "../../shared/api/mediaReferenceUpload";
 import { isSafeCanvasUploadPath, readCanvasImageBlobAsDataUrl } from "../canvas/image-generation/canvasImageReferences";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import type { WorkbenchSourceIntent } from "../series-workbench/sourceIntent";
 import type { CreatorModel, CreatorPrompt } from "../../shared/api/creatorSettings";
 import {
   buildQuickReferencePlan,
@@ -378,6 +379,14 @@ interface MediaGenerationPageProps {
   readonly sessionGeneration: number;
   onUnauthorized(): void;
   onOpenTasks(): void;
+  readonly workbenchSourceIntent?: WorkbenchSourceIntent | null;
+}
+
+interface RequestedWorkbenchSource {
+  readonly intent: WorkbenchSourceIntent;
+  readonly interactionVersion: number;
+  readonly needsConfirmation: boolean;
+  readonly confirmed: boolean;
 }
 
 function record(value: unknown): Record<string, unknown> | null {
@@ -632,6 +641,7 @@ export function MediaGenerationPage({
   sessionGeneration,
   onUnauthorized,
   onOpenTasks,
+  workbenchSourceIntent = null,
 }: MediaGenerationPageProps) {
   const [mode, setMode] = useState<MediaMode>("video");
   const [batchVideoActive, setBatchVideoActive] = useState(false);
@@ -654,6 +664,14 @@ export function MediaGenerationPage({
   const [singleGenerationCounts, setSingleGenerationCounts] = useState<Readonly<Record<string, number>>>({});
   const [singleGenerationGroup, setSingleGenerationGroup] = useState<SingleMediaGenerationGroupView | null>(null);
   const singleGenerationGroupRef = useRef<SingleMediaGenerationGroup | null>(null);
+  const singleModeGroupsRef = useRef<Record<SingleMediaPreferenceMode, SingleMediaGenerationGroup | null>>({
+    image: null,
+    video: null,
+  });
+  const singleModeGroupViewsRef = useRef<Record<SingleMediaPreferenceMode, SingleMediaGenerationGroupView | null>>({
+    image: null,
+    video: null,
+  });
   const singleGenerationGroupOwnerRef = useRef<number | null>(null);
   const singleTaskStatusReadsRef = useRef(new Set<string>());
   const [singleModePreferenceFeedback, setSingleModePreferenceFeedback] = useState<SingleMediaModePreferenceFeedback | null>(null);
@@ -689,6 +707,8 @@ export function MediaGenerationPage({
   const quickReferenceRestoreGenerationRef = useRef(0);
   const quickReferenceActionControllerRef = useRef<AbortController | null>(null);
   const quickReferenceActionRef = useRef(false);
+  const lastWorkbenchIntentEpochRef = useRef<number | null>(null);
+  const workbenchTargetInteractionVersionRef = useRef(0);
   const [preparingQuickReference, setPreparingQuickReference] = useState(false);
   const [quickReferenceActionMessage, setQuickReferenceActionMessage] = useState<string | null>(null);
   const catalogReadyRef = useRef(false);
@@ -722,6 +742,8 @@ export function MediaGenerationPage({
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [chapterError, setChapterError] = useState<string | null>(null);
   const [directoryError, setDirectoryError] = useState<string | null>(null);
+  const [requestedWorkbenchSource, setRequestedWorkbenchSource] = useState<RequestedWorkbenchSource | null>(null);
+  const [workbenchSourceNotice, setWorkbenchSourceNotice] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingSubmission | null>(null);
   const pendingRef = useRef<PendingSubmission | null>(null);
   const [requesting, setRequesting] = useState(false);
@@ -740,10 +762,63 @@ export function MediaGenerationPage({
     readonly sessionGeneration: number;
     readonly signature: string;
   } | null>(null);
+  const acceptedReceiptContextByModeRef = useRef<{
+    image: typeof acceptedReceiptContextRef.current;
+    video: typeof acceptedReceiptContextRef.current;
+  }>({ image: null, video: null });
+  const outcomeByModeRef = useRef<Record<SingleMediaPreferenceMode, SubmissionOutcome | null>>({
+    image: null,
+    video: null,
+  });
   const mountedRef = useRef(false);
   const identityRef = useRef({ userId, services, sessionGeneration, signature: "" });
+  const verifiedWorkbenchChaptersRef = useRef<{
+    readonly key: string;
+    readonly services: WorkspaceServices;
+    readonly chapters: Chapter[];
+  } | null>(null);
+  const verifiedWorkbenchDirectoryRef = useRef<{
+    readonly key: string;
+    readonly services: WorkspaceServices;
+    readonly storyboards: StoryboardAsset[];
+    readonly characters: Character[];
+    readonly scenes: Scene[];
+    readonly props: Prop[];
+  } | null>(null);
   const onUnauthorizedRef = useRef(onUnauthorized);
   onUnauthorizedRef.current = onUnauthorized;
+
+  function rememberSingleModePresentation(preferenceMode: SingleMediaPreferenceMode) {
+    const activeGroup = singleGenerationGroupRef.current;
+    if (activeGroup?.mode === preferenceMode) {
+      singleModeGroupsRef.current[preferenceMode] = activeGroup;
+    }
+    const activeView = singleGenerationGroup?.mode === preferenceMode
+      ? singleGenerationGroup
+      : singleModeGroupViewsRef.current[preferenceMode];
+    if (activeView !== null && activeView !== undefined) {
+      singleModeGroupViewsRef.current[preferenceMode] = activeView;
+    }
+    outcomeByModeRef.current[preferenceMode] = outcome;
+    acceptedReceiptContextByModeRef.current[preferenceMode] = acceptedReceiptContextRef.current;
+  }
+
+  function restoreSingleModePresentation(preferenceMode: SingleMediaPreferenceMode) {
+    const group = singleModeGroupsRef.current[preferenceMode];
+    singleGenerationGroupRef.current = group;
+    singleGenerationGroupOwnerRef.current = group?.operationOwnerId ?? null;
+    setSingleGenerationGroup(singleModeGroupViewsRef.current[preferenceMode]);
+    acceptedReceiptContextRef.current = acceptedReceiptContextByModeRef.current[preferenceMode];
+    setOutcome(outcomeByModeRef.current[preferenceMode]);
+  }
+
+  function hideSingleModePresentation() {
+    singleGenerationGroupRef.current = null;
+    singleGenerationGroupOwnerRef.current = null;
+    setSingleGenerationGroup(null);
+    acceptedReceiptContextRef.current = null;
+    setOutcome(null);
+  }
 
   const selectedVideoModel = videoModels.find((model) => model.id === selectedVideoModelId) ?? null;
   const selectedImageModel = imageModels.find((model) => model.id === selectedImageModelId) ?? null;
@@ -798,6 +873,14 @@ export function MediaGenerationPage({
   const selectedChapter = chapters.find((item) => (
     item.id === selectedChapterId && item.series_id === selectedSeriesId
   )) ?? null;
+  const selectedDirectoryKey = JSON.stringify([
+    userId,
+    services.apiBaseUrl,
+    sessionGeneration,
+    selectedSeriesId,
+    selectedChapterId,
+  ]);
+  const selectedChaptersKey = JSON.stringify([userId, services.apiBaseUrl, sessionGeneration, selectedSeriesId]);
   const videoOptions = useMemo(() => modelOptions(selectedVideoModel), [selectedVideoModel]);
   const imageOptions = useMemo(() => modelOptions(selectedImageModel), [selectedImageModel]);
   const sortedChapters = useMemo(() => [...chapters].sort((left, right) => left.order - right.order), [chapters]);
@@ -896,6 +979,13 @@ export function MediaGenerationPage({
   function updatePending(value: PendingSubmission | null) {
     pendingRef.current = value;
     setPending(value);
+  }
+
+  function recordWorkbenchTargetInteraction() {
+    workbenchTargetInteractionVersionRef.current += 1;
+    verifiedWorkbenchChaptersRef.current = null;
+    verifiedWorkbenchDirectoryRef.current = null;
+    setRequestedWorkbenchSource(null);
   }
 
   function pendingBelongsToOperation(ownerId: number): boolean {
@@ -1269,6 +1359,11 @@ export function MediaGenerationPage({
       activeBatchSubmissionRef.current = null;
       singleGenerationGroupRef.current = null;
       singleGenerationGroupOwnerRef.current = null;
+      singleModeGroupsRef.current = { image: null, video: null };
+      singleModeGroupViewsRef.current = { image: null, video: null };
+      acceptedReceiptContextRef.current = null;
+      acceptedReceiptContextByModeRef.current = { image: null, video: null };
+      outcomeByModeRef.current = { image: null, video: null };
       setSingleGenerationGroup(null);
       setOutcome(null);
       return;
@@ -1276,6 +1371,23 @@ export function MediaGenerationPage({
 
     const previousPending = pendingRef.current;
     const group = singleGenerationGroupRef.current ?? previousPending?.singleGroup ?? null;
+    for (const preferenceMode of ["image", "video"] as const) {
+      const storedGroup = singleModeGroupsRef.current[preferenceMode];
+      if (storedGroup !== null && storedGroup !== group) {
+        storedGroup.ownerServices = services;
+        const storedView = singleModeGroupViewsRef.current[preferenceMode];
+        if (storedView !== null && storedView.operationOwnerId === storedGroup.operationOwnerId) {
+          singleModeGroupViewsRef.current[preferenceMode] = { ...storedView, ownerServices: services };
+        }
+      }
+      const accepted = acceptedReceiptContextByModeRef.current[preferenceMode];
+      if (accepted !== null) {
+        acceptedReceiptContextByModeRef.current[preferenceMode] = { ...accepted, services };
+      }
+    }
+    if (acceptedReceiptContextRef.current !== null) {
+      acceptedReceiptContextRef.current = { ...acceptedReceiptContextRef.current, services };
+    }
     const activeBatchSubmission = activeBatchSubmissionRef.current;
     const needsRecoveryRun = previousPending !== null
       || activeBatchSubmission !== null
@@ -1480,8 +1592,9 @@ export function MediaGenerationPage({
         return;
       }
       if (read.value !== mode) {
+        if (mode === "image" || mode === "video") rememberSingleModePresentation(mode);
+        restoreSingleModePresentation(read.value);
         setMode(read.value);
-        setOutcome(null);
       }
       setSingleModePreferenceFeedback({
         contextKey,
@@ -1894,6 +2007,14 @@ export function MediaGenerationPage({
   }, [imageModels, loading, mode, prompts, services, sessionGeneration, userId]);
 
   useEffect(() => {
+    const verifiedChapters = verifiedWorkbenchChaptersRef.current;
+    if (selectedSeriesId !== "" && verifiedChapters?.key === selectedChaptersKey
+      && verifiedChapters.services === services) {
+      setChapterError(null);
+      setChapterLoading(false);
+      setChapters(verifiedChapters.chapters);
+      return;
+    }
     if (selectedSeriesId === "") {
       setChapters([]);
       setSelectedChapterId("");
@@ -1916,7 +2037,9 @@ export function MediaGenerationPage({
     setPropAssets([]);
     setSelectedBatchKeys([]);
     void services.listChapters(selectedSeriesId, controller.signal).then((result) => {
-      if (current && !controller.signal.aborted) setChapters(result);
+      if (current && !controller.signal.aborted) {
+        setChapters(result);
+      }
     }).catch((error: unknown) => {
       if (!current || controller.signal.aborted) return;
       if (isUnauthorized(error)) onUnauthorizedRef.current();
@@ -1929,7 +2052,7 @@ export function MediaGenerationPage({
       current = false;
       controller.abort();
     };
-  }, [selectedSeriesId, services]);
+  }, [selectedChaptersKey, selectedSeriesId, services]);
 
   useEffect(() => {
     if (selectedSeriesId === "" || selectedChapterId === "") {
@@ -1940,6 +2063,22 @@ export function MediaGenerationPage({
       setPropAssets([]);
       setDirectoryError(null);
       setDirectoryLoading(false);
+      return;
+    }
+    const verifiedDirectory = verifiedWorkbenchDirectoryRef.current;
+    if (verifiedDirectory?.key === selectedDirectoryKey && verifiedDirectory.services === services) {
+      setDirectoryError(null);
+      setDirectoryLoading(false);
+      setStoryboardAssets(verifiedDirectory.storyboards);
+      setCharacterAssets(verifiedDirectory.characters);
+      setSceneAssets(verifiedDirectory.scenes);
+      setPropAssets(verifiedDirectory.props);
+      setAssetChoices([
+        ...libraryChoices("storyboard", verifiedDirectory.storyboards),
+        ...libraryChoices("character", verifiedDirectory.characters),
+        ...libraryChoices("scene", verifiedDirectory.scenes),
+        ...libraryChoices("prop", verifiedDirectory.props),
+      ]);
       return;
     }
     const controller = new AbortController();
@@ -1991,7 +2130,7 @@ export function MediaGenerationPage({
       current = false;
       controller.abort();
     };
-  }, [selectedChapterId, selectedSeriesId, services]);
+  }, [selectedChapterId, selectedDirectoryKey, selectedSeriesId, services]);
 
   useEffect(() => {
     if (singleAssetId !== "" && !singleAssetChoices.some((asset) => asset.id === singleAssetId)) {
@@ -2002,11 +2141,250 @@ export function MediaGenerationPage({
     }
   }, [singleAssetChoices, singleAssetId, singleStoryboardAssetId, storyboardAssets]);
 
+  useEffect(() => {
+    const intent = workbenchSourceIntent;
+    if (intent === null || lastWorkbenchIntentEpochRef.current === intent.navigationEpoch) return;
+    lastWorkbenchIntentEpochRef.current = intent.navigationEpoch;
+    if (intent.actorId !== userId || intent.services !== services || intent.apiBaseUrl !== services.apiBaseUrl
+      || intent.sessionGeneration !== sessionGeneration || !intent.isCurrent()) {
+      setWorkbenchSourceNotice("左侧来源已变化，生成目标没有更新。请重新选择来源。");
+      return;
+    }
+    setWorkbenchSourceNotice(null);
+    setRequestedWorkbenchSource({
+      intent,
+      interactionVersion: workbenchTargetInteractionVersionRef.current,
+      needsConfirmation: pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current,
+      confirmed: false,
+    });
+  }, [services, sessionGeneration, userId, workbenchSourceIntent]);
+
+  useEffect(() => {
+    const request = requestedWorkbenchSource;
+    if (request === null) return;
+    const intent = request.intent;
+    if (!intent.isCurrent() || intent.actorId !== userId || intent.services !== services
+      || intent.apiBaseUrl !== services.apiBaseUrl || intent.sessionGeneration !== sessionGeneration) {
+      setRequestedWorkbenchSource(null);
+      setWorkbenchSourceNotice("左侧来源已失效，当前媒体目标保持不变。");
+      return;
+    }
+    if (request.interactionVersion !== workbenchTargetInteractionVersionRef.current) {
+      setRequestedWorkbenchSource(null);
+      setWorkbenchSourceNotice("你已手动更改媒体目标，保留当前选择。需要时可重新点选左侧来源。");
+      return;
+    }
+    if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current) {
+      if (!request.needsConfirmation) setRequestedWorkbenchSource({ ...request, needsConfirmation: true });
+      return;
+    }
+    if (request.needsConfirmation && !request.confirmed) return;
+    if (intent.target.kind === "asset" && intent.target.category === "fused") {
+      setRequestedWorkbenchSource(null);
+      setWorkbenchSourceNotice("融合素材不能作为普通图片或视频消息目标；原媒体目标保持不变。");
+      return;
+    }
+    if (loading) return;
+    if (intent.target.kind !== "chapter" && mode !== "image" && mode !== "video") return;
+    const controller = new AbortController();
+    let active = true;
+    const isCandidateCurrent = () => active
+      && mountedRef.current
+      && !controller.signal.aborted
+      && identityRef.current.userId === userId
+      && identityRef.current.services === services
+      && identityRef.current.sessionGeneration === sessionGeneration
+      && identityRef.current.services.apiBaseUrl === intent.apiBaseUrl
+      && request.interactionVersion === workbenchTargetInteractionVersionRef.current
+      && intent.isCurrent();
+    const finishFailure = (message: string) => {
+      if (!isCandidateCurrent()) return;
+      setRequestedWorkbenchSource(null);
+      setWorkbenchSourceNotice(message);
+    };
+    setWorkbenchSourceNotice("正在独立核对左侧媒体来源；核对期间保留当前剧集、章节、目标和提示词。");
+
+    const directoryReads = intent.target.kind === "chapter"
+      ? Promise.resolve(null)
+      : Promise.all([
+        services.listStoryboardAssets(intent.seriesId, intent.chapterId, controller.signal),
+        services.listCharacters(intent.seriesId, controller.signal),
+        services.listScenes(intent.seriesId, controller.signal),
+        services.listProps(intent.seriesId, controller.signal),
+      ]);
+    void Promise.all([
+      services.listSeries(controller.signal),
+      services.listChapters(intent.seriesId, controller.signal),
+      directoryReads,
+    ]).then(([candidateSeries, candidateChapters, candidateDirectories]) => {
+      if (!isCandidateCurrent()) return;
+      const seriesMatches = candidateSeries.filter((item) => item.id === intent.seriesId && item.can_enter === true);
+      if (seriesMatches.length !== 1) {
+        finishFailure(seriesMatches.length === 0
+          ? "左侧剧集已不在最新可进入目录中；当前媒体目标保持不变。"
+          : "左侧剧集编号不唯一，无法安全应用媒体目标。媒体目标保持不变。");
+        return;
+      }
+      const chapterMatches = candidateChapters.filter((chapter) => (
+        chapter.id === intent.chapterId && chapter.series_id === intent.seriesId
+      ));
+      if (chapterMatches.length !== 1) {
+        finishFailure(chapterMatches.length === 0
+          ? "左侧章节已不在最新剧集目录中；当前剧集、章节、目标和提示词保持不变。"
+          : "左侧章节编号不唯一；当前剧集、章节、目标和提示词保持不变。");
+        return;
+      }
+      const chapter = chapterMatches[0]!;
+      if (intent.target.kind === "chapter") {
+        const candidateChaptersKey = JSON.stringify([
+          userId,
+          services.apiBaseUrl,
+          sessionGeneration,
+          intent.seriesId,
+        ]);
+        verifiedWorkbenchChaptersRef.current = {
+          key: candidateChaptersKey,
+          services,
+          chapters: candidateChapters,
+        };
+        setSeries(candidateSeries);
+        setChapters(candidateChapters);
+        setChapterError(null);
+        setChapterLoading(false);
+        setSelectedSeriesId(intent.seriesId);
+        setSelectedChapterId(intent.chapterId);
+        setSingleAssetId("");
+        setSingleStoryboardAssetId("");
+        setRequestedWorkbenchSource(null);
+        setWorkbenchSourceNotice("已选择左侧章节。请在媒体页面明确选择分镜或素材目标；系统不会把章节伪装成媒体消息目标。");
+        return;
+      }
+      if (candidateDirectories === null) {
+        finishFailure("左侧章节素材目录无法读取；当前剧集、章节、目标和提示词保持不变。");
+        return;
+      }
+      const [candidateStoryboards, candidateCharacters, candidateScenes, candidateProps] = candidateDirectories;
+      let selectedTarget:
+        | { readonly kind: "frame"; readonly storyboardAssetId: string }
+        | { readonly kind: "asset"; readonly assetType: MediaGenerationAssetType; readonly assetId: string }
+        | null = null;
+      if (intent.target.kind === "frame") {
+        const target = intent.target;
+        const content = chapter.content;
+        const frameMatches = Array.isArray(content) ? content.flatMap((frame, index) => {
+          const storyboard = frame.storyboard;
+          return Array.isArray(storyboard) && storyboard[0] === target.storyboardAssetId ? [index] : [];
+        }) : [];
+        const assetMatches = candidateStoryboards.filter((asset) => asset.id === target.storyboardAssetId
+          && asset.series_id === intent.seriesId && asset.chapter_id === intent.chapterId);
+        if (frameMatches.length !== 1 || assetMatches.length !== 1 || assetMatches[0]?.frame_index !== frameMatches[0]) {
+          finishFailure("左侧分镜身份在最新章节和素材目录中无法唯一核对；当前媒体目标保持不变。");
+          return;
+        }
+        selectedTarget = { kind: "frame", storyboardAssetId: target.storyboardAssetId };
+      } else {
+        const target = intent.target;
+        const assetType = target.category === "characters" ? "character"
+          : target.category === "scenes" ? "scene"
+            : target.category === "props" ? "prop"
+              : target.category === "storyboard" ? "storyboard" : null;
+        const directory = assetType === "character" ? candidateCharacters
+          : assetType === "scene" ? candidateScenes
+            : assetType === "prop" ? candidateProps
+              : assetType === "storyboard" ? candidateStoryboards : [];
+        const assetMatches = directory.filter((asset) => asset.id === target.assetId
+          && asset.series_id === intent.seriesId
+          && (assetType !== "storyboard" || ("chapter_id" in asset && asset.chapter_id === intent.chapterId)));
+        if (assetType === null || assetMatches.length !== 1) {
+          finishFailure("左侧素材身份在最新目录中无法唯一核对；当前媒体目标保持不变。");
+          return;
+        }
+        selectedTarget = { kind: "asset", assetType, assetId: target.assetId };
+      }
+      if (!isCandidateCurrent() || selectedTarget === null) return;
+      const scopedStoryboards = candidateStoryboards.filter((asset) => (
+        asset.series_id === intent.seriesId && asset.chapter_id === intent.chapterId
+      ));
+      const scopedCharacters = candidateCharacters.filter((asset) => asset.series_id === intent.seriesId);
+      const scopedScenes = candidateScenes.filter((asset) => asset.series_id === intent.seriesId);
+      const scopedProps = candidateProps.filter((asset) => asset.series_id === intent.seriesId);
+      const candidateDirectoryKey = JSON.stringify([
+        userId,
+        services.apiBaseUrl,
+        sessionGeneration,
+        intent.seriesId,
+        intent.chapterId,
+      ]);
+      const candidateChaptersKey = JSON.stringify([
+        userId,
+        services.apiBaseUrl,
+        sessionGeneration,
+        intent.seriesId,
+      ]);
+      verifiedWorkbenchChaptersRef.current = {
+        key: candidateChaptersKey,
+        services,
+        chapters: candidateChapters,
+      };
+      verifiedWorkbenchDirectoryRef.current = {
+        key: candidateDirectoryKey,
+        services,
+        storyboards: scopedStoryboards,
+        characters: scopedCharacters,
+        scenes: scopedScenes,
+        props: scopedProps,
+      };
+      setSeries(candidateSeries);
+      setChapters(candidateChapters);
+      setChapterError(null);
+      setChapterLoading(false);
+      setStoryboardAssets(scopedStoryboards);
+      setCharacterAssets(scopedCharacters);
+      setSceneAssets(scopedScenes);
+      setPropAssets(scopedProps);
+      setAssetChoices([
+        ...libraryChoices("storyboard", scopedStoryboards),
+        ...libraryChoices("character", scopedCharacters),
+        ...libraryChoices("scene", scopedScenes),
+        ...libraryChoices("prop", scopedProps),
+      ]);
+      setDirectoryError(null);
+      setDirectoryLoading(false);
+      setSelectedBatchKeys([]);
+      setSelectedSeriesId(intent.seriesId);
+      setSelectedChapterId(intent.chapterId);
+      if (selectedTarget.kind === "frame") {
+        setSingleTargetMode("frame_message");
+        setSingleStoryboardAssetId(selectedTarget.storyboardAssetId);
+        setSingleAssetId("");
+      } else {
+        setSingleTargetMode("asset_message");
+        setSingleAssetType(selectedTarget.assetType);
+        setSingleAssetId(selectedTarget.assetId);
+        setSingleStoryboardAssetId("");
+      }
+      setRequestedWorkbenchSource(null);
+      setWorkbenchSourceNotice("已将左侧选择应用为媒体目标；提交时仍会重新核对当前目录。");
+    }).catch((error: unknown) => {
+      if (!isCandidateCurrent()) return;
+      if (isUnauthorized(error)) onUnauthorizedRef.current();
+      const detail = describeFailure(error);
+      finishFailure(`左侧目标目录核对失败（${detail}）；当前剧集、章节、目标和提示词保持不变。`);
+    });
+    return () => {
+      active = false;
+      controller.abort();
+    };
+  }, [
+    loading, mode, pending, requesting, requestedWorkbenchSource, services, sessionGeneration, series,
+    uploadingReference, userId,
+  ]);
+
   const setModeSafely = (value: MediaMode) => {
     if (pendingRef.current !== null || requestingRef.current || uploadInProgressRef.current
       || quickReferenceActionRef.current || savingQuickReferencePreferencesRef.current
       || savingBatchPreferencesRef.current || batchVideoActive) return;
-    acceptedReceiptContextRef.current = null;
+    if (mode === "image" || mode === "video") rememberSingleModePresentation(mode);
     if (value === "image" || value === "video") {
       const saved = writeSingleMediaModePreference(
         { apiBaseUrl: services.apiBaseUrl, userId },
@@ -2021,14 +2399,23 @@ export function MediaGenerationPage({
       });
     }
     setMode(value);
-    setOutcome(null);
+    if (value === "image" || value === "video") restoreSingleModePresentation(value);
+    else hideSingleModePresentation();
     setReferenceUploadStatus(null);
   };
 
   const applyReceipt = (signature: string, receipt: MediaGenerationReceipt) => {
     if (signature !== identityRef.current.signature) return;
-    acceptedReceiptContextRef.current = { userId, services, sessionGeneration, signature };
-    setOutcome({ signature, receipt, message: receiptMessage(receipt) });
+    const acceptedContext = { userId, services, sessionGeneration, signature };
+    const nextOutcome = { signature, receipt, message: receiptMessage(receipt) };
+    acceptedReceiptContextRef.current = acceptedContext;
+    const receiptMode = receipt.operation === "image.single" ? "image"
+      : receipt.operation === "video.single" ? "video" : null;
+    if (receiptMode !== null) {
+      acceptedReceiptContextByModeRef.current[receiptMode] = acceptedContext;
+      outcomeByModeRef.current[receiptMode] = nextOutcome;
+    }
+    setOutcome(nextOutcome);
     updatePending(null);
   };
 
@@ -2117,9 +2504,7 @@ export function MediaGenerationPage({
   }
 
   function publishSingleGenerationGroup(group: SingleMediaGenerationGroup, message: string | null = null) {
-    singleGenerationGroupRef.current = group;
-    singleGenerationGroupOwnerRef.current = group.operationOwnerId;
-    setSingleGenerationGroup({
+    const view: SingleMediaGenerationGroupView = {
       mode: group.mode,
       signature: group.signature,
       ownerKey: group.ownerKey,
@@ -2135,7 +2520,12 @@ export function MediaGenerationPage({
         ...(taskStatusReading === undefined ? {} : { taskStatusReading }),
       })),
       message,
-    });
+    };
+    singleModeGroupsRef.current[group.mode] = group;
+    singleModeGroupViewsRef.current[group.mode] = view;
+    singleGenerationGroupRef.current = group;
+    singleGenerationGroupOwnerRef.current = group.operationOwnerId;
+    setSingleGenerationGroup(view);
   }
 
   function updateSingleGenerationGroupItem(
@@ -2143,18 +2533,24 @@ export function MediaGenerationPage({
     index: number,
     update: Partial<SingleMediaGenerationGroupView["items"][number]>,
   ) {
-    const retainedGroup = singleGenerationGroupRef.current;
+    const retainedGroup = singleModeGroupsRef.current[group.mode];
     if (retainedGroup !== null && retainedGroup.operationOwnerId === group.operationOwnerId) {
       const retainedItem = retainedGroup.items.find((candidate) => candidate.index === index);
       if (retainedItem !== undefined) Object.assign(retainedItem, update);
+      const currentView = singleModeGroupViewsRef.current[group.mode];
+      if (currentView !== null && currentView.operationOwnerId === retainedGroup.operationOwnerId) {
+        const nextView = {
+          ...currentView,
+          items: currentView.items.map((item) => item.index === index ? { ...item, ...update } : item),
+        };
+        singleModeGroupViewsRef.current[group.mode] = nextView;
+      }
     }
-    setSingleGenerationGroup((current) => {
-      if (current === null || current.operationOwnerId !== group.operationOwnerId) return current;
-      return {
-        ...current,
-        items: current.items.map((item) => item.index === index ? { ...item, ...update } : item),
-      };
-    });
+    const activeView = singleModeGroupViewsRef.current[group.mode];
+    if (mode === group.mode && singleGenerationGroupRef.current?.operationOwnerId === group.operationOwnerId
+      && activeView !== null && activeView.operationOwnerId === group.operationOwnerId) {
+      setSingleGenerationGroup(activeView);
+    }
   }
 
   async function refreshSingleGenerationTaskStatus(
@@ -2179,7 +2575,7 @@ export function MediaGenerationPage({
       capturedServices,
       capturedUserId,
       capturedSessionGeneration,
-    ) && singleGenerationGroupOwnerRef.current === group.operationOwnerId;
+    ) && singleModeGroupsRef.current[group.mode]?.operationOwnerId === group.operationOwnerId;
     const controller = makeGenerationController();
     updateSingleGenerationGroupItem(group, item.index, { taskStatusReading: true, taskStatusMessage: null });
     try {
@@ -2247,8 +2643,12 @@ export function MediaGenerationPage({
       return;
     }
     if (identityRef.current.signature === group.signature) {
-      acceptedReceiptContextRef.current = { userId, services, sessionGeneration, signature: group.signature };
-      setOutcome({ signature: group.signature, message });
+      const acceptedContext = { userId, services, sessionGeneration, signature: group.signature };
+      const nextOutcome = { signature: group.signature, message };
+      acceptedReceiptContextRef.current = acceptedContext;
+      acceptedReceiptContextByModeRef.current[group.mode] = acceptedContext;
+      outcomeByModeRef.current[group.mode] = nextOutcome;
+      setOutcome(nextOutcome);
     }
     finishGenerationOperation(group.operationOwnerId);
   }
@@ -3305,7 +3705,26 @@ export function MediaGenerationPage({
       )}
 
       {catalogError !== null && <p className="media-generation-alert" role="alert">配置目录读取失败：{catalogError}</p>}
+      {workbenchSourceNotice !== null && <p className="media-generation-note" role="status">{workbenchSourceNotice}</p>}
       {loading && <p role="status">正在读取剧集、模型和提示词目录…</p>}
+      {requestedWorkbenchSource !== null && (
+        <section className="media-generation-note" aria-label="待应用的左侧来源">
+          <p role="status">{pending !== null || requesting || uploadingReference
+            ? "媒体操作仍在进行。原目标、请求和回执保持不变；左侧新来源已暂存。"
+            : requestedWorkbenchSource.needsConfirmation && !requestedWorkbenchSource.confirmed
+              ? "媒体操作已结束。请确认后再应用刚才选择的左侧来源。"
+              : mode !== "image" && mode !== "video"
+                ? "来源已确认。请先选择普通图片或普通视频，再应用为对应目标。"
+                : "正在核对左侧来源与最新章节目录…"}</p>
+          {requestedWorkbenchSource.needsConfirmation && !requestedWorkbenchSource.confirmed
+            && pending === null && !requesting && !uploadingReference && (
+            <button className="secondary-button" onClick={() => setRequestedWorkbenchSource((current) => (
+              current === null ? null : { ...current, confirmed: true }
+            ))} type="button">应用左侧来源</button>
+          )}
+          <button className="text-button" onClick={() => setRequestedWorkbenchSource(null)} type="button">保留当前媒体目标</button>
+        </section>
+      )}
       {!loading && services.mediaGeneration === undefined && (
         <p className="media-generation-note" role="status">当前服务没有接入媒体生成提交接口，页面不会模拟生成结果。</p>
       )}
@@ -3383,7 +3802,10 @@ export function MediaGenerationPage({
 
             <label>
               <span>{isImageMode ? "图片目标" : "视频目标"}</span>
-              <select disabled={isFrozen} onChange={(event) => setSingleTargetMode(event.target.value as SingleTargetMode)} value={singleTargetMode}>
+              <select disabled={isFrozen} onChange={(event) => {
+                recordWorkbenchTargetInteraction();
+                setSingleTargetMode(event.target.value as SingleTargetMode);
+              }} value={singleTargetMode}>
                 <option value="standalone">{isImageMode ? "独立图片" : "独立视频"}</option>
                 <option value="frame_message">章节分镜消息</option>
                 <option value="asset_message">章节素材消息</option>
@@ -3391,11 +3813,15 @@ export function MediaGenerationPage({
             </label>
             {singleTargetMode !== "standalone" && (
               <>
-                <label><span>剧集</span><select disabled={isFrozen} onChange={(event) => setSelectedSeriesId(event.target.value)} value={selectedSeriesId}>
+                <label><span>剧集</span><select disabled={isFrozen} onChange={(event) => {
+                  recordWorkbenchTargetInteraction();
+                  setSelectedSeriesId(event.target.value);
+                }} value={selectedSeriesId}>
                   <option value="">选择剧集</option>
                   {series.filter((item) => item.can_enter).map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
                 </select></label>
                 <label><span>章节</span><select disabled={isFrozen || chapterLoading || selectedSeriesId === ""} onChange={(event) => {
+                  recordWorkbenchTargetInteraction();
                   setSelectedChapterId(event.target.value);
                   setSingleAssetId("");
                   setSingleStoryboardAssetId("");
@@ -3406,18 +3832,27 @@ export function MediaGenerationPage({
               </>
             )}
             {singleTargetMode === "frame_message" && (
-              <label className="media-generation-wide"><span>分镜目标</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => setSingleStoryboardAssetId(event.target.value)} value={singleStoryboardAssetId}>
+              <label className="media-generation-wide"><span>分镜目标</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => {
+                recordWorkbenchTargetInteraction();
+                setSingleStoryboardAssetId(event.target.value);
+              }} value={singleStoryboardAssetId}>
                 <option value="">选择章节分镜</option>
                 {storyboardAssets.map((asset) => <option key={asset.id} value={asset.id}>第 {asset.frame_index + 1} 镜 · {asset.name}</option>)}
               </select></label>
             )}
             {singleTargetMode === "asset_message" && (
               <>
-                <label><span>素材类型</span><select disabled={isFrozen} onChange={(event) => setSingleAssetType(event.target.value as MediaGenerationAssetType)} value={singleAssetType}>
+                <label><span>素材类型</span><select disabled={isFrozen} onChange={(event) => {
+                  recordWorkbenchTargetInteraction();
+                  setSingleAssetType(event.target.value as MediaGenerationAssetType);
+                }} value={singleAssetType}>
                   <option value="character">角色</option><option value="scene">场景</option><option value="prop">道具</option>
                   <option value="storyboard">分镜</option>
                 </select></label>
-                <label><span>目标素材</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => setSingleAssetId(event.target.value)} value={singleAssetId}>
+                <label><span>目标素材</span><select disabled={isFrozen || directoryLoading || selectedChapterId === ""} onChange={(event) => {
+                  recordWorkbenchTargetInteraction();
+                  setSingleAssetId(event.target.value);
+                }} value={singleAssetId}>
                   <option value="">选择素材</option>
                   {singleAssetChoices.map((asset) => <option key={asset.id} value={asset.id}>{asset.label}</option>)}
                 </select></label>

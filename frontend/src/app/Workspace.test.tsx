@@ -18,6 +18,7 @@ import { ApiError } from "../shared/api/errors";
 import { MediaGenerationError, type MediaGenerationPort, type MediaGenerationRun } from "../shared/api/mediaGeneration";
 import { parsePersonalProductionSnapshot } from "../shared/api/personalProductionNotes";
 import { digestPersonalProductionMediaIdentity } from "../features/chapters/personal-production/mediaIdentity";
+import { readSeriesWorkbenchPreferences } from "../features/series-workbench/preferences";
 import type { PersonalRoughCutSnapshot } from "../shared/api/personalRoughCut";
 import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../shared/api/myTasks";
 import type { MyTeam } from "../shared/api/teams";
@@ -71,6 +72,7 @@ type CapturedNavigationIntent = {
 };
 
 const chapterNavigationProbe = vi.hoisted(() => ({
+  mountedInstances: 0,
   target: null as CapturedChapterTarget | null,
   callback: null as ((target: CapturedChapterTarget) => void) | null,
   frameTarget: null as CapturedFrameTarget | null,
@@ -98,6 +100,10 @@ vi.mock("../features/chapters/ChapterBrowser", async (importOriginal) => {
   return {
     ...actual,
     ChapterBrowser: (props: Parameters<typeof actual.ChapterBrowser>[0]) => {
+      useEffect(() => {
+        chapterNavigationProbe.mountedInstances += 1;
+        return () => { chapterNavigationProbe.mountedInstances -= 1; };
+      }, []);
       const navigationIntent = props.navigationIntent ?? null;
       const capturedIntent: CapturedNavigationIntent | null = navigationIntent === null
         ? null
@@ -756,6 +762,7 @@ describe("read-only workspace", () => {
   beforeEach(() => {
     window.localStorage.clear();
     vi.stubGlobal("fetch", vi.fn());
+    chapterNavigationProbe.mountedInstances = 0;
     chapterNavigationProbe.target = null;
     chapterNavigationProbe.callback = null;
     chapterNavigationProbe.frameTarget = null;
@@ -781,6 +788,7 @@ describe("read-only workspace", () => {
     cleanup();
     vi.unstubAllGlobals();
     window.localStorage.clear();
+    chapterNavigationProbe.mountedInstances = 0;
     chapterNavigationProbe.target = null;
     chapterNavigationProbe.callback = null;
     chapterNavigationProbe.frameTarget = null;
@@ -1294,6 +1302,436 @@ describe("read-only workspace", () => {
       .toHaveAttribute("aria-pressed", "true");
     expect(fetch).not.toHaveBeenCalled();
   });
+
+  it("keeps the real ChapterBrowser instance mounted while Workspace switches workbench routes", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "https://workbench.example.test/api";
+    const services = { ...createDemoServices(window.localStorage), apiBaseUrl };
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const { container } = renderWorkspace(services);
+
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    await within(seriesRegion).findAllByRole("article");
+    const seriesCard = within(seriesRegion).getByRole("heading", { name: "雾港来信" }).closest("article");
+    if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+
+    const chapterRoot = container.querySelector(".chapter-browser");
+    expect(chapterRoot).not.toBeNull();
+    expect(chapterNavigationProbe.mountedInstances).toBe(1);
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    fireEvent.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+    expect(await screen.findByRole("heading", { name: "创作区" })).toBeInTheDocument();
+    expect(chapterNavigationProbe.mountedInstances).toBe(1);
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
+    const resourceColumn = await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    for (const category of ["故事板", "角色", "场景", "道具", "融合素材"]) {
+      expect(within(resourceColumn).getByRole("heading", { name: category })).toBeInTheDocument();
+    }
+    const characterSourceId = `${demoSeries[0]!.id}-character-linlan`;
+    const preferenceScope = { userId: "demo-user", apiBaseUrl, seriesId: demoSeries[0]!.id };
+    const separator = screen.getByRole("separator", { name: "调整剧集内容与创作区宽度" });
+    fireEvent.keyDown(separator, { key: "ArrowRight" });
+    expect(readSeriesWorkbenchPreferences(preferenceScope).preferences.leftWidths.storyboard).toBe(72);
+
+    fireEvent.click(screen.getByRole("button", { name: "素材库" }));
+    expect(await screen.findByRole("region", { name: "雾港来信 · 素材库" })).toBeInTheDocument();
+    expect(chapterNavigationProbe.mountedInstances).toBe(1);
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
+    fireEvent.keyDown(separator, { key: "ArrowRight" });
+    const leftWidths = readSeriesWorkbenchPreferences(preferenceScope).preferences.leftWidths;
+    expect(leftWidths).toMatchObject({ storyboard: 72, assets: 72 });
+    fireEvent.click(screen.getByRole("button", { name: "分镜" }));
+    await screen.findByRole("button", { name: "林岚" });
+
+    const chatRoot = container.querySelector(".chat-assistant-page");
+    const mediaRoot = container.querySelector(".media-generation-page");
+    expect(chatRoot).not.toBeNull();
+    expect(mediaRoot).not.toBeNull();
+    const routeTabs = container.querySelector(".series-workbench-route-tabs");
+    if (!(routeTabs instanceof HTMLElement)) throw new Error("The workbench route tabs were not rendered.");
+    fireEvent.click(within(routeTabs).getByRole("button", { name: "图片与视频" }));
+    const currentResourceColumn = screen.getByRole("region", { name: "镜头 1 的五类关联素材" });
+    await user.click(await within(currentResourceColumn).findByRole("button", { name: "林岚" }));
+    await waitFor(() => {
+      expect(screen.getByLabelText("素材类型")).toHaveValue("character");
+      expect(screen.getByLabelText("目标素材")).toHaveValue(characterSourceId);
+    });
+    const mediaPrompt = screen.getByLabelText("视频提示词");
+    await user.type(mediaPrompt, "右侧媒体草稿保持在原页面");
+    await user.selectOptions(screen.getByLabelText("目标素材"), "");
+    await waitFor(() => expect(screen.getByLabelText("目标素材")).toHaveValue(""));
+    fireEvent.click(within(routeTabs).getByRole("button", { name: "AI 助手" }));
+    expect(container.querySelector(".media-generation-page")).toBe(mediaRoot);
+    expect(within(routeTabs).getByRole("button", { name: "AI 助手" })).toHaveAttribute("aria-pressed", "true");
+    await screen.findByLabelText("会话目标");
+    fireEvent.click(within(routeTabs).getByRole("button", { name: "图片与视频" }));
+    expect(container.querySelector(".media-generation-page")).toBe(mediaRoot);
+    expect(screen.getByLabelText("视频提示词")).toBe(mediaPrompt);
+    expect(mediaPrompt).toHaveValue("右侧媒体草稿保持在原页面");
+    expect(screen.getByLabelText("目标素材")).toHaveValue("");
+    fireEvent.click(screen.getByRole("button", { name: "素材库" }));
+    const assetLibrary = await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+    const linlanCard = within(assetLibrary).getByRole("heading", { name: "林岚" }).closest("article");
+    if (!(linlanCard instanceof HTMLElement)) throw new Error("The linked character card was not rendered.");
+    await user.click(within(linlanCard).getByRole("button", { name: "查看关联镜头：林岚" }));
+    const assetUsage = await within(assetLibrary).findByRole("region", { name: "关联镜头" });
+    const firstUsageChapter = within(assetUsage).getByRole("heading", { name: /第一章 · 雾起/ }).closest("li");
+    if (!(firstUsageChapter instanceof HTMLElement)) throw new Error("The verified asset chapter was not rendered.");
+    const secondUsageChapter = within(assetUsage).getByRole("heading", { name: /第二章 · 来信/ }).closest("li");
+    if (!(secondUsageChapter instanceof HTMLElement)) throw new Error("The second verified asset chapter was not rendered.");
+    const mediaChapterSelect = within(mediaRoot as HTMLElement).getByLabelText("章节") as HTMLSelectElement;
+    const secondChapterId = Array.from(mediaChapterSelect.options)
+      .find((option) => option.textContent?.includes("第二章 · 来信"))?.value;
+    if (secondChapterId === undefined || secondChapterId === "") throw new Error("The verified media chapter option was not rendered.");
+    await user.click(within(secondUsageChapter).getByRole("button", { name: /在 AI 中使用此素材/ }));
+    await waitFor(() => expect(screen.getByLabelText("目标素材")).toHaveValue(characterSourceId));
+    await waitFor(() => expect(within(mediaRoot as HTMLElement).getByLabelText("章节")).toHaveValue(secondChapterId));
+    expect(screen.getByRole("button", { name: "素材库" })).toHaveAttribute("aria-pressed", "true");
+    const mediaTargetBeforeLocate = (screen.getByLabelText("目标素材") as HTMLSelectElement).value;
+    await user.click(within(firstUsageChapter).getByRole("button", { name: /定位对应镜头/ }));
+    expect(screen.getByRole("button", { name: "分镜" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("目标素材")).toHaveValue(mediaTargetBeforeLocate);
+    expect(within(mediaRoot as HTMLElement).getByLabelText("章节")).toHaveValue(secondChapterId);
+    expect(container.querySelector(".chat-assistant-page")).toBe(chatRoot);
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
+
+    fireEvent.click(within(topbar).getByRole("button", { name: "AI 助手", hidden: true }));
+    expect(await screen.findByRole("heading", { name: "AI 聊天助手" })).toBeInTheDocument();
+    expect(chapterNavigationProbe.mountedInstances).toBe(1);
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
+    expect(container.querySelector(".chat-assistant-page")).toBe(chatRoot);
+    expect(container.querySelector(".media-generation-page")).toBe(mediaRoot);
+
+    fireEvent.click(within(topbar).getByRole("button", { name: "AI 生成", hidden: true }));
+    expect(await screen.findByRole("heading", { name: "AI 生成" })).toBeInTheDocument();
+    expect(chapterNavigationProbe.mountedInstances).toBe(1);
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
+    expect(container.querySelector(".chat-assistant-page")).toBe(chatRoot);
+    expect(container.querySelector(".media-generation-page")).toBe(mediaRoot);
+    expect(screen.getByLabelText("视频提示词")).toBe(mediaPrompt);
+    expect(screen.getByLabelText("视频提示词")).toHaveValue("右侧媒体草稿保持在原页面");
+
+    fireEvent.click(within(topbar).getByRole("button", { name: "返回剧集工作台" }));
+    expect(await screen.findByRole("heading", { name: "创作区" })).toBeInTheDocument();
+    expect(container.querySelector(".chapter-browser")).toBe(chapterRoot);
+    expect(container.querySelector(".chat-assistant-page")).toBe(chatRoot);
+    expect(container.querySelector(".media-generation-page")).toBe(mediaRoot);
+  }, 15_000);
+
+  it("persists only confirmed workbench widths when cancelling drags through view and route changes", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "https://workbench-width-cancel.example.test/api";
+    const services = { ...createDemoServices(window.localStorage), apiBaseUrl };
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const preferenceScope = { userId: "demo-user", apiBaseUrl, seriesId: demoSeries[0]!.id };
+
+    async function openWorkbench() {
+      const rendered = renderWorkspace(services);
+      const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+      await within(seriesRegion).findAllByRole("article");
+      const seriesCard = within(seriesRegion).getByRole("heading", { name: "雾港来信" }).closest("article");
+      if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+      await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+      const topbar = rendered.container.querySelector(".topbar");
+      if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+      fireEvent.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+      await screen.findByRole("heading", { name: "创作区" });
+      const surface = rendered.container.querySelector(".series-workbench-surface");
+      if (!(surface instanceof HTMLElement)) throw new Error("The workbench surface was not rendered.");
+      vi.spyOn(surface, "getBoundingClientRect").mockReturnValue({ width: 1_000 } as DOMRect);
+      const separator = screen.getByRole("separator", { name: "调整剧集内容与创作区宽度" });
+      Object.defineProperties(separator, {
+        setPointerCapture: { configurable: true, value: vi.fn() },
+        hasPointerCapture: { configurable: true, value: () => true },
+        releasePointerCapture: { configurable: true, value: vi.fn() },
+      });
+      return { ...rendered, separator };
+    }
+
+    let rendered = await openWorkbench();
+    expect(rendered.separator).toHaveAttribute("aria-valuenow", "70");
+    fireEvent.pointerDown(rendered.separator, { pointerId: 301, button: 0, isPrimary: true, clientX: 100 });
+    fireEvent.pointerMove(rendered.separator, { pointerId: 301, clientX: 200 });
+    expect(rendered.separator).toHaveAttribute("aria-valuenow", "80");
+    expect(readSeriesWorkbenchPreferences(preferenceScope).preferences.leftWidths.storyboard).toBe(70);
+
+    fireEvent.click(screen.getByRole("button", { name: "素材库" }));
+    await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+    expect(readSeriesWorkbenchPreferences(preferenceScope).preferences.leftWidths)
+      .toMatchObject({ storyboard: 70, assets: 70 });
+    rendered.unmount();
+
+    rendered = await openWorkbench();
+    expect(rendered.separator).toHaveAttribute("aria-valuenow", "70");
+    fireEvent.pointerDown(rendered.separator, { pointerId: 302, button: 0, isPrimary: true, clientX: 100 });
+    fireEvent.pointerMove(rendered.separator, { pointerId: 302, clientX: 200 });
+    expect(rendered.separator).toHaveAttribute("aria-valuenow", "80");
+    const routeTabs = rendered.container.querySelector(".series-workbench-route-tabs");
+    if (!(routeTabs instanceof HTMLElement)) throw new Error("The workbench route tabs were not rendered.");
+    fireEvent.click(within(routeTabs).getByRole("button", { name: "图片与视频" }));
+    expect(rendered.separator).toHaveAttribute("aria-valuenow", "70");
+    expect(readSeriesWorkbenchPreferences(preferenceScope).preferences.leftWidths)
+      .toMatchObject({ storyboard: 70, assets: 70 });
+    rendered.unmount();
+
+    rendered = await openWorkbench();
+    expect(rendered.separator).toHaveAttribute("aria-valuenow", "70");
+    fireEvent.pointerDown(rendered.separator, { pointerId: 303, button: 0, isPrimary: true, clientX: 100 });
+    fireEvent.pointerMove(rendered.separator, { pointerId: 303, clientX: 200 });
+    fireEvent.pointerUp(rendered.separator, { pointerId: 303 });
+    expect(readSeriesWorkbenchPreferences(preferenceScope).preferences.leftWidths.assets).toBe(80);
+    rendered.unmount();
+
+    rendered = await openWorkbench();
+    expect(rendered.separator).toHaveAttribute("aria-valuenow", "80");
+  }, 15_000);
+
+  it("uses the team-selected series as the real chapter, asset, and media source host", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "http://127.0.0.1:4175/api";
+    const createdAt = "2026-10-28T00:00:00";
+    const team = {
+      id: "workbench-team-1117",
+      name: "工作台团队",
+      owner_id: "fixture-user",
+      created_at: createdAt,
+    };
+    const teamDetail: TeamDetail = {
+      ...team,
+      my_role: "owner",
+      my_permissions: [],
+      members: [{
+        user_id: "fixture-user",
+        username: "演示创作者",
+        avatar_url: null,
+        role: "owner",
+        permissions: [],
+        joined_at: createdAt,
+      }],
+    };
+    const hostA: Series = {
+      ...demoSeries[0]!,
+      id: "workbench-host-a-1117",
+      name: "已有宿主 A",
+      user_id: "fixture-user",
+      team_id: null,
+      team_name: null,
+      can_enter: true,
+    };
+    const hostB: Series = {
+      ...demoSeries[0]!,
+      id: "workbench-team-b-1117",
+      name: "团队剧集 B",
+      user_id: "fixture-user",
+      team_id: team.id,
+      team_name: team.name,
+      can_enter: true,
+    };
+    const characterId = "workbench-team-b-character-1117";
+    const hostAChapter = chapterSnapshot(hostA.id, "workbench-a-chapter-1117", "A 章节", "A 正文");
+    const hostBChapter = chapterWithAssetReference(
+      hostB.id,
+      "workbench-b-chapter-1117",
+      "B 章节",
+      "B 正文",
+      "character",
+      characterId,
+    );
+    const teamCharacter = characterSnapshot(hostB.id, "B 剧集角色", characterId);
+    const teamSeriesRow: TeamSeriesRecord = {
+      id: hostB.id,
+      name: hostB.name,
+      description: hostB.description,
+      image_url: hostB.image_url,
+      user_id: hostB.user_id,
+      owner_name: "演示创作者",
+      owner_avatar_url: null,
+      claimed_by: null,
+      claimed_by_username: "",
+      claimed_by_avatar_url: null,
+      created_at: createdAt,
+      updated_at: createdAt,
+      chapter_count: 1,
+      asset_counts: { characters: 1, scenes: 0, props: 0, storyboard: 1 },
+    };
+    const apiServices = createApiServices(apiBaseUrl, { storage: window.localStorage, fetcher: vi.fn() });
+    const managementPort = apiServices.teamManagement as TeamManagementServicePort;
+    vi.spyOn(managementPort, "listTeams").mockResolvedValue([{
+      ...team,
+      member_count: 1,
+      my_role: "owner",
+    }]);
+    vi.spyOn(managementPort, "getTeam").mockResolvedValue(teamDetail);
+    const teamSeriesPort = apiServices.teamSeries as TeamSeriesServicePort;
+    vi.spyOn(teamSeriesPort, "listTeamSeries").mockResolvedValue({
+      items: [teamSeriesRow],
+      total: 1,
+      page: 1,
+      page_size: 10,
+      total_pages: 1,
+    });
+    const listChapters = vi.fn(async (seriesId: string) => seriesId === hostB.id ? [hostBChapter] : [hostAChapter]);
+    const listCharacters = vi.fn(async (seriesId: string) => seriesId === hostB.id ? [teamCharacter] : []);
+    const listStoryboardAssets = vi.fn(async (seriesId: string, chapterId: string) => (
+      [{
+        ...storyboardAssetSnapshot(seriesId, chapterId, `${chapterId}-frame`, 0),
+      }]
+    ));
+    const getSeries = vi.fn(async (seriesId: string) => {
+      if (seriesId === hostB.id) return hostB;
+      throw new Error(`Unexpected team-series open for ${seriesId}`);
+    });
+    const base = createDemoServices(window.localStorage);
+    const services: WorkspaceServices = {
+      ...base,
+      ...apiServices,
+      mode: "api",
+      apiBaseUrl,
+      restore: async () => authenticatedFixtureUser(),
+      listSeries: vi.fn(async () => [hostA, hostB]),
+      getSeries,
+      listChapters,
+      listStoryboardAssets,
+      listCharacters,
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    window.localStorage.setItem(API_TOKEN_KEY, "workbench-team-host-session");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify(authenticatedFixtureUser()));
+    vi.spyOn(window, "confirm").mockReturnValue(true);
+    const { container } = renderWorkspace(services);
+    const navigation = await screen.findByRole("navigation", { name: "主要导航" });
+
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    const teamDirectory = await screen.findByRole("region", { name: "我的团队目录" });
+    await user.click(await within(teamDirectory).findByRole("button", { name: /工作台团队/ }));
+    await screen.findByRole("heading", { name: "工作台团队" });
+    await user.click(screen.getByRole("tab", { name: "团队剧集" }));
+    const teamSeriesCard = await screen.findByRole("heading", { name: hostB.name });
+    const teamSeriesArticle = teamSeriesCard.closest("article");
+    if (!(teamSeriesArticle instanceof HTMLElement)) throw new Error("The team-series row was not rendered.");
+    await user.click(within(teamSeriesArticle).getByRole("button", { name: /只读查看章节/ }));
+    await screen.findByText("B 正文");
+    expect(listChapters).toHaveBeenCalledWith(hostB.id, expect.any(AbortSignal));
+    expect(container.querySelector(".chapter-browser")).toHaveTextContent("B 章节");
+
+    await user.click(screen.getByRole("button", { name: "返回剧集列表" }));
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const hostACard = within(seriesRegion).getByRole("heading", { name: hostA.name }).closest("article");
+    if (!(hostACard instanceof HTMLElement)) throw new Error("The existing A series was not rendered.");
+    await user.click(within(hostACard).getByRole("button", { name: /只读查看章节/ }));
+    await screen.findByText("A 正文");
+    expect(container.querySelector(".chapter-browser")).toHaveTextContent("A 章节");
+
+    await user.click(within(navigation).getByRole("button", { name: "我的团队" }));
+    const reopenedTeamDirectory = await screen.findByRole("region", { name: "我的团队目录" });
+    await user.click(await within(reopenedTeamDirectory).findByRole("button", { name: /工作台团队/ }));
+    await screen.findByRole("heading", { name: "工作台团队" });
+    await user.click(screen.getByRole("tab", { name: "团队剧集" }));
+    const reopenedTeamSeriesCard = await screen.findByRole("heading", { name: hostB.name });
+    const reopenedTeamSeriesArticle = reopenedTeamSeriesCard.closest("article");
+    if (!(reopenedTeamSeriesArticle instanceof HTMLElement)) throw new Error("The team-series row was not rendered again.");
+    await user.click(within(reopenedTeamSeriesArticle).getByRole("button", { name: /只读查看素材库/ }));
+    await screen.findByRole("heading", { name: `${hostB.name} · 素材库` });
+    expect(getSeries).toHaveBeenCalledWith(hostB.id, expect.any(AbortSignal));
+    expect(listCharacters).toHaveBeenCalledWith(hostB.id, expect.any(AbortSignal));
+    expect(listCharacters.mock.calls.at(-1)?.[0]).toBe(hostB.id);
+
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+    await screen.findByRole("heading", { name: "创作区" });
+    fireEvent.click(screen.getByRole("button", { name: "素材库" }));
+    const workbenchLibrary = await screen.findByRole("region", { name: `${hostB.name} · 素材库` });
+    const characterCard = within(workbenchLibrary).getByRole("heading", { name: teamCharacter.name }).closest("article");
+    if (!(characterCard instanceof HTMLElement)) throw new Error("The B character card was not rendered.");
+    const routeTabs = container.querySelector(".series-workbench-route-tabs");
+    if (!(routeTabs instanceof HTMLElement)) throw new Error("The workbench route tabs were not rendered.");
+    await user.click(within(routeTabs).getByRole("button", { name: "图片与视频" }));
+    const mediaRoot = container.querySelector(".media-generation-page");
+    if (!(mediaRoot instanceof HTMLElement)) throw new Error("The workbench media consumer was not rendered.");
+    const media = within(mediaRoot);
+    await user.click(media.getByRole("button", { name: "普通视频" }));
+    await user.click(within(characterCard).getByRole("button", { name: `查看关联镜头：${teamCharacter.name}` }));
+    const usage = await within(workbenchLibrary).findByRole("region", { name: "关联镜头" });
+    const teamChapterRow = within(usage).getByRole("heading", { name: /B 章节/ }).closest("li");
+    if (!(teamChapterRow instanceof HTMLElement)) throw new Error("The B chapter usage row was not rendered.");
+    await user.click(within(teamChapterRow).getByRole("button", { name: /在 AI 中使用此素材/ }));
+    await waitFor(() => expect(media.getByLabelText("剧集")).toHaveValue(hostB.id));
+    expect(media.getByLabelText("章节")).toHaveValue(hostBChapter.id);
+    expect(media.getByLabelText("目标素材")).toHaveValue(characterId);
+    expect(listChapters.mock.calls.some(([seriesId]) => seriesId === hostB.id)).toBe(true);
+  }, 20_000);
+
+  it("uses a verified asset chapter to update idle chat from the workbench asset view", async () => {
+    const user = userEvent.setup();
+    const apiBaseUrl = "https://workbench-asset-chat.example.test/api";
+    const series = demoSeries[0]!;
+    const assetId = `${series.id}-character-linlan`;
+    const chapter = chapterWithAssetReference(series.id, "workbench-chat-asset-chapter", "第一章 · 雾起", "关联正文", "character", assetId);
+    const unexpectedChatWrite = async (): Promise<never> => { throw new Error("Unexpected chat mutation in source-target test."); };
+    const unexpectedStoryboardWrite = async (): Promise<never> => { throw new Error("Unexpected storyboard mutation in source-target test."); };
+    const services: WorkspaceServices = {
+      ...createDemoServices(window.localStorage),
+      apiBaseUrl,
+      chatAssistant: {
+        beginRun: () => ({
+          isCurrent: () => true,
+          listMessages: async () => [],
+          createMessage: unexpectedChatWrite,
+          deleteMessage: unexpectedChatWrite,
+          getTaskByMessage: async () => ({ kind: "missing" }),
+          stream: async function* () { yield { type: "done", data: {} }; },
+        }),
+      },
+      storyboardGeneration: {
+        listModels: async () => [],
+        listPrompts: async () => [],
+        quote: unexpectedStoryboardWrite,
+        stream: async function* () { yield { type: "complete", data: {} }; },
+        getSubmission: unexpectedStoryboardWrite,
+        getTask: unexpectedStoryboardWrite,
+      },
+      creatorSettings: emptyCreatorSettingsService(),
+      listChapters: vi.fn(async () => [chapter]),
+      listStoryboardAssets: vi.fn(async () => []),
+      listCharacters: vi.fn(async () => [characterSnapshot(series.id, "林岚", assetId)]),
+      listScenes: vi.fn(async () => []),
+      listProps: vi.fn(async () => []),
+    };
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    renderWorkspace(services);
+
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    await within(seriesRegion).findAllByRole("article");
+    const seriesCard = within(seriesRegion).getByRole("heading", { name: "雾港来信" }).closest("article");
+    if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+    const topbar = document.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    fireEvent.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+    await screen.findByRole("heading", { name: "创作区" });
+    const routeTabs = document.querySelector(".series-workbench-route-tabs");
+    if (!(routeTabs instanceof HTMLElement)) throw new Error("The workbench route tabs were not rendered.");
+    fireEvent.click(within(routeTabs).getByRole("button", { name: "AI 助手" }));
+    await waitFor(() => expect(screen.getByLabelText("会话目标")).toBeEnabled());
+
+    fireEvent.click(screen.getByRole("button", { name: "素材库" }));
+    const assetLibrary = await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+    const linlanCard = within(assetLibrary).getByRole("heading", { name: "林岚" }).closest("article");
+    if (!(linlanCard instanceof HTMLElement)) throw new Error("The linked character card was not rendered.");
+    await user.click(within(linlanCard).getByRole("button", { name: "查看关联镜头：林岚" }));
+    const usage = await within(assetLibrary).findByRole("region", { name: "关联镜头" });
+    const chapterRow = within(usage).getByRole("heading", { name: /第一章 · 雾起/ }).closest("li");
+    if (!(chapterRow instanceof HTMLElement)) throw new Error("The verified chapter was not rendered.");
+    await user.click(within(chapterRow).getByRole("button", { name: /在 AI 中使用此素材/ }));
+
+    await waitFor(() => expect(screen.getByLabelText("会话目标")).toHaveValue(`asset:character:${assetId}`));
+    expect(screen.getByRole("button", { name: "素材库" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByLabelText("章节")).toHaveValue(chapter.id);
+  }, 15_000);
 
   it("offers fused asset management in the mobile task entries for an enterable selected series", async () => {
     const user = userEvent.setup();

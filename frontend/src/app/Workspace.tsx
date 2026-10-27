@@ -9,6 +9,7 @@ import { FusedAssetsPage } from "../features/fused-assets/FusedAssetsPage";
 import type {
   AssetFrameUsageChapterTarget,
   AssetFrameUsageFrameTarget,
+  AssetFrameUsageWorkbenchTarget,
 } from "../features/assets/AssetFrameUsagePanel";
 import type { FrameAssetReferenceAssetTarget } from "../features/chapters/FrameAssetReferencesPanel";
 import { SeriesPage } from "../features/series/SeriesPage";
@@ -18,6 +19,20 @@ import { MediaGenerationPage } from "../features/media-generation/MediaGeneratio
 import { ChatAssistantPage, type ChatAssistantSourceIntent } from "../features/chat/ChatAssistantPage";
 import { AccountPage } from "../features/account/AccountPage";
 import { TeamsPage } from "../features/teams/TeamsPage";
+import { SeriesWorkbenchSurface, type SeriesWorkbenchSurfaceMode } from "../features/series-workbench/SeriesWorkbenchSurface";
+import {
+  defaultSeriesWorkbenchPreferences,
+  readSeriesWorkbenchPreferences,
+  writeSeriesWorkbenchPreferences,
+  type SeriesWorkbenchLeftView,
+  type SeriesWorkbenchPreferences,
+  type SeriesWorkbenchRoute,
+} from "../features/series-workbench/preferences";
+import type {
+  WorkbenchSourceIntent,
+  WorkbenchSourceSelection,
+} from "../features/series-workbench/sourceIntent";
+import "../features/series-workbench/seriesWorkbench.css";
 import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 import type { ProviderQuotaServicePort } from "../shared/api/providerQuota";
 import type { ZhangyugePatServicePort } from "../shared/api/zhangyugePat";
@@ -41,7 +56,7 @@ function restoreErrorMessage(error: ApiError): string {
 }
 
 type WorkspaceView = "series" | "chapters" | "assets" | "fused-assets" | "tasks" | "teams" | "creator-settings"
-  | "media-generation" | "chat-assistant" | "account";
+  | "media-generation" | "chat-assistant" | "series-workbench" | "account";
 
 function Dashboard() {
   const { services, state, logout, refreshCurrentUser, sessionGeneration } = useAuth();
@@ -63,7 +78,15 @@ function Dashboard() {
     seriesShareGuardScopeRevisionRef.current += 1;
   }
   const [selectedSeries, setSelectedSeries] = useState<Series | null>(null);
+  const [workbenchSeries, setWorkbenchSeries] = useState<Series | null>(null);
   const [selectedView, setSelectedView] = useState<WorkspaceView>("series");
+  const [workbenchRoute, setWorkbenchRoute] = useState<SeriesWorkbenchRoute>(defaultSeriesWorkbenchPreferences.route);
+  const [workbenchLeftView, setWorkbenchLeftView] = useState<Exclude<SeriesWorkbenchLeftView, "continuous-preview">>(defaultSeriesWorkbenchPreferences.leftView);
+  const [workbenchLeftWidths, setWorkbenchLeftWidths] = useState<SeriesWorkbenchPreferences["leftWidths"]>(defaultSeriesWorkbenchPreferences.leftWidths);
+  const workbenchCommittedLeftWidthsRef = useRef<SeriesWorkbenchPreferences["leftWidths"]>(defaultSeriesWorkbenchPreferences.leftWidths);
+  const [workbenchPreferenceNotice, setWorkbenchPreferenceNotice] = useState<string | null>(null);
+  const [chatWorkbenchIntent, setChatWorkbenchIntent] = useState<WorkbenchSourceIntent | null>(null);
+  const [mediaWorkbenchIntent, setMediaWorkbenchIntent] = useState<WorkbenchSourceIntent | null>(null);
   const [mediaGenerationVisited, setMediaGenerationVisited] = useState(false);
   const [chatAssistantVisited, setChatAssistantVisited] = useState(false);
   const [chatAssistantSeries, setChatAssistantSeries] = useState<Series | null>(null);
@@ -77,6 +100,8 @@ function Dashboard() {
   const assetNavigationIntentRef = useRef<AssetNavigationIntent | null>(null);
   assetNavigationIntentRef.current = assetNavigationIntent;
   const navigationEpoch = useRef(0);
+  const workbenchNavigationEpoch = useRef(0);
+  const workbenchSourceIntentRef = useRef<WorkbenchSourceIntent | null>(null);
   const dashboardScope = useRef({
     userId: state.status === "authenticated" ? state.user.id : null,
     services,
@@ -91,6 +116,7 @@ function Dashboard() {
   const currentNavigationContext = useRef<{
     userId: string;
     services: typeof services;
+    sessionGeneration: number;
     selectedSeries: Series | null;
     selectedView: WorkspaceView;
     scopeEpoch: number;
@@ -144,6 +170,7 @@ function Dashboard() {
   if (state.status !== "authenticated") {
     return null;
   }
+  const currentUserId = state.user.id;
 
   let scopeChanged = false;
   if (dashboardScope.current.userId !== state.user.id || dashboardScope.current.services !== services) {
@@ -157,7 +184,17 @@ function Dashboard() {
     setChapterNavigationIntent(null);
     setAssetNavigationIntent(null);
     setSelectedSeries(null);
+    setWorkbenchSeries(null);
     setSelectedView("series");
+    setWorkbenchRoute(defaultSeriesWorkbenchPreferences.route);
+    setWorkbenchLeftView(defaultSeriesWorkbenchPreferences.leftView);
+    workbenchCommittedLeftWidthsRef.current = defaultSeriesWorkbenchPreferences.leftWidths;
+    setWorkbenchLeftWidths(defaultSeriesWorkbenchPreferences.leftWidths);
+    setWorkbenchPreferenceNotice(null);
+    workbenchNavigationEpoch.current += 1;
+    workbenchSourceIntentRef.current = null;
+    setChatWorkbenchIntent(null);
+    setMediaWorkbenchIntent(null);
     setMediaGenerationVisited(false);
     setChatAssistantVisited(false);
     setChatAssistantSeries(null);
@@ -167,6 +204,7 @@ function Dashboard() {
   const renderNavigationContext = {
     userId: state.user.id,
     services,
+    sessionGeneration,
     selectedSeries: scopeChanged ? null : selectedSeries,
     selectedView: scopeChanged ? "series" : selectedView,
     scopeEpoch: dashboardScopeEpoch.current,
@@ -311,6 +349,167 @@ function Dashboard() {
     setSelectedView("chat-assistant");
   }
 
+  function persistWorkbenchPreferences(
+    route: SeriesWorkbenchRoute,
+    leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">,
+    leftWidths: SeriesWorkbenchPreferences["leftWidths"],
+  ) {
+    if (selectedSeries === null || services.apiBaseUrl === null) {
+      setWorkbenchPreferenceNotice("当前账号、接口或剧集身份不完整；工作台仍可使用，但布局和工具选择不会记住。");
+      return;
+    }
+    const saved = writeSeriesWorkbenchPreferences({
+      userId: currentUserId,
+      apiBaseUrl: services.apiBaseUrl,
+      seriesId: selectedSeries.id,
+    }, { route, leftView, leftWidths });
+    setWorkbenchPreferenceNotice(saved
+      ? null
+      : "浏览器未能保存工作台布局；当前页面仍可继续使用。");
+  }
+
+  function workbenchLayoutOwnerKey(): string {
+    return JSON.stringify([
+      currentUserId,
+      services.apiBaseUrl,
+      sessionGeneration,
+      dashboardScopeEpoch.current,
+      workbenchSeries?.id ?? null,
+    ]);
+  }
+
+  function enterSeriesWorkbench(series: Series | null = selectedSeries) {
+    if (series === null || series.can_enter !== true) return;
+    const restored = services.apiBaseUrl === null
+      ? { preferences: defaultSeriesWorkbenchPreferences, available: false }
+      : readSeriesWorkbenchPreferences({
+      userId: currentUserId,
+        apiBaseUrl: services.apiBaseUrl,
+        seriesId: series.id,
+      });
+    setWorkbenchRoute(restored.preferences.route);
+    setWorkbenchLeftView(restored.preferences.leftView);
+    workbenchCommittedLeftWidthsRef.current = restored.preferences.leftWidths;
+    setWorkbenchLeftWidths(restored.preferences.leftWidths);
+    setWorkbenchPreferenceNotice(restored.available
+      ? null
+      : "当前浏览器或接口身份无法读取工作台偏好；仍可手动切换工具和调整布局。");
+    setSelectedSeries(series);
+    setChatAssistantSeries(series);
+    setWorkbenchSeries(series);
+    setChatAssistantVisited(true);
+    setMediaGenerationVisited(true);
+    workbenchSourceIntentRef.current = null;
+    setChatWorkbenchIntent(null);
+    setMediaWorkbenchIntent(null);
+    setSelectedView("series-workbench");
+  }
+
+  function changeWorkbenchRoute(route: SeriesWorkbenchRoute) {
+    setWorkbenchRoute(route);
+    persistWorkbenchPreferences(route, workbenchLeftView, workbenchCommittedLeftWidthsRef.current);
+  }
+
+  function changeWorkbenchLeftView(view: Exclude<SeriesWorkbenchLeftView, "continuous-preview">) {
+    setWorkbenchLeftView(view);
+    persistWorkbenchPreferences(workbenchRoute, view, workbenchCommittedLeftWidthsRef.current);
+  }
+
+  function changeWorkbenchWidth(
+    leftView: Exclude<SeriesWorkbenchLeftView, "continuous-preview">,
+    width: number,
+    commit: boolean,
+    ownerKey: string,
+  ) {
+    if (ownerKey !== workbenchLayoutOwnerKey()) return;
+    if (commit && (selectedView !== "series-workbench" || workbenchLeftView !== leftView)) return;
+    if (!commit) {
+      setWorkbenchLeftWidths((current) => ({ ...current, [leftView]: width }));
+      return;
+    }
+    const committedWidths = { ...workbenchCommittedLeftWidthsRef.current, [leftView]: width };
+    workbenchCommittedLeftWidthsRef.current = committedWidths;
+    setWorkbenchLeftWidths(committedWidths);
+    persistWorkbenchPreferences(workbenchRoute, leftView, committedWidths);
+  }
+
+  function acceptWorkbenchSource(selection: WorkbenchSourceSelection) {
+    const current = currentNavigationContext.current;
+    if (
+      !dashboardMounted.current
+      || current === null
+      || current !== renderNavigationContext
+      || current.userId !== currentUserId
+      || current.services !== services
+      || current.scopeEpoch !== dashboardScopeEpoch.current
+      || current.selectedView !== "series-workbench"
+      || current.selectedSeries === null
+      || current.selectedSeries.can_enter !== true
+      || selection.seriesId !== current.selectedSeries.id
+      || selection.chapterId.trim() === ""
+      || selection.target.chapterId !== selection.chapterId
+      || (selection.target.kind === "frame" && selection.target.storyboardAssetId.trim() === "")
+      || (selection.target.kind === "asset" && selection.target.assetId.trim() === "")
+      || !selection.isCurrent()
+    ) return;
+
+    if (selection.target.kind === "asset" && selection.target.category === "fused") {
+      setSelectedView("fused-assets");
+      return;
+    }
+
+    const navigationEpoch = ++workbenchNavigationEpoch.current;
+    let intent: WorkbenchSourceIntent;
+    intent = {
+      ...selection,
+      actorId: currentUserId,
+      apiBaseUrl: services.apiBaseUrl,
+      services,
+      sessionGeneration,
+      navigationEpoch,
+      isCurrent: () => {
+        const active = currentNavigationContext.current;
+        return workbenchSourceIntentRef.current === intent
+        && dashboardMounted.current
+        && dashboardScope.current.userId === current.userId
+        && dashboardScope.current.services === current.services
+        && dashboardScopeEpoch.current === current.scopeEpoch
+        && active?.userId === current.userId
+        && active.services === current.services
+        && active.scopeEpoch === current.scopeEpoch
+        && active.sessionGeneration === intent.sessionGeneration
+        && active.services.apiBaseUrl === intent.apiBaseUrl
+        && intent.navigationEpoch === workbenchNavigationEpoch.current
+        && selection.isCurrent();
+      },
+    };
+    workbenchSourceIntentRef.current = intent;
+    if (workbenchRoute === "chat") setChatWorkbenchIntent(intent);
+    else setMediaWorkbenchIntent(intent);
+  }
+
+  function acceptAssetLibraryChapter(target: AssetFrameUsageChapterTarget) {
+    acceptAssetChapterTarget(target);
+  }
+
+  function acceptAssetLibraryFrame(target: AssetFrameUsageFrameTarget) {
+    acceptAssetFrameTarget(target);
+  }
+
+  function acceptAssetLibraryWorkbenchTarget(target: AssetFrameUsageWorkbenchTarget) {
+    acceptWorkbenchSource({
+      seriesId: target.seriesId,
+      chapterId: target.chapterId,
+      target: {
+        kind: "asset",
+        chapterId: target.chapterId,
+        category: target.category,
+        assetId: target.assetId,
+      },
+      isCurrent: target.isCurrent,
+    });
+  }
+
   function navigateToFusedAssets() {
     if (selectedView === "fused-assets" || selectedSeries === null || selectedSeries.can_enter !== true
       || !confirmLeaveCurrentView()) return;
@@ -355,7 +554,7 @@ function Dashboard() {
       || dashboardScope.current.services !== current.services
       || dashboardScopeEpoch.current !== current.scopeEpoch
       || current.selectedSeries === null
-      || current.selectedView !== "assets"
+      || (current.selectedView !== "assets" && current.selectedView !== "series-workbench")
       || current.selectedSeries.can_enter !== true
       || target.seriesId !== current.selectedSeries.id
       || target.chapterId.trim() === ""
@@ -374,7 +573,11 @@ function Dashboard() {
     };
     navigationIntentRef.current = intent;
     setChapterNavigationIntent(intent);
-    setSelectedView("chapters");
+    if (current.selectedView === "series-workbench") {
+      changeWorkbenchLeftView("storyboard");
+    } else {
+      setSelectedView("chapters");
+    }
   }
 
   function acceptFrameReferenceTarget(target: FrameAssetReferenceAssetTarget) {
@@ -392,7 +595,7 @@ function Dashboard() {
       || dashboardScope.current.services !== current.services
       || dashboardScopeEpoch.current !== current.scopeEpoch
       || current.selectedSeries === null
-      || current.selectedView !== "chapters"
+      || (current.selectedView !== "chapters" && current.selectedView !== "series-workbench")
       || current.selectedSeries.can_enter !== true
       || target.seriesId !== current.selectedSeries.id
       || target.assetId.trim() === ""
@@ -431,7 +634,7 @@ function Dashboard() {
       || dashboardScope.current.services !== current.services
       || dashboardScopeEpoch.current !== current.scopeEpoch
       || current.selectedSeries === null
-      || current.selectedView !== "assets"
+      || (current.selectedView !== "assets" && current.selectedView !== "series-workbench")
       || current.selectedSeries.can_enter !== true
       || target.seriesId !== current.selectedSeries.id
       || target.chapterId.trim() === ""
@@ -457,11 +660,17 @@ function Dashboard() {
     };
     navigationIntentRef.current = intent;
     setChapterNavigationIntent(intent);
-    setSelectedView("chapters");
+    if (current.selectedView === "series-workbench") {
+      changeWorkbenchLeftView("storyboard");
+    } else {
+      setSelectedView("chapters");
+    }
   }
 
   function acceptChatAssistantSource(target: ChatAssistantSourceIntent) {
     const current = currentNavigationContext.current;
+    const chatSurfaceActive = current?.selectedView === "chat-assistant"
+      || (current?.selectedView === "series-workbench" && workbenchRoute === "chat");
     if (
       !dashboardMounted.current
       || current === null
@@ -469,7 +678,7 @@ function Dashboard() {
       || current.userId !== renderNavigationContext.userId
       || current.services !== renderNavigationContext.services
       || current.selectedSeries !== renderNavigationContext.selectedSeries
-      || current.selectedView !== "chat-assistant"
+      || !chatSurfaceActive
       || current.selectedView !== renderNavigationContext.selectedView
       || current.scopeEpoch !== renderNavigationContext.scopeEpoch
       || dashboardScope.current.userId !== current.userId
@@ -519,6 +728,17 @@ function Dashboard() {
   const zhangyugePatService = (services as typeof services & {
     zhangyugePat?: ZhangyugePatServicePort;
   }).zhangyugePat;
+  const workbenchSurfaceMode: SeriesWorkbenchSurfaceMode = selectedView === "series-workbench"
+    ? "workbench"
+    : selectedView === "chapters"
+      ? "chapters"
+      : selectedView === "assets"
+        ? "assets"
+      : selectedView === "chat-assistant"
+        ? "chat"
+        : selectedView === "media-generation"
+          ? "media"
+          : "hidden";
 
   return (
     <div className="workspace-shell">
@@ -658,6 +878,8 @@ function Dashboard() {
                 ? "AI 生成"
               : selectedView === "chat-assistant"
                 ? "AI 助手"
+              : selectedView === "series-workbench"
+                ? "剧集工作台"
               : selectedView === "fused-assets"
                 ? "融合素材"
               : selectedView === "account"
@@ -689,6 +911,15 @@ function Dashboard() {
             {selectedView !== "media-generation" && (
               <button className="mobile-task-entry" onClick={navigateToMediaGeneration} type="button">
                 AI 生成
+              </button>
+            )}
+            {workbenchSeries !== null && workbenchSeries.can_enter === true
+              && ["chapters", "assets", "chat-assistant", "media-generation", "fused-assets"].includes(selectedView) && (
+              <button className="workbench-entry-button" onClick={() => {
+                if (!confirmLeaveCurrentView()) return;
+                enterSeriesWorkbench(workbenchSeries);
+              }} type="button">
+                {selectedView === "chapters" || selectedView === "assets" ? "剧集工作台" : "返回剧集工作台"}
               </button>
             )}
             {selectedSeries !== null && selectedView !== "chat-assistant" && (
@@ -746,12 +977,14 @@ function Dashboard() {
                 clearChapterNavigationIntent();
                 clearAssetNavigationIntent();
                 setSelectedSeries(series);
+                setWorkbenchSeries(series);
                 setSelectedView("chapters");
               }}
               onViewAssets={(series) => {
                 clearChapterNavigationIntent();
                 clearAssetNavigationIntent();
                 setSelectedSeries(series);
+                setWorkbenchSeries(series);
                 setSelectedView("assets");
               }}
               active={selectedSeries === null && selectedView === "series"}
@@ -767,47 +1000,94 @@ function Dashboard() {
               isSuperuser={state.user.is_superuser}
             />
           </div>
-          {selectedSeries !== null && selectedView === "chapters" && (
-            <ChapterBrowser
-              key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + selectedSeries.id}
-              onBack={() => {
-                clearChapterNavigationIntent();
-                clearAssetNavigationIntent();
-                setSelectedSeries(null);
-                setSelectedView("series");
-              }}
-              onUnauthorized={logoutFromWorkspace}
-              sessionGeneration={sessionGeneration}
-              navigationIntent={chapterNavigationIntent}
-              onNavigationAbandoned={(epoch) => clearChapterNavigationIntent(epoch)}
-              onNavigateToAsset={acceptFrameReferenceTarget}
-              onNavigationConsumed={(epoch) => clearChapterNavigationIntent(epoch)}
-              series={selectedSeries}
-              services={services}
-              userId={state.user.id}
-            />
-          )}
-          {selectedSeries !== null && selectedView === "assets" && (
-            <AssetLibrary
-              key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + selectedSeries.id}
-              onBack={() => {
-                clearChapterNavigationIntent();
-                clearAssetNavigationIntent();
-                setSelectedSeries(null);
-                setSelectedView("series");
-              }}
-              onUnauthorized={logoutFromWorkspace}
-              onNavigationAbandoned={(epoch) => clearAssetNavigationIntent(epoch)}
-              onNavigationConsumed={(epoch) => clearAssetNavigationIntent(epoch)}
-              navigationIntent={assetNavigationIntent}
-              onViewChapter={acceptAssetChapterTarget}
-              onViewFrame={acceptAssetFrameTarget}
-              generationHistoryPort={services.assetGenerationHistory}
-              series={selectedSeries}
-              services={services}
-              userId={state.user.id}
-            />
-          )}
+          <SeriesWorkbenchSurface
+            ownerKey={workbenchLayoutOwnerKey()}
+            chat={chatAssistantVisited && chatAssistantSeries !== null ? (
+              <ChatAssistantPage
+                key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}:${chatAssistantSeries.id}`}
+                services={services}
+                series={chatAssistantSeries}
+                userId={state.user.id}
+                sessionGeneration={sessionGeneration}
+                onUnauthorized={logoutFromWorkspace}
+                onBack={() => setSelectedView("chapters")}
+                onNavigateSource={acceptChatAssistantSource}
+                workbenchSourceIntent={chatWorkbenchIntent}
+              />
+            ) : null}
+            storyboard={workbenchSeries !== null ? (
+              <ChapterBrowser
+                key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + workbenchSeries.id}
+                onBack={() => {
+                  clearChapterNavigationIntent();
+                  clearAssetNavigationIntent();
+                  setSelectedSeries(null);
+                  setWorkbenchSeries(null);
+                  setSelectedView("series");
+                }}
+                onUnauthorized={logoutFromWorkspace}
+                sessionGeneration={sessionGeneration}
+                navigationIntent={chapterNavigationIntent}
+                onNavigationAbandoned={(epoch) => clearChapterNavigationIntent(epoch)}
+                onNavigateToAsset={acceptFrameReferenceTarget}
+                onNavigationConsumed={(epoch) => clearChapterNavigationIntent(epoch)}
+                onWorkbenchSource={acceptWorkbenchSource}
+                workbenchActive={selectedView === "series-workbench" && workbenchLeftView === "storyboard"}
+                series={workbenchSeries}
+                services={services}
+                userId={state.user.id}
+              />
+            ) : null}
+            assets={workbenchSeries !== null ? (
+              <AssetLibrary
+                key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + workbenchSeries.id}
+                onBack={() => {
+                  if (selectedView === "series-workbench") {
+                    setWorkbenchLeftView("storyboard");
+                    return;
+                  }
+                  clearChapterNavigationIntent();
+                  clearAssetNavigationIntent();
+                  setSelectedSeries(null);
+                  setWorkbenchSeries(null);
+                  setSelectedView("series");
+                }}
+                onUnauthorized={logoutFromWorkspace}
+                onNavigationAbandoned={(epoch) => clearAssetNavigationIntent(epoch)}
+                onNavigationConsumed={(epoch) => clearAssetNavigationIntent(epoch)}
+                navigationIntent={assetNavigationIntent}
+                onViewChapter={acceptAssetLibraryChapter}
+                onViewFrame={acceptAssetLibraryFrame}
+                {...(selectedView === "series-workbench"
+                  ? { onUseAsWorkbenchTarget: acceptAssetLibraryWorkbenchTarget }
+                  : {})}
+                generationHistoryPort={services.assetGenerationHistory}
+                series={workbenchSeries}
+                services={services}
+                userId={state.user.id}
+              />
+            ) : null}
+            leftView={workbenchLeftView}
+            leftWidth={workbenchLeftWidths[workbenchLeftView]}
+            media={mediaGenerationVisited ? (
+              <MediaGenerationPage
+                key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
+                services={services}
+                userId={state.user.id}
+                sessionGeneration={sessionGeneration}
+                onUnauthorized={logoutFromWorkspace}
+                onOpenTasks={() => setSelectedView("tasks")}
+                workbenchSourceIntent={mediaWorkbenchIntent}
+              />
+            ) : null}
+            mode={workbenchSurfaceMode}
+            onLeftViewChange={changeWorkbenchLeftView}
+            onRouteChange={changeWorkbenchRoute}
+            onWidthChange={(leftView, width, ownerKey) => changeWorkbenchWidth(leftView, width, false, ownerKey)}
+            onWidthCommit={(leftView, width, ownerKey) => changeWorkbenchWidth(leftView, width, true, ownerKey)}
+            preferenceNotice={workbenchPreferenceNotice}
+            route={workbenchRoute}
+          />
           {selectedSeries !== null && selectedView === "fused-assets" && selectedSeries.can_enter === true && (
             <FusedAssetsPage
               key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}:${selectedSeries.id}`}
@@ -829,40 +1109,6 @@ function Dashboard() {
               userId={state.user.id}
             />
           )}
-          {mediaGenerationVisited && (
-            <div
-              hidden={selectedView !== "media-generation"}
-              inert={selectedView !== "media-generation"}
-              aria-hidden={selectedView !== "media-generation"}
-            >
-              <MediaGenerationPage
-                key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
-                services={services}
-                userId={state.user.id}
-                sessionGeneration={sessionGeneration}
-                onUnauthorized={logoutFromWorkspace}
-                onOpenTasks={() => setSelectedView("tasks")}
-              />
-            </div>
-          )}
-          {chatAssistantVisited && chatAssistantSeries !== null && (
-            <div
-              hidden={selectedView !== "chat-assistant"}
-              inert={selectedView !== "chat-assistant"}
-              aria-hidden={selectedView !== "chat-assistant"}
-            >
-              <ChatAssistantPage
-                key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}:${chatAssistantSeries.id}`}
-                services={services}
-                series={chatAssistantSeries}
-                userId={state.user.id}
-                sessionGeneration={sessionGeneration}
-                onUnauthorized={logoutFromWorkspace}
-                onBack={() => setSelectedView("chapters")}
-                onNavigateSource={acceptChatAssistantSource}
-              />
-            </div>
-          )}
           {selectedView === "teams" && (
             <TeamsPage
               key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}`}
@@ -883,6 +1129,11 @@ function Dashboard() {
                 clearChapterNavigationIntent();
                 clearAssetNavigationIntent();
                 setSelectedSeries(series);
+                setWorkbenchSeries(series);
+                setChatAssistantSeries(series);
+                workbenchSourceIntentRef.current = null;
+                setChatWorkbenchIntent(null);
+                setMediaWorkbenchIntent(null);
                 setSelectedView(destination);
               }}
             />
