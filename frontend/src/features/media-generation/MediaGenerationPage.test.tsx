@@ -924,10 +924,32 @@ describe("MediaGenerationPage", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     const referenceUrl = "/uploads/storyboard/reference.png";
     const characterUrl = "https://cdn.example.test/character.png";
+    const stylePrompt: CreatorPrompt = {
+      id: "quick-reference-style-1046",
+      category: "style",
+      name: "分镜风格",
+      user_prompt: JSON.stringify({
+        storyboard: "水墨线稿风格",
+        storyboard_image: referenceUrl,
+        general: "通用画风",
+      }),
+      sort_order: 0,
+      user_id: "actor-926",
+    };
+    const baseCreatorSettings = creatorSettings();
+    const listCreatorPrompts = baseCreatorSettings.listPrompts;
+    const creatorSettingsWithStyle: CreatorSettingsServicePort = {
+      ...baseCreatorSettings,
+      listPrompts: vi.fn(async (category, signal) => [
+        ...(await listCreatorPrompts(category, signal)),
+        stylePrompt,
+      ]),
+    };
     const chapter = {
       ...chapterFixture(),
-      content: [{ storyboard: ["storyboard-926"], character: ["character-926"], text: "镜头一：5.2 秒" }],
+      content: [{ storyboard: ["storyboard-926"], character: ["character-926"], text: "", original_text: "镜头一：5.2 秒" }],
     };
+    const series = { ...seriesFixture(), style_prompt_id: stylePrompt.id, style_prompt: null };
     const storyboard = { ...storyboardFixture(), image_url: referenceUrl };
     const character = { ...characterFixture(), image_url: characterUrl };
     const submitImage = vi.fn<MediaGenerationRun["submitImage"]>(async () => ({
@@ -949,11 +971,11 @@ describe("MediaGenerationPage", () => {
       ...base,
       mode: "api",
       apiBaseUrl: "http://127.0.0.1:4175/api",
-      creatorSettings: creatorSettings(),
+      creatorSettings: creatorSettingsWithStyle,
       mediaGeneration: generationPort(vi.fn(async () => ({ operation: "image.batch" as const, tasks: [] })), undefined, submitImage),
       userPreferences: preferences.port,
       canvasData: { ...base.canvasData!, readImage } as NonNullable<WorkspaceServices["canvasData"]>,
-      listSeries: vi.fn(async () => [seriesFixture()]),
+      listSeries: vi.fn(async () => [series]),
       listChapters: vi.fn(async () => [chapter]),
       listStoryboardAssets: vi.fn(async () => [storyboard]),
       listCharacters: vi.fn(async () => [character]),
@@ -1008,6 +1030,10 @@ describe("MediaGenerationPage", () => {
     expect(readImage).toHaveBeenCalledOnce();
     expect(readImage).toHaveBeenCalledWith(referenceUrl, expect.any(AbortSignal));
     expect((screen.getByLabelText("图片提示词") as HTMLTextAreaElement).value).toContain("镜头一：5.2 秒");
+    expect((screen.getByLabelText("图片提示词") as HTMLTextAreaElement).value).toContain("【风格提示词】\n水墨线稿风格");
+    expect((screen.getByLabelText("图片提示词") as HTMLTextAreaElement).value).toContain("【风格参考图】");
+    expect((screen.getByLabelText("图片提示词") as HTMLTextAreaElement).value).toContain("图片1 = 风格参考");
+    expect((screen.getByLabelText("图片提示词") as HTMLTextAreaElement).value).toContain("图片1 = 雨巷转场镜头");
     expect(screen.getByLabelText("提示词目录")).toHaveValue("");
     expect(screen.getByLabelText("参考图片 URL（每行一项）")).toHaveValue("");
     expect(screen.getByText(/已准备 2 张章节参考图/)).toBeInTheDocument();
