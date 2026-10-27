@@ -147,6 +147,8 @@ import {
   type CreatorPromptUpdateInput,
   type CreatorSettingsServicePort,
 } from "./creatorSettings";
+import { createProviderQuotaHttp } from "./providerQuotaHttp";
+import type { ProviderQuotaServicePort } from "./providerQuota";
 import type { FrameReviewServicePort } from "./frameReview";
 import type { FrameOptimizeServicePort } from "./frameOptimize";
 import {
@@ -334,6 +336,7 @@ export interface WorkspaceServices {
   readonly frameReview?: FrameReviewServicePort;
   readonly frameOptimize?: FrameOptimizeServicePort;
   readonly creatorSettings?: CreatorSettingsServicePort;
+  readonly providerQuota?: ProviderQuotaServicePort;
   exportSeries?(seriesId: string, signal: AbortSignal): Promise<unknown>;
   importSeries?(input: ImportSeriesInput, signal: AbortSignal): Promise<ImportSeriesResponse>;
   logout(): void;
@@ -1986,6 +1989,7 @@ function timeoutSignal(parent: AbortSignal, timeoutMs: number): {
 
 const STORYBOARD_STREAM_TOTAL_TIMEOUT_MS = 5 * 60_000;
 const STORYBOARD_STREAM_IDLE_TIMEOUT_MS = 45_000;
+const PROVIDER_QUOTA_BALANCE_TIMEOUT_MS = 60_000;
 
 function storyboardStreamTimeout(parent: AbortSignal): {
   signal: AbortSignal;
@@ -2126,6 +2130,8 @@ type ApiEndpoint =
   | "taskRequest"
   | "myTeams"
   | "creatorModels"
+  | "providerQuotaAccounts"
+  | "providerQuotaAccountBalance"
   | "creatorModel"
   | "promoteCreatorModelToSystem"
   | "demoteCreatorModelToPersonal"
@@ -2160,6 +2166,7 @@ function apiRequestDefinition(
     modelId?: string;
     promptId?: string;
     sessionId?: string;
+    providerQuotaAccountId?: string;
   },
 ): ApiRequestDefinition {
   if (endpoint === "login") {
@@ -2302,6 +2309,13 @@ function apiRequestDefinition(
   }
   if (endpoint === "myTeams") {
     return { path: "/teams/my", method: "GET" };
+  }
+  if (endpoint === "providerQuotaAccounts") {
+    return { path: "/provider-quota/accounts", method: "GET" };
+  }
+  if (endpoint === "providerQuotaAccountBalance") {
+    const accountId = encodeApiPathId(identifiers?.providerQuotaAccountId, "供应商监控账号");
+    return { path: `/provider-quota/accounts/${accountId}/balance`, method: "GET" };
   }
   if (endpoint === "testCreatorModelConnection") {
     return { path: "/models/test-connection", method: "POST" };
@@ -2501,12 +2515,14 @@ export function createApiServices(
       modelId?: string;
       promptId?: string;
       sessionId?: string;
+      providerQuotaAccountId?: string;
     },
     requestBaseUrl = apiBaseUrl,
+    requestTimeoutMs = timeoutMs,
   ): Promise<unknown> {
     const requestDefinition = apiRequestDefinition(endpoint, identifiers);
     const url = new URL(`${requestBaseUrl}${requestDefinition.path}`);
-    const timed = timeoutSignal(signal, timeoutMs);
+    const timed = timeoutSignal(signal, requestTimeoutMs);
     const headers = new Headers({ Accept: "application/json" });
     const multipartBody = typeof FormData !== "undefined" && body instanceof FormData ? body : undefined;
     if (body !== undefined && multipartBody === undefined) {
@@ -2631,11 +2647,13 @@ export function createApiServices(
       modelId?: string;
       promptId?: string;
       sessionId?: string;
+      providerQuotaAccountId?: string;
     },
+    requestTimeoutMs?: number,
   ): Promise<unknown> {
     try {
       ensureCurrentApiSession(storage, token, signal);
-      const result = await request(endpoint, token, signal, body, identifiers);
+      const result = await request(endpoint, token, signal, body, identifiers, apiBaseUrl, requestTimeoutMs);
       ensureCurrentApiSession(storage, token, signal);
       return result;
     } catch (error) {
@@ -3143,6 +3161,20 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     creatorSettings,
+    providerQuota: createProviderQuotaHttp(async (call, signal) => {
+      const token = requireApiToken(storage);
+      if (call.endpoint === "providerQuotaAccountBalance") {
+        return requestForCurrentApiSession(
+          call.endpoint,
+          token,
+          signal,
+          undefined,
+          { providerQuotaAccountId: call.accountId },
+          PROVIDER_QUOTA_BALANCE_TIMEOUT_MS,
+        );
+      }
+      return requestForCurrentApiSession(call.endpoint, token, signal);
+    }),
     frameReview,
     frameOptimize,
     accountProfile,

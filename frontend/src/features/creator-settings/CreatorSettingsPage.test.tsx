@@ -16,6 +16,7 @@ import type {
 } from "../../shared/api/creatorSettings";
 import { parseCreatorModel } from "../../shared/api/creatorSettings";
 import { CreatorSettingsPage } from "./CreatorSettingsPage";
+import type { ProviderQuotaAccount, ProviderQuotaBalance, ProviderQuotaServicePort } from "../../shared/api/providerQuota";
 
 afterEach(() => {
   cleanup();
@@ -255,10 +256,22 @@ function makeService() {
   };
 }
 
-function renderPage(service: CreatorSettingsServicePort, userId = ownerId, isSuperuser = false) {
+function renderPage(
+  service: CreatorSettingsServicePort,
+  userId = ownerId,
+  isSuperuser = false,
+  providerQuotaService?: ProviderQuotaServicePort,
+) {
   const onUnauthorized = vi.fn();
   const onBack = vi.fn();
-  const view = render(<CreatorSettingsPage isSuperuser={isSuperuser} onBack={onBack} onUnauthorized={onUnauthorized} service={service} userId={userId} />);
+  const view = render(<CreatorSettingsPage
+    isSuperuser={isSuperuser}
+    onBack={onBack}
+    onUnauthorized={onUnauthorized}
+    providerQuotaService={providerQuotaService}
+    service={service}
+    userId={userId}
+  />);
   return { onUnauthorized, onBack, view };
 }
 
@@ -1002,6 +1015,107 @@ describe("creator settings", () => {
     expect(service.promoteModelToSystem).toHaveBeenCalledTimes(2);
     expect(onUnauthorized).not.toHaveBeenCalled();
     expect(confirmSpy).toHaveBeenCalledTimes(3);
+  });
+
+  it("opens quota lookup only for administrators, preserves drafts, isolates cards, and drops a late previous-actor result", async () => {
+    const user = userEvent.setup();
+    const { service: settingsService } = makeService();
+    const accounts: ProviderQuotaAccount[] = [
+      { id: "quota-zero", name: "零余额", providerType: "deepseek", isActive: true, sortOrder: 0, consoleUrl: null },
+      { id: "quota-error", name: "异常账户", providerType: "new_api", isActive: true, sortOrder: 1, consoleUrl: null },
+      { id: "quota-slow", name: "迟到账户", providerType: "new_api", isActive: true, sortOrder: 2, consoleUrl: null },
+      { id: "quota-disabled", name: "停用账户", providerType: "aliyun", isActive: false, sortOrder: 3, consoleUrl: null },
+    ];
+    const lateBalance = deferred<ProviderQuotaBalance>();
+    const makeBalance = (
+      id: string,
+      overrides: Partial<ProviderQuotaBalance> = {},
+    ): ProviderQuotaBalance => ({
+      id,
+      name: `额度 ${id}`,
+      providerType: "deepseek",
+      isActive: true,
+      disabled: false,
+      configured: true,
+      unit: "$",
+      unitSuffix: "",
+      decimals: 2,
+      balanceLabel: "剩余额度",
+      warnBelow: 10,
+      balance: 12,
+      used: null,
+      total: null,
+      toppedUp: null,
+      granted: null,
+      credits: null,
+      balanceCny: null,
+      available: null,
+      extraMeta: [],
+      updatedAt: "2026-10-27 10:30:00",
+      hasErrors: false,
+      sessionReused: false,
+      consoleUrl: null,
+      ...overrides,
+    });
+    const quotaService: ProviderQuotaServicePort = {
+      listAccounts: vi.fn(async () => accounts),
+      getBalance: vi.fn(async (accountId: string) => {
+        if (accountId === "quota-zero") return makeBalance(accountId, { balance: 0, total: 0 });
+        if (accountId === "quota-error") return makeBalance(accountId, { balance: null, hasErrors: true });
+        if (accountId === "quota-slow") return lateBalance.promise;
+        throw new Error("inactive account must not be queried");
+      }),
+    };
+
+    const regularUser = renderPage(settingsService, ownerId, false, quotaService);
+    await screen.findByText("我的文本模型");
+    expect(screen.queryByRole("button", { name: "供应商额度监控" })).not.toBeInTheDocument();
+    expect(quotaService.listAccounts).not.toHaveBeenCalled();
+    expect(quotaService.getBalance).not.toHaveBeenCalled();
+    cleanup();
+
+    const { onUnauthorized, view } = renderPage(settingsService, ownerId, true, quotaService);
+    const personalCard = (await screen.findByText("我的文本模型")).closest("article");
+    expect(personalCard).not.toBeNull();
+    await user.click(within(personalCard!).getByRole("button", { name: "编辑" }));
+    const draftName = await screen.findByLabelText("名称");
+    await user.clear(draftName);
+    await user.type(draftName, "未保存的模型草稿");
+
+    await user.click(await screen.findByRole("button", { name: "供应商额度监控" }));
+    expect(await screen.findByRole("region", { name: "供应商额度监控" })).toBeInTheDocument();
+    expect(screen.getByLabelText("名称")).toHaveValue("未保存的模型草稿");
+    expect(await screen.findByText("监控账号 4 家")).toBeInTheDocument();
+    expect(await screen.findByText("$0.00")).toBeInTheDocument();
+    expect(screen.getByText("总额 $0.00")).toBeInTheDocument();
+    expect(await screen.findByText("额度查询异常，请检查该账号配置或稍后重试。"))
+      .toBeInTheDocument();
+    expect(screen.getByText("该监控账号已停用。")).toBeInTheDocument();
+    expect(screen.queryByText(/总剩余额度/)).not.toBeInTheDocument();
+    expect(quotaService.listAccounts).toHaveBeenCalledTimes(1);
+    expect(quotaService.getBalance).toHaveBeenCalledTimes(3);
+    expect(quotaService.getBalance).not.toHaveBeenCalledWith("quota-disabled", expect.anything());
+
+    view.rerender(
+      <CreatorSettingsPage
+        isSuperuser={false}
+        onBack={vi.fn()}
+        onUnauthorized={onUnauthorized}
+        providerQuotaService={quotaService}
+        service={settingsService}
+        userId={otherOwnerId}
+      />,
+    );
+    await act(async () => {
+      lateBalance.resolve(makeBalance("quota-slow", { name: "不可显示的迟到余额" }));
+      await lateBalance.promise;
+    });
+    expect(screen.queryByRole("region", { name: "供应商额度监控" })).not.toBeInTheDocument();
+    expect(screen.queryByText("不可显示的迟到余额")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "供应商额度监控" })).not.toBeInTheDocument();
+    expect(quotaService.listAccounts).toHaveBeenCalledTimes(1);
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(regularUser.onUnauthorized).not.toHaveBeenCalled();
   });
 
   it("drops api_key values from model response projections", () => {
