@@ -9,11 +9,11 @@ from dataclasses import dataclass
 from collections.abc import Mapping
 from typing import Any
 
+from .domain import DEFAULT_BASE_URL
 from .ports import AistarslabTransport
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_BASE_URL = "https://api.video.aistarslab.com/openapi"
 CONFIG_CACHE_TTL = 600
 
 

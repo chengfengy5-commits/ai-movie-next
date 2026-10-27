@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from starlette.concurrency import run_in_threadpool
 
-from haoai_backend.admin_system_models.ports import Cipher, UnitOfWorkFactory as SystemModelUnitOfWorkFactory
+from haoai_backend.admin_system_models.ports import Cipher
 from haoai_backend.admin_system_config.ports import UnitOfWorkFactory as SystemConfigUnitOfWorkFactory
 from haoai_backend.model_configs.ports import ModelConfigsUnitOfWorkFactory
 
@@ -19,14 +19,14 @@ from .errors import (
     AistarslabForbidden,
     AistarslabNotFound,
 )
-from .persistence import create_system_model, sync_system_models
 from .ports import (
+    AistarslabConfigCache,
     AistarslabLegacyReaderFactory,
-    AistarslabTransport,
+    AistarslabProvider,
+    AistarslabSystemModelWriter,
     Clock,
     IdFactory,
 )
-from .provider import AistarslabClient, ConfigCache, DEFAULT_BASE_URL
 
 
 class AistarslabApplication:
@@ -36,22 +36,22 @@ class AistarslabApplication:
         model_configs_uow_factory: ModelConfigsUnitOfWorkFactory | None,
         legacy_reader_factory: AistarslabLegacyReaderFactory,
         system_config_uow_factory: SystemConfigUnitOfWorkFactory | None,
-        system_model_uow_factory: SystemModelUnitOfWorkFactory | None,
+        system_model_writer: AistarslabSystemModelWriter,
         cipher: Cipher,
-        transport: AistarslabTransport,
+        provider: AistarslabProvider,
         clock: Clock,
         id_factory: IdFactory,
-        cache: ConfigCache | None = None,
+        cache: AistarslabConfigCache,
     ) -> None:
         self._model_configs_uow_factory = model_configs_uow_factory
         self._legacy_reader_factory = legacy_reader_factory
         self._system_config_uow_factory = system_config_uow_factory
-        self._system_model_uow_factory = system_model_uow_factory
+        self._system_model_writer = system_model_writer
         self._cipher = cipher
-        self._provider = AistarslabClient(transport)
+        self._provider = provider
         self._clock = clock
         self._id_factory = id_factory
-        self._cache = cache or ConfigCache()
+        self._cache = cache
 
     async def _credentials(self, user_id: str) -> tuple[str | None, str | None]:
         return await run_in_threadpool(
@@ -171,13 +171,11 @@ class AistarslabApplication:
         )
 
         record = await run_in_threadpool(
-            create_system_model,
-            self._system_model_uow_factory,
-            self._cipher,
+            self._system_model_writer.create_system_model,
             category="video",
             name=name,
             model=f"{channel}:{model_name}",
-            base_url=base_url or DEFAULT_BASE_URL,
+            base_url=base_url or domain.DEFAULT_BASE_URL,
             params=params_value,
             cost_per_call=base_cost,
             description=description,
@@ -268,13 +266,11 @@ class AistarslabApplication:
         )
 
         record = await run_in_threadpool(
-            create_system_model,
-            self._system_model_uow_factory,
-            self._cipher,
+            self._system_model_writer.create_system_model,
             category="image",
             name=name,
             model=f"{channel}:{model_name}",
-            base_url=base_url or DEFAULT_BASE_URL,
+            base_url=base_url or domain.DEFAULT_BASE_URL,
             params=params_value,
             cost_per_call=base_cost,
             description=description,
@@ -357,14 +353,11 @@ class AistarslabApplication:
         image_config = data.get("imageConfig") or []
         multiplier = await self._multiplier()
         result = await run_in_threadpool(
-            sync_system_models,
-            self._system_model_uow_factory,
-            self._legacy_reader_factory,
-            self._cipher,
+            self._system_model_writer.sync_system_models,
             video_config=video_config,
             image_config=image_config,
             api_key=api_key,
-            base_url=base_url or DEFAULT_BASE_URL,
+            base_url=base_url or domain.DEFAULT_BASE_URL,
             multiplier=multiplier,
             id_factory=self._id_factory,
         )

@@ -27,7 +27,9 @@ from haoai_backend.admin_system_models.tables import (
     metadata as admin_system_models_metadata,
 )
 from haoai_backend.authentication.errors import AuthenticationError
+from haoai_backend.aistarslab.application import AistarslabApplication
 from haoai_backend.aistarslab.http import build_aistarslab_router
+from haoai_backend.aistarslab.ports import AistarslabCredentialRecord
 from haoai_backend.aistarslab.readers import (
     build_sqlalchemy_aistarslab_legacy_reader_factory,
 )
@@ -213,6 +215,63 @@ def config_data() -> dict[str, Any]:
             }
         ],
     }
+
+
+def test_application_accepts_explicit_provider_cache_and_writer_ports() -> None:
+    class RecordingProvider:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def fetch_config(self, api_key: str, base_url: str) -> dict[str, Any]:
+            self.calls.append((api_key, base_url))
+            return {"videoConfig": [], "imageConfig": []}
+
+        async def get_credits(self, _api_key: str, _base_url: str) -> int | None:
+            return None
+
+    class RecordingCache:
+        def __init__(self) -> None:
+            self.stored: dict[str, Any] | None = None
+
+        def get_fresh(self, _now: float) -> dict[str, Any] | None:
+            return None
+
+        def store(self, data: dict[str, Any], _now: float) -> None:
+            self.stored = data
+
+        def clear(self) -> None:
+            self.stored = None
+
+    class CredentialReader:
+        def list_active_system_credentials(self):
+            return [
+                AistarslabCredentialRecord(
+                    api_key="gAAAAAprovider-key",
+                    base_url="https://provider.example.test/openapi",
+                )
+            ]
+
+    provider = RecordingProvider()
+    cache = RecordingCache()
+    application = AistarslabApplication(
+        model_configs_uow_factory=None,
+        legacy_reader_factory=CredentialReader,
+        system_config_uow_factory=None,
+        system_model_writer=object(),
+        cipher=FakeCipher(),
+        provider=provider,
+        clock=lambda: 1_000.0,
+        id_factory=lambda: "synthetic-id",
+        cache=cache,
+    )
+
+    result = asyncio.run(application.config("member"))
+
+    assert result == {"videoConfig": [], "imageConfig": [], "credits": None}
+    assert provider.calls == [
+        ("provider-key", "https://provider.example.test/openapi")
+    ]
+    assert cache.stored == {"videoConfig": [], "imageConfig": []}
 
 
 @pytest.fixture

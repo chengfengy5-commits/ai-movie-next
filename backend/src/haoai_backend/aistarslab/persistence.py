@@ -16,7 +16,11 @@ from haoai_backend.admin_system_models.ports import (
 )
 
 from .errors import AistarslabUnavailable
-from .ports import AistarslabLegacyReaderFactory
+from .ports import (
+    AistarslabLegacyReaderFactory,
+    AistarslabSystemModelWriter,
+    IdFactory,
+)
 
 _LIST_LIMIT = 2_147_483_647
 
@@ -235,3 +239,66 @@ def sync_system_models(
             "updated": updated,
             "total": created + updated,
         }
+
+
+class AistarslabSystemModelWriterAdapter(AistarslabSystemModelWriter):
+    """Bind AIStarsLab model writes to the existing UoW and cipher adapters."""
+
+    def __init__(
+        self,
+        unit_of_work_factory: UnitOfWorkFactory | None,
+        legacy_reader_factory: AistarslabLegacyReaderFactory,
+        cipher: Cipher,
+    ) -> None:
+        self._unit_of_work_factory = unit_of_work_factory
+        self._legacy_reader_factory = legacy_reader_factory
+        self._cipher = cipher
+
+    def create_system_model(
+        self,
+        *,
+        category: str,
+        name: str,
+        model: str,
+        base_url: str,
+        params: str,
+        cost_per_call: int,
+        description: str,
+        api_key: str,
+        id_factory: IdFactory,
+    ) -> SystemModelRecord:
+        return create_system_model(
+            self._unit_of_work_factory,
+            self._cipher,
+            category=category,
+            name=name,
+            model=model,
+            base_url=base_url,
+            params=params,
+            cost_per_call=cost_per_call,
+            description=description,
+            api_key=api_key,
+            id_factory=id_factory,
+        )
+
+    def sync_system_models(
+        self,
+        *,
+        video_config: list[dict[str, Any]],
+        image_config: list[dict[str, Any]],
+        api_key: str,
+        base_url: str,
+        multiplier: float,
+        id_factory: IdFactory,
+    ) -> dict[str, int]:
+        return sync_system_models(
+            self._unit_of_work_factory,
+            self._legacy_reader_factory,
+            self._cipher,
+            video_config=video_config,
+            image_config=image_config,
+            api_key=api_key,
+            base_url=base_url,
+            multiplier=multiplier,
+            id_factory=id_factory,
+        )

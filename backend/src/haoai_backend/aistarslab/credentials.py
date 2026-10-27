@@ -8,8 +8,8 @@ from haoai_backend.admin_system_models.ports import Cipher
 from haoai_backend.admin_system_config.ports import UnitOfWorkFactory as SystemConfigUnitOfWorkFactory
 from haoai_backend.model_configs.ports import ModelConfigsUnitOfWorkFactory
 
+from .domain import DEFAULT_BASE_URL
 from .ports import AistarslabLegacyReaderFactory
-from .provider import DEFAULT_BASE_URL
 
 
 def get_credentials(
