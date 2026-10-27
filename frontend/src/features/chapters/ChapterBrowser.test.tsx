@@ -32,6 +32,10 @@ import type {
 import frameOptimizeStatusWire from "../../testing/fixtures/frameOptimizeStatusWire.json";
 import type { StoryboardGenerationServicePort } from "../storyboard-generation/contracts";
 import { digestPersonalProductionMediaIdentity } from "./personal-production/mediaIdentity";
+import {
+  storyboardChapterStorageKey,
+  storyboardPageSizeStorageKey,
+} from "./storyboardBrowsePreferences";
 import { demoSeries } from "../series/demoSeries";
 import { ChapterBrowser, type ChapterNavigationIntent } from "./ChapterBrowser";
 import type {
@@ -40,12 +44,12 @@ import type {
 } from "./PersonalProductionNotesPanel";
 
 const personalNotesBridge = vi.hoisted(() => ({
-  onLocateResume: null as ((target: { position: number; isCurrent(): boolean }) => void) | null,
+  onLocateResume: null as ((target: { position: number; isCurrent(): boolean }) => boolean | void | Promise<boolean | void>) | null,
   onResumeInvalidated: null as (() => void) | null,
   lastTarget: null as { position: number; isCurrent(): boolean } | null,
   onRegisterFrameRead: null as ((identity: PersonalProductionNoteReadIdentity) => void) | null,
   onFrameReadInvalidated: null as ((identity: PersonalProductionNoteReadIdentity) => void) | null,
-  onLocateProductionNoteFrame: null as ((target: PersonalProductionNoteFrameTarget) => boolean) | null,
+  onLocateProductionNoteFrame: null as ((target: PersonalProductionNoteFrameTarget) => boolean | Promise<boolean>) | null,
   onClose: null as ((identity: PersonalProductionNoteReadIdentity | null) => void) | null,
   lastProductionNoteTarget: null as PersonalProductionNoteFrameTarget | null,
   assets: [] as StoryboardAsset[],
@@ -58,7 +62,7 @@ const frameAssetReferencesBridge = vi.hoisted(() => ({
 
 const roughCutPanelBridge = vi.hoisted(() => ({
   onClose: null as (() => void) | null,
-  onLocateFrame: null as ((target: PersonalRoughCutFrameTarget) => boolean) | null,
+  onLocateFrame: null as ((target: PersonalRoughCutFrameTarget) => boolean | Promise<boolean>) | null,
   lastTarget: null as PersonalRoughCutFrameTarget | null,
   onFrameNavigationInvalidated: null as ((identity: PersonalRoughCutReadIdentity) => void) | null,
   lastInvalidation: null as PersonalRoughCutReadIdentity | null,
@@ -80,7 +84,7 @@ vi.mock("./PersonalProductionNotesPanel", async (importOriginal) => {
         ...props,
         onLocateResume: (target) => {
           personalNotesBridge.lastTarget = target;
-          props.onLocateResume(target);
+          return props.onLocateResume(target);
         },
         onLocateProductionNoteFrame: (target) => {
           personalNotesBridge.lastProductionNoteTarget = target;
@@ -150,6 +154,11 @@ function chapter(
     lock: null,
     ...overrides,
   };
+}
+
+function seedStoryboardPageSize(userId: string, chapterId: string, pageSize = 10): void {
+  const scope = { userId, apiBaseUrl, seriesId: series.id, chapterId };
+  window.localStorage.setItem(storyboardPageSizeStorageKey(scope), String(pageSize));
 }
 
 function asset(id: string, chapterId: string, imageUrl: string | null = null): StoryboardAsset {
@@ -1187,8 +1196,13 @@ describe("read-only chapter browser", () => {
     const first = chapter("chapter-first", "同名章节", [
       { storyboard: ["storyboard-first"], character: ["character-first"], text: "首章文字" },
     ]);
+    const targetPosition = 22;
     const target = chapter("chapter-target", "同名章节", [
-      { storyboard: ["storyboard-other"], character: ["character-other"], text: "镜头一文字" },
+      ...Array.from({ length: targetPosition - 1 }, (_, index) => ({
+        storyboard: [`storyboard-other-${index + 1}`],
+        character: [`character-other-${index + 1}`],
+        text: `镜头${index + 1}文字`,
+      })),
       {
         storyboard: ["storyboard-target", "ignored-second-id"],
         character: ["character-target"],
@@ -1201,8 +1215,13 @@ describe("read-only chapter browser", () => {
     const onConsumed = vi.fn();
     const onAbandoned = vi.fn();
     const onUnauthorized = vi.fn();
+    const browseUserId = "browse-navigation-user";
+    const browseScope = { userId: browseUserId, apiBaseUrl, seriesId: series.id, chapterId: target.id };
+    window.localStorage.setItem(storyboardPageSizeStorageKey(browseScope), "10");
+    window.localStorage.setItem(storyboardChapterStorageKey(browseScope), JSON.stringify({ page: 2, scrollTop: 700 }));
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
     const intent: ChapterNavigationIntent = {
-      userId: "demo-user",
+      userId: browseUserId,
       services,
       seriesId: series.id,
       chapterId: target.id,
@@ -1214,19 +1233,18 @@ describe("read-only chapter browser", () => {
       },
     };
 
-    renderBrowser(services, vi.fn(), onUnauthorized, series, "demo-user", {
+    renderBrowser(services, vi.fn(), onUnauthorized, series, browseUserId, {
       intent,
       onConsumed,
       onAbandoned,
     });
 
-    expect(await screen.findByText("目标镜头文字")).toBeInTheDocument();
+    expect(await screen.findByText("镜头11文字")).toBeInTheDocument();
     expect(listChapters).toHaveBeenCalledTimes(1);
     await waitFor(() => expect(listStoryboardAssets).toHaveBeenCalledTimes(1));
     expect(listStoryboardAssets).toHaveBeenCalledWith(series.id, target.id, expect.any(AbortSignal));
-    const targetArticle = screen.getByRole("article", { name: "同名章节 · 镜头 2" });
-    const scrollIntoView = vi.fn();
-    Object.defineProperty(targetArticle, "scrollIntoView", { configurable: true, value: scrollIntoView });
+    expect(screen.getByText(/第 2 \/ 3 页/)).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "同名章节 · 镜头 22" })).not.toBeInTheDocument();
     expect(onConsumed).not.toHaveBeenCalled();
 
     await act(async () => {
@@ -1237,16 +1255,22 @@ describe("read-only chapter browser", () => {
       await pendingAssets.promise;
     });
 
+    const targetArticle = await screen.findByRole("article", { name: "同名章节 · 镜头 22" });
+    await act(async () => {
+      await Promise.resolve();
+    });
     expect(targetArticle).toHaveFocus();
-    expect(targetArticle).toHaveAttribute("aria-label", "同名章节 · 镜头 2");
-    expect(scrollIntoView).toHaveBeenCalledWith({ behavior: "auto", block: "center" });
-    expect(screen.getByText("已定位到目标镜头 2。")).toBeInTheDocument();
+    expect(targetArticle).toHaveAttribute("aria-label", "同名章节 · 镜头 22");
+    expect(screen.getByText(/第 3 \/ 3 页/)).toBeInTheDocument();
+    expect(screen.getByText("已定位到目标镜头 22。")).toBeInTheDocument();
     expect(listChapters).toHaveBeenCalledTimes(1);
     expect(listStoryboardAssets).toHaveBeenCalledTimes(1);
     expect(onConsumed).toHaveBeenCalledTimes(1);
     expect(onConsumed).toHaveBeenCalledWith(intent.navigationEpoch);
     expect(onAbandoned).not.toHaveBeenCalled();
     expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(scrollTo).not.toHaveBeenCalledWith(0, 700);
+    scrollTo.mockRestore();
   });
 
   it.each([
@@ -3042,7 +3066,7 @@ describe("read-only chapter browser", () => {
     await act(async () => {
       invalidate(target.readIdentity);
       register(target.readIdentity);
-      staleLocateResult = locate(target);
+      staleLocateResult = (await locate(target)) === true;
     });
     expect(staleLocateResult).toBe(false);
     expect(target.isCurrent()).toBe(true);
@@ -3116,7 +3140,7 @@ describe("read-only chapter browser", () => {
     await act(async () => {
       oldClose(oldTarget.readIdentity);
       oldInvalidate(oldTarget.readIdentity);
-      staleLocateResult = oldLocate(oldTarget);
+      staleLocateResult = (await oldLocate(oldTarget)) === true;
     });
     expect(staleLocateResult).toBe(false);
     expect(screen.getByRole("region", { name: "我的制作记录" })).toBeInTheDocument();
@@ -3211,7 +3235,7 @@ describe("read-only chapter browser", () => {
     let staleLocateResult = true;
     await act(async () => {
       oldRegister(oldReadIdentity);
-      staleLocateResult = oldLocate(staleTarget);
+      staleLocateResult = (await oldLocate(staleTarget)) === true;
       oldClose(oldReadIdentity);
       oldInvalidate(oldReadIdentity);
     });
@@ -5758,6 +5782,244 @@ describe("read-only chapter browser", () => {
     await user.click(within(issueRow!).getByRole("button", { name: "定位分镜" }));
 
     expect(document.activeElement).toBe(screen.getByLabelText("制作缺项章节 · 镜头 1"));
+  });
+
+  it("lets a note and resume locator reveal their original off-page frame", async () => {
+    const user = userEvent.setup();
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    const targetPosition = 11;
+    const browseUserId = "notes-cross-page-user";
+    const imageUrl = "http://127.0.0.1:4175/media/cross-page-note.png";
+    const imageDigest = await digestPersonalProductionMediaIdentity(imageUrl);
+    if (imageDigest === null) throw new Error("The local image identity should produce a digest.");
+    const current = chapter("chapter-notes-cross-page", "跨页记录章节", [
+      ...Array.from({ length: targetPosition - 1 }, (_, index) => ({
+        text: `前置镜头 ${index + 1}`,
+        storyboard: [`note-cross-page-filler-${index + 1}`],
+      })),
+      { text: "跨页目标镜头", storyboard: ["note-cross-page-target"] },
+    ]);
+    seedStoryboardPageSize(browseUserId, current.id);
+    const { services, listStoryboardAssets } = makeServices([current], {
+      [current.id]: [asset("note-cross-page-target", current.id, imageUrl)],
+    });
+    const missingFrames = Array.from({ length: targetPosition - 1 }, (_, index) => ({
+      frame_index: index,
+      storyboard_asset_id: null,
+      media_revision: null,
+      source_valid: false,
+      asset_image_digest: null,
+      preview_digest: null,
+      invalid_reason: "missing" as const,
+    }));
+    vi.spyOn(services, "getPersonalProductionNotes").mockResolvedValue(parsePersonalProductionSnapshot({
+      chapter_id: current.id,
+      revision: 1,
+      media_state: "ready",
+      frames: [
+        ...missingFrames,
+        {
+          frame_index: targetPosition - 1,
+          storyboard_asset_id: "note-cross-page-target",
+          media_revision: 1,
+          source_valid: true,
+          asset_image_digest: imageDigest,
+          preview_digest: null,
+          invalid_reason: null,
+        },
+      ],
+      frame_notes: { "note-cross-page-target": { status: "needs_revision", note: "跨页制作记录" } },
+      resume_frame_id: "note-cross-page-target",
+    }, current.id));
+    renderBrowser(services, vi.fn(), vi.fn(), series, browseUserId);
+
+    await user.click(await screen.findByRole("button", { name: "查看我的制作记录" }));
+    expect(await screen.findByText("跨页制作记录")).toBeInTheDocument();
+    const noteLocator = screen.getByRole("button", { name: "定位到记录镜头 11" });
+    const queuedFrames = new Set<number>();
+    const cancelledFrames = new Set<number>();
+    let nextFrameId = 0;
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation(() => {
+      const id = ++nextFrameId;
+      queuedFrames.add(id);
+      return id;
+    });
+    vi.spyOn(window, "cancelAnimationFrame").mockImplementation((id) => {
+      cancelledFrames.add(id);
+      queuedFrames.delete(id);
+    });
+    await user.selectOptions(screen.getByRole("combobox", { name: "每页分镜" }), "20");
+    const queuedBeforeLocate = [...queuedFrames];
+    expect(queuedBeforeLocate.length).toBeGreaterThan(0);
+    expect(screen.getByRole("article", { name: "跨页记录章节 · 镜头 11" })).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(noteLocator);
+      fireEvent.click(screen.getByRole("button", { name: "定位到续作镜头" }));
+    });
+    expect(queuedBeforeLocate.some((id) => cancelledFrames.has(id))).toBe(true);
+    await waitFor(() => expect(noteLocator).toBeEnabled());
+    expect(screen.queryByText("未能定位当前记录镜头，请确认镜头仍可见后重试。"))
+      .not.toBeInTheDocument();
+    expect(screen.getByText("已定位到续作镜头 11。")).toBeInTheDocument();
+
+    await user.selectOptions(screen.getByRole("combobox", { name: "每页分镜" }), "10");
+    await user.click(noteLocator);
+    const target = await screen.findByRole("article", { name: "跨页记录章节 · 镜头 11" });
+    await waitFor(() => expect(target).toHaveFocus());
+    expect(screen.getByText("已定位到记录镜头 11。")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "上一页分镜" }));
+    expect(await screen.findByRole("article", { name: "跨页记录章节 · 镜头 1" })).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "定位到续作镜头" }));
+    const resumedTarget = await screen.findByRole("article", { name: "跨页记录章节 · 镜头 11" });
+    await waitFor(() => expect(resumedTarget).toHaveFocus());
+    expect(screen.getByText("已定位到续作镜头 11。")).toBeInTheDocument();
+    expect(listStoryboardAssets).toHaveBeenCalledTimes(1);
+    scrollTo.mockRestore();
+  });
+
+  it("lets the rough-cut locator reveal its stable frame position on a later page", async () => {
+    const user = userEvent.setup();
+    const targetPosition = 22;
+    const browseUserId = "rough-cut-cross-page-user";
+    const current = chapter("chapter-rough-cut-cross-page", "跨页粗剪章节", [
+      ...Array.from({ length: targetPosition - 1 }, (_, index) => ({
+        text: `前置粗剪镜头 ${index + 1}`,
+        storyboard: [`rough-cut-cross-page-filler-${index + 1}`],
+      })),
+      { text: "粗剪目标镜头", storyboard: ["rough-cut-cross-page-target"] },
+    ]);
+    seedStoryboardPageSize(browseUserId, current.id);
+    const { services } = makeServices([current], {
+      [current.id]: [{ ...asset("rough-cut-cross-page-target", current.id), frame_index: targetPosition - 1 }],
+    });
+    vi.spyOn(services, "getPersonalRoughCut").mockResolvedValue({
+      chapter_id: current.id,
+      revision: 1,
+      saved: true,
+      frames: [{
+        asset_id: "rough-cut-cross-page-target",
+        frame_index: 0,
+        text: "粗剪快照中的目标",
+        preview_url: null,
+        missing_reason: "当前没有可用视频。",
+        included: false,
+        pending: true,
+      }],
+      removed_asset_ids: [],
+    });
+    renderBrowser(services, vi.fn(), vi.fn(), series, browseUserId);
+
+    await user.click(await screen.findByRole("button", { name: "查看我的粗剪草稿" }));
+    expect(await screen.findByText("粗剪快照中的目标")).toBeInTheDocument();
+    const locate = await screen.findByRole("button", { name: "定位到对应镜头 22" });
+    expect(screen.queryByRole("article", { name: "跨页粗剪章节 · 镜头 22" })).not.toBeInTheDocument();
+    await user.click(locate);
+    const target = await screen.findByRole("article", { name: "跨页粗剪章节 · 镜头 22" });
+    await waitFor(() => expect(target).toHaveFocus());
+    expect(screen.getByText("已定位到粗剪镜头 22。")).toBeInTheDocument();
+  });
+
+  it("lets the production checklist locator reveal the original storyboard frame", async () => {
+    const user = userEvent.setup();
+    const targetPosition = 11;
+    const browseUserId = "checklist-cross-page-user";
+    const current = chapter("chapter-checklist-cross-page", "跨页清单章节", [
+      ...Array.from({ length: targetPosition - 1 }, (_, index) => ({
+        text: `前置清单镜头 ${index + 1}`,
+        storyboard: [`checklist-cross-page-filler-${index + 1}`],
+      })),
+      { text: "清单目标镜头", storyboard: ["checklist-cross-page-target"] },
+    ]);
+    seedStoryboardPageSize(browseUserId, current.id);
+    const storyboardAssets = (current.content ?? []).map((_frame, index) => ({
+      ...asset(index === targetPosition - 1
+        ? "checklist-cross-page-target"
+        : `checklist-cross-page-filler-${index + 1}`, current.id),
+      frame_index: index,
+    }));
+    const { services } = makeServices([current], { [current.id]: storyboardAssets });
+    renderBrowser(services, vi.fn(), vi.fn(), series, browseUserId);
+
+    await user.click(await screen.findByRole("button", { name: "制作缺项" }));
+    const issue = await screen.findByText("分镜 11：预览未配置");
+    const issueRow = issue.closest("li");
+    if (issueRow === null) throw new Error("The target checklist issue should have a row.");
+    await user.click(within(issueRow).getByRole("button", { name: "定位分镜" }));
+    const target = await screen.findByRole("article", { name: "跨页清单章节 · 镜头 11" });
+    await waitFor(() => expect(target).toHaveFocus());
+    expect(screen.getByText("已定位到关联分镜 11。")).toBeInTheDocument();
+  });
+
+  it("restores the scoped page and actual window scroll, then persists manual scrolling", async () => {
+    const browseUserId = "browse-scroll-restore-user";
+    const current = chapter("chapter-browse-scroll-restore", "滚动恢复章节", Array.from({ length: 23 }, (_, index) => ({
+      text: `滚动章节镜头 ${index + 1}`,
+      storyboard: [`scroll-frame-${index + 1}`],
+    })));
+    const browseScope = { userId: browseUserId, apiBaseUrl, seriesId: series.id, chapterId: current.id };
+    window.localStorage.setItem(storyboardPageSizeStorageKey(browseScope), "10");
+    window.localStorage.setItem(storyboardChapterStorageKey(browseScope), JSON.stringify({ page: 2, scrollTop: 460 }));
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    const originalScrollY = Object.getOwnPropertyDescriptor(window, "scrollY");
+    Object.defineProperty(window, "scrollY", { configurable: true, value: 0 });
+
+    try {
+      const { services } = makeServices([current]);
+      renderBrowser(services, vi.fn(), vi.fn(), series, browseUserId);
+      expect(await screen.findByRole("article", { name: "滚动恢复章节 · 镜头 11" })).toBeInTheDocument();
+      expect(screen.getByText(/第 2 \/ 3 页/)).toBeInTheDocument();
+      await waitFor(() => expect(scrollTo).toHaveBeenCalledWith(0, 460));
+
+      Object.defineProperty(window, "scrollY", { configurable: true, value: 720 });
+      act(() => window.dispatchEvent(new Event("scroll")));
+      await waitFor(() => {
+        const saved = JSON.parse(window.localStorage.getItem(storyboardChapterStorageKey(browseScope)) ?? "null") as {
+          scrollTop?: number;
+        } | null;
+        expect(saved?.scrollTop).toBe(720);
+      });
+    } finally {
+      scrollTo.mockRestore();
+      if (originalScrollY === undefined) {
+        Reflect.deleteProperty(window, "scrollY");
+      } else {
+        Object.defineProperty(window, "scrollY", originalScrollY);
+      }
+    }
+  });
+
+  it("keeps manual paging available when browse storage cannot be read or written", async () => {
+    const user = userEvent.setup();
+    const browseUserId = "unavailable-browse-storage-user";
+    const current = chapter("chapter-browse-storage-unavailable", "存储不可用章节", Array.from({ length: 23 }, (_, index) => ({
+      text: `可手动翻页镜头 ${index + 1}`,
+      storyboard: [`storage-failure-frame-${index + 1}`],
+    })));
+    const { services } = makeServices([current]);
+    const originalGetItem = Storage.prototype.getItem;
+    const originalSetItem = Storage.prototype.setItem;
+    const getItem = vi.spyOn(Storage.prototype, "getItem").mockImplementation(function (this: Storage, key: string) {
+      if (key.startsWith("haoai:storyboard-browse:")) throw new Error("Storage read denied");
+      return originalGetItem.call(this, key);
+    });
+    const setItem = vi.spyOn(Storage.prototype, "setItem").mockImplementation(function (this: Storage, key: string, value: string) {
+      if (key.startsWith("haoai:storyboard-browse:")) throw new Error("Storage write denied");
+      originalSetItem.call(this, key, value);
+    });
+    const scrollTo = vi.spyOn(window, "scrollTo").mockImplementation(() => undefined);
+    renderBrowser(services, vi.fn(), vi.fn(), series, browseUserId);
+
+    expect(await screen.findByRole("article", { name: "存储不可用章节 · 镜头 1" })).toBeInTheDocument();
+    expect(screen.getByText("无法读取浏览偏好；可继续手动翻页和滚动。")).toBeInTheDocument();
+    await user.selectOptions(screen.getByRole("combobox", { name: "每页分镜" }), "10");
+    await user.click(screen.getByRole("button", { name: "下一页分镜" }));
+    expect(await screen.findByRole("article", { name: "存储不可用章节 · 镜头 11" })).toBeInTheDocument();
+    expect(screen.getByText("浏览状态未能保存；本次翻页和定位仍可继续使用。")).toBeInTheDocument();
+    expect(screen.queryByRole("article", { name: "存储不可用章节 · 镜头 1" })).not.toBeInTheDocument();
+    getItem.mockRestore();
+    setItem.mockRestore();
+    scrollTo.mockRestore();
   });
 
 });
