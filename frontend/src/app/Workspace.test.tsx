@@ -19,10 +19,12 @@ import { MediaGenerationError, type MediaGenerationPort, type MediaGenerationRun
 import { parsePersonalProductionSnapshot } from "../shared/api/personalProductionNotes";
 import { digestPersonalProductionMediaIdentity } from "../features/chapters/personal-production/mediaIdentity";
 import { readSeriesWorkbenchPreferences } from "../features/series-workbench/preferences";
+import type { FusedSourceEntrySelection } from "../features/series-workbench/fusedSourceEntry";
 import type { PersonalRoughCutSnapshot } from "../shared/api/personalRoughCut";
 import { MY_TASK_PAGE_SIZE, type MyTaskPage, type MyTaskRecord } from "../shared/api/myTasks";
 import type { MyTeam } from "../shared/api/teams";
-import type { CreatorModel, CreatorSettingsServicePort } from "../shared/api/creatorSettings";
+import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../shared/api/creatorSettings";
+import type { FusedGenerationInput, FusedGenerationPort, FusedGenerationReceipt } from "../shared/api/fusedGeneration";
 import type { AccountProfileServicePort } from "../shared/api/accountProfile";
 import type { AccountSecurityServicePort } from "../shared/api/accountSecurity";
 import type { TeamDetail, TeamManagementServicePort } from "../shared/api/teamManagement";
@@ -95,6 +97,11 @@ const assetNavigationProbe = vi.hoisted(() => ({
   sourcePanelCloseCallback: null as (() => void) | null,
 }));
 
+const fusedSourceProbe = vi.hoisted(() => ({
+  selection: null as FusedSourceEntrySelection | null,
+  parentCallback: null as ((selection: FusedSourceEntrySelection) => void) | null,
+}));
+
 vi.mock("../features/chapters/ChapterBrowser", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../features/chapters/ChapterBrowser")>();
   return {
@@ -134,6 +141,7 @@ vi.mock("../features/chapters/ChapterBrowser", async (importOriginal) => {
         onNavigateToAsset?: (target: CapturedReferenceAssetTarget) => void;
       };
       const parentAssetCallback = navigationProps.onNavigateToAsset;
+      const parentFusedSourceCallback = props.onFusedSource;
       if (parentAssetCallback !== undefined) {
         assetNavigationProbe.parentCallback = parentAssetCallback;
       }
@@ -144,6 +152,13 @@ vi.mock("../features/chapters/ChapterBrowser", async (importOriginal) => {
             assetNavigationProbe.target = target;
             assetNavigationProbe.parentCallback = parentAssetCallback;
             parentAssetCallback(target);
+          },
+        }),
+        ...(parentFusedSourceCallback === undefined ? {} : {
+          onFusedSource: (selection: FusedSourceEntrySelection) => {
+            fusedSourceProbe.selection = selection;
+            fusedSourceProbe.parentCallback = parentFusedSourceCallback;
+            parentFusedSourceCallback(selection);
           },
         }),
         ...(props.onNavigationConsumed === undefined ? {} : {
@@ -600,6 +615,66 @@ function emptyCreatorSettingsService(): CreatorSettingsServicePort {
   };
 }
 
+function fusedSourceWorkspaceServices(
+  submit: FusedGenerationPort["submit"] = async () => ({ taskId: "fused-task", messageId: null }),
+): WorkspaceServices {
+  const base = createDemoServices(window.localStorage);
+  const listCharacters = base.listCharacters;
+  const listProps = base.listProps;
+  const listChapters = base.listChapters;
+  const listStoryboardAssets = base.listStoryboardAssets;
+  const creatorSettings = emptyCreatorSettingsService();
+  const model: CreatorModel = {
+    id: "workspace-fused-image-model",
+    category: "image",
+    name: "工作台融合模型",
+    provider: "openai",
+    model: "test-image-model",
+    base_url: null,
+    params: JSON.stringify({ image_size: { enabled: true, options: ["1024x1024"], default: "1024x1024" } }),
+    sort_order: 0,
+    is_system: false,
+    user_id: "demo-user",
+  };
+  const prompt: CreatorPrompt = {
+    id: "workspace-fused-prompt",
+    category: "fuse",
+    name: "融合模板",
+    system_prompt: "融合系统提示词",
+    user_prompt: JSON.stringify({ character: "角色提示词", prop: "道具提示词" }),
+    sort_order: 0,
+    is_system: false,
+    user_id: "demo-user",
+  };
+  creatorSettings.listModels = vi.fn(async (category) => category === "image" ? [model] : []);
+  creatorSettings.listPrompts = vi.fn(async (category) => category === "fuse" ? [prompt] : []);
+  return {
+    ...base,
+    creatorSettings,
+    fusedGeneration: { submit },
+    listCharacters: async (seriesId, signal) => (await listCharacters(seriesId, signal)).map((asset) => ({
+      ...asset,
+      image_url: asset.image_url ?? `/uploads/${asset.id}.png`,
+    })),
+    listProps: async (seriesId, signal) => (await listProps(seriesId, signal)).map((asset) => ({
+      ...asset,
+      image_url: asset.image_url ?? `/uploads/${asset.id}.png`,
+    })),
+    listStoryboardAssets: async (seriesId, chapterId, signal) => {
+      const [chapters, assets] = await Promise.all([
+        listChapters(seriesId, signal),
+        listStoryboardAssets(seriesId, chapterId, signal),
+      ]);
+      const chapter = chapters.find((candidate) => candidate.id === chapterId);
+      return assets.map((asset) => ({
+        ...asset,
+        frame_index: chapter?.content?.findIndex((frame) => Array.isArray(frame.storyboard)
+          && frame.storyboard.includes(asset.id)) ?? asset.frame_index,
+      }));
+    },
+  };
+}
+
 function authenticatedFixtureUser(id = "fixture-user", username = "演示创作者"): User {
   return {
     ...fixtureUser,
@@ -773,6 +848,8 @@ describe("read-only workspace", () => {
     chapterNavigationProbe.intentHistory.length = 0;
     chapterNavigationProbe.consumedEpochs.length = 0;
     chapterNavigationProbe.abandonedEpochs.length = 0;
+    fusedSourceProbe.selection = null;
+    fusedSourceProbe.parentCallback = null;
     assetNavigationProbe.target = null;
     assetNavigationProbe.parentCallback = null;
     assetNavigationProbe.intent = null;
@@ -786,6 +863,7 @@ describe("read-only workspace", () => {
     activeScrollProbe?.restore();
     activeScrollProbe = null;
     cleanup();
+    vi.restoreAllMocks();
     vi.unstubAllGlobals();
     window.localStorage.clear();
     chapterNavigationProbe.mountedInstances = 0;
@@ -799,6 +877,8 @@ describe("read-only workspace", () => {
     chapterNavigationProbe.intentHistory.length = 0;
     chapterNavigationProbe.consumedEpochs.length = 0;
     chapterNavigationProbe.abandonedEpochs.length = 0;
+    fusedSourceProbe.selection = null;
+    fusedSourceProbe.parentCallback = null;
     assetNavigationProbe.target = null;
     assetNavigationProbe.parentCallback = null;
     assetNavigationProbe.intent = null;
@@ -1755,6 +1835,321 @@ describe("read-only workspace", () => {
     expect(await screen.findByRole("region", { name: "雾港来信 · 融合素材" })).toBeInTheDocument();
     expect(screen.getByRole("heading", { name: "雾港来信 · 融合素材" })).toBeInTheDocument();
   });
+
+  it("routes real frame and asset selections through the stable fused page host", async () => {
+    const user = userEvent.setup();
+    const services = fusedSourceWorkspaceServices();
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const { container } = renderWorkspace(services);
+
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesCard = (await within(seriesRegion).findByRole("heading", { name: "雾港来信" })).closest("article");
+    if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+
+    const frameColumn = await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    const frameFusionButton = within(frameColumn).getByRole("button", { name: "融合镜头角色" });
+    await waitFor(() => expect(frameFusionButton).toBeEnabled());
+    await user.click(frameFusionButton);
+    const fusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    const fusedPage = container.querySelector(".fused-assets-page");
+    expect(fusedPage).not.toBeNull();
+    expect(await within(fusedRegion).findByText(/已回读来源/)).toBeInTheDocument();
+    await user.click(within(fusedRegion).getByRole("button", { name: "应用来源到当前草稿" }));
+    expect(await within(fusedRegion).findByLabelText("当前分镜目标")).toHaveTextContent(`${demoSeries[0]!.id}-chapter-opening`);
+
+    const customImageInput = within(fusedRegion).getByLabelText("自定义图片地址");
+    await waitFor(() => expect(customImageInput).toBeEnabled());
+    await user.type(customImageInput, "https://example.invalid/draft-image.png");
+    await user.click(within(topbar).getByRole("button", { name: "返回剧集工作台" }));
+    expect(container.querySelector(".fused-assets-page")).toBe(fusedPage);
+    expect(customImageInput).toHaveValue("https://example.invalid/draft-image.png");
+
+    await user.click(screen.getByRole("button", { name: "素材库" }));
+    const library = await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+    const roleCard = await within(library).findByRole("article", { name: "林岚素材卡片" });
+    await user.click(within(roleCard).getByRole("button", { name: "用作融合角色" }));
+    const returnedFusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    expect(container.querySelector(".fused-assets-page")).toBe(fusedPage);
+    expect(await within(returnedFusedRegion).findByText(/角色\/道具素材入口已准备/)).toBeInTheDocument();
+    expect(within(returnedFusedRegion).getByLabelText("自定义图片地址")).toHaveValue("https://example.invalid/draft-image.png");
+    await user.click(within(returnedFusedRegion).getByRole("button", { name: "应用来源到当前草稿" }));
+    expect(within(returnedFusedRegion).queryByLabelText("当前分镜目标")).not.toBeInTheDocument();
+    expect(within(returnedFusedRegion).getByLabelText("林岚")).toBeChecked();
+
+    await user.click(within(topbar).getByRole("button", { name: "返回剧集工作台" }));
+    await user.click(screen.getByRole("button", { name: "素材库" }));
+    const propLibrary = await screen.findByRole("region", { name: "雾港来信 · 素材库" });
+    await user.click(within(propLibrary).getByRole("button", { name: "道具" }));
+    const propCard = await within(propLibrary).findByRole("article", { name: "黄铜钥匙素材卡片" });
+    await user.click(within(propCard).getByRole("button", { name: "用作融合道具" }));
+    const propFusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    await within(propFusedRegion).findByText(/角色\/道具素材入口已准备/);
+    await user.click(within(propFusedRegion).getByRole("button", { name: "应用来源到当前草稿" }));
+    expect(await within(propFusedRegion).findByText(/已切换到道具类型/)).toBeInTheDocument();
+    const applyPropSource = within(propFusedRegion).getByRole("button", { name: "应用来源到当前草稿" });
+    await waitFor(() => expect(applyPropSource).toBeEnabled());
+    await user.click(applyPropSource);
+    expect(within(propFusedRegion).queryByLabelText("当前分镜目标")).not.toBeInTheDocument();
+    expect(within(propFusedRegion).getByLabelText("黄铜钥匙")).toBeChecked();
+    expect(container.querySelector(".fused-assets-page")).toBe(fusedPage);
+
+    const staleSelection = fusedSourceProbe.selection;
+    const staleParentCallback = fusedSourceProbe.parentCallback;
+    expect(staleSelection).not.toBeNull();
+    expect(staleParentCallback).not.toBeNull();
+    expect(staleSelection!.isCurrent()).toBe(false);
+    const staleSelectionWithLateProof = { ...staleSelection!, isCurrent: () => true };
+    act(() => staleParentCallback!(staleSelectionWithLateProof));
+    expect(container.querySelector(".fused-assets-page")).toBe(fusedPage);
+    expect(within(returnedFusedRegion).queryByText(/已回读来源|素材入口已准备/)).not.toBeInTheDocument();
+  }, 20_000);
+
+  it("opens a verified frame target with no linked members for manual fusion selection", async () => {
+    const user = userEvent.setup();
+    const services = fusedSourceWorkspaceServices();
+    const listChapters = services.listChapters;
+    services.listChapters = async (seriesId, signal) => (await listChapters(seriesId, signal)).map((chapter) => (
+      chapter.id === `${seriesId}-chapter-opening`
+        ? {
+          ...chapter,
+          content: chapter.content?.map((frame, index) => index === 0 ? { ...frame, character: [] } : frame) ?? null,
+        }
+        : chapter
+    ));
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const { container } = renderWorkspace(services);
+
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesCard = (await within(seriesRegion).findByRole("heading", { name: "雾港来信" })).closest("article");
+    if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+
+    const frameColumn = await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    const frameFusionButton = within(frameColumn).getByRole("button", { name: "融合镜头角色" });
+    await waitFor(() => expect(frameFusionButton).toBeEnabled());
+    expect(within(frameColumn).getAllByText("当前镜头未关联素材，可进入后手动选择。")).toHaveLength(2);
+    await user.click(frameFusionButton);
+
+    const fusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    await within(fusedRegion).findByText(/已回读来源/);
+    await user.click(within(fusedRegion).getByRole("button", { name: "应用来源到当前草稿" }));
+    expect(within(fusedRegion).getByLabelText("当前分镜目标")).toHaveTextContent(`${demoSeries[0]!.id}-frame-opening`);
+    const roleCheckbox = within(fusedRegion).getByLabelText("林岚");
+    expect(roleCheckbox).not.toBeChecked();
+    await user.click(roleCheckbox);
+    expect(roleCheckbox).toBeChecked();
+  }, 20_000);
+
+  it("submits the actual frame proof from the Workspace source entry to the fused service", async () => {
+    const user = userEvent.setup();
+    const submittedInputs: FusedGenerationInput[] = [];
+    const services = fusedSourceWorkspaceServices(async (input) => {
+      submittedInputs.push(input);
+      throw new Error("simulated response loss");
+    });
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const { container } = renderWorkspace(services);
+
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesCard = (await within(seriesRegion).findByRole("heading", { name: "雾港来信" })).closest("article");
+    if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+
+    const frameColumn = await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    const frameFusionButton = within(frameColumn).getByRole("button", { name: "融合镜头角色" });
+    await waitFor(() => expect(frameFusionButton).toBeEnabled());
+    await user.click(frameFusionButton);
+    const fusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    const fusedPage = container.querySelector(".fused-assets-page");
+    expect(fusedPage).not.toBeNull();
+    await within(fusedRegion).findByText(/已回读来源/);
+    await user.click(within(fusedRegion).getByRole("button", { name: "应用来源到当前草稿" }));
+    const submitButton = within(fusedRegion).getByRole("button", { name: "提交融合生成" });
+    await waitFor(() => expect(submitButton).toBeEnabled());
+    await user.click(submitButton);
+
+    await waitFor(() => expect(submittedInputs).toHaveLength(1));
+    expect(submittedInputs[0]).toMatchObject({
+      series_id: demoSeries[0]!.id,
+      member_type: "character",
+      members: [{ kind: "asset", id: `${demoSeries[0]!.id}-character-linlan` }],
+      chapter_id: `${demoSeries[0]!.id}-chapter-opening`,
+      frame_index: 0,
+      storyboard_asset_id: `${demoSeries[0]!.id}-frame-opening`,
+      expected_frame: expect.objectContaining({
+        storyboard: [`${demoSeries[0]!.id}-frame-opening`],
+        character: [`${demoSeries[0]!.id}-character-linlan`],
+      }),
+    });
+    expect(await within(fusedRegion).findByText("待核对")).toBeInTheDocument();
+
+    await user.click(within(topbar).getByRole("button", { name: "返回剧集工作台" }));
+    await user.click(within(topbar).getByRole("button", { name: "融合素材" }));
+    const returnedFusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    expect(container.querySelector(".fused-assets-page")).toBe(fusedPage);
+    expect(await within(returnedFusedRegion).findByText("待核对")).toBeInTheDocument();
+    expect(submittedInputs).toHaveLength(1);
+  }, 20_000);
+
+  it("serializes the Workspace frame source proof through the fused HTTP adapter", async () => {
+    const user = userEvent.setup();
+    const demoServices = fusedSourceWorkspaceServices();
+    await demoServices.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    window.localStorage.setItem(API_TOKEN_KEY, "workspace-fused-wire-token");
+    window.localStorage.setItem(API_USER_KEY, JSON.stringify({ id: "demo-user" }));
+
+    const fetcher = vi.fn<typeof fetch>(async () => jsonResponse({
+      task_id: "workspace-wire-task",
+      message_id: null,
+    }));
+    const apiServices = createApiServices("http://127.0.0.1:4175/api", {
+      storage: window.localStorage,
+      fetcher,
+    });
+    if (apiServices.fusedGeneration === undefined) throw new Error("Expected the fused HTTP service.");
+    const services: WorkspaceServices = {
+      ...demoServices,
+      fusedGeneration: apiServices.fusedGeneration,
+    };
+
+    const { container } = renderWorkspace(services);
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesCard = (await within(seriesRegion).findByRole("heading", { name: "雾港来信" })).closest("article");
+    if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+
+    const frameColumn = await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    const frameFusionButton = within(frameColumn).getByRole("button", { name: "融合镜头角色" });
+    await waitFor(() => expect(frameFusionButton).toBeEnabled());
+    await user.click(frameFusionButton);
+    const fusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    await within(fusedRegion).findByText(/已回读来源/);
+    await user.click(within(fusedRegion).getByRole("button", { name: "应用来源到当前草稿" }));
+    const submitButton = within(fusedRegion).getByRole("button", { name: "提交融合生成" });
+    await waitFor(() => expect(submitButton).toBeEnabled());
+    await user.click(submitButton);
+
+    await waitFor(() => expect(fetcher).toHaveBeenCalledOnce());
+    const [url, init] = fetcher.mock.calls[0]!;
+    expect(String(url)).toBe("http://127.0.0.1:4175/api/fused-assets/generate");
+    expect(init?.method).toBe("POST");
+    expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer workspace-fused-wire-token");
+    expect(new Headers(init?.headers).get("Idempotency-Key")).toEqual(expect.any(String));
+    const serialized = JSON.parse(String(init?.body)) as Record<string, unknown>;
+    expect(serialized).toMatchObject({
+      series_id: demoSeries[0]!.id,
+      member_type: "character",
+      chapter_id: `${demoSeries[0]!.id}-chapter-opening`,
+      frame_index: 0,
+      storyboard_asset_id: `${demoSeries[0]!.id}-frame-opening`,
+      expected_frame: {
+        storyboard: [`${demoSeries[0]!.id}-frame-opening`],
+        character: [`${demoSeries[0]!.id}-character-linlan`],
+      },
+    });
+    expect(await within(fusedRegion).findByText("已受理")).toBeInTheDocument();
+  }, 20_000);
+
+  it("keeps a pending fused request frozen while a new frame source waits for explicit application", async () => {
+    const user = userEvent.setup();
+    const submittedInputs: FusedGenerationInput[] = [];
+    const submittedKeys: string[] = [];
+    let resolveSubmit!: (receipt: FusedGenerationReceipt) => void;
+    const response = new Promise<FusedGenerationReceipt>((resolve) => { resolveSubmit = resolve; });
+    const services = fusedSourceWorkspaceServices(async (input, _signal, options) => {
+      submittedInputs.push(input);
+      if (options?.idempotencyKey !== undefined) submittedKeys.push(options.idempotencyKey);
+      return response;
+    });
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    const { container } = renderWorkspace(services);
+
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(true);
+    const seriesRegion = await screen.findByRole("region", { name: "我的剧集" });
+    const seriesCard = (await within(seriesRegion).findByRole("heading", { name: "雾港来信" })).closest("article");
+    if (!(seriesCard instanceof HTMLElement)) throw new Error("The demo series card was not rendered.");
+    await user.click(within(seriesCard).getByRole("button", { name: /只读查看章节/ }));
+    const topbar = container.querySelector(".topbar");
+    if (!(topbar instanceof HTMLElement)) throw new Error("The Workspace topbar was not rendered.");
+    await user.click(within(topbar).getByRole("button", { name: "剧集工作台" }));
+
+    const firstFrameColumn = await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    const firstSourceButton = within(firstFrameColumn).getByRole("button", { name: "融合镜头角色" });
+    await waitFor(() => expect(firstSourceButton).toBeEnabled());
+    await user.click(firstSourceButton);
+    const fusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    await within(fusedRegion).findByText(/已回读来源/);
+    await user.click(within(fusedRegion).getByRole("button", { name: "应用来源到当前草稿" }));
+    const originalTarget = within(fusedRegion).getByLabelText("当前分镜目标");
+    expect(originalTarget).toHaveTextContent(`${demoSeries[0]!.id}-frame-opening`);
+
+    await user.click(within(fusedRegion).getByRole("button", { name: "提交融合生成" }));
+    await waitFor(() => expect(submittedInputs).toHaveLength(1));
+    const originalRequest = submittedInputs[0];
+    if (originalRequest === undefined) throw new Error("The original fused request was not captured.");
+    const originalInput = JSON.parse(JSON.stringify(originalRequest)) as FusedGenerationInput;
+    const originalKey = submittedKeys[0];
+    if (originalKey === undefined) throw new Error("The original fused submission key was not captured.");
+    expect(originalKey.length).toBeGreaterThan(0);
+    expect(Object.isFrozen(originalRequest)).toBe(true);
+    expect(await within(fusedRegion).findByRole("button", { name: "正在提交…" })).toBeDisabled();
+
+    await user.click(within(topbar).getByRole("button", { name: "返回剧集工作台" }));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(confirm).toHaveBeenCalledWith("融合写入或目录核对仍在进行。离开后原请求和本地任务记录会保留，服务器结果仍可能需要核对。仍要离开吗？");
+    const secondChapterButton = await screen.findByRole("button", { name: /第二章 · 来信/ });
+    await user.click(secondChapterButton);
+    const nextFrameColumn = await screen.findByRole("region", { name: "镜头 1 的五类关联素材" });
+    const nextSourceButton = within(nextFrameColumn).getByRole("button", { name: "融合镜头角色" });
+    await waitFor(() => expect(nextSourceButton).toBeEnabled());
+    await user.click(nextSourceButton);
+
+    const returnedFusedRegion = await screen.findByRole("region", { name: "雾港来信 · 融合素材" });
+    await within(returnedFusedRegion).findByText(/已回读来源/);
+    expect(await within(returnedFusedRegion).findByText("提交中")).toBeInTheDocument();
+    expect(within(returnedFusedRegion).getByRole("button", { name: "正在提交…" })).toBeDisabled();
+    const applyNextSource = within(returnedFusedRegion).getByRole("button", { name: "应用来源到当前草稿" });
+    expect(applyNextSource).toBeDisabled();
+    expect(within(returnedFusedRegion).getByLabelText("当前分镜目标")).toHaveTextContent(`${demoSeries[0]!.id}-frame-opening`);
+    expect(submittedInputs).toHaveLength(1);
+    expect(submittedInputs[0]).toBe(originalRequest);
+    expect(submittedInputs[0]).toEqual(originalInput);
+    expect(submittedKeys).toEqual([originalKey]);
+
+    confirm.mockReturnValue(false);
+    await user.click(within(topbar).getByRole("button", { name: "返回剧集工作台" }));
+    expect(confirm).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("region", { name: "雾港来信 · 融合素材" })).toBeInTheDocument();
+    expect(within(returnedFusedRegion).getByText("提交中")).toBeInTheDocument();
+    expect(submittedInputs).toHaveLength(1);
+    expect(submittedInputs[0]).toBe(originalRequest);
+    expect(submittedKeys).toEqual([originalKey]);
+
+    await act(async () => {
+      resolveSubmit({ taskId: "fused-pending-task", messageId: null });
+      await response;
+    });
+    await waitFor(() => expect(applyNextSource).toBeEnabled());
+    await user.click(applyNextSource);
+    expect(await within(returnedFusedRegion).findByLabelText("当前分镜目标")).toHaveTextContent(`${demoSeries[0]!.id}-frame-letter-second`);
+    expect(submittedInputs).toHaveLength(1);
+    expect(submittedInputs[0]).toBe(originalRequest);
+    expect(submittedInputs[0]).toEqual(originalInput);
+    expect(submittedKeys).toEqual([originalKey]);
+  }, 20_000);
 
 
   it.each([

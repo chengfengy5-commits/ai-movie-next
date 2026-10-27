@@ -270,10 +270,60 @@ describe("asset library", () => {
     expect(screen.getByText("细框眼镜，深色外套。")).toBeInTheDocument();
     expect(screen.getByText("<script>window.bad = true</script>")).toBeInTheDocument();
     expect(screen.getByRole("img", { name: "顾行舟没有可显示的本地图片" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "用作融合角色" })).toBeDisabled();
+    expect(screen.getByText("素材没有可用图片，不能作为融合成员。")).toBeInTheDocument();
     expect(screen.queryByText(/internal-canonical|voice-reference|voice\.mp3/)).not.toBeInTheDocument();
     expect(container.querySelector("audio, audio source, script")).toBeNull();
     expect(fetchSpy).not.toHaveBeenCalled();
     expect(serviceSet.listChapters).not.toHaveBeenCalled();
+  });
+
+  it("offers actual role and prop cards as standalone fused sources without guessing a frame", async () => {
+    const user = userEvent.setup();
+    const fusedSource = vi.fn();
+    const services = makeServices({
+      listCharacters: vi.fn(async () => [character({ id: "role-source", image_url: "/role-source.png" })]),
+      listProps: vi.fn(async () => [prop({ id: "prop-source", image_url: "/prop-source.png" })]),
+    });
+    const view = render(
+      <AssetLibrary
+        onBack={vi.fn()}
+        onFusedSource={fusedSource}
+        onUnauthorized={vi.fn()}
+        series={series}
+        services={services}
+        sessionGeneration={7}
+        userId="actor-a"
+      />,
+    );
+
+    const roleCard = await screen.findByRole("article", { name: "顾行舟素材卡片" });
+    await user.click(within(roleCard).getByRole("button", { name: "用作融合角色" }));
+    expect(fusedSource).toHaveBeenCalledOnce();
+    expect(fusedSource.mock.calls[0]?.[0]).toMatchObject({
+      actorId: "actor-a",
+      apiBaseUrl,
+      sessionGeneration: 7,
+      seriesId: series.id,
+      memberType: "character",
+      memberAssetIds: ["role-source"],
+      target: null,
+    });
+    expect(fusedSource.mock.calls[0]?.[0].isCurrent()).toBe(true);
+
+    await user.click(screen.getByRole("button", { name: "道具" }));
+    const propCard = await screen.findByRole("article", { name: "旧铜钥匙素材卡片" });
+    await user.click(within(propCard).getByRole("button", { name: "用作融合道具" }));
+    expect(fusedSource).toHaveBeenCalledTimes(2);
+    expect(fusedSource.mock.calls[1]?.[0]).toMatchObject({
+      memberType: "prop",
+      memberAssetIds: ["prop-source"],
+      target: null,
+    });
+    expect(fusedSource.mock.calls[0]?.[0].isCurrent()).toBe(false);
+    expect(services.listChapters).not.toHaveBeenCalled();
+    expect(services.listProps).toHaveBeenCalled();
+    view.unmount();
   });
 
   it("keeps image upload records across a parent directory refresh without reusing old receipts", async () => {

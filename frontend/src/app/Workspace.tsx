@@ -6,6 +6,7 @@ import { LoginPage } from "../features/auth/LoginPage";
 import { ChapterBrowser, type ChapterNavigationIntent } from "../features/chapters/ChapterBrowser";
 import { AssetLibrary, type AssetNavigationIntent } from "../features/assets/AssetLibrary";
 import { FusedAssetsPage } from "../features/fused-assets/FusedAssetsPage";
+import type { FusedGenerationOpenIntent } from "../features/fused-assets/fusedGenerationEntryIntent";
 import type {
   AssetFrameUsageChapterTarget,
   AssetFrameUsageFrameTarget,
@@ -32,6 +33,7 @@ import type {
   WorkbenchSourceIntent,
   WorkbenchSourceSelection,
 } from "../features/series-workbench/sourceIntent";
+import type { FusedSourceEntrySelection } from "../features/series-workbench/fusedSourceEntry";
 import "../features/series-workbench/seriesWorkbench.css";
 import type { CreatorSettingsServicePort } from "../shared/api/creatorSettings";
 import type { ProviderQuotaServicePort } from "../shared/api/providerQuota";
@@ -57,6 +59,11 @@ function restoreErrorMessage(error: ApiError): string {
 
 type WorkspaceView = "series" | "chapters" | "assets" | "fused-assets" | "tasks" | "teams" | "creator-settings"
   | "media-generation" | "chat-assistant" | "series-workbench" | "account";
+
+interface FusedPageHost {
+  readonly series: Series;
+  readonly openIntent: FusedGenerationOpenIntent | null;
+}
 
 function Dashboard() {
   const { services, state, logout, refreshCurrentUser, sessionGeneration } = useAuth();
@@ -96,6 +103,7 @@ function Dashboard() {
   const [seriesShareGuardVersion, setSeriesShareGuardVersion] = useState(0);
   const [chapterNavigationIntent, setChapterNavigationIntent] = useState<ChapterNavigationIntent | null>(null);
   const [assetNavigationIntent, setAssetNavigationIntent] = useState<AssetNavigationIntent | null>(null);
+  const [fusedPageHosts, setFusedPageHosts] = useState<Map<string, FusedPageHost>>(() => new Map());
   const navigationIntentRef = useRef<ChapterNavigationIntent | null>(null);
   const assetNavigationIntentRef = useRef<AssetNavigationIntent | null>(null);
   assetNavigationIntentRef.current = assetNavigationIntent;
@@ -110,7 +118,9 @@ function Dashboard() {
   const dashboardMounted = useRef(false);
   const creatorSettingsDirtyRef = useRef(false);
   const accountDirtyRef = useRef(false);
-  const fusedAssetWriteInFlightRef = useRef(false);
+  const fusedAssetWriteInFlightRef = useRef(new Map<string, boolean>());
+  const fusedOpenIntentEpochRef = useRef(0);
+  const dashboardSessionGenerationRef = useRef(sessionGeneration);
   const teamGuardRef = useRef({ scopeKey: "", dirty: false, inFlight: false });
   const seriesShareGuardRef = useRef({ scopeKey: "", dirty: false, inFlight: false });
   const currentNavigationContext = useRef<{
@@ -173,9 +183,11 @@ function Dashboard() {
   const currentUserId = state.user.id;
 
   let scopeChanged = false;
-  if (dashboardScope.current.userId !== state.user.id || dashboardScope.current.services !== services) {
+  if (dashboardScope.current.userId !== state.user.id || dashboardScope.current.services !== services
+    || dashboardSessionGenerationRef.current !== sessionGeneration) {
     scopeChanged = true;
     dashboardScope.current = { userId: state.user.id, services };
+    dashboardSessionGenerationRef.current = sessionGeneration;
     dashboardScopeEpoch.current += 1;
     seriesShareGuardRef.current = { scopeKey: "", dirty: false, inFlight: false };
     navigationEpoch.current += 1;
@@ -198,7 +210,9 @@ function Dashboard() {
     setMediaGenerationVisited(false);
     setChatAssistantVisited(false);
     setChatAssistantSeries(null);
-    fusedAssetWriteInFlightRef.current = false;
+    setFusedPageHosts(new Map());
+    fusedAssetWriteInFlightRef.current.clear();
+    fusedOpenIntentEpochRef.current += 1;
   }
 
   const renderNavigationContext = {
@@ -249,16 +263,19 @@ function Dashboard() {
     setSelectedSeries(null);
     setSelectedView("series");
     setMediaGenerationVisited(false);
-    fusedAssetWriteInFlightRef.current = false;
+    setFusedPageHosts(new Map());
+    fusedAssetWriteInFlightRef.current.clear();
+    fusedOpenIntentEpochRef.current += 1;
     logout();
   }
 
   function confirmLeaveCurrentView(): boolean {
-    if (selectedView === "fused-assets" && fusedAssetWriteInFlightRef.current) {
-      if (!window.confirm("融合素材写入或目录核对仍在进行。离开会停止本地跟踪；服务器操作仍可能完成，这不代表已取消。仍要离开吗？")) {
+    const activeFusedHostKey = selectedSeries === null ? null : fusedPageHostKey(selectedSeries.id);
+    if (selectedView === "fused-assets" && activeFusedHostKey !== null
+      && fusedAssetWriteInFlightRef.current.get(activeFusedHostKey) === true) {
+      if (!window.confirm("融合写入或目录核对仍在进行。离开后原请求和本地任务记录会保留，服务器结果仍可能需要核对。仍要离开吗？")) {
         return false;
       }
-      fusedAssetWriteInFlightRef.current = false;
     }
     if (selectedView === "series"
       && seriesShareGuardRef.current.scopeKey === seriesShareGuardScopeKey
@@ -378,6 +395,30 @@ function Dashboard() {
     ]);
   }
 
+  function fusedPageHostKey(seriesId: string): string {
+    return JSON.stringify([
+      currentUserId,
+      services.apiBaseUrl,
+      sessionGeneration,
+      dashboardScopeEpoch.current,
+      seriesId,
+    ]);
+  }
+
+  function rememberFusedPageHost(series: Series, openIntent?: FusedGenerationOpenIntent): string {
+    const key = fusedPageHostKey(series.id);
+    setFusedPageHosts((current) => {
+      const existing = current.get(key);
+      const next = new Map(current);
+      next.set(key, {
+        series,
+        openIntent: openIntent ?? existing?.openIntent ?? null,
+      });
+      return next;
+    });
+    return key;
+  }
+
   function enterSeriesWorkbench(series: Series | null = selectedSeries) {
     if (series === null || series.can_enter !== true) return;
     const restored = services.apiBaseUrl === null
@@ -488,6 +529,48 @@ function Dashboard() {
     else setMediaWorkbenchIntent(intent);
   }
 
+  function acceptFusedSourceEntry(selection: FusedSourceEntrySelection) {
+    const current = currentNavigationContext.current;
+    const sourceSeries = current?.selectedView === "series-workbench" ? workbenchSeries : current?.selectedSeries ?? null;
+    if (
+      !dashboardMounted.current
+      || current === null
+      || current !== renderNavigationContext
+      || (current.selectedView !== "series-workbench" && current.selectedView !== "assets")
+      || sourceSeries === null
+      || sourceSeries.can_enter !== true
+      || selection.actorId !== currentUserId
+      || selection.services !== services
+      || selection.apiBaseUrl !== services.apiBaseUrl
+      || selection.sessionGeneration !== sessionGeneration
+      || selection.seriesId !== sourceSeries.id
+      || !Number.isSafeInteger(selection.sourceEpoch)
+      || selection.sourceEpoch < 0
+      || (selection.target === null && selection.memberAssetIds.length === 0)
+      || selection.memberAssetIds.some((id) => id.trim() === "" || id !== id.trim())
+      || new Set(selection.memberAssetIds).size !== selection.memberAssetIds.length
+      || (selection.target !== null && (selection.target.chapterId.trim() === ""
+        || selection.target.frameIndex < 0 || !Number.isSafeInteger(selection.target.frameIndex)))
+      || !selection.isCurrent()
+    ) return;
+
+    const epoch = ++fusedOpenIntentEpochRef.current;
+    const openIntent: FusedGenerationOpenIntent = {
+      id: `workspace-fused-entry:${dashboardScopeEpoch.current}:${epoch}`,
+      epoch,
+      userId: currentUserId,
+      apiBaseUrl: services.apiBaseUrl,
+      seriesId: sourceSeries.id,
+      sessionGeneration,
+      memberType: selection.memberType,
+      memberAssetIds: Object.freeze([...selection.memberAssetIds]),
+      target: selection.target,
+    };
+    rememberFusedPageHost(sourceSeries, openIntent);
+    setSelectedSeries(sourceSeries);
+    setSelectedView("fused-assets");
+  }
+
   function acceptAssetLibraryChapter(target: AssetFrameUsageChapterTarget) {
     acceptAssetChapterTarget(target);
   }
@@ -515,6 +598,7 @@ function Dashboard() {
       || !confirmLeaveCurrentView()) return;
     clearChapterNavigationIntent();
     clearAssetNavigationIntent();
+    rememberFusedPageHost(selectedSeries);
     setSelectedView("fused-assets");
   }
 
@@ -1017,7 +1101,7 @@ function Dashboard() {
             ) : null}
             storyboard={workbenchSeries !== null ? (
               <ChapterBrowser
-                key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + workbenchSeries.id}
+                key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + sessionGeneration + ":" + workbenchSeries.id}
                 onBack={() => {
                   clearChapterNavigationIntent();
                   clearAssetNavigationIntent();
@@ -1032,6 +1116,7 @@ function Dashboard() {
                 onNavigateToAsset={acceptFrameReferenceTarget}
                 onNavigationConsumed={(epoch) => clearChapterNavigationIntent(epoch)}
                 onWorkbenchSource={acceptWorkbenchSource}
+                onFusedSource={acceptFusedSourceEntry}
                 workbenchActive={selectedView === "series-workbench" && workbenchLeftView === "storyboard"}
                 series={workbenchSeries}
                 services={services}
@@ -1040,7 +1125,7 @@ function Dashboard() {
             ) : null}
             assets={workbenchSeries !== null ? (
               <AssetLibrary
-                key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + workbenchSeries.id}
+                key={state.user.id + ":" + dashboardScopeEpoch.current + ":" + sessionGeneration + ":" + workbenchSeries.id}
                 onBack={() => {
                   if (selectedView === "series-workbench") {
                     setWorkbenchLeftView("storyboard");
@@ -1061,6 +1146,10 @@ function Dashboard() {
                 {...(selectedView === "series-workbench"
                   ? { onUseAsWorkbenchTarget: acceptAssetLibraryWorkbenchTarget }
                   : {})}
+                onFusedSource={acceptFusedSourceEntry}
+                sessionGeneration={sessionGeneration}
+                active={selectedView === "assets"
+                  || (selectedView === "series-workbench" && workbenchLeftView === "assets")}
                 generationHistoryPort={services.assetGenerationHistory}
                 series={workbenchSeries}
                 services={services}
@@ -1088,18 +1177,41 @@ function Dashboard() {
             preferenceNotice={workbenchPreferenceNotice}
             route={workbenchRoute}
           />
-          {selectedSeries !== null && selectedView === "fused-assets" && selectedSeries.can_enter === true && (
-            <FusedAssetsPage
-              key={`${state.user.id}:${dashboardScopeEpoch.current}:${sessionGeneration}:${selectedSeries.id}`}
-              services={services}
-              series={selectedSeries}
-              userId={state.user.id}
-              sessionGeneration={sessionGeneration}
-              onBack={navigateToSeries}
-              onUnauthorized={logoutFromWorkspace}
-              onActivityChange={(active) => { fusedAssetWriteInFlightRef.current = active; }}
-            />
-          )}
+          {!scopeChanged && Array.from(fusedPageHosts.entries()).map(([hostKey, host]) => {
+            const active = selectedView === "fused-assets"
+              && selectedSeries?.id === host.series.id
+              && selectedSeries.can_enter === true;
+            return (
+              <div
+                aria-hidden={!active}
+                className="fused-assets-workspace-host"
+                hidden={!active}
+                inert={!active}
+                key={hostKey}
+              >
+                <FusedAssetsPage
+                  key={hostKey}
+                  openIntent={active ? host.openIntent : null}
+                  onIntentConsumed={(intentId) => {
+                    setFusedPageHosts((current) => {
+                      const existing = current.get(hostKey);
+                      if (existing === undefined || existing.openIntent?.id !== intentId) return current;
+                      const next = new Map(current);
+                      next.set(hostKey, { ...existing, openIntent: null });
+                      return next;
+                    });
+                  }}
+                  services={services}
+                  series={host.series}
+                  userId={state.user.id}
+                  sessionGeneration={sessionGeneration}
+                  onBack={navigateToSeries}
+                  onUnauthorized={logoutFromWorkspace}
+                  onActivityChange={(isActive) => { fusedAssetWriteInFlightRef.current.set(hostKey, isActive); }}
+                />
+              </div>
+            );
+          })}
           {selectedView === "tasks" && (
             <MyTasksPage
               key={state.user.id}
