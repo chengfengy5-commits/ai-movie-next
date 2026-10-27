@@ -4,11 +4,14 @@ import json
 from datetime import datetime
 
 import pytest
+from pydantic import ValidationError
 
 from haoai_backend.fused_generation.application import prepare_fused_generation
 from haoai_backend.fused_generation.domain import FusedServerImageModel
-from haoai_backend.fused_generation.errors import FusedGenerationBadRequest
+from haoai_backend.fused_generation.errors import FusedGenerationBadRequest, FusedGenerationConflict
+from haoai_backend.fused_generation.durable_application import canonical_fused_request_document
 from haoai_backend.fused_generation.schemas import FusedAssetGenerateRequest
+from haoai_backend.fused_generation.durable_values import json_digest
 from haoai_backend.generation_catalog.domain import ModelSource, PromptOperation, PromptSelection
 from haoai_backend.shared.identity import TrustedActor
 
@@ -171,6 +174,201 @@ def test_prepare_filters_foreign_assets_and_numbers_only_actual_references():
     assert uow.rollback_count == 0
     assert uow.close_count == 1
     assert not any(isinstance(event, tuple) and event[0] == "prompt" for event in uow.events)
+
+
+def test_stable_target_guard_follows_the_unique_frame_after_reorder():
+    target = {
+        "storyboard": ["shot-a"],
+        "text": "林岚推开门",
+        "details": {"lighting": "冷光", "objects": ["门", "钥匙"]},
+        "fused": [{"id": "old-result"}],
+    }
+    current_target = {**target, "fused": [{"id": "new-result"}]}
+    other = {"storyboard": ["shot-b"], "text": "走廊空镜", "details": {"objects": []}}
+    uow = FakeUnitOfWork()
+    uow.chapter = {
+        "id": "chapter-a",
+        "series_id": "series-a",
+        "content": json.dumps([other, current_target], ensure_ascii=False),
+    }
+
+    prepared = prepare_fused_generation(
+        _factory(uow),
+        TrustedActor("owner-a"),
+        _request(
+            chapter_id="chapter-a",
+            frame_index=0,
+            storyboard_asset_id="shot-a",
+            expected_frame=target,
+        ),
+    )
+
+    assert prepared.target_frame is not None
+    assert prepared.target_frame.frame_index == 1
+    assert prepared.target_frame.identity == json.dumps(
+        {"storyboard": ["shot-a"], "text": "林岚推开门", "details": {"lighting": "冷光", "objects": ["门", "钥匙"]}},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def test_changed_stable_target_conflicts_before_model_fee():
+    uow = FakeUnitOfWork()
+    actual = {"storyboard": ["shot-a"], "text": "B"}
+    uow.chapter = {"id": "chapter-a", "series_id": "series-a", "content": json.dumps([actual])}
+
+    with pytest.raises(FusedGenerationConflict, match="内容已变化"):
+        prepare_fused_generation(
+            _factory(uow),
+            TrustedActor("owner-a"),
+            _request(
+                chapter_id="chapter-a",
+                storyboard_asset_id="shot-a",
+                expected_frame={"storyboard": ["shot-a"], "text": "A"},
+                members=[{"kind": "asset", "id": "character-with-image"}],
+            ),
+        )
+
+    assert not any(isinstance(event, tuple) and event[0] == "model-and-fee-commit" for event in uow.events)
+
+
+def test_target_guard_rejects_duplicate_ids_and_boolean_number_confusion():
+    duplicate_uow = FakeUnitOfWork()
+    duplicate = {"storyboard": ["shot-a"], "text": "same"}
+    duplicate_uow.chapter = {
+        "id": "chapter-a",
+        "series_id": "series-a",
+        "content": json.dumps([duplicate, duplicate]),
+    }
+    with pytest.raises(FusedGenerationConflict, match="身份重复"):
+        prepare_fused_generation(
+            _factory(duplicate_uow),
+            TrustedActor("owner-a"),
+            _request(
+                chapter_id="chapter-a",
+                storyboard_asset_id="shot-a",
+                expected_frame=duplicate,
+                members=[{"kind": "asset", "id": "character-with-image"}],
+            ),
+        )
+    typed_uow = FakeUnitOfWork()
+    typed_actual = {"text": "same", "order": 1}
+    typed_uow.chapter = {"id": "chapter-a", "series_id": "series-a", "content": json.dumps([typed_actual])}
+    with pytest.raises(FusedGenerationConflict, match="内容已变化"):
+        prepare_fused_generation(
+            _factory(typed_uow),
+            TrustedActor("owner-a"),
+            _request(
+                chapter_id="chapter-a",
+                frame_index=0,
+                expected_frame={"text": "same", "order": True},
+                expected_content=[{"text": "same", "order": True}],
+                members=[{"kind": "asset", "id": "character-with-image"}],
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    "relationship",
+    ["shot-a", ["shot-a", "shot-b"], ["shot-a", "shot-a"]],
+)
+def test_stable_target_guard_rejects_noncanonical_storyboard_relationships_before_fee(relationship):
+    uow = FakeUnitOfWork()
+    frame = {"storyboard": relationship, "text": "A"}
+    uow.chapter = {"id": "chapter-a", "series_id": "series-a", "content": json.dumps([frame])}
+
+    with pytest.raises(FusedGenerationConflict, match="分镜目标不存在或身份重复"):
+        prepare_fused_generation(
+            _factory(uow),
+            TrustedActor("owner-a"),
+            _request(
+                chapter_id="chapter-a",
+                storyboard_asset_id="shot-a",
+                expected_frame=frame,
+                members=[{"kind": "asset", "id": "character-with-image"}],
+            ),
+        )
+
+    assert not any(isinstance(event, tuple) and event[0] == "model-and-fee-commit" for event in uow.events)
+
+
+def test_no_id_fallback_requires_a_unique_non_fused_frame_identity():
+    frame = {"text": "无稳定ID镜头", "characters": ["林岚"], "custom": {"unknown": [1, 2]}}
+    uow = FakeUnitOfWork()
+    uow.chapter = {
+        "id": "chapter-a",
+        "series_id": "series-a",
+        "content": json.dumps([{**frame, "fused": ["new attachment"]}]),
+    }
+    prepared = prepare_fused_generation(
+        _factory(uow),
+        TrustedActor("owner-a"),
+        _request(
+            chapter_id="chapter-a",
+            frame_index=0,
+            expected_frame=frame,
+            expected_content=[{**frame, "fused": ["old attachment"]}],
+            members=[{"kind": "asset", "id": "character-with-image"}],
+        ),
+    )
+    assert prepared.target_frame is not None and prepared.target_frame.frame_index == 0
+
+    duplicate_uow = FakeUnitOfWork()
+    duplicate_uow.chapter = {
+        "id": "chapter-a",
+        "series_id": "series-a",
+        "content": json.dumps([frame, frame]),
+    }
+    with pytest.raises(FusedGenerationConflict, match="无法区分"):
+        prepare_fused_generation(
+            _factory(duplicate_uow),
+            TrustedActor("owner-a"),
+            _request(
+                chapter_id="chapter-a",
+                frame_index=0,
+                expected_frame=frame,
+                expected_content=[frame, frame],
+                members=[{"kind": "asset", "id": "character-with-image"}],
+            ),
+        )
+
+
+def test_target_proof_rejects_non_finite_json():
+    with pytest.raises(ValidationError, match="有限 JSON"):
+        _request(
+            chapter_id="chapter-a",
+            storyboard_asset_id="shot-a",
+            expected_frame={"value": float("nan")},
+        )
+
+
+def test_legacy_canonical_document_keeps_published_fields_and_defaults():
+    request = FusedAssetGenerateRequest.model_validate({
+        "series_id": "series-a",
+        "members": [{"id": "asset-a"}],
+        "model_id": "client-model",
+    })
+    expected = {
+        "series_id": "series-a",
+        "member_type": "prop",
+        "members": [{"kind": "asset", "id": "asset-a", "url": None, "name": None}],
+        "model_id": "client-model",
+        "prompt_id": None,
+        "prompt_system": None,
+        "prompt_user": None,
+        "size": None,
+        "chapter_id": None,
+        "frame_index": None,
+        "name": None,
+    }
+    canonical = canonical_fused_request_document(request)
+    assert canonical == expected
+    assert json_digest(canonical) == json_digest(expected)
+    assert canonical_fused_request_document(request.model_copy(update={"expected_frame": None})) == expected
+    guarded = canonical_fused_request_document(request.model_copy(update={"expected_frame": {"x": 1}}))
+    assert guarded["expected_frame"] == {"x": 1}
+    assert json_digest(guarded) != json_digest(expected)
 
 
 def test_prompt_id_uses_catalog_text_and_mapping_after_system_model_charge():

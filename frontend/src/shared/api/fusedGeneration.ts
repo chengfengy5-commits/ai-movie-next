@@ -13,9 +13,12 @@ export interface FusedGenerationInput {
   readonly prompt_system: string | null;
   readonly prompt_user: string | null;
   readonly size: string | null;
-  readonly chapter_id: null;
-  readonly frame_index: null;
+  readonly chapter_id: string | null;
+  readonly frame_index: number | null;
   readonly name: null;
+  readonly storyboard_asset_id?: string | null;
+  readonly expected_frame?: Readonly<Record<string, unknown>> | null;
+  readonly expected_content?: readonly unknown[] | null;
 }
 
 export interface FusedGenerationReceipt {

@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Callable, Mapping
 from typing import Any
 
 from haoai_backend.shared.identity import TrustedActor
 
 from .domain import FusedFrameTarget, FusedPromptText, PreparedFusedGeneration
-from .errors import FusedGenerationBadRequest, FusedGenerationNotFound, FusedGenerationUnavailable
+from .errors import FusedGenerationBadRequest, FusedGenerationConflict, FusedGenerationNotFound, FusedGenerationUnavailable
 from .ports import FusedGenerationUnitOfWork, FusedGenerationUnitOfWorkFactory
 from .schemas import FusedAssetGenerateRequest
 
@@ -149,6 +150,14 @@ def _resolve_target_frame(
     uow: FusedGenerationUnitOfWork,
     request: FusedAssetGenerateRequest,
 ) -> FusedFrameTarget | None:
+    has_target_proof = any((
+        request.storyboard_asset_id is not None,
+        request.expected_frame is not None,
+        request.expected_content is not None,
+    ))
+    if has_target_proof:
+        return _resolve_guarded_target_frame(uow, request)
+
     if request.frame_index is not None and not request.chapter_id:
         raise FusedGenerationBadRequest("指定分镜时必须同时提供 chapter_id")
     if not request.chapter_id or request.frame_index is None:
@@ -177,6 +186,110 @@ def _resolve_target_frame(
     )
 
 
+def _resolve_guarded_target_frame(
+    uow: FusedGenerationUnitOfWork,
+    request: FusedAssetGenerateRequest,
+) -> FusedFrameTarget:
+    if not request.chapter_id:
+        raise FusedGenerationBadRequest("验证分镜目标时必须提供 chapter_id")
+    chapter = uow.load_chapter(request.chapter_id)
+    if chapter is None:
+        raise FusedGenerationNotFound("章节不存在")
+    if chapter.get("series_id") != request.series_id:
+        raise FusedGenerationBadRequest("章节不属于当前剧集")
+    frames = _parse_frames(chapter.get("content"))
+
+    if request.storyboard_asset_id is not None:
+        if request.expected_frame is None or request.expected_content is not None:
+            raise FusedGenerationBadRequest("稳定分镜目标必须提供 expected_frame，且不能同时提供 expected_content")
+        if request.frame_index is not None and (
+            isinstance(request.frame_index, bool) or request.frame_index < 0
+        ):
+            raise FusedGenerationBadRequest("frame_index 无效")
+        matches = [
+            index for index, frame in enumerate(frames)
+            if isinstance(frame, Mapping)
+            and _frame_storyboard_id(frame) == request.storyboard_asset_id
+        ]
+        if len(matches) != 1:
+            raise FusedGenerationConflict("分镜目标不存在或身份重复，请刷新后重新选择")
+        index = matches[0]
+        actual = frames[index]
+        if not isinstance(actual, Mapping) or not _frame_snapshot_matches(actual, request.expected_frame):
+            raise FusedGenerationConflict("分镜目标内容已变化，请刷新后重新选择")
+        return FusedFrameTarget(
+            chapter_id=request.chapter_id,
+            frame_index=index,
+            identity=_frame_identity(actual),
+        )
+
+    if (
+        request.expected_frame is None
+        or request.expected_content is None
+        or request.frame_index is None
+        or isinstance(request.frame_index, bool)
+        or request.frame_index < 0
+    ):
+        raise FusedGenerationBadRequest("无稳定分镜ID时必须提供完整章节快照、目标分镜快照和有效 frame_index")
+    if not _chapter_snapshot_matches(frames, request.expected_content):
+        raise FusedGenerationConflict("章节分镜内容已变化，请刷新后重新选择")
+    index = request.frame_index
+    if index >= len(frames) or not isinstance(frames[index], Mapping):
+        raise FusedGenerationConflict("目标分镜不存在，请刷新后重新选择")
+    target = frames[index]
+    if not _frame_snapshot_matches(target, request.expected_frame):
+        raise FusedGenerationConflict("目标分镜内容已变化，请刷新后重新选择")
+    if not isinstance(target, Mapping) or not _frame_has_no_storyboard_identity(target):
+        raise FusedGenerationConflict("目标分镜身份结构无效，请刷新后重新选择")
+    identity = _frame_identity(target)
+    if sum(
+        1 for frame in frames
+        if isinstance(frame, Mapping) and _frame_identity(frame) == identity
+    ) != 1:
+        raise FusedGenerationConflict("章节中存在无法区分的相同分镜，不能安全指定目标")
+    return FusedFrameTarget(chapter_id=request.chapter_id, frame_index=index, identity=identity)
+
+
+def _frame_snapshot_matches(actual: Mapping[str, object], expected: Mapping[str, object]) -> bool:
+    actual_content = {key: value for key, value in actual.items() if key != "fused"}
+    expected_content = {key: value for key, value in expected.items() if key != "fused"}
+    return _json_values_equal(actual_content, expected_content)
+
+
+def _chapter_snapshot_matches(actual: list[object], expected: list[object]) -> bool:
+    if len(actual) != len(expected):
+        return False
+    for actual_frame, expected_frame in zip(actual, expected, strict=True):
+        if isinstance(actual_frame, Mapping) and isinstance(expected_frame, Mapping):
+            if not _frame_snapshot_matches(actual_frame, expected_frame):
+                return False
+        elif not _json_values_equal(actual_frame, expected_frame):
+            return False
+    return True
+
+
+def _json_values_equal(left: object, right: object) -> bool:
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left is right
+    if isinstance(left, (int, float)) or isinstance(right, (int, float)):
+        if not isinstance(left, (int, float)) or not isinstance(right, (int, float)):
+            return False
+        if (isinstance(left, float) and not math.isfinite(left)) or (
+            isinstance(right, float) and not math.isfinite(right)
+        ):
+            return False
+        return left == right
+    if isinstance(left, Mapping) or isinstance(right, Mapping):
+        if not isinstance(left, Mapping) or not isinstance(right, Mapping) or left.keys() != right.keys():
+            return False
+        return all(_json_values_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) or isinstance(right, list):
+        if not isinstance(left, list) or not isinstance(right, list) or len(left) != len(right):
+            return False
+        return all(_json_values_equal(a, b) for a, b in zip(left, right, strict=True))
+    return type(left) is type(right) and left == right
+
+
 def _parse_frames(value: object) -> list[object]:
     if isinstance(value, list):
         return value
@@ -192,3 +305,25 @@ def _parse_frames(value: object) -> list[object]:
 def _frame_identity(frame: Mapping[str, object]) -> str:
     stable_frame = {key: value for key, value in frame.items() if key != "fused"}
     return json.dumps(stable_frame, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _frame_storyboard_id(frame: Mapping[str, object]) -> str | None:
+    """Return the one canonical storyboard reference stored on a frame."""
+    references = frame.get("storyboard")
+    if (
+        not isinstance(references, list)
+        or len(references) != 1
+        or not isinstance(references[0], str)
+        or not references[0].strip()
+    ):
+        return None
+    return references[0]
+
+
+def _frame_has_no_storyboard_identity(frame: Mapping[str, object]) -> bool:
+    if "storyboard" not in frame:
+        return True
+    references = frame["storyboard"]
+    return isinstance(references, list) and all(
+        reference is None or reference == "" for reference in references
+    )

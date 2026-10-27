@@ -2,6 +2,12 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { FusedAsset, Series } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import {
+  resolveFusedGenerationTarget,
+  type FusedGenerationOpenIntent,
+  type FusedGenerationTargetProof,
+  type FusedGenerationTargetedOpenIntent,
+} from "./fusedGenerationEntryIntent";
 import { FusedGenerationPanel } from "./FusedGenerationPanel";
 import "./fusedAssets.css";
 
@@ -10,10 +16,20 @@ interface FusedAssetsPageProps {
   readonly series: Series;
   readonly userId: string;
   readonly sessionGeneration: number;
+  readonly openIntent?: FusedGenerationOpenIntent | null;
   onBack(): void;
   onUnauthorized(): void;
   onActivityChange?(active: boolean): void;
+  onIntentConsumed?(intentId: string): void;
 }
+
+type ResolvedEntryIntent = FusedGenerationOpenIntent;
+
+type EntryIntentState =
+  | { readonly status: "checking"; readonly intentId: string }
+  | { readonly status: "ready"; readonly intent: ResolvedEntryIntent }
+  | { readonly status: "stale"; readonly intentId: string; readonly message: string }
+  | null;
 
 interface PageScope {
   readonly services: WorkspaceServices;
@@ -41,6 +57,23 @@ function sameScope(left: PageScope, right: PageScope): boolean {
     && left.seriesId === right.seriesId
     && left.userId === right.userId
     && left.sessionGeneration === right.sessionGeneration;
+}
+
+function isSafeIntentId(value: unknown): value is string {
+  return typeof value === "string" && value.trim() === value && value.length > 0 && value.length <= 128
+    && !/[\u0000-\u001f\u007f-\u009f/\\]/u.test(value);
+}
+
+function isTargetProof(value: unknown): value is FusedGenerationTargetProof {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const target = value as Record<string, unknown>;
+  if (!isSafeIntentId(target.chapterId) || !Number.isSafeInteger(target.frameIndex)
+    || (target.frameIndex as number) < 0 || target.expectedFrame === null
+    || typeof target.expectedFrame !== "object" || Array.isArray(target.expectedFrame)) return false;
+  if (target.storyboardAssetId !== undefined) {
+    return isSafeIntentId(target.storyboardAssetId) && target.expectedContent === undefined;
+  }
+  return Array.isArray(target.expectedContent);
 }
 
 function displayName(asset: FusedAsset): string {
@@ -143,9 +176,11 @@ export function FusedAssetsPage({
   series,
   userId,
   sessionGeneration,
+  openIntent = null,
   onBack,
   onUnauthorized,
   onActivityChange,
+  onIntentConsumed,
 }: FusedAssetsPageProps) {
   const [assets, setAssets] = useState<FusedAsset[]>([]);
   const [loading, setLoading] = useState(true);
@@ -156,6 +191,7 @@ export function FusedAssetsPage({
   const [feedback, setFeedback] = useState<MutationFeedback | null>(null);
   const [failedImages, setFailedImages] = useState<ReadonlySet<string>>(() => new Set());
   const [generationActive, setGenerationActive] = useState(false);
+  const [entryIntentState, setEntryIntentState] = useState<EntryIntentState>(null);
   const scopeRef = useRef<PageScope>({
     services,
     seriesId: series.id,
@@ -167,6 +203,8 @@ export function FusedAssetsPage({
   unauthorizedRef.current = onUnauthorized;
   const activityChangeRef = useRef(onActivityChange);
   activityChangeRef.current = onActivityChange;
+  const intentConsumedRef = useRef(onIntentConsumed);
+  intentConsumedRef.current = onIntentConsumed;
   const mountedRef = useRef(false);
   const controllersRef = useRef(new Set<AbortController>());
   const readControllerRef = useRef<AbortController | null>(null);
@@ -271,6 +309,105 @@ export function FusedAssetsPage({
       activeWriteRef.current = null;
     };
   }, [readDirectory, services, series.id, userId, sessionGeneration]);
+
+  useEffect(() => {
+    if (openIntent === null) {
+      setEntryIntentState(null);
+      return;
+    }
+    const scope = scopeRef.current;
+    if (openIntent.userId !== scope.userId || openIntent.apiBaseUrl !== scope.services.apiBaseUrl
+      || openIntent.seriesId !== scope.seriesId || openIntent.sessionGeneration !== scope.sessionGeneration) {
+      setEntryIntentState({
+        status: "stale",
+        intentId: openIntent.id,
+        message: "入口来源已不属于当前账号、API 会话或剧集，请返回来源重新打开。",
+      });
+      return;
+    }
+    if ((openIntent.memberType !== "character" && openIntent.memberType !== "prop")
+      || !Array.isArray(openIntent.memberAssetIds)
+      || (openIntent.target === null && openIntent.memberAssetIds.length === 0)
+      || openIntent.memberAssetIds.some((id) => !isSafeIntentId(id))
+      || new Set(openIntent.memberAssetIds).size !== openIntent.memberAssetIds.length) {
+      setEntryIntentState({
+        status: "stale",
+        intentId: openIntent.id,
+        message: "入口没有可核对的角色或道具素材，请返回来源重新选择。",
+      });
+      return;
+    }
+    if (openIntent.target === null) {
+      setEntryIntentState({ status: "ready", intent: openIntent });
+      return;
+    }
+    if (!isTargetProof(openIntent.target)) {
+      setEntryIntentState({
+        status: "stale",
+        intentId: openIntent.id,
+        message: "入口分镜证明无效，请返回来源重新选择。",
+      });
+      return;
+    }
+    const targetedIntent: FusedGenerationTargetedOpenIntent = {
+      ...openIntent,
+      target: openIntent.target,
+    };
+    const controller = startEntryIntentRead();
+    let active = true;
+    setEntryIntentState({ status: "checking", intentId: openIntent.id });
+    void (async () => {
+      try {
+        const chapters = await scope.services.listChapters(scope.seriesId, controller.signal);
+        if (!active || !isCurrentScope(scope, controller.signal)) return;
+        const chapterMatches = chapters.filter((chapter) => (
+          chapter.id === targetedIntent.target.chapterId && chapter.series_id === scope.seriesId
+        ));
+        if (chapterMatches.length !== 1) {
+          setEntryIntentState({ status: "stale", intentId: openIntent.id, message: "来源章节已不存在或身份重复。" });
+          return;
+        }
+        const chapter = chapterMatches[0]!;
+        const storyboards = await scope.services.listStoryboardAssets(scope.seriesId, chapter.id, controller.signal);
+        if (!active || !isCurrentScope(scope, controller.signal)) return;
+        const resolution = resolveFusedGenerationTarget(targetedIntent, chapter, storyboards);
+        if (resolution.status === "stale") {
+          setEntryIntentState({ status: "stale", intentId: openIntent.id, message: resolution.reason });
+          return;
+        }
+        setEntryIntentState({
+          status: "ready",
+          intent: { ...openIntent, target: resolution.target },
+        });
+      } catch (error) {
+        if (!active || !isCurrentScope(scope, controller.signal)) return;
+        if (error instanceof ApiError && error.status === 401) unauthorizedRef.current();
+        else if (!(error instanceof ApiError && error.kind === "aborted")) {
+          setEntryIntentState({
+            status: "stale",
+            intentId: openIntent.id,
+            message: "无法回读来源章节和分镜目录，请刷新后重新选择。",
+          });
+        }
+      }
+    })();
+    return () => {
+      active = false;
+      controller.abort();
+      controllersRef.current.delete(controller);
+    };
+  }, [openIntent, services, series.id, userId, sessionGeneration, isCurrentScope]);
+
+  function startEntryIntentRead(): AbortController {
+    const controller = new AbortController();
+    controllersRef.current.add(controller);
+    return controller;
+  }
+
+  function handleIntentConsumed(intentId: string): void {
+    setEntryIntentState((current) => current?.status === "ready" && current.intent.id === intentId ? null : current);
+    intentConsumedRef.current?.(intentId);
+  }
 
   function startController(): AbortController {
     const controller = new AbortController();
@@ -504,8 +641,16 @@ export function FusedAssetsPage({
           {directoryFeedback.message}
         </p>
       )}
+      {entryIntentState?.status === "checking" && (
+        <p className="fused-assets-state" role="status">正在回读入口章节和分镜目录，验证原目标…</p>
+      )}
+      {entryIntentState?.status === "stale" && (
+        <p className="fused-assets-alert" role="alert">{entryIntentState.message}</p>
+      )}
       <FusedGenerationPanel
         blocked={activeWriteRef.current !== null}
+        openIntent={entryIntentState?.status === "ready" ? entryIntentState.intent : null}
+        onIntentConsumed={handleIntentConsumed}
         onActivityChange={handleGenerationActivity}
         onRefreshAssets={refreshDirectory}
         onUnauthorized={onUnauthorized}

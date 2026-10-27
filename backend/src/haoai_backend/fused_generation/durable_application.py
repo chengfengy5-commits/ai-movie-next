@@ -42,6 +42,21 @@ from .ports import FusedGenerationUnitOfWorkFactory
 from .schemas import FusedAssetGenerateRequest
 
 _OPERATION = "fused.image"
+_LEGACY_REQUEST_FIELDS = (
+    "series_id",
+    "member_type",
+    "members",
+    "model_id",
+    "prompt_id",
+    "prompt_system",
+    "prompt_user",
+    "size",
+    "chapter_id",
+    "frame_index",
+    "name",
+)
+_LEGACY_MEMBER_FIELDS = ("kind", "id", "url", "name")
+_TARGET_PROOF_FIELDS = ("storyboard_asset_id", "expected_frame", "expected_content")
 
 
 @dataclass(frozen=True, slots=True)
@@ -72,7 +87,7 @@ def submit_durable_fused_generation(
     if not _valid_idempotency_key(idempotency_key):
         raise FusedGenerationBadRequest("Idempotency-Key 格式无效")
 
-    request_document = request.model_dump(mode="json")
+    request_document = canonical_fused_request_document(request)
     request_digest = json_digest(request_document)
     existing = _lookup_submission(uow_factory, actor.user_id, idempotency_key)
     if existing is not None:
@@ -229,6 +244,24 @@ def submit_durable_fused_generation(
         reference_names=reference_names,
         target_frame=target_frame,
     )
+
+
+def canonical_fused_request_document(request: FusedAssetGenerateRequest) -> dict[str, object]:
+    """Return the published legacy request shape plus only active target proofs."""
+    dumped = request.model_dump(mode="json")
+    document: dict[str, object] = {
+        field: dumped[field]
+        for field in _LEGACY_REQUEST_FIELDS
+    }
+    document["members"] = [
+        {field: member[field] for field in _LEGACY_MEMBER_FIELDS}
+        for member in dumped["members"]
+    ]
+    for field in _TARGET_PROOF_FIELDS:
+        value = dumped[field]
+        if value is not None:
+            document[field] = value
+    return document
 
 
 def _complete_snapshot_and_accept(

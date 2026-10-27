@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ApiError } from "./errors";
 import { createApiServices } from "./services";
+import { createFusedGenerationHttp } from "./fusedGenerationHttp";
 import { API_TOKEN_KEY, API_USER_KEY, type StorageLike } from "./storage";
 import type { FusedGenerationInput } from "./fusedGeneration";
 
@@ -57,6 +58,29 @@ describe("fused generation HTTP adapter", () => {
     expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer fused-session-token");
     expect(JSON.parse(String(init?.body))).toEqual(input);
     expect(JSON.stringify(receipt)).not.toContain("private_value");
+  });
+
+  it("serializes a captured stable storyboard target and omits null proof fields", async () => {
+    const requestJson = vi.fn(async () => ({ task_id: "task-targeted", message_id: "message-targeted" }));
+    const port = createFusedGenerationHttp(requestJson);
+    const expectedFrame = { storyboard: ["shot-a"], text: "林原推门", custom: [1, true] };
+
+    await port.submit({
+      ...input,
+      chapter_id: "chapter-1",
+      frame_index: 3,
+      storyboard_asset_id: "shot-a",
+      expected_frame: expectedFrame,
+      expected_content: null,
+    }, new AbortController().signal);
+
+    expect(requestJson).toHaveBeenCalledWith({
+      ...input,
+      chapter_id: "chapter-1",
+      frame_index: 3,
+      storyboard_asset_id: "shot-a",
+      expected_frame: expectedFrame,
+    }, expect.any(AbortSignal), undefined);
   });
 
   it("does not retry a not-wired 503 and rejects an unverified response", async () => {
@@ -126,5 +150,23 @@ describe("fused generation HTTP adapter", () => {
     });
     expect(JSON.stringify(receipt)).not.toContain("must-not-escape");
     expect(JSON.stringify(receipt)).not.toContain("prompt");
+  });
+
+  it("accepts the full persisted submission-key range and rejects control characters", async () => {
+    const lookupJson = vi.fn(async (_idempotencyKey: string, _signal: AbortSignal) => ({
+      status: "charged_incomplete",
+      fee_disposition: "debit",
+      fee_amount: 4,
+      task_id: null,
+      message_id: null,
+    }));
+    const port = createFusedGenerationHttp(vi.fn(), lookupJson);
+    const signal = new AbortController().signal;
+
+    await port.lookupSubmission!("k".repeat(200), signal);
+    await expect(port.lookupSubmission!("k".repeat(256), signal)).rejects.toMatchObject({ kind: "invalid-response" });
+    await expect(port.lookupSubmission!("invalid\nkey", signal)).rejects.toMatchObject({ kind: "invalid-response" });
+    expect(lookupJson).toHaveBeenCalledOnce();
+    expect(lookupJson.mock.calls[0]?.[0]).toBe("k".repeat(200));
   });
 });

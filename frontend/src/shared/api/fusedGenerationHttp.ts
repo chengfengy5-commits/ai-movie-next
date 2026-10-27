@@ -13,9 +13,22 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function isFiniteJson(value: unknown): boolean {
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) return value.every(isFiniteJson);
+  if (isRecord(value)) return Object.values(value).every(isFiniteJson);
+  return false;
+}
+
 function isSafeId(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value && value.length > 0
     && value.length <= 128 && !/[\u0000-\u001f\u007f-\u009f/\\]/u.test(value);
+}
+
+function isSafeSubmissionKey(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 255
+    && value.trim() === value && !/[\u0000-\u001f\u007f]/u.test(value);
 }
 
 function parseReceipt(value: unknown): FusedGenerationReceipt {
@@ -88,9 +101,22 @@ function validateInput(input: FusedGenerationInput): void {
     || (input.prompt_system !== null && typeof input.prompt_system !== "string")
     || (input.prompt_user !== null && typeof input.prompt_user !== "string")
     || (input.size !== null && typeof input.size !== "string")
-    || input.chapter_id !== null || input.frame_index !== null || input.name !== null
+    || (input.chapter_id !== null && !isSafeId(input.chapter_id))
+    || (input.frame_index !== null && (!Number.isSafeInteger(input.frame_index) || input.frame_index < 0))
+    || input.name !== null
     || !Array.isArray(input.members) || input.members.length === 0) {
     throw new ApiError("invalid-response", "融合生成请求字段无效，未发送请求。", null);
+  }
+  const hasStableTarget = input.storyboard_asset_id != null;
+  const hasExpectedFrame = input.expected_frame != null;
+  const hasExpectedContent = input.expected_content != null;
+  if ((hasStableTarget && (!isSafeId(input.storyboard_asset_id) || input.chapter_id === null
+      || !hasExpectedFrame || hasExpectedContent))
+    || (hasExpectedFrame && (!isRecord(input.expected_frame) || !isFiniteJson(input.expected_frame)))
+    || (hasExpectedContent && (!Array.isArray(input.expected_content) || !isFiniteJson(input.expected_content)))
+    || (!hasStableTarget && (hasExpectedFrame || hasExpectedContent)
+      && (input.chapter_id === null || input.frame_index === null || !hasExpectedFrame || !hasExpectedContent))) {
+    throw new ApiError("invalid-response", "融合分镜目标证明无效，未发送请求。", null);
   }
   for (const member of input.members) {
     if (member.kind === "asset") {
@@ -135,15 +161,18 @@ export function createFusedGenerationHttp(
         prompt_system: input.prompt_system,
         prompt_user: input.prompt_user,
         size: input.size,
-        chapter_id: null,
-        frame_index: null,
+        chapter_id: input.chapter_id,
+        frame_index: input.frame_index,
         name: null,
+        ...(input.storyboard_asset_id == null ? {} : { storyboard_asset_id: input.storyboard_asset_id }),
+        ...(input.expected_frame == null ? {} : { expected_frame: input.expected_frame }),
+        ...(input.expected_content == null ? {} : { expected_content: input.expected_content }),
       };
       return parseReceipt(await requestJson(payload, signal, options));
     },
     ...(lookupJson === undefined ? {} : {
       async lookupSubmission(idempotencyKey: string, signal: AbortSignal) {
-        if (!isSafeId(idempotencyKey) || idempotencyKey.length > 255) {
+        if (!isSafeSubmissionKey(idempotencyKey)) {
           throw new ApiError("invalid-response", "融合提交核对键无效。", null);
         }
         return parseSubmissionReceipt(await lookupJson(idempotencyKey, signal));
