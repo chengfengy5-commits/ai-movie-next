@@ -37,6 +37,8 @@ from haoai_backend.generation_core.base_schema import (
     ExecutionStepRow,
     TaskSubmissionRow,
 )
+from haoai_backend.generation_core.schema import ExecutionAttemptGroupRow
+from haoai_backend.generation_runtime.registry import HAOAI_ATTEMPT_GROUP
 AdmissionWireReceipt: TypeAlias = SingleAdmissionReceipt | BatchImageReceipt
 _PRODUCER_MODULE = "haoai_backend.generation_credentials.snapshot_producer"
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
@@ -49,6 +51,19 @@ _SUPPORTED_GRAPH_VERSIONS = {
     "video.single": "video-single-v1",
     "image.batch": "image-batch-v1",
 }
+_ATTEMPT_GROUP_VERSION = HAOAI_ATTEMPT_GROUP.registry_version
+_ATTEMPT_GROUP_STATES = frozenset(
+    {
+        "prepared",
+        "active",
+        "pending_verification",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "policy_stopped",
+        "succeeded_late",
+    }
+)
 _TASK_TYPES_BY_OPERATION = {
     "image.single": "image-single",
     "video.single": "video-single",
@@ -593,59 +608,77 @@ def _lookup(
                 wanted_step_ids = (
                     expected.ordered_tasks[position].step_ids if expected is not None else None
                 )
-                if (
-                    len(step_rows) != 1
-                    or (wanted_step_ids is not None and tuple(row["id"] for row in step_rows) != wanted_step_ids)
+                uses_attempt_group = graph_version == _ATTEMPT_GROUP_VERSION
+                expected_step_keys = (
+                    HAOAI_ATTEMPT_GROUP.attempt_step_ids
+                    if uses_attempt_group
+                    else ("generate",)
+                )
+                if len(step_rows) != len(expected_step_keys) or (
+                    wanted_step_ids is not None
+                    and tuple(row["id"] for row in step_rows) != wanted_step_ids
                 ):
                     return _refusal("receipt_unverified", "原始任务执行步骤不完整")
-                step = step_rows[0]
-                snapshot = step["input_snapshot"]
-                if isinstance(snapshot, str):
-                    try:
-                        snapshot = json.loads(snapshot)
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        return _refusal("receipt_unverified", "执行步骤快照无效")
-                if (
-                    step["billing_unit_id"] != unit["id"]
-                    or step["step_key"] != "generate"
-                    or step["dependencies"] not in ([], ())
-                    or step["step_order"] != 0
-                    or step["required"] is not True
-                    or step["execution_status"] not in _STEP_EXECUTION_STATES
-                    or step["input_digest"] != request_data["request_digest"]
-                    or step["input_digest"] != request_digest
-                    or not isinstance(snapshot, dict)
-                    or (
-                        set(snapshot) != _CURRENT_STEP_SNAPSHOT_KEYS
-                        if expected is not None
-                        else set(snapshot)
-                        not in {_LEGACY_STEP_SNAPSHOT_KEYS, _CURRENT_STEP_SNAPSHOT_KEYS}
-                    )
-                    or snapshot.get("server_attempt_id") != request_data["server_attempt_id"]
-                    or snapshot.get("prepared_payload_id") != request_data["prepared_payload_id"]
-                    or snapshot.get("protected_ref") != request_data["protected_ref"]
-                    or snapshot.get("snapshot_digest") != request_data["snapshot_digest"]
-                    or (
-                        expected is not None
-                        and snapshot.get("ordered_manifest_digest") != expected_manifest_digest
-                    )
-                    or (
-                        "ordered_manifest_digest" in snapshot
-                        and (
-                            not isinstance(snapshot.get("ordered_manifest_digest"), str)
-                            or not _DIGEST.fullmatch(snapshot["ordered_manifest_digest"])
-                        )
-                    )
+                expected_required = not uses_attempt_group
+                for step_order, (step, step_key) in enumerate(
+                    zip(step_rows, expected_step_keys, strict=True)
                 ):
-                    return _refusal("receipt_unverified", "受保护输入与执行步骤关联无效")
-                snapshot_format = (
-                    "current"
-                    if "ordered_manifest_digest" in snapshot
-                    else "legacy"
-                )
-                step_snapshot_formats.add(snapshot_format)
-                if snapshot_format == "current":
-                    persisted_manifest_digests.add(snapshot["ordered_manifest_digest"])
+                    snapshot = step["input_snapshot"]
+                    if isinstance(snapshot, str):
+                        try:
+                            snapshot = json.loads(snapshot)
+                        except (TypeError, ValueError, json.JSONDecodeError):
+                            return _refusal("receipt_unverified", "执行步骤快照无效")
+                    if (
+                        step["billing_unit_id"] != unit["id"]
+                        or step["step_key"] != step_key
+                        or step["dependencies"] not in ([], ())
+                        or step["step_order"] != step_order
+                        or step["required"] is not expected_required
+                        or step["execution_status"] not in _STEP_EXECUTION_STATES
+                        or step["input_digest"] != request_data["request_digest"]
+                        or step["input_digest"] != request_digest
+                        or not isinstance(snapshot, dict)
+                        or (
+                            set(snapshot) != _CURRENT_STEP_SNAPSHOT_KEYS
+                            if expected is not None
+                            else set(snapshot)
+                            not in {_LEGACY_STEP_SNAPSHOT_KEYS, _CURRENT_STEP_SNAPSHOT_KEYS}
+                        )
+                        or snapshot.get("server_attempt_id") != request_data["server_attempt_id"]
+                        or snapshot.get("prepared_payload_id") != request_data["prepared_payload_id"]
+                        or snapshot.get("protected_ref") != request_data["protected_ref"]
+                        or snapshot.get("snapshot_digest") != request_data["snapshot_digest"]
+                        or (
+                            expected is not None
+                            and snapshot.get("ordered_manifest_digest") != expected_manifest_digest
+                        )
+                        or (
+                            "ordered_manifest_digest" in snapshot
+                            and (
+                                not isinstance(snapshot.get("ordered_manifest_digest"), str)
+                                or not _DIGEST.fullmatch(snapshot["ordered_manifest_digest"])
+                            )
+                        )
+                    ):
+                        return _refusal("receipt_unverified", "受保护输入与执行步骤关联无效")
+                    snapshot_format = (
+                        "current"
+                        if "ordered_manifest_digest" in snapshot
+                        else "legacy"
+                    )
+                    step_snapshot_formats.add(snapshot_format)
+                    if snapshot_format == "current":
+                        persisted_manifest_digests.add(snapshot["ordered_manifest_digest"])
+
+                if not _verify_attempt_group(
+                    session,
+                    unit_id=unit["id"],
+                    graph_version=graph_version,
+                    step_ids=tuple(row["id"] for row in step_rows),
+                    request_digest=request_data["request_digest"],
+                ):
+                    return _refusal("receipt_unverified", "原始任务 Group 与三步快照不一致")
 
                 task_message_id = task["message_id"] or None
                 if operation == "image.batch":
@@ -667,7 +700,10 @@ def _lookup(
 
             if len(step_snapshot_formats) != 1 or len(persisted_manifest_digests) > 1:
                 return _refusal("receipt_unverified", "原始任务 manifest 摘要集合不一致")
-            if graph_version != _SUPPORTED_GRAPH_VERSIONS[operation]:
+            if graph_version == _ATTEMPT_GROUP_VERSION:
+                if operation != "video.single":
+                    return _refusal("receipt_unverified", "attempt group 只支持 HaoAI 视频任务")
+            elif graph_version != _SUPPORTED_GRAPH_VERSIONS[operation]:
                 return _refusal("receipt_unverified", "原始任务图版本不属于已支持的冻结版本")
             if len(task_types) != 1:
                 return _refusal("receipt_unverified", "原始任务集合混用了不同任务类型")
@@ -845,6 +881,66 @@ def _credit_log_columns(log_table: object) -> tuple[object, ...]:
         log_table.c.type,
         log_table.c.related_debit_id,
     )
+
+
+def _verify_attempt_group(
+    session: Session,
+    *,
+    unit_id: str,
+    graph_version: str | None,
+    step_ids: tuple[str, ...],
+    request_digest: str,
+) -> bool:
+    rows = session.execute(
+        select(ExecutionAttemptGroupRow.__table__).where(
+            ExecutionAttemptGroupRow.__table__.c.unit_id == unit_id
+        )
+    ).mappings().all()
+    if graph_version != _ATTEMPT_GROUP_VERSION:
+        return not rows
+    if len(rows) != 1:
+        return False
+
+    group = rows[0]
+    stored_steps = group["attempt_step_ids"]
+    if (
+        group["group_key"] != HAOAI_ATTEMPT_GROUP.group_key
+        or group["registry_version"] != _ATTEMPT_GROUP_VERSION
+        or not isinstance(stored_steps, list)
+        or tuple(stored_steps) != step_ids
+        or len(step_ids) != len(HAOAI_ATTEMPT_GROUP.attempt_step_ids)
+        or group["original_payload_digest"] != request_digest
+        or type(group["max_retries"]) is not int
+        or group["max_retries"] != HAOAI_ATTEMPT_GROUP.max_retries
+        or type(group["active_attempt"]) is not int
+        or not 0 <= group["active_attempt"] < len(step_ids)
+        or group["status"] not in _ATTEMPT_GROUP_STATES
+        or type(group["poll_used"]) is not int
+        or not 0 <= group["poll_used"] <= HAOAI_ATTEMPT_GROUP.max_polls
+        or type(group["poll_sequence"]) is not int
+        or group["poll_sequence"] != group["poll_used"]
+        or type(group["auth_unavailable_streak"]) is not int
+        or not 0 <= group["auth_unavailable_streak"] <= 12
+        or group["active_eligibility_version"] != _ATTEMPT_GROUP_VERSION
+        or (
+            group["terminal_reason"] is not None
+            and not _nonblank(group["terminal_reason"], maximum=128)
+        )
+        or (
+            group["outstanding_reservation_ref"] is not None
+            and not _nonblank(group["outstanding_reservation_ref"], maximum=36)
+        )
+        or (
+            group["sticky_policy_stop_event_ref"] is not None
+            and not _nonblank(group["sticky_policy_stop_event_ref"], maximum=36)
+        )
+        or (
+            group["selected_evidence_id"] is not None
+            and not _nonblank(group["selected_evidence_id"], maximum=36)
+        )
+    ):
+        return False
+    return True
 
 
 def _expected_manifest_digest(expected: AdmissionStaged) -> str | None:

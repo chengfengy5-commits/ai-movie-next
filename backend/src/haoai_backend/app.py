@@ -120,6 +120,9 @@ from .chat_text_generation import ChatTextGenerationConfiguration
 from .chat_text_generation.http import build_chat_text_generation_router
 from .frame_optimize_http import build_frame_optimize_router
 from .generation_core.admission_staging import build_media_snapshot_producer
+from .generation_core.haoai_group.cancellation import (
+    SqlAlchemyHaoaiGroupCancellation,
+)
 from .generation_core.frame_optimize_cancellation import (
     SqlAlchemyFrameOptimizeCancellation,
 )
@@ -202,7 +205,10 @@ from .task_observation.frame_review_cancellation import (
 )
 from .task_observation.http import build_task_observation_router
 from .task_observation.persistence import task_observation_unit_of_work_factory
-from .task_observation.ports import CancellationConnectionFactory, CancellationSignalRegistry
+from .task_observation.ports import (
+    CancellationConnectionFactory,
+    CancellationSignalRegistry,
+)
 
 SessionFactory = Callable[[], Session]
 _GENERATION_WORKER_POLL_INTERVAL_SECONDS = 0.25
@@ -1046,6 +1052,20 @@ def create_app(
                 crypto=capabilities.crypto,
                 proof_authority=capabilities.proof_authority,
             )
+    haoai_group_cancellation = None
+    if (
+        video_single_worker_configuration is not None
+        and video_single_session_bound
+        and effective_session_factory is not None
+    ):
+        capabilities = video_single_worker_configuration.registry_capabilities
+        if isinstance(capabilities.proof_authority, HmacProofAuthority):
+            haoai_group_cancellation = SqlAlchemyHaoaiGroupCancellation(
+                session_factory=effective_session_factory,
+                db_clock=video_single_worker_configuration.runtime.db_clock,
+                proof_authority=capabilities.proof_authority,
+                id_factory=video_single_worker_configuration.runtime.id_factory,
+            )
     app.include_router(
         build_task_observation_router(
             uow_factory=task_uow_factory,
@@ -1055,6 +1075,7 @@ def create_app(
             cancellation_writer=task_cancellation_writer,
             frame_review_cancellation=frame_review_cancellation,
             frame_optimize_cancellation=frame_optimize_cancellation,
+            haoai_group_cancellation=haoai_group_cancellation,
         )
     )
     app.include_router(

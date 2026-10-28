@@ -412,7 +412,9 @@ def build_operation_graph_plan(
             step_ids=(item.step_ids[0], item.step_ids[1], item.step_ids[2]),
             required=True,
             max_retries=HAOAI_ATTEMPT_GROUP.max_retries,
-            original_payload_digest=tasks[0].payload_digest,
+            # Provider polling binds the original wire request, not the Task's
+            # aggregate graph identity. Keep those digests distinct.
+            original_payload_digest=item.request_digest,
         )
 
     plan_payload = {

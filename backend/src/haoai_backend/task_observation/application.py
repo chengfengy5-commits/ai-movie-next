@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import Any, TypeVar
 
 from haoai_backend.shared.identity import TrustedActor
+from haoai_backend.generation_runtime.registry import HAOAI_ATTEMPT_GROUP
 from haoai_backend.teams.policy import has_team_permission
 
 from .domain import TaskRecord
@@ -31,6 +32,7 @@ from .ports import (
     CancellationSignalRegistry,
     FrameOptimizeCancellationPort,
     FrameReviewCancellationPort,
+    HaoaiGroupCancellationPort,
     TaskCancellationWriter,
     TaskObservationUnitOfWork,
     TaskRow,
@@ -257,6 +259,7 @@ def request_batch_optimize_cancel(
     cancellation_writer: TaskCancellationWriter | None,
     frame_review_cancellation: FrameReviewCancellationPort | None = None,
     frame_optimize_cancellation: FrameOptimizeCancellationPort | None = None,
+    haoai_group_cancellation: HaoaiGroupCancellationPort | None = None,
 ) -> dict[str, Any]:
     """Route registered reviews through their own transaction, preserving legacy order."""
     if factory is None:
@@ -265,6 +268,7 @@ def request_batch_optimize_cancel(
         cancellation_writer is None
         and frame_review_cancellation is None
         and frame_optimize_cancellation is None
+        and haoai_group_cancellation is None
     ):
         raise TaskObservationUnavailable("任务取消服务尚未接线")
 
@@ -275,6 +279,37 @@ def request_batch_optimize_cancel(
 
         task_type = _value(task, "type")
         request_data = _object_mapping(_value(task, "request_data"))
+        haoai_group_hint = _registered_haoai_group_candidate(request_data)
+        if task_type == "video-single":
+            try:
+                unit = uow.unique_billing_unit(task_id)
+            except Exception:
+                # A video graph that cannot be read safely must not reach the legacy writer.
+                haoai_group_hint = True
+            else:
+                haoai_group_hint = haoai_group_hint or _haoai_group_unit_hint(unit)
+            if haoai_group_cancellation is not None or haoai_group_hint:
+                return "haoai-group", {
+                    "task_id": _value(task, "id"),
+                    "status": _value(task, "status"),
+                    "group_hint": haoai_group_hint,
+                }
+        elif haoai_group_cancellation is not None:
+            # Probe under the Group adapter's fresh owner lock before any legacy
+            # writer. This also catches orphaned or malformed Group rows whose
+            # Task type or Unit markers no longer agree with the original graph.
+            return "haoai-group-probe", {
+                "task_id": _value(task, "id"),
+                "status": _value(task, "status"),
+                "group_hint": haoai_group_hint,
+            }
+        if haoai_group_hint:
+            # A Group marker on another task family is a malformed partial graph.
+            return "haoai-group-invalid", {
+                "task_id": _value(task, "id"),
+                "status": _value(task, "status"),
+            }
+
         selected = _registered_frame_review_candidate(task_type, request_data)
         if task_type == "ai-review" and not selected:
             try:
@@ -324,6 +359,42 @@ def request_batch_optimize_cancel(
     route, value = _run_read_only(factory, operation)
     if route == "legacy":
         return value
+    if route == "haoai-group-invalid":
+        raise TaskObservationUnavailable("视频任务记录无法通过安全校验")
+    if route in {"haoai-group", "haoai-group-probe"}:
+        if haoai_group_cancellation is None:
+            raise TaskObservationUnavailable("HaoAI 视频取消服务尚未接线")
+        outcome = haoai_group_cancellation.cancel_owned(actor, value["task_id"])
+        if outcome == "not_selected":
+            if value["group_hint"]:
+                raise TaskObservationUnavailable("视频任务记录无法通过安全校验")
+            if route == "haoai-group-probe":
+                return request_batch_optimize_cancel(
+                    factory,
+                    actor,
+                    task_id,
+                    signal_registry,
+                    cancellation_writer,
+                    frame_review_cancellation,
+                    frame_optimize_cancellation,
+                    None,
+                )
+            if cancellation_writer is None:
+                raise TaskObservationUnavailable("任务取消服务尚未接线")
+            if value["status"] in ("queued", "processing"):
+                signal = signal_registry.get(value["task_id"]) if signal_registry is not None else None
+                if signal:
+                    signal.set()
+                cancellation_writer.request_cancel(value["task_id"])
+            return {"task_id": value["task_id"], "status": "cancelling"}
+        if outcome in {"settled", "retained"}:
+            signal = signal_registry.get(value["task_id"]) if signal_registry is not None else None
+            if signal:
+                signal.set()
+            return {"task_id": value["task_id"], "status": "cancelling"}
+        if outcome == "terminal_projection":
+            return {"task_id": value["task_id"], "status": value["status"]}
+        raise TaskObservationUnavailable("视频任务取消状态暂时无法安全确认")
     if route == "frame-optimize":
         if frame_optimize_cancellation is None:
             raise TaskObservationUnavailable("注册分镜优化取消服务尚未接线")
@@ -371,6 +442,24 @@ def _registered_frame_review_candidate(
             "protected_ref",
         )
     )
+
+
+def _registered_haoai_group_candidate(
+    request_data: Mapping[str, Any] | None,
+) -> bool:
+    if request_data is None:
+        return False
+    version = HAOAI_ATTEMPT_GROUP.registry_version
+    return (
+        request_data.get("step_graph_version") == version
+        or request_data.get("graph_version") == version
+    )
+
+
+def _haoai_group_unit_hint(unit: TaskValue | None) -> bool:
+    if unit is None:
+        return False
+    return _value(unit, "step_graph_version") == HAOAI_ATTEMPT_GROUP.registry_version
 
 
 def _registered_frame_optimize_candidate(

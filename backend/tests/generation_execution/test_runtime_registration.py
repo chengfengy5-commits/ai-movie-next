@@ -455,6 +455,38 @@ def test_inline_timer_and_explicit_recovery_share_one_tracked_guard() -> None:
     runtime.shutdown("test complete")
 
 
+def test_video_single_cancel_and_due_dispatch_uses_registered_recovery() -> None:
+    events: list[str] = []
+
+    class VideoRecovery:
+        def consume_cancel_and_due(self, scope, *, stop_signal: Event) -> str:
+            assert scope == OwnerTaskScope("owner", "video-task", "video.single")
+            assert not stop_signal.is_set()
+            events.append("video-cancel-and-due")
+            return "retained"
+
+    recovery = VideoRecovery()
+    runtime = build_runtime(
+        _config(events),
+        (
+            RegisteredExecutorFactory(
+                "video-single",
+                lambda: _Port(events),
+                lambda: _Executor(events),
+                recovery_factory=lambda: recovery,
+            ),
+        ),
+    )
+
+    outcome = runtime.consume_cancel_and_due(
+        OwnerTaskScope("owner", "video-task", "video.single")
+    )
+
+    assert outcome == "retained"
+    assert events == ["video-cancel-and-due"]
+    runtime.shutdown("test complete")
+
+
 def test_scanner_shutdown_reports_tracked_recovery_and_live_scanner_until_unwind() -> None:
     scanner_entered = Event()
     release_scanner = Event()

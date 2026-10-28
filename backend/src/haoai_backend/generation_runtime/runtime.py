@@ -328,6 +328,7 @@ class _ConfiguredRuntime:
         task_type = {
             "frame.review": "ai-review",
             "frame.optimize": "batch-optimize",
+            "video.single": "video-single",
         }.get(scope.operation)
         if task_type is None:
             return "pending"

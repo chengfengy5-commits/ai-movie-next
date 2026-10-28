@@ -32,6 +32,7 @@ from haoai_backend.generation_catalog.admission_types import (
 )
 from haoai_backend.generation_catalog.domain import ModelSelection
 from haoai_backend.generation_contracts.errors import GenerationError
+from haoai_backend.generation_contracts.records import ExecutionAttemptGroup
 from haoai_backend.generation_contracts.types import (
     AdmissionFingerprint,
     FrozenExecutionSnapshot,
@@ -55,13 +56,14 @@ from haoai_backend.generation_core.graph_planning import (
     OperationGraphPlan,
     build_operation_graph_plan,
 )
+from haoai_backend.generation_core.persistence import GenerationRecordRepository
 from haoai_backend.generation_core.unit_fees import (
     InsufficientAdmissionCredits,
     UnitFeeStagingResult,
     stage_unit_fees,
 )
 from haoai_backend.generation_credentials.domain import PreparedPayloadStaged
-from haoai_backend.generation_runtime.registry import operation_policy
+from haoai_backend.generation_runtime.registry import HAOAI_ATTEMPT_GROUP, operation_policy
 from haoai_backend.generation_task_concurrency import graph_tasks_match_shape
 
 
@@ -73,7 +75,7 @@ _SUPPORTED_GRAPH_VERSIONS = {
     "video.single": "video-single-v1",
     "image.batch": "image-batch-v1",
 }
-_UNSUPPORTED_ATTEMPT_GROUP_VERSION = "video-haoai-attempt-group-v1"
+_ATTEMPT_GROUP_VERSION = HAOAI_ATTEMPT_GROUP.registry_version
 _PROJECTION_FIELDS = frozenset(
     {
         "operation",
@@ -341,16 +343,17 @@ def _build_graph_and_rows(
     if policy is None or policy.task_type is None or policy.graph_version is None:
         return _stage_refusal("configuration_unavailable", "当前操作没有已冻结图策略", abort=True)
     graph_version = staged_result.graph_version
-    if graph_version == _UNSUPPORTED_ATTEMPT_GROUP_VERSION:
-        return _stage_refusal(
-            "configuration_unavailable",
-            "当前准入入口不支持 HaoAI 三步 attempt group 图",
-            abort=True,
-        )
-    if (
-        graph_version != _SUPPORTED_GRAPH_VERSIONS[operation]
-        or policy.graph_version != graph_version
-    ):
+    uses_attempt_group = graph_version == _ATTEMPT_GROUP_VERSION
+    if uses_attempt_group:
+        if operation != "video.single" or any(
+            item.snapshot.model_ref.provider != "haoai" for item in items
+        ):
+            return _stage_refusal(
+                "configuration_unavailable",
+                "HaoAI attempt group 与原视频模型来源不匹配",
+                abort=True,
+            )
+    elif graph_version != _SUPPORTED_GRAPH_VERSIONS[operation] or policy.graph_version != graph_version:
         return _stage_refusal("configuration_unavailable", "producer 图版本不属于当前支持范围", abort=True)
 
     seen_attempts: set[str] = set()
@@ -466,7 +469,10 @@ def _build_graph_and_rows(
             return legacy_projection
         task_id = _new_id(binding._server_id_factory, all_generated_ids)
         unit_id = _new_id(binding._server_id_factory, all_generated_ids)
-        step_id = _new_id(binding._server_id_factory, all_generated_ids)
+        step_ids = tuple(
+            _new_id(binding._server_id_factory, all_generated_ids)
+            for _ in range(3 if uses_attempt_group else 1)
+        )
         user_message_id: str | None = None
         assistant_message_id: str | None = None
         if operation == "image.batch":
@@ -492,7 +498,7 @@ def _build_graph_and_rows(
                 target_id=target_id,
                 task_id=task_id,
                 unit_id=unit_id,
-                step_ids=(step_id,),
+                step_ids=step_ids,
                 request_digest=request_digest,
                 rule_digest=rule_digest,
                 snapshot=snapshot,
@@ -548,7 +554,7 @@ def _build_graph_and_rows(
                 "task_id": task_id,
                 "item_key": item.server_attempt_id,
                 "operation": operation,
-                "step_graph_version": policy.graph_version,
+                "step_graph_version": graph_version,
                 "input_digest": request_digest,
                 "quoted_amount": quote,
                 "debited_amount": 0,
@@ -567,27 +573,35 @@ def _build_graph_and_rows(
                 "updated_at": now,
             }
         )
-        step_rows.append(
-            {
-                "id": step_id,
-                "billing_unit_id": unit_id,
-                "step_key": "generate",
-                "dependencies": [],
-                "input_digest": request_digest,
-                "input_snapshot": {
-                    "server_attempt_id": item.server_attempt_id,
-                    "prepared_payload_id": item.prepared_payload_id,
-                    "protected_ref": item.protected_ref,
-                    "snapshot_digest": "",
-                    "ordered_manifest_digest": manifest_digest,
-                },
-                "required": True,
-                "step_order": 0,
-                "execution_status": "prepared",
-                "created_at": now,
-                "updated_at": now,
-            }
+        step_keys = (
+            HAOAI_ATTEMPT_GROUP.attempt_step_ids
+            if uses_attempt_group
+            else ("generate",)
         )
+        for step_order, (step_id, step_key) in enumerate(
+            zip(step_ids, step_keys, strict=True)
+        ):
+            step_rows.append(
+                {
+                    "id": step_id,
+                    "billing_unit_id": unit_id,
+                    "step_key": step_key,
+                    "dependencies": [],
+                    "input_digest": request_digest,
+                    "input_snapshot": {
+                        "server_attempt_id": item.server_attempt_id,
+                        "prepared_payload_id": item.prepared_payload_id,
+                        "protected_ref": item.protected_ref,
+                        "snapshot_digest": "",
+                        "ordered_manifest_digest": manifest_digest,
+                    },
+                    "required": not uses_attempt_group,
+                    "step_order": step_order,
+                    "execution_status": "prepared",
+                    "created_at": now,
+                    "updated_at": now,
+                }
+            )
         if user_message_id is not None and assistant_message_id is not None:
             message_rows.extend(
                 (
@@ -625,7 +639,7 @@ def _build_graph_and_rows(
             StagedTaskExpectation(
                 task_id=task_id,
                 unit_id=unit_id,
-                step_ids=(step_id,),
+                step_ids=step_ids,
                 server_attempt_id=item.server_attempt_id,
                 prepared_payload_id=item.prepared_payload_id,
                 protected_ref=item.protected_ref,
@@ -646,6 +660,7 @@ def _build_graph_and_rows(
             operation,
             graph_version=graph_version,
             items=graph_inputs,
+            attempt_group_id=(graph_inputs[0].unit_id if uses_attempt_group else None),
         )
         if not graph_tasks_match_shape(operation, len(preparation.items), graph.tasks):
             return _stage_refusal(
@@ -682,7 +697,11 @@ def _build_graph_and_rows(
             request_data=row["request_data"],
             message_ids=expectation.message_ids,
         ))
-        step_rows[index]["input_snapshot"]["snapshot_digest"] = graph_item.snapshot_digest
+        step_start = index * (3 if uses_attempt_group else 1)
+        for offset in range(len(graph_item.step_ids)):
+            step_rows[step_start + offset]["input_snapshot"]["snapshot_digest"] = (
+                graph_item.snapshot_digest
+            )
     expectations = updated_expectations
 
     with session.no_autoflush:
@@ -715,6 +734,34 @@ def _build_graph_and_rows(
             session.execute(insert(AITaskRow.__table__), item_rows)
             session.execute(insert(BillingUnitRow.__table__), unit_rows)
             session.execute(insert(ExecutionStepRow.__table__), step_rows)
+            if graph.attempt_group is not None:
+                attempt_group = graph.attempt_group
+                group_result = GenerationRecordRepository(session).stage_record(
+                    ExecutionAttemptGroup(
+                        unit_id=attempt_group.unit_id,
+                        group_key=attempt_group.group_key,
+                        registry_version=attempt_group.registry_version,
+                        attempt_step_ids=attempt_group.step_ids,
+                        original_payload_digest=attempt_group.original_payload_digest,
+                        max_retries=attempt_group.max_retries,
+                        active_attempt=0,
+                        selected_evidence_id=None,
+                        status="prepared",
+                        poll_used=0,
+                        auth_unavailable_streak=0,
+                        terminal_reason=None,
+                        poll_sequence=0,
+                        next_poll_at=None,
+                        outstanding_reservation_ref=None,
+                        sticky_policy_stop_event_ref=None,
+                        active_eligibility_version=attempt_group.registry_version,
+                    )
+                )
+                if group_result.status != "created":
+                    raise GenerationError(
+                        "admission_stage_failed",
+                        "HaoAI attempt group 未能与原任务图一起暂存",
+                    )
             if message_rows:
                 session.execute(insert(chat_messages), message_rows)
             fee_result = stage_unit_fees(

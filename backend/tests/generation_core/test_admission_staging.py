@@ -732,7 +732,7 @@ def test_payload_subreferences_preserve_opaque_id_without_rewriting_it() -> None
     }
 
 
-def test_unsupported_haoai_attempt_group_is_refused_before_graph_writes() -> None:
+def test_haoai_attempt_group_is_refused_for_a_non_haoai_snapshot_before_graph_writes() -> None:
     session, engine = _staging_database()
     try:
         with session.begin():
@@ -770,7 +770,7 @@ def test_unsupported_haoai_attempt_group_is_refused_before_graph_writes() -> Non
 
             assert isinstance(result, AdmissionStageRefusal)
             assert result.code == "configuration_unavailable"
-            assert "HaoAI 三步" in result.message
+            assert "模型来源不匹配" in result.message
             assert result.caller_must_abort is True
             assert session.execute(select(TaskSubmissionRow.__table__.c.id)).all() == []
     finally:

@@ -51,10 +51,12 @@ from haoai_backend.generation_providers.video.haoai_codec import (
     parse_haoai_create_response,
     parse_haoai_query_response,
 )
+from haoai_backend.media_uploads.domain import MAX_VIDEO_BYTES
 
 PROVIDER_NAME = "haoai"
 VIDEO_CATEGORY = "video"
 MAX_RESPONSE_BYTES = 1024 * 1024
+MAX_BOUND_CONTENT_SECONDS = 600.0
 RESPONSE_CHUNK_BYTES = 64 * 1024
 MAX_CANDIDATE_CHARACTERS = 8192
 MAX_SHADOW_ROUNDS = 8
@@ -69,6 +71,19 @@ _CREATE_REJECTED_STATE = "provider_rejected_request"
 _UNSAFE_ID_STATE = "provider_identity_unusable"
 _UNSAFE_LOCATOR_ERROR = "provider media locator is unsafe"
 _QUERY_ERROR = "provider query is unavailable"
+_CONTENT_ERROR = "provider content is unavailable"
+_CONTENT_TYPES = frozenset(
+    {
+        "video/avi",
+        "video/mp4",
+        "video/mpeg",
+        "video/quicktime",
+        "video/webm",
+        "video/x-m4v",
+        "video/x-matroska",
+        "video/x-msvideo",
+    }
+)
 _CONTENT_NEEDED = "bound_content_needed"
 _ALLOWED_REFERENCE_KINDS = frozenset({"managed_url", "public_http", "data_uri"})
 _ALLOWED_SAFE_STATES = frozenset(
@@ -118,6 +133,7 @@ class _ResponseReadFailure(Exception):
 class _HttpResult:
     status_code: int
     body: bytes
+    media_type: str | None = None
 
 
 class HaoaiVideoProvider:
@@ -175,8 +191,60 @@ class HaoaiVideoProvider:
         snapshot: FrozenExecutionSnapshot,
         external_ref: ExternalOperationRef,
     ) -> ReferenceInput:
-        del snapshot, external_ref
-        raise NotImplementedError(_UNSUPPORTED_DETAIL)
+        _require_no_running_event_loop()
+        self._validate_binding(snapshot, self._binding.intent)
+        self._validate_external_ref(external_ref, self._binding.intent)
+
+        credential = self.resolve_original_credential(
+            self._binding.credential_binding, "content"
+        )
+        if credential == "unavailable":
+            raise ValueError(_CONTENT_ERROR)
+        if not _safe_response_candidate(
+            external_ref.external_id, credential.secret, kind="id"
+        ):
+            raise ValueError(_CONTENT_ERROR)
+
+        endpoint = (
+            _query_endpoint(
+                snapshot,
+                self._binding.credential_binding,
+                external_ref.external_id,
+            )
+            + "/content"
+        )
+        try:
+            result = asyncio.run(
+                self._exchange(
+                    "GET",
+                    endpoint,
+                    headers={
+                        "Authorization": f"Bearer {credential.secret}",
+                        "Accept": "video/*",
+                    },
+                    content=None,
+                    timeout_seconds=MAX_BOUND_CONTENT_SECONDS,
+                    operation_timeout_seconds=MAX_BOUND_CONTENT_SECONDS,
+                    max_response_bytes=MAX_VIDEO_BYTES,
+                )
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            raise ValueError(_CONTENT_ERROR) from None
+        if (
+            result.status_code != 200
+            or result.media_type not in _CONTENT_TYPES
+            or not result.body
+            or len(result.body) > MAX_VIDEO_BYTES
+        ):
+            raise ValueError(_CONTENT_ERROR)
+        return ReferenceInput(
+            kind="bytes",
+            locator=None,
+            content=result.body,
+            media_type=result.media_type,
+        )
 
     def resolve_original_credential(
         self,
@@ -188,9 +256,6 @@ class HaoaiVideoProvider:
             raise ValueError(_BINDING_ERROR)
         if purpose not in ("create", "query", "content"):
             raise ValueError(_BINDING_ERROR)
-        if purpose == "content":
-            return "unavailable"
-
         try:
             credential = self._credential_resolver(binding, purpose)
         except Exception:
@@ -475,18 +540,31 @@ class HaoaiVideoProvider:
         headers: Mapping[str, str],
         content: bytes | None,
         timeout_seconds: float,
+        operation_timeout_seconds: float | None = None,
+        max_response_bytes: int = MAX_RESPONSE_BYTES,
     ) -> _HttpResult:
-        manager = self._http_client_factory()
+        operation_deadline = None
+        if operation_timeout_seconds is not None:
+            if operation_timeout_seconds <= 0:
+                raise ValueError("operation timeout must be positive")
+            operation_deadline = (
+                asyncio.get_running_loop().time() + operation_timeout_seconds
+            )
+
+        manager: object | None = None
         entered = False
         response: object | None = None
         iterator: object | None = None
         status_code: int | None = None
         body: bytes | None = None
+        media_type: str | None = None
         primary_error: BaseException | None = None
         cleanup_errors: list[BaseException] = []
         cleanup_cancellation: asyncio.CancelledError | None = None
 
-        try:
+        async def perform_request() -> None:
+            nonlocal manager, entered, response, iterator, status_code, body, media_type
+
             client = await manager.__aenter__()
             entered = True
             response = await client.request(
@@ -501,19 +579,38 @@ class HaoaiVideoProvider:
             if type(raw_status) is not int:
                 raise _InvalidResponseBody()
             status_code = raw_status
+            media_type = _response_media_type(getattr(response, "headers", {}))
             try:
                 iterator = await _response_iterator(response)
-                body = await _read_response_body(response, iterator)
+                body = await _read_response_body(
+                    response, iterator, max_bytes=max_response_bytes
+                )
             except asyncio.CancelledError:
                 raise
             except Exception:
                 raise _ResponseReadFailure(status_code) from None
+
+        try:
+            if operation_deadline is None:
+                manager = self._http_client_factory()
+                await perform_request()
+            else:
+                async with asyncio.timeout_at(operation_deadline):
+                    manager = self._http_client_factory()
+                    _raise_if_deadline_expired(operation_deadline)
+                    await perform_request()
+                    _raise_if_deadline_expired(operation_deadline)
         except BaseException as exc:
             primary_error = exc
         finally:
             for resource in (iterator, response):
                 try:
-                    await _close_owned_resource(resource)
+                    if operation_deadline is None:
+                        await _close_owned_resource(resource)
+                    else:
+                        await _await_until_deadline(
+                            _close_owned_resource(resource), operation_deadline
+                        )
                 except BaseException as exc:
                     cleanup_errors.append(exc)
                     if (
@@ -521,15 +618,19 @@ class HaoaiVideoProvider:
                         and isinstance(exc, asyncio.CancelledError)
                     ):
                         cleanup_cancellation = exc
-            if entered:
+            if entered and manager is not None:
                 try:
-                    await manager.__aexit__(
+                    exit_call = manager.__aexit__(
                         type(primary_error) if primary_error is not None else None,
                         primary_error,
                         primary_error.__traceback__
                         if primary_error is not None
                         else None,
                     )
+                    if operation_deadline is None:
+                        await exit_call
+                    else:
+                        await _await_until_deadline(exit_call, operation_deadline)
                 except BaseException as exc:
                     cleanup_errors.append(exc)
                     if (
@@ -548,7 +649,11 @@ class HaoaiVideoProvider:
             raise cleanup_errors[0]
         if status_code is None or body is None:
             raise _InvalidResponseBody()
-        return _HttpResult(status_code=status_code, body=body)
+        return _HttpResult(
+            status_code=status_code,
+            body=body,
+            media_type=media_type,
+        )
 
     def _validate_binding(
         self,
@@ -861,10 +966,17 @@ async def _response_iterator(response: object) -> object:
     return iterator
 
 
-async def _read_response_body(response: object, iterator: object) -> bytes:
+async def _read_response_body(
+    response: object,
+    iterator: object,
+    *,
+    max_bytes: int = MAX_RESPONSE_BYTES,
+) -> bytes:
+    if type(max_bytes) is not int or max_bytes <= 0:
+        raise _InvalidResponseBody()
     headers = getattr(response, "headers", {})
     declared_length = _content_length(headers)
-    if declared_length is not None and declared_length > MAX_RESPONSE_BYTES:
+    if declared_length is not None and declared_length > max_bytes:
         raise _ResponseTooLarge()
     if not hasattr(iterator, "__aiter__"):
         raise _InvalidResponseBody()
@@ -873,10 +985,30 @@ async def _read_response_body(response: object, iterator: object) -> bytes:
     async for chunk in iterator:
         if not isinstance(chunk, (bytes, bytearray, memoryview)):
             raise _InvalidResponseBody()
-        if len(body) + len(chunk) > MAX_RESPONSE_BYTES:
+        if len(body) + len(chunk) > max_bytes:
             raise _ResponseTooLarge()
         body.extend(chunk)
     return bytes(body)
+
+
+def _response_media_type(headers: object) -> str | None:
+    if not isinstance(headers, Mapping):
+        return None
+    values = [
+        value
+        for key, value in headers.items()
+        if isinstance(key, str) and key.lower() == "content-type"
+    ]
+    if len(values) != 1 or not isinstance(values[0], str):
+        return None
+    media_type = values[0].split(";", 1)[0].strip().lower()
+    if (
+        not media_type
+        or _has_control_characters(media_type)
+        or media_type not in _CONTENT_TYPES
+    ):
+        return None
+    return media_type
 
 
 def _content_length(headers: object) -> int | None:
@@ -911,6 +1043,21 @@ async def _close_owned_resource(resource: object | None) -> None:
     result = close()
     if inspect.isawaitable(result):
         await result
+
+
+async def _await_until_deadline(awaitable: object, deadline: float) -> object:
+    if not inspect.isawaitable(awaitable):
+        _raise_if_deadline_expired(deadline)
+        return awaitable
+    async with asyncio.timeout_at(deadline):
+        result = await awaitable
+        _raise_if_deadline_expired(deadline)
+        return result
+
+
+def _raise_if_deadline_expired(deadline: float) -> None:
+    if asyncio.get_running_loop().time() >= deadline:
+        raise TimeoutError("operation deadline expired")
 
 
 def _safe_response_candidate(
