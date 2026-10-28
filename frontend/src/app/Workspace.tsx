@@ -4,6 +4,7 @@ import type { Series } from "../shared/api/contracts";
 import { useAuth } from "../features/auth/AuthProvider";
 import { LoginPage } from "../features/auth/LoginPage";
 import { AppearanceControl } from "../features/appearance/AppearanceControl";
+import { PublicSiteTutorialLink } from "../features/site-config/PublicSiteConfigProvider";
 import { ChapterBrowser, type ChapterNavigationIntent } from "../features/chapters/ChapterBrowser";
 import { AssetLibrary, type AssetNavigationIntent } from "../features/assets/AssetLibrary";
 import { FusedAssetsPage } from "../features/fused-assets/FusedAssetsPage";
@@ -1012,6 +1013,7 @@ function Dashboard() {
         </nav>
         <div className="workspace-appearance">
           <AppearanceControl />
+          <PublicSiteTutorialLink className="sidebar-tutorial-link" />
         </div>
         <div className="sidebar-bottom">
           <span className="sidebar-avatar" aria-hidden="true">

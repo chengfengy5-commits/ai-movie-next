@@ -766,6 +766,19 @@ a:focus-visible {
   line-height: 1.8;
 }
 
+.sidebar-tutorial-link {
+  display: block;
+  margin: 10px 10px 0;
+  color: #b6d1cb;
+  font-size: 10px;
+  line-height: 1.7;
+  text-underline-offset: 3px;
+}
+
+.sidebar-tutorial-link:hover {
+  color: #ffffff;
+}
+
 .sidebar-bottom {
   display: flex;
   align-items: center;
