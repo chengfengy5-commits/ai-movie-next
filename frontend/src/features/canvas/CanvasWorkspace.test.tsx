@@ -5,6 +5,11 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Series } from "../../shared/api/contracts";
 import { CanvasDataError, type CanvasDataPort } from "../../shared/api/canvasData";
+import type {
+  ChapterGenerationHistoryContext,
+  ChapterGenerationHistoryPort,
+  ChapterGenerationHistoryRun,
+} from "../../shared/api/chapterGenerationHistory";
 import { ApiError } from "../../shared/api/errors";
 import type { WorkspaceServices } from "../../shared/api/services";
 import {
@@ -15,7 +20,7 @@ import {
 } from "../../shared/api/canvasSources";
 import type { CanvasDocument } from "./canvasDocument";
 import { CanvasMediaPreview } from "./CanvasMediaPreview";
-import { CanvasWorkspace } from "./CanvasWorkspace";
+import { CanvasWorkspace, canvasFramePreparationProgress } from "./CanvasWorkspace";
 
 const chapter: Chapter = {
   id: "chapter-a",
@@ -191,12 +196,248 @@ function workspaceElement(
   );
 }
 
+function stubChapterGenerationHistoryMediaReader(readMedia: ChapterGenerationHistoryRun["readMedia"]) {
+  const captured = { context: null as ChapterGenerationHistoryContext | null };
+  const run = { isCurrent: () => true, readMedia } as unknown as ChapterGenerationHistoryRun;
+  const port = {
+    beginRun: vi.fn((context: ChapterGenerationHistoryContext) => {
+      captured.context = context;
+      return run;
+    }),
+  } as unknown as ChapterGenerationHistoryPort;
+  return { captured, port };
+}
+
 afterEach(() => {
   cleanup();
   vi.useRealTimers();
 });
 
 describe("CanvasWorkspace", () => {
+  it("shows selected frame information and navigates to a related asset", async () => {
+    setup();
+    await screen.findByText("门前的来信");
+
+    fireEvent.click(screen.getByLabelText("分镜 1"));
+    const information = screen.getByRole("region", { name: "选中内容信息" });
+    expect(within(information).getByText("门前的来信")).toBeTruthy();
+    expect(within(information).getByRole("progressbar").getAttribute("value")).toBe("30");
+    expect(within(information).getByText("所属章节")).toBeTruthy();
+    expect(within(information).getByText("林澜")).toBeTruthy();
+
+    fireEvent.click(within(information).getByRole("button", { name: "定位" }));
+    expect(screen.getByRole("article", { name: "林澜" }).className).toContain("is-selected");
+    expect(screen.getByRole("region", { name: "选中内容信息" })
+      .querySelector(".canvas-selected-information-kind")?.textContent).toBe("角色素材");
+  });
+
+  it("resolves a selected video's stable owning frame without adding a graph edge", async () => {
+    const snapshot = mediaSnapshot("e".repeat(64), "/uploads/preview.png");
+    const sourcePort: CanvasSourcePort = {
+      read: vi.fn(async () => snapshot),
+      write: vi.fn<CanvasSourcePort["write"]>(() => new Promise(() => undefined)),
+    };
+    setup(undefined, false, document, sourcePort);
+    fireEvent.click(await screen.findByLabelText("视频 1"));
+
+    let information = screen.getByRole("region", { name: "选中内容信息" });
+    expect(within(information).getAllByText("所属镜头")).toHaveLength(2);
+    expect(within(information).getAllByText("分镜 1")).toHaveLength(2);
+    fireEvent.click(within(information).getByRole("button", { name: "编辑媒体来源" }));
+    expect(await screen.findByRole("dialog", { name: "编辑视频槽 1" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "关闭媒体来源编辑" }));
+
+    information = screen.getByRole("region", { name: "选中内容信息" });
+    fireEvent.click(within(information).getByRole("button", { name: "定位" }));
+    const frameArticle = screen.getByRole("article", { name: "分镜 1" });
+    expect(frameArticle.className).toContain("is-selected");
+    information = screen.getByRole("region", { name: "选中内容信息" });
+    expect(within(information).getByRole("button", { name: "编辑分镜文字" })).toBeEnabled();
+    const videoRelation = within(information).getAllByRole("listitem")
+      .find((item) => item.textContent?.includes("视频 1"));
+    expect(videoRelation).toBeTruthy();
+    fireEvent.click(within(videoRelation!).getByRole("button", { name: "定位" }));
+    expect(screen.getByLabelText("视频 1").className).toContain("is-selected");
+  });
+
+  it("reads selected video media through the chapter history run and renders a video player", async () => {
+    const baseSnapshot = mediaSnapshot("f".repeat(64), "/uploads/preview.png");
+    const snapshot: CanvasSourceSnapshot = {
+      ...baseSnapshot,
+      chapter: {
+        ...baseSnapshot.chapter,
+        content: [{ ...baseSnapshot.chapter.content![0]!, videos: ["/uploads/clip.mp4"] }],
+      },
+    };
+    const sourcePort: CanvasSourcePort = {
+      read: vi.fn(async () => snapshot),
+      write: vi.fn<CanvasSourcePort["write"]>(() => new Promise(() => undefined)),
+    };
+    const readMedia = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["video-bytes"], { type: "video/mp4" }));
+    const history = stubChapterGenerationHistoryMediaReader(readMedia);
+    const workspace = setup(undefined, false, document, sourcePort, {
+      apiBaseUrl: "https://api.example.test/api",
+      chapterGenerationHistory: history.port,
+    });
+    const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    const createObjectURL = vi.fn(() => "blob:canvas-video-preview");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+
+    try {
+      fireEvent.click(await screen.findByLabelText("视频 1"));
+      expect(await screen.findByLabelText("视频 1生成视频")).toBeTruthy();
+      expect(history.port.beginRun).toHaveBeenCalledOnce();
+      expect(history.captured.context).toMatchObject({
+        actorId: "actor-a",
+        seriesId: "series-a",
+        chapterId: "chapter-a",
+        targetKind: "frame-preview",
+        storyboardAssetId: "board-a",
+        frameIndex: 0,
+        mode: "video",
+      });
+      expect(history.captured.context?.isContextCurrent()).toBe(true);
+      expect(readMedia).toHaveBeenCalledWith("/uploads/clip.mp4", expect.any(AbortSignal));
+      expect(createObjectURL).toHaveBeenCalledWith(expect.any(Blob));
+
+      workspace.unmount();
+      expect(revokeObjectURL).toHaveBeenCalledWith("blob:canvas-video-preview");
+    } finally {
+      if (originalCreateObjectURL === undefined) delete (URL as Partial<typeof URL>).createObjectURL;
+      else Object.defineProperty(URL, "createObjectURL", originalCreateObjectURL);
+      if (originalRevokeObjectURL === undefined) delete (URL as Partial<typeof URL>).revokeObjectURL;
+      else Object.defineProperty(URL, "revokeObjectURL", originalRevokeObjectURL);
+    }
+  });
+
+  it("resolves the video reader mode from a legacy video frame preview URL", async () => {
+    const snapshot = mediaSnapshot("9".repeat(64), "https://media.example.invalid/frame-preview.mp4?token=signature");
+    const sourcePort: CanvasSourcePort = {
+      read: vi.fn(async () => snapshot),
+      write: vi.fn<CanvasSourcePort["write"]>(() => new Promise(() => undefined)),
+    };
+    const readMedia = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["preview-video"], { type: "video/mp4" }));
+    const history = stubChapterGenerationHistoryMediaReader(readMedia);
+    const workspace = setup(undefined, false, document, sourcePort, {
+      apiBaseUrl: "https://api.example.test/api",
+      chapterGenerationHistory: history.port,
+    });
+    const originalCreateObjectURL = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+    const originalRevokeObjectURL = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: vi.fn(() => "blob:legacy-frame-video") });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: vi.fn() });
+
+    try {
+      fireEvent.click(await screen.findByLabelText("分镜 1"));
+      expect(await screen.findByLabelText("分镜预览生成视频")).toBeTruthy();
+      expect(history.captured.context).toMatchObject({ targetKind: "frame-preview", mode: "video" });
+      expect(readMedia).toHaveBeenCalledWith("https://media.example.invalid/frame-preview.mp4?token=signature", expect.any(AbortSignal));
+      workspace.unmount();
+    } finally {
+      if (originalCreateObjectURL === undefined) delete (URL as Partial<typeof URL>).createObjectURL;
+      else Object.defineProperty(URL, "createObjectURL", originalCreateObjectURL);
+      if (originalRevokeObjectURL === undefined) delete (URL as Partial<typeof URL>).revokeObjectURL;
+      else Object.defineProperty(URL, "revokeObjectURL", originalRevokeObjectURL);
+    }
+  });
+
+  it("resolves a referenced secondary storyboard image to its unique owning frame", async () => {
+    const baseSnapshot = mediaSnapshot("b".repeat(64), "/uploads/preview.png");
+    const snapshot: CanvasSourceSnapshot = {
+      ...baseSnapshot,
+      chapter: {
+        ...baseSnapshot.chapter,
+        content: [{ ...baseSnapshot.chapter.content![0]!, storyboard: ["board-a", "board-b"] }],
+      },
+      storyboard_assets: [
+        baseSnapshot.storyboard_assets[0]!,
+        {
+          id: "board-b",
+          series_id: "series-a",
+          chapter_id: "chapter-a",
+          frame_index: 0,
+          name: "次要构图",
+          description: "第二个故事板引用",
+          image_url: "/uploads/secondary-board.png",
+          created_at: "2026-01-01T00:00:00Z",
+          updated_at: "2026-01-01T00:00:00Z",
+        },
+      ],
+    };
+    const sourcePort: CanvasSourcePort = {
+      read: vi.fn(async () => snapshot),
+      write: vi.fn<CanvasSourcePort["write"]>(() => new Promise(() => undefined)),
+    };
+    setup(undefined, false, document, sourcePort);
+
+    fireEvent.click(await screen.findByLabelText("次要构图"));
+    const information = screen.getByRole("region", { name: "选中内容信息" });
+    expect(within(information).getAllByText("分镜 1")).toHaveLength(2);
+    expect(within(information).getByRole("button", { name: "编辑所属镜头" })).toBeEnabled();
+    fireEvent.click(within(information).getByRole("button", { name: "定位" }));
+    expect(screen.getByRole("article", { name: "分镜 1" }).className).toContain("is-selected");
+  });
+
+  it("keeps a dirty canvas draft when selected information offers a guarded source edit", async () => {
+    const workspace = setup();
+    await screen.findByText("门前的来信");
+    fireEvent.click(screen.getByRole("button", { name: "新增便签" }));
+    const noteText = await screen.findByLabelText("便签文字");
+    fireEvent.change(noteText, { target: { value: "保留中的便签草稿" } });
+
+    fireEvent.click(screen.getByLabelText("分镜 1"));
+    let information = screen.getByRole("region", { name: "选中内容信息" });
+    expect(within(information).getByText("门前的来信")).toBeTruthy();
+    expect(within(information).getByRole("button", { name: "编辑分镜文字" })).toBeDisabled();
+    expect(within(information).getAllByText("请先保存画布草稿，再编辑章节来源。")).toHaveLength(2);
+
+    fireEvent.click(within(information).getByRole("button", { name: "定位" }));
+    information = screen.getByRole("region", { name: "选中内容信息" });
+    expect(information.querySelector(".canvas-selected-information-kind")?.textContent).toBe("角色素材");
+    expect(within(information).getByRole("button", { name: "编辑素材" })).toBeDisabled();
+    expect(screen.getByLabelText("便签文字")).toHaveValue("保留中的便签草稿");
+    expect(workspace.services.canvasSource?.write).not.toHaveBeenCalled();
+  });
+
+  it("keeps selected source edits blocked after an unknown canvas save", async () => {
+    const save = vi.fn<CanvasDataPort["save"]>().mockRejectedValue(new CanvasDataError("unknown", "unknown"));
+    const workspace = setup(save);
+    await screen.findByText("门前的来信");
+    fireEvent.click(screen.getByRole("button", { name: "新增便签" }));
+    fireEvent.change(await screen.findByLabelText("便签文字"), { target: { value: "待核对的草稿" } });
+    fireEvent.click(screen.getByLabelText("分镜 1"));
+    fireEvent.click(screen.getByRole("button", { name: "保存布局" }));
+    await screen.findByText(/保存结果暂时无法确认/);
+
+    const information = screen.getByRole("region", { name: "选中内容信息" });
+    expect(within(information).getByRole("button", { name: "编辑分镜文字" })).toBeDisabled();
+    expect(within(information).getAllByText("画布保存结果待核对，草稿已保留；核对前不能切换来源编辑。")).toHaveLength(2);
+    expect((screen.getByLabelText("便签文字") as HTMLTextAreaElement).value).toBe("待核对的草稿");
+    expect(workspace.services.canvasSource?.write).not.toHaveBeenCalled();
+  });
+
+  it("preserves the legacy frame preparation progress weighting", () => {
+    const preparedSnapshot: CanvasSourceSnapshot = {
+      ...sourceSnapshot,
+      characters: [{ ...sourceSnapshot.characters[0]!, image_url: "/uploads/character.png" }],
+      storyboard_assets: [{
+        id: "board-ready", series_id: series.id, chapter_id: chapter.id, frame_index: 0,
+        name: "已准备故事板", description: null, image_url: "/uploads/storyboard.png",
+        created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+      }],
+    };
+    expect(canvasFramePreparationProgress({
+      preview: "/uploads/preview.png",
+      character: ["character-a", "missing-character"],
+      scene: [],
+      prop: [],
+      storyboard: ["board-ready"],
+    }, preparedSnapshot)).toBe(95);
+  });
+
   it.each(["chapter list", "legacy source reads"] as const)(
     "calls the unauthorized handler when initial %s return 401",
     async (source) => {

@@ -30,12 +30,18 @@ import type {
   SceneUpdateInput,
 } from "../../shared/api/assetManagement";
 import type { WorkspaceServices } from "../../shared/api/services";
+import { classifyMediaExportUrl } from "../../shared/api/mediaExportReader";
 import { FrameTextEditor } from "../chapters/FrameTextEditor";
 import type { FrameTextSaveResult } from "../chapters/FrameTextEditor";
 import { FrameStructureEditor, type FrameStructureMode, type FrameStructureSubmitResult } from "../chapters/frame-structure/FrameStructureEditor";
 import type { FrameStructureDraft } from "../chapters/frame-structure/contract";
 import { AssetManagementDialog, type AssetDirectory, type GuardedAssetMutation } from "../assets/management/AssetManagementDialog";
 import { CanvasMediaSourceEditor } from "./CanvasMediaSourceEditor";
+import {
+  CanvasSelectedInformation,
+  type CanvasInformationMediaPreview,
+  type CanvasInformationRelation,
+} from "./CanvasSelectedInformation";
 import { CanvasGenerationResultsDialog, type PendingCanvasGenerationIntent } from "./generation-results/CanvasGenerationResultsDialog";
 import { CanvasImageGenerationDialog } from "./image-generation/CanvasImageGenerationDialog";
 import { collectCanvasImageReferenceCandidates } from "./image-generation/canvasImageReferences";
@@ -90,12 +96,46 @@ type CanvasSourceEditor =
 
 type WithoutLifecycle<T> = T extends { lifecycle: AbortController } ? Omit<T, "lifecycle"> : never;
 
+function framePreparationCategoryPoints(
+  references: unknown,
+  assets: readonly { id: string; series_id: string; chapter_id?: string; image_url: string | null }[],
+  seriesId: string,
+  chapterId: string,
+): number {
+  if (!Array.isArray(references) || references.length === 0) return 10;
+  let readyCount = 0;
+  for (const reference of references) {
+    if (typeof reference !== "string") continue;
+    const matches = assets.filter((asset) => asset.id === reference && asset.series_id === seriesId
+      && (asset.chapter_id === undefined || asset.chapter_id === chapterId));
+    if (matches.length === 1 && Boolean(matches[0]?.image_url)) readyCount += 1;
+  }
+  return (readyCount / references.length) * 10;
+}
+
+export function canvasFramePreparationProgress(frame: unknown, snapshot: CanvasSourceSnapshot): number {
+  const values = isRecord(frame) ? frame : {};
+  return Math.round((values.preview ? 60 : 0)
+    + framePreparationCategoryPoints(values.character, snapshot.characters, snapshot.series_id, snapshot.chapter_id)
+    + framePreparationCategoryPoints(values.scene, snapshot.scenes, snapshot.series_id, snapshot.chapter_id)
+    + framePreparationCategoryPoints(values.prop, snapshot.props, snapshot.series_id, snapshot.chapter_id)
+    + framePreparationCategoryPoints(values.storyboard, snapshot.storyboard_assets, snapshot.series_id, snapshot.chapter_id));
+}
+
 interface UnknownSourceIntent {
   kind: "unknown" | "conflict";
   command: CanvasSourceCommand;
   frozen: CanvasSourceSnapshot;
   frozenVersion: string;
   verifiedSnapshot: CanvasSourceSnapshot | null;
+}
+
+interface CanvasInformationMediaInput {
+  readonly key: string;
+  readonly node: CanvasGraphNode;
+  readonly mediaUrl: string;
+  readonly mode: "image" | "video";
+  readonly assetKind?: CanvasAssetKind;
 }
 
 interface PendingSourceAcknowledgement {
@@ -178,6 +218,11 @@ function frameText(frame: unknown): string {
   const record = frame as Record<string, unknown>;
   return typeof record.text === "string" ? record.text
     : typeof record.original_text === "string" ? record.original_text : "";
+}
+
+function canvasMediaModeForNode(node: CanvasGraphNode): "image" | "video" {
+  return node.kind === "video" || /\.(?:mp4|webm|mov|m4v|m3u8)(?:[?#]|$)/iu.test(node.detail)
+    ? "video" : "image";
 }
 
 function asCanvasSourceError(cause: unknown): CanvasSourceError {
@@ -492,7 +537,9 @@ export function CanvasWorkspace({
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
   const selectedNodeRef = useRef<string | null>(selectedNode);
   selectedNodeRef.current = selectedNode;
+  const selectedNodeAttemptRef = useRef(0);
   function selectCanvasNode(ref: string | null): void {
+    if (selectedNodeRef.current !== ref) selectedNodeAttemptRef.current += 1;
     selectedNodeRef.current = ref;
     setSelectedNode(ref);
   }
@@ -781,6 +828,28 @@ export function CanvasWorkspace({
     if (documentState.document === null) return;
     applyDocument(patchCanvasViewport(documentState.document, next));
   }, [applyDocument, documentState.document]);
+
+  function navigateToCanvasNode(ref: string): void {
+    const matches = referenceGraph.nodes.filter((node) => node.ref === ref);
+    if (matches.length !== 1) {
+      setSourceMessage("关联内容当前无法通过唯一节点身份定位，未按名称或旧位置猜测。");
+      return;
+    }
+    const target = matches[0]!;
+    setFilter("all");
+    setSelectedEdge(null);
+    selectCanvasNode(target.ref);
+
+    const viewportElement = viewportRef.current;
+    if (viewportElement === null || documentState.status === "unknown" || documentState.status === "conflict") return;
+    const bounds = viewportElement.getBoundingClientRect();
+    if (bounds.width <= 0 || bounds.height <= 0) return;
+    changeViewport({
+      ...viewport,
+      x: bounds.width / 2 - (target.x + target.width / 2) * viewport.zoom,
+      y: bounds.height / 2 - (target.y + target.height / 2) * viewport.zoom,
+    });
+  }
 
   function commitNodePosition(node: CanvasGraphNode, x: number, y: number): void {
     if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || documentState.document === null) return;
@@ -1564,22 +1633,495 @@ export function CanvasWorkspace({
           documentState.dirty ? "有未保存更改" :
             documentState.status === "unsupported" ? "只读" : "已保存";
 
-  const selectedSourceNode = graph.nodes.find((node) => node.ref === selectedNode) ?? null;
+  const selectedSourceMatches = selectedNode === null ? [] : graph.nodes.filter((node) => node.ref === selectedNode);
+  const selectedSourceNode = selectedSourceMatches.length === 1 ? selectedSourceMatches[0]! : null;
   const selectedFrameNode = selectedSourceNode?.kind === "frame" ? selectedSourceNode : null;
   const selectedMediaNode = selectedSourceNode?.kind === "preview" || selectedSourceNode?.kind === "video"
     ? selectedSourceNode : null;
   const selectedAssetKind: CanvasAssetKind | null = selectedSourceNode?.kind === "character"
     || selectedSourceNode?.kind === "scene" || selectedSourceNode?.kind === "prop"
     ? selectedSourceNode.kind : null;
-  const selectedAsset = selectedAssetKind !== null && selectedSourceNode?.itemId !== undefined && sources !== null
-    ? assetCollection(sources, selectedAssetKind).find((item) => item.id === selectedSourceNode.itemId) ?? null
-    : null;
+  const selectedAssetMatches = selectedAssetKind !== null && selectedSourceNode?.itemId !== undefined && sources !== null
+    ? assetCollection(sources, selectedAssetKind).filter((item) => item.id === selectedSourceNode.itemId
+      && item.series_id === series.id)
+    : [];
+  const selectedAsset = selectedAssetMatches.length === 1 ? selectedAssetMatches[0]! : null;
   const sourceActionDisabled = services.canvasSource === undefined || sourceWritesBlocked
     || (documentState.dirty && !sourceBindingDraftRef.current) || documentState.status === "saving"
     || documentState.status === "unknown" || documentState.status === "conflict";
+  const sourceEditBlockedReason = services.canvasSource === undefined
+    ? "当前模式未接入章节来源编辑。"
+    : documentState.status === "unknown" || documentState.status === "conflict"
+      ? "画布保存结果待核对，草稿已保留；核对前不能切换来源编辑。"
+      : documentState.dirty && !sourceBindingDraftRef.current
+        ? "请先保存画布草稿，再编辑章节来源。"
+        : sourceActionDisabled ? "章节来源操作尚未完成或当前不可用。" : undefined;
   const selectedFrameTarget = selectedFrameNode?.sourceTarget ?? null;
   const selectedMediaTarget = selectedMediaNode?.sourceTarget ?? null;
   const selectedFrameCount = Array.isArray(sources?.chapter.content) ? sources.chapter.content.length : 0;
+
+  function frameNodeForMediaNode(mediaNode: CanvasGraphNode): CanvasGraphNode | null {
+    const target = mediaNode.sourceTarget;
+    if (sources === null || (mediaNode.kind !== "preview" && mediaNode.kind !== "video")
+      || target === null || target === undefined || mediaNode.frameIndex !== target.index) return null;
+    const currentTarget = resolveCanvasFrameTarget(sources.chapter, sources.storyboard_assets, target.index);
+    if (currentTarget === null || currentTarget.index !== target.index
+      || currentTarget.storyboard_id !== target.storyboard_id) return null;
+    const matches = referenceGraph.nodes.filter((node) => node.kind === "frame"
+      && node.frameIndex === target.index
+      && node.sourceTarget !== null && node.sourceTarget !== undefined
+      && node.sourceTarget.index === target.index
+      && node.sourceTarget.storyboard_id === target.storyboard_id);
+    return matches.length === 1 ? matches[0]! : null;
+  }
+
+  function frameNodeForStoryboardNode(storyboardNode: CanvasGraphNode): CanvasGraphNode | null {
+    if (storyboardNode.kind !== "media" || sources === null || storyboardNode.itemId === undefined
+      || storyboardNode.frameIndex === undefined) return null;
+    const assetMatches = sources.storyboard_assets.filter((asset) => asset.id === storyboardNode.itemId
+      && asset.series_id === series.id && asset.chapter_id === selectedChapter.id);
+    const asset = assetMatches.length === 1 ? assetMatches[0] ?? null : null;
+    if (asset === null || asset.frame_index !== storyboardNode.frameIndex) return null;
+    const currentFrame = sources.chapter.content?.[asset.frame_index];
+    if (!isRecord(currentFrame) || !Array.isArray(currentFrame.storyboard)
+      || !currentFrame.storyboard.includes(asset.id)) return null;
+    const ownerRefs = referenceGraph.edges.filter((edge) => !edge.manual && edge.relation === "reference"
+      && edge.targetRef === storyboardNode.ref).map((edge) => edge.sourceRef);
+    const ownerNodes = [...new Set(ownerRefs)].flatMap((ref) => {
+      const matches = referenceGraph.nodes.filter((node) => node.ref === ref && node.kind === "frame");
+      return matches.length === 1 ? matches : [];
+    }).filter((node) => {
+      const target = node.sourceTarget;
+      if (target === null || target === undefined || node.frameIndex !== asset.frame_index
+        || target.index !== asset.frame_index) return false;
+      const currentTarget = resolveCanvasFrameTarget(sources.chapter, sources.storyboard_assets, target.index);
+      return currentTarget !== null && currentTarget.index === target.index
+        && currentTarget.storyboard_id === target.storyboard_id;
+    });
+    return ownerNodes.length === 1 ? ownerNodes[0]! : null;
+  }
+
+  function editActionForInformationNode(node: CanvasGraphNode): {
+    label: string;
+    onActivate?: () => void;
+    disabledReason?: string;
+  } | null {
+    if (node.kind === "frame") {
+      if (node.sourceTarget === null || node.sourceTarget === undefined || node.frameIndex === undefined) {
+        return { label: "编辑分镜文字", disabledReason: "镜头来源身份未能唯一确认。" };
+      }
+      if (sourceActionDisabled) return {
+        label: "编辑分镜文字",
+        ...(sourceEditBlockedReason === undefined ? {} : { disabledReason: sourceEditBlockedReason }),
+      };
+      return { label: "编辑分镜文字", onActivate: () => openFrameTextEditor(node) };
+    }
+    if (node.kind === "character" || node.kind === "scene" || node.kind === "prop") {
+      const assetKind = node.kind as CanvasAssetKind;
+      const matches = sources !== null && node.itemId !== undefined
+        ? assetCollection(sources, assetKind).filter((item) => item.id === node.itemId && item.series_id === series.id)
+        : [];
+      if (matches.length !== 1) return { label: "编辑素材", disabledReason: "素材身份未能唯一确认。" };
+      if (sourceActionDisabled) return {
+        label: "编辑素材",
+        ...(sourceEditBlockedReason === undefined ? {} : { disabledReason: sourceEditBlockedReason }),
+      };
+      return { label: "编辑素材", onActivate: () => openAssetEditor(assetKind, "edit", matches[0]!) };
+    }
+    if (node.kind === "preview" || node.kind === "video") {
+      if (node.sourceTarget === null || node.sourceTarget === undefined || node.sourceField === undefined) {
+        return { label: "编辑媒体来源", disabledReason: "媒体所属镜头身份未能唯一确认。" };
+      }
+      if (sourceActionDisabled) return {
+        label: "编辑媒体来源",
+        ...(sourceEditBlockedReason === undefined ? {} : { disabledReason: sourceEditBlockedReason }),
+      };
+      return {
+        label: "编辑媒体来源",
+        onActivate: () => openMediaEditor(node.sourceTarget!, node.sourceField!, node.sourceSlot ?? null, false),
+      };
+    }
+    return null;
+  }
+
+  const selectedInformationRelations: CanvasInformationRelation[] = [];
+  const selectedInformationRelatedNodes: CanvasGraphNode[] = [];
+  const seenRelatedRefs = new Set<string>();
+  function addSelectedInformationRelation(node: CanvasGraphNode, relationship: string): void {
+    if (seenRelatedRefs.has(node.ref)) return;
+    seenRelatedRefs.add(node.ref);
+    selectedInformationRelatedNodes.push(node);
+    const editAction = editActionForInformationNode(node);
+    selectedInformationRelations.push({
+      key: node.ref,
+      relationship,
+      label: node.title,
+      onLocate: () => navigateToCanvasNode(node.ref),
+      ...(editAction === null ? {} : {
+        editLabel: editAction.label,
+        ...(editAction.onActivate === undefined ? {} : { onEdit: editAction.onActivate }),
+        ...(editAction.disabledReason === undefined ? {} : { editDisabledReason: editAction.disabledReason }),
+      }),
+    });
+  }
+  if (selectedSourceNode !== null) {
+    const relatedEdges = referenceGraph.edges.filter((edge) => !edge.manual
+      && (edge.sourceRef === selectedSourceNode.ref || edge.targetRef === selectedSourceNode.ref));
+    for (const edge of relatedEdges) {
+      const relatedRef = edge.sourceRef === selectedSourceNode.ref ? edge.targetRef : edge.sourceRef;
+      if (seenRelatedRefs.has(relatedRef)) continue;
+      const matches = referenceGraph.nodes.filter((node) => node.ref === relatedRef);
+      if (matches.length !== 1) {
+        seenRelatedRefs.add(relatedRef);
+        selectedInformationRelations.push({
+          key: edge.id,
+          relationship: "关联内容",
+          label: "无法确认唯一节点",
+          locateDisabledReason: "未按名称或旧位置猜测。",
+        });
+        continue;
+      }
+      const relatedNode = matches[0]!;
+      const relationship = selectedSourceNode.kind === "frame"
+        ? relatedNode.kind === "character" || relatedNode.kind === "scene" || relatedNode.kind === "prop"
+          ? "引用素材" : "关联媒体"
+        : relatedNode.kind === "frame"
+          ? selectedSourceNode.kind === "character" || selectedSourceNode.kind === "scene" || selectedSourceNode.kind === "prop"
+            ? "关联镜头" : "所属镜头"
+          : "关联内容";
+      addSelectedInformationRelation(relatedNode, relationship);
+    }
+    if (selectedSourceNode.kind === "frame") {
+      for (const mediaNode of referenceGraph.nodes.filter((node) => node.kind === "video")) {
+        if (frameNodeForMediaNode(mediaNode)?.ref === selectedSourceNode.ref) {
+          addSelectedInformationRelation(mediaNode, "关联媒体");
+        }
+      }
+    } else if (selectedSourceNode.kind === "video") {
+      const ownerFrame = frameNodeForMediaNode(selectedSourceNode);
+      if (ownerFrame !== null) addSelectedInformationRelation(ownerFrame, "所属镜头");
+    }
+  }
+
+  const selectedFrameValue = selectedFrameNode !== null && sources !== null && selectedFrameNode.frameIndex !== undefined
+    ? sources.chapter.content?.[selectedFrameNode.frameIndex] : undefined;
+  const selectedFrameRecord = isRecord(selectedFrameValue) ? selectedFrameValue : null;
+  const selectedFrameText = selectedFrameRecord === null ? null
+    : typeof selectedFrameRecord.text === "string" ? selectedFrameRecord.text
+      : typeof selectedFrameRecord.original_text === "string" ? selectedFrameRecord.original_text : "";
+  const selectedStoryboardMatches = selectedSourceNode?.kind === "media" && selectedSourceNode.itemId !== undefined && sources !== null
+    ? sources.storyboard_assets.filter((asset) => asset.id === selectedSourceNode.itemId
+      && asset.series_id === series.id && asset.chapter_id === selectedChapter.id)
+    : [];
+  const selectedStoryboard = selectedStoryboardMatches.length === 1 ? selectedStoryboardMatches[0]! : null;
+  const selectedOwnerFrame = selectedSourceNode?.kind === "preview" || selectedSourceNode?.kind === "video"
+    ? frameNodeForMediaNode(selectedSourceNode)
+    : selectedSourceNode?.kind === "media" ? frameNodeForStoryboardNode(selectedSourceNode) : null;
+
+  function referencedAssetCount(kind: "character" | "scene" | "prop"): number {
+    return new Set(referenceGraph.edges.filter((edge) => edge.relation === "uses")
+      .map((edge) => edge.sourceRef)
+      .filter((ref) => referenceGraph.nodes.some((node) => node.ref === ref && node.kind === kind))).size;
+  }
+
+  function selectedInformationFields(): Array<{ label: string; value: string }> {
+    if (selectedSourceNode === null) {
+      if (selectedNode !== null || sources === null) return [];
+      return [
+        { label: "镜头", value: `${selectedFrameCount} 个` },
+        { label: "角色", value: `${referencedAssetCount("character")} 个` },
+        { label: "场景", value: `${referencedAssetCount("scene")} 个` },
+        { label: "道具", value: `${referencedAssetCount("prop")} 个` },
+      ];
+    }
+
+    switch (selectedSourceNode.kind) {
+      case "frame":
+        return [{ label: "所属章节", value: sources?.chapter.title ?? selectedChapter.title }];
+      case "character":
+      case "scene":
+      case "prop":
+        return [{ label: "所属剧集", value: series.name }];
+      case "media":
+      case "preview":
+      case "video":
+        return [
+          { label: "所属章节", value: sources?.chapter.title ?? selectedChapter.title },
+          { label: "所属镜头", value: selectedOwnerFrame?.title ?? "无法确认唯一镜头" },
+        ];
+      case "note":
+      case "card":
+        return [{ label: "所属画布", value: `${series.name} · ${sources?.chapter.title ?? selectedChapter.title}` }];
+    }
+  }
+
+  function selectedInformationKind(): string {
+    if (selectedSourceNode === null) return selectedNode !== null ? "身份无法确认" : "章节概览";
+    switch (selectedSourceNode.kind) {
+      case "frame": return "镜头";
+      case "character": return "角色素材";
+      case "scene": return "场景素材";
+      case "prop": return "道具素材";
+      case "media": return "故事板图片";
+      case "preview": return "镜头预览";
+      case "video": return "视频";
+      case "note": return "便签";
+      case "card": return "文本卡片";
+    }
+  }
+
+  const selectedInfoFields = selectedInformationFields();
+  const selectedInfoKindLabel = selectedInformationKind();
+  const selectedInfoTitle = selectedSourceNode?.title ?? (selectedNode !== null
+    ? "所选内容已变化或身份不唯一" : sources?.chapter.title ?? selectedChapter.title);
+  const selectedInfoDescription = selectedAsset !== null ? selectedAsset.description
+    : selectedAssetKind !== null ? "当前素材身份无法唯一确认。"
+      : selectedStoryboard !== null ? selectedStoryboard.description
+        : selectedSourceNode?.kind === "media" ? "当前故事板身份无法唯一确认。"
+          : selectedNode !== null && selectedSourceNode === null ? "所选节点身份当前无法唯一确认。" : undefined;
+  const selectedInfoFullText = selectedSourceNode?.kind === "frame" ? selectedFrameText
+    : selectedSourceNode?.kind === "note" || selectedSourceNode?.kind === "card" ? selectedSourceNode.detail : undefined;
+  const selectedInfoProgress = selectedFrameRecord !== null && sources !== null
+    ? canvasFramePreparationProgress(selectedFrameRecord, sources) : null;
+  const selectedInformationMediaInputs: CanvasInformationMediaInput[] = [];
+  if (selectedSourceNode?.kind === "frame") {
+    for (const node of selectedInformationRelatedNodes) {
+      if (node.kind === "preview" || node.kind === "video") {
+        if (node.detail !== "") selectedInformationMediaInputs.push({
+          key: node.ref,
+          node,
+          mediaUrl: node.detail,
+          mode: canvasMediaModeForNode(node),
+        });
+      } else if (node.kind === "media" && node.itemId !== undefined && sources !== null) {
+        const matches = sources.storyboard_assets.filter((asset) => asset.id === node.itemId
+          && asset.series_id === series.id && asset.chapter_id === selectedChapter.id);
+        if (matches.length === 1 && matches[0]?.image_url) selectedInformationMediaInputs.push({
+          key: node.ref,
+          node,
+          mediaUrl: matches[0].image_url,
+          mode: "image",
+        });
+      }
+    }
+  } else if ((selectedSourceNode?.kind === "preview" || selectedSourceNode?.kind === "video")
+    && selectedSourceNode.detail !== "") {
+    selectedInformationMediaInputs.push({
+      key: selectedSourceNode.ref,
+      node: selectedSourceNode,
+      mediaUrl: selectedSourceNode.detail,
+      mode: canvasMediaModeForNode(selectedSourceNode),
+    });
+  } else if (selectedSourceNode?.kind === "media" && selectedStoryboard?.image_url) {
+    selectedInformationMediaInputs.push({
+      key: selectedSourceNode.ref,
+      node: selectedSourceNode,
+      mediaUrl: selectedStoryboard.image_url,
+      mode: "image",
+    });
+  } else if (selectedAssetKind !== null && selectedSourceNode !== null && selectedAsset?.image_url) {
+    selectedInformationMediaInputs.push({
+      key: selectedSourceNode.ref,
+      node: selectedSourceNode,
+      mediaUrl: selectedAsset.image_url,
+      mode: "image",
+      assetKind: selectedAssetKind,
+    });
+  }
+  function primaryInformationAction(node: CanvasGraphNode, label?: string) {
+    const editAction = editActionForInformationNode(node);
+    if (editAction === null) return undefined;
+    return {
+      label: label ?? editAction.label,
+      ...(editAction.onActivate === undefined ? {} : { onActivate: editAction.onActivate }),
+      ...(editAction.disabledReason === undefined ? {} : { disabledReason: editAction.disabledReason }),
+    };
+  }
+
+  function selectedInformationPrimaryAction() {
+    if (selectedSourceNode === null) return undefined;
+    if (selectedSourceNode.kind === "media") {
+      return selectedOwnerFrame === null ? undefined : primaryInformationAction(selectedOwnerFrame, "编辑所属镜头");
+    }
+    return primaryInformationAction(selectedSourceNode);
+  }
+
+  const selectedPrimaryAction = selectedInformationPrimaryAction();
+  const selectedInfoDeleteAction = selectedSourceNode?.itemCollection !== undefined
+    ? {
+      label: selectedSourceNode.kind === "note" ? "删除便签" : "删除文本卡片",
+      ...(sourceOutcomeUnresolved ? { disabledReason: "当前写入待核对，删除操作已停用。" }
+        : !documentState.writable ? { disabledReason: "当前画布只读。" } : {}),
+      onDelete: removeSelected,
+    }
+    : undefined;
+
+  function createInformationMediaPreview(input: CanvasInformationMediaInput): CanvasInformationMediaPreview {
+    const ownerRef = selectedNodeRef.current;
+    const ownerAttempt = selectedNodeAttemptRef.current;
+    const sourceEpoch = scopeEpochRef.current;
+    const sourceVersion = sources?.version ?? null;
+    const capturedScopeKey = scopeKey;
+    const capturedServiceIdentity = serviceIdentity;
+    const key = [
+      capturedScopeKey,
+      sourceVersion ?? "",
+      ownerRef ?? "",
+      ownerAttempt,
+      input.key,
+      input.mode,
+      input.mediaUrl,
+    ].join("\u0000");
+
+    function isMediaOwnerCurrent(): boolean {
+      if (ownerRef === null || selectedNodeRef.current !== ownerRef
+        || selectedNodeAttemptRef.current !== ownerAttempt
+        || scopeEpochRef.current !== sourceEpoch
+        || generationWorkspaceIdentityRef.current.scopeKey !== capturedScopeKey
+        || generationWorkspaceIdentityRef.current.serviceIdentity !== capturedServiceIdentity
+        || sourcesRef.current?.version !== sourceVersion) return false;
+
+      const currentSnapshot = sourcesRef.current;
+      if (currentSnapshot === null) return false;
+      if (input.assetKind !== undefined) {
+        const matches = assetCollection(currentSnapshot, input.assetKind)
+          .filter((asset) => asset.id === input.node.itemId && asset.series_id === series.id);
+        return matches.length === 1 && matches[0]?.image_url === input.mediaUrl;
+      }
+      if (input.node.kind === "media") {
+        const matches = currentSnapshot.storyboard_assets.filter((asset) => asset.id === input.node.itemId
+          && asset.series_id === series.id && asset.chapter_id === selectedChapter.id);
+        return matches.length === 1 && matches[0]?.image_url === input.mediaUrl
+          && matches[0]?.frame_index === input.node.frameIndex;
+      }
+      const target = input.node.sourceTarget;
+      if ((input.node.kind !== "preview" && input.node.kind !== "video")
+        || target === null || target === undefined || input.node.frameIndex !== target.index) return false;
+      const currentTarget = resolveCanvasFrameTarget(currentSnapshot.chapter, currentSnapshot.storyboard_assets, target.index);
+      if (currentTarget === null || currentTarget.index !== target.index
+        || currentTarget.storyboard_id !== target.storyboard_id) return false;
+      const frame = currentSnapshot.chapter.content?.[target.index];
+      if (!isRecord(frame)) return false;
+      if (input.node.kind === "preview") return frame.preview === input.mediaUrl;
+      const slot = input.node.sourceSlot;
+      return typeof slot === "number" && Array.isArray(frame.videos) && frame.videos[slot] === input.mediaUrl;
+    }
+
+    if (services.apiBaseUrl === null) {
+      return {
+        key,
+        assetName: input.node.title,
+        mediaUrl: input.mediaUrl,
+        mode: input.mode,
+        unsafeMedia: false,
+        unavailableReason: "当前模式未接入安全媒体预览。",
+      };
+    }
+
+    try {
+      const route = classifyMediaExportUrl(input.mediaUrl, services.apiBaseUrl);
+      if (route.kind === "anonymous-public" && new URL(route.url).protocol !== "https:") {
+        return { key, assetName: input.node.title, mediaUrl: input.mediaUrl, mode: input.mode, unsafeMedia: true };
+      }
+    } catch {
+      return { key, assetName: input.node.title, mediaUrl: input.mediaUrl, mode: input.mode, unsafeMedia: true };
+    }
+
+    let readMedia: CanvasInformationMediaPreview["readMedia"];
+    let runIsCurrent: (() => boolean) | undefined;
+    try {
+      if (input.assetKind !== undefined) {
+        const port = services.assetGenerationHistory;
+        const assetId = input.node.itemId;
+        if (port === undefined || assetId === undefined) {
+          return {
+            key, assetName: input.node.title, mediaUrl: input.mediaUrl, mode: input.mode, unsafeMedia: false,
+            unavailableReason: "当前模式未接入素材媒体读取服务。",
+          };
+        }
+        const run = port.beginRun({
+          actorId: userId,
+          seriesId: series.id,
+          chapterId: selectedChapter.id,
+          assetType: input.assetKind,
+          assetId,
+          mode: "image",
+          isContextCurrent: isMediaOwnerCurrent,
+        });
+        readMedia = (url, signal) => run.readMedia(url, signal);
+        runIsCurrent = () => isMediaOwnerCurrent() && run.isCurrent();
+      } else {
+        const port = services.chapterGenerationHistory;
+        if (port === undefined) {
+          return {
+            key, assetName: input.node.title, mediaUrl: input.mediaUrl, mode: input.mode, unsafeMedia: false,
+            unavailableReason: "当前模式未接入章节媒体读取服务。",
+          };
+        }
+        if (input.node.kind === "media") {
+          if (input.node.itemId === undefined || input.node.frameIndex === undefined) {
+            return {
+              key, assetName: input.node.title, mediaUrl: input.mediaUrl, mode: input.mode, unsafeMedia: false,
+              unavailableReason: "故事板图片身份未能唯一确认，未读取媒体。",
+            };
+          }
+          const run = port.beginRun({
+            actorId: userId,
+            seriesId: series.id,
+            chapterId: selectedChapter.id,
+            targetKind: "storyboard-image",
+            storyboardAssetId: input.node.itemId,
+            frameIndex: input.node.frameIndex,
+            mode: "image",
+            isContextCurrent: isMediaOwnerCurrent,
+          });
+          readMedia = (url, signal) => run.readMedia(url, signal);
+          runIsCurrent = () => isMediaOwnerCurrent() && run.isCurrent();
+        } else {
+          const target = input.node.sourceTarget;
+          if ((input.node.kind !== "preview" && input.node.kind !== "video")
+            || target === null || target === undefined || input.node.frameIndex !== target.index) {
+            return {
+              key, assetName: input.node.title, mediaUrl: input.mediaUrl, mode: input.mode, unsafeMedia: false,
+              unavailableReason: "媒体所属镜头身份未能唯一确认，未读取媒体。",
+            };
+          }
+          const run = port.beginRun({
+            actorId: userId,
+            seriesId: series.id,
+            chapterId: selectedChapter.id,
+            targetKind: "frame-preview",
+            storyboardAssetId: target.storyboard_id,
+            frameIndex: target.index,
+            mode: input.mode,
+            isContextCurrent: isMediaOwnerCurrent,
+          });
+          readMedia = (url, signal) => run.readMedia(url, signal);
+          runIsCurrent = () => isMediaOwnerCurrent() && run.isCurrent();
+        }
+      }
+    } catch {
+      return {
+        key, assetName: input.node.title, mediaUrl: input.mediaUrl, mode: input.mode, unsafeMedia: false,
+        unavailableReason: "当前登录或媒体来源范围无法确认，未读取媒体。",
+      };
+    }
+
+    return {
+      key,
+      assetName: input.node.title,
+      mediaUrl: input.mediaUrl,
+      mode: input.mode,
+      unsafeMedia: false,
+      isCurrent: runIsCurrent,
+      onUnauthorized: () => {
+        if (runIsCurrent?.()) unauthorizedRef.current();
+      },
+      readMedia,
+    };
+  }
+
+  const selectedInformationMediaPreviews = selectedInformationMediaInputs.map(createInformationMediaPreview);
   const selectedGenerationTarget = sources !== null && selectedSourceNode !== null
     ? generationTargetForNode(sources, selectedSourceNode)
     : null;
@@ -2694,6 +3236,24 @@ export function CanvasWorkspace({
             ))}
           </div>
         </div>
+
+        {sources !== null && !sourceLoading && sourceError === null && (
+          <CanvasSelectedInformation
+            {...(selectedInfoDescription === undefined
+              && selectedSourceNode === null && selectedNode === null
+              ? { description: "当前章节镜头数量及已引用的角色、场景和道具素材数量。" }
+              : selectedInfoDescription === undefined ? {} : { description: selectedInfoDescription })}
+            {...(selectedInfoDeleteAction === undefined ? {} : { deleteAction: selectedInfoDeleteAction })}
+            fields={selectedInfoFields}
+            {...(selectedInfoFullText === undefined ? {} : { fullText: selectedInfoFullText })}
+            kindLabel={selectedInfoKindLabel}
+            mediaPreviews={selectedInformationMediaPreviews}
+            preparationProgress={selectedInfoProgress}
+            {...(selectedPrimaryAction === undefined ? {} : { primaryAction: selectedPrimaryAction })}
+            relations={selectedInformationRelations}
+            title={selectedInfoTitle}
+          />
+        )}
 
         {sourceError !== null && <p className="canvas-error" role="alert">{sourceError}</p>}
         {sourceError !== null && services.canvasSource !== undefined && (
