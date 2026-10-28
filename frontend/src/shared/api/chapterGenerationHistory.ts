@@ -84,6 +84,9 @@ export interface ChapterGenerationHistoryRun {
   isCurrent(): boolean;
   readSnapshot(signal: AbortSignal): Promise<ChapterGenerationHistorySnapshot>;
   adopt(input: ChapterGenerationHistoryAdoptInput, signal: AbortSignal): Promise<ChapterGenerationHistoryAdoptResult>;
+  retryOssUpload(message: ChapterGenerationHistoryMessage, signal: AbortSignal): Promise<string>;
+  updateMessageContent(message: ChapterGenerationHistoryMessage, content: string, signal: AbortSignal): Promise<void>;
+  deleteMessage(message: ChapterGenerationHistoryMessage, signal: AbortSignal): Promise<void>;
   readMedia(url: string, signal: AbortSignal): Promise<Blob>;
 }
 

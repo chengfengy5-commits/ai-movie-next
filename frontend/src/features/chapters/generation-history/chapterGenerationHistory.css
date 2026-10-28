@@ -122,6 +122,10 @@
   color: var(--success, #1c7651);
 }
 
+.chapter-generation-history-notice.progress {
+  color: var(--text-muted, #647184);
+}
+
 .chapter-generation-history-body {
   display: grid;
   gap: 12px;
@@ -223,6 +227,22 @@
   margin-bottom: 18px;
   border-color: var(--border-color, #d8dee8);
   color: var(--text-primary, #18212d);
+}
+
+.chapter-generation-history-delete-confirmation {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--danger, #a72d37);
+  border-radius: 10px;
+  background: var(--surface-muted, #f3f5f8);
+  color: var(--text-primary, #18212d);
+}
+
+.chapter-generation-history-delete-confirmation p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
 }
 
 @media (max-width: 640px) {

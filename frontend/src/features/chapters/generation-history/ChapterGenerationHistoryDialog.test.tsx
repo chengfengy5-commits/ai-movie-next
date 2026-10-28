@@ -39,6 +39,7 @@ function createProps(overrides: Partial<ComponentProps<typeof ChapterGenerationH
     writable: true,
     readOnlyReason: null,
     confirmation: null,
+    deleteConfirmationMessageId: null,
     busy: false,
     notice: null,
     previewAssetName: "镜头 3",
@@ -50,6 +51,11 @@ function createProps(overrides: Partial<ComponentProps<typeof ChapterGenerationH
     onModeChange: vi.fn(),
     onPageChange: vi.fn(),
     onPrepareAdoption: vi.fn(),
+    onDownload: vi.fn(),
+    onTransfer: vi.fn(),
+    onPrepareDelete: vi.fn(),
+    onCancelDelete: vi.fn(),
+    onConfirmDelete: vi.fn(),
     onCancelConfirmation: vi.fn(),
     onConfirmAdoption: vi.fn(),
     onVerifyUnknown: vi.fn(),
@@ -96,6 +102,22 @@ describe("ChapterGenerationHistoryDialog", () => {
     fireEvent.click(screen.getByRole("button", { name: "确认替换镜头预览" }));
     expect(confirmationProps.onConfirmAdoption).toHaveBeenCalledTimes(1);
     expect(screen.getByText("确认将此历史结果写入当前镜头预览？")).toBeTruthy();
+  });
+
+  it("requires explicit confirmation before deleting a history message", () => {
+    const props = createProps();
+    render(<ChapterGenerationHistoryDialog {...props} />);
+
+    fireEvent.click(screen.getByRole("button", { name: "删除记录" }));
+    expect(props.onPrepareDelete).toHaveBeenCalledWith(message);
+    expect(screen.queryByRole("button", { name: "确认删除历史消息" })).toBeNull();
+
+    const confirmationProps = createProps({ deleteConfirmationMessageId: message.id });
+    cleanup();
+    render(<ChapterGenerationHistoryDialog {...confirmationProps} />);
+    expect(screen.getByText("确认删除这条历史消息？只删除该条记录，不会修改章节或素材中的媒体字段。")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "确认删除历史消息" }));
+    expect(confirmationProps.onConfirmDelete).toHaveBeenCalledTimes(1);
   });
 
   it("keeps ambiguous targets browse-only and offers read-only verification for unknown writes", () => {
