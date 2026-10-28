@@ -32,6 +32,8 @@ class ServerConfiguration:
     r2_secret_key: SecretValue | None
     frame_optimize_enabled: bool = False
     frame_optimize_credentials_file: Path | None = field(default=None, repr=False)
+    frame_review_enabled: bool = False
+    frame_review_credentials_file: Path | None = field(default=None, repr=False)
     user_task_max_concurrency: int = 0
     image_single_enabled: bool = False
     image_single_credentials_file: Path | None = field(default=None, repr=False)
@@ -48,6 +50,19 @@ class ServerConfiguration:
     def __post_init__(self) -> None:
         if type(self.user_task_max_concurrency) is not int:
             raise ServerConfigurationError("AI_USER_MAX_CONCURRENT must be an integer")
+        if type(self.frame_review_enabled) is not bool:
+            raise ServerConfigurationError("FRAME_REVIEW_ENABLED must be explicit")
+        if self.frame_review_credentials_file is not None and (
+            not isinstance(self.frame_review_credentials_file, Path)
+            or not self.frame_review_credentials_file.is_absolute()
+        ):
+            raise ServerConfigurationError(
+                "FRAME_REVIEW_CREDENTIALS_FILE must be an absolute path"
+            )
+        if self.frame_review_enabled and self.frame_review_credentials_file is None:
+            raise ServerConfigurationError(
+                "FRAME_REVIEW_CREDENTIALS_FILE is required when frame.review is enabled"
+            )
         if type(self.image_single_enabled) is not bool:
             raise ServerConfigurationError("IMAGE_SINGLE_ENABLED must be explicit")
         if type(self.image_batch_enabled) is not bool:
@@ -226,10 +241,18 @@ def load_server_configuration(
     frame_optimize_credentials_file = _optional_absolute_path(
         values, "FRAME_OPTIMIZE_CREDENTIALS_FILE"
     )
+    frame_review_enabled = _boolean(values, "FRAME_REVIEW_ENABLED", default=False)
+    frame_review_credentials_file = _optional_absolute_path(
+        values, "FRAME_REVIEW_CREDENTIALS_FILE"
+    )
     user_task_max_concurrency = _user_task_concurrency_limit(values)
     if frame_optimize_enabled and frame_optimize_credentials_file is None:
         raise ServerConfigurationError(
             "FRAME_OPTIMIZE_CREDENTIALS_FILE is required when frame.optimize is enabled"
+        )
+    if frame_review_enabled and frame_review_credentials_file is None:
+        raise ServerConfigurationError(
+            "FRAME_REVIEW_CREDENTIALS_FILE is required when frame.review is enabled"
         )
     image_single_enabled = _boolean(
         values,
@@ -339,6 +362,8 @@ def load_server_configuration(
             r2_secret_key=None,
             frame_optimize_enabled=frame_optimize_enabled,
             frame_optimize_credentials_file=frame_optimize_credentials_file,
+            frame_review_enabled=frame_review_enabled,
+            frame_review_credentials_file=frame_review_credentials_file,
             user_task_max_concurrency=user_task_max_concurrency,
             image_single_enabled=image_single_enabled,
             image_single_credentials_file=image_single_credentials_file,
@@ -400,6 +425,8 @@ def load_server_configuration(
         r2_secret_key=SecretValue(values["OBJECT_STORAGE_SECRET_ACCESS_KEY"]),
         frame_optimize_enabled=frame_optimize_enabled,
         frame_optimize_credentials_file=frame_optimize_credentials_file,
+        frame_review_enabled=frame_review_enabled,
+        frame_review_credentials_file=frame_review_credentials_file,
         user_task_max_concurrency=user_task_max_concurrency,
         image_single_enabled=image_single_enabled,
         image_single_credentials_file=image_single_credentials_file,

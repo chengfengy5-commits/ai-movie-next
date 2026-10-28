@@ -57,6 +57,10 @@ from haoai_backend.generation_runtime.worker_capacity import WorkerCapacityBoots
 from .browser_cors import ServerBrowserCorsApp
 from .configuration import ServerConfiguration, ServerConfigurationError
 from .fused_generation import FusedGenerationHostConfiguration
+from .frame_review import (
+    build_frame_review_host_configuration,
+    include_frame_review_router,
+)
 from .generation import (
     _database_clock,
     _uuid_id,
@@ -212,6 +216,10 @@ def create_server_host(
             configuration,
             session_factory=session_factory,
         )
+        frame_review_configuration = build_frame_review_host_configuration(
+            configuration,
+            session_factory=session_factory,
+        )
         authentication_runtime = _ServerAuthenticationRuntime(
             session_factory=session_factory,
             secret_key=configuration.secret_key.value,
@@ -314,16 +322,31 @@ def create_server_host(
             )
 
         chat_text_generation_configuration = None
-        if configuration.text_chat_enabled:
+        if configuration.text_chat_enabled or frame_review_configuration.enabled:
             from haoai_backend.chat_text_generation.openai_runtime import (
                 OpenAICompatibleChatTextRuntime,
             )
 
             chat_text_generation_configuration = ChatTextGenerationConfiguration(
-                runtime=OpenAICompatibleChatTextRuntime(),
+                runtime=(
+                    OpenAICompatibleChatTextRuntime()
+                    if configuration.text_chat_enabled
+                    else None
+                ),
                 max_user_concurrency=configuration.user_task_max_concurrency,
-                server_id_factory=_uuid_id,
-                clock=_database_clock(session_factory),
+                server_id_factory=(
+                    frame_review_configuration.id_factory
+                    if frame_review_configuration.enabled
+                    else _uuid_id
+                ),
+                clock=(
+                    frame_review_configuration.clock
+                    if frame_review_configuration.enabled
+                    else _database_clock(session_factory)
+                ),
+                frame_review_admission=(
+                    frame_review_configuration.admission_configuration
+                ),
             )
 
         worker_capacity_bootstrap = None
@@ -343,6 +366,7 @@ def create_server_host(
                 frame_optimize_configuration is not None
                 and frame_optimize_configuration.enabled
             )
+            or frame_review_configuration.worker_configuration is not None
         )
         if worker_capacity_enabled:
             worker_capacity_bootstrap = WorkerCapacityBootstrap(
@@ -418,6 +442,9 @@ def create_server_host(
                 else None
             ),
             frame_optimize_worker_configuration=frame_optimize_configuration,
+            frame_review_worker_configuration=(
+                frame_review_configuration.worker_configuration
+            ),
             storyboard_asset_generation_runtime=storyboard_asset_generation_runtime,
             chat_media_admission_configuration=(
                 image_generation_configuration.admission_configuration
@@ -442,12 +469,20 @@ def create_server_host(
             ),
             worker_capacity_bootstrap=worker_capacity_bootstrap,
         )
+        include_frame_review_router(
+            app,
+            session_factory=session_factory,
+            authentication_runtime=authentication_runtime,
+            configuration=frame_review_configuration,
+            max_user_concurrency=configuration.user_task_max_concurrency,
+        )
         app.state.server_session_factory = session_factory
         app.state.server_resources = resources
         app.state.server_engine = engine
         app.state.server_frame_optimize_worker_configuration = (
             frame_optimize_configuration
         )
+        app.state.server_frame_review_configuration = frame_review_configuration
         app.state.server_image_generation_configuration = (
             image_generation_configuration
         )
