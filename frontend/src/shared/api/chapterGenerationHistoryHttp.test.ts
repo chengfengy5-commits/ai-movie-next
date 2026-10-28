@@ -74,7 +74,11 @@ function createProof(mediaUrl: string | null = null) {
   return { mapping_digest: mappingDigest, target_digest: targetDigest, media_url: mediaUrl };
 }
 
-function createSnapshot(context: ChapterGenerationHistoryContext, mediaUrl: string | null = null) {
+function createSnapshot(
+  context: ChapterGenerationHistoryContext,
+  mediaUrl: string | null = null,
+  messages = [createMessage(context)],
+) {
   return {
     protocol_version: 1,
     series_id: seriesId,
@@ -86,7 +90,7 @@ function createSnapshot(context: ChapterGenerationHistoryContext, mediaUrl: stri
     writable: true,
     read_only_reason: null,
     target_proof: createProof(mediaUrl),
-    messages: [createMessage(context)],
+    messages,
   };
 }
 
@@ -106,6 +110,91 @@ function createPort(fetcher: typeof fetch, storage = createStorage()) {
 }
 
 describe("createChapterGenerationHistoryHttpPort", () => {
+  it.each([
+    ["frame-preview", "/chat-messages/"],
+    ["storyboard-image", "/asset-chat-messages/"],
+  ] as const)("transfers, updates, and deletes through the %s message routes", async (targetKind, updatePath) => {
+    const context = createContext(targetKind);
+    const original = createMessage(context);
+    const transferredUrl = "https://storage.example.test/owned/history-result.png?signature=retained";
+    const { message_digest: _messageDigest, ...messageResponse } = original;
+    const updated = { ...messageResponse, created_at: "2026-10-28T10:00:00", content: transferredUrl };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(createSnapshot(context, null, [original])))
+      .mockResolvedValueOnce(response({ url: transferredUrl }))
+      .mockResolvedValueOnce(response(updated))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const run = createPort(fetcher).beginRun(context);
+    const signal = new AbortController().signal;
+
+    await run.readSnapshot(signal);
+    await expect(run.retryOssUpload(original, signal)).resolves.toBe(transferredUrl);
+    await expect(run.updateMessageContent(original, transferredUrl, signal)).resolves.toBeUndefined();
+    await expect(run.deleteMessage(original, signal)).resolves.toBeUndefined();
+
+    const transferRequest = fetcher.mock.calls[1]!;
+    expect(new URL(String(transferRequest[0])).pathname).toBe("/api/upload/retry-oss");
+    expect(JSON.parse(String(transferRequest[1]?.body))).toEqual({ url: original.content });
+    const updateRequest = fetcher.mock.calls[2]!;
+    expect(new URL(String(updateRequest[0])).pathname).toContain(updatePath);
+    expect(updateRequest[1]?.method).toBe("PUT");
+    expect(JSON.parse(String(updateRequest[1]?.body))).toEqual({ content: transferredUrl });
+    const deleteRequest = fetcher.mock.calls[3]!;
+    expect(new URL(String(deleteRequest[0])).pathname).toContain(`${updatePath}single/`);
+    expect(deleteRequest[1]?.method).toBe("DELETE");
+    expect(deleteRequest[1]?.body).toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(4);
+  });
+
+  it("accepts the real digest-free naive-UTC PUT response when its UTC instant matches the history GET", async () => {
+    const context = createContext();
+    const original = createMessage(context);
+    const transferredUrl = "https://storage.example.test/owned/history-result.png?signature=retained";
+    const { message_digest: _messageDigest, ...messageResponse } = original;
+    const updated = { ...messageResponse, created_at: "2026-10-28T10:00:00", content: transferredUrl };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(createSnapshot(context, null, [original])))
+      .mockResolvedValueOnce(response(updated));
+    const run = createPort(fetcher).beginRun(context);
+    const signal = new AbortController().signal;
+    await run.readSnapshot(signal);
+
+    await expect(run.updateMessageContent(original, transferredUrl, signal)).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("treats a mismatched PUT response without a digest as unknown", async () => {
+    const context = createContext();
+    const original = createMessage(context);
+    const transferredUrl = "https://storage.example.test/owned/history-result.png?signature=retained";
+    const { message_digest: _messageDigest, ...messageResponse } = original;
+    const mismatched = { ...messageResponse, id: "different-message", content: transferredUrl };
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(createSnapshot(context, null, [original])))
+      .mockResolvedValueOnce(response(mismatched));
+    const run = createPort(fetcher).beginRun(context);
+    const signal = new AbortController().signal;
+    await run.readSnapshot(signal);
+
+    await expect(run.updateMessageContent(original, transferredUrl, signal))
+      .rejects.toMatchObject({ kind: "unknown" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not retry an unknown OSS transfer response", async () => {
+    const context = createContext();
+    const message = createMessage(context);
+    const fetcher = vi.fn<typeof fetch>()
+      .mockResolvedValueOnce(response(createSnapshot(context, null, [message])))
+      .mockResolvedValueOnce(response({ detail: "temporary_failure" }, 503));
+    const run = createPort(fetcher).beginRun(context);
+    const signal = new AbortController().signal;
+    await run.readSnapshot(signal);
+
+    await expect(run.retryOssUpload(message, signal)).rejects.toMatchObject({ kind: "unknown", status: 503 });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     ["frame-preview", "image"],
     ["frame-preview", "video"],

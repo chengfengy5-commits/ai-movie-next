@@ -20,6 +20,7 @@ import { API_TOKEN_KEY, API_USER_KEY, browserStorage, type StorageLike } from ".
 const CONTROL_CHARACTERS = /[\u0000-\u001f\u007f-\u009f]/u;
 const SHA256_HEX = /^[0-9a-f]{64}$/u;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
+const ISO_DATETIME = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,6}))?(?:([Zz])|([+-])(\d{2}):(\d{2}))?$/u;
 
 export interface ChapterGenerationHistoryHttpOptions {
   readonly storage?: StorageLike;
@@ -60,6 +61,40 @@ function actorIdFromStorage(storage: StorageLike): string | null {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function parseBackendChatTimestamp(value: string): string | null {
+  const parts = ISO_DATETIME.exec(value);
+  if (parts === null) return null;
+  const year = Number(parts[1]);
+  const month = Number(parts[2]);
+  const day = Number(parts[3]);
+  const hour = Number(parts[4]);
+  const minute = Number(parts[5]);
+  const second = Number(parts[6]);
+  if (year < 1 || month < 1 || month > 12 || day < 1 || day > 31
+    || hour > 23 || minute > 59 || second > 59) return null;
+
+  const date = new Date(0);
+  date.setUTCFullYear(year, month - 1, day);
+  date.setUTCHours(hour, minute, second, 0);
+  if (date.getUTCFullYear() !== year || date.getUTCMonth() !== month - 1 || date.getUTCDate() !== day
+    || date.getUTCHours() !== hour || date.getUTCMinutes() !== minute || date.getUTCSeconds() !== second) {
+    return null;
+  }
+
+  let offsetMinutes = 0;
+  if (parts[9] !== undefined) {
+    const offsetHours = Number(parts[10]);
+    const offsetRemainder = Number(parts[11]);
+    if (offsetHours > 23 || offsetRemainder > 59) return null;
+    const direction = parts[9] === "+" ? 1 : -1;
+    offsetMinutes = direction * (offsetHours * 60 + offsetRemainder);
+  }
+
+  const epochSeconds = date.getTime() / 1000 - offsetMinutes * 60;
+  const microseconds = (parts[7] ?? "").padEnd(6, "0");
+  return `${epochSeconds}:${microseconds}`;
 }
 
 function parseReadOnlyReason(value: unknown): ChapterGenerationHistoryReadOnlyReason | null {
@@ -131,6 +166,57 @@ function parseMessage(value: unknown, context: ChapterGenerationHistoryContext):
     created_at: value.created_at,
     message_digest: value.message_digest,
   };
+}
+
+function validateMessageUpdateAck(
+  value: unknown,
+  context: ChapterGenerationHistoryContext,
+  expected: ChapterGenerationHistoryMessage,
+  content: string,
+): void {
+  if (!isRecord(value)) fail("invalid-response", "消息写回回执格式无法识别。");
+  const nullableStrings = ["asset_type", "asset_id", "model_name"] as const;
+  const acknowledgedTimestamp = typeof value.created_at === "string"
+    ? parseBackendChatTimestamp(value.created_at)
+    : null;
+  const expectedTimestamp = parseBackendChatTimestamp(expected.created_at);
+  if (!isIdentifier(value.id)
+    || value.id !== expected.id
+    || value.chapter_id !== context.chapterId
+    || (value.frame_index !== null && (!Number.isSafeInteger(value.frame_index) || (value.frame_index as number) < 0))
+    || nullableStrings.some((key) => value[key] !== null && typeof value[key] !== "string")
+    || value.chat_mode !== context.mode
+    || value.role !== expected.role
+    || value.content !== content
+    || value.model_name !== expected.model_name
+    || typeof value.created_at !== "string"
+    || acknowledgedTimestamp === null
+    || acknowledgedTimestamp !== expectedTimestamp) {
+    fail("invalid-response", "消息写回回执与原消息身份或新地址不一致。");
+  }
+
+  const expectedTupleMatches = context.targetKind === "frame-preview"
+    ? value.frame_index === context.frameIndex && value.asset_type === null && value.asset_id === null
+    : value.frame_index === null && value.asset_type === "storyboard" && value.asset_id === context.storyboardAssetId;
+  if (!expectedTupleMatches) {
+    fail("invalid-response", "消息写回回执与当前镜头或素材不一致。");
+  }
+}
+
+function sameHistoryMessage(
+  expected: ChapterGenerationHistoryMessage,
+  actual: ChapterGenerationHistoryMessage | undefined,
+): boolean {
+  return actual !== undefined
+    && actual.id === expected.id
+    && actual.chapter_id === expected.chapter_id
+    && actual.frame_index === expected.frame_index
+    && actual.asset_type === expected.asset_type
+    && actual.asset_id === expected.asset_id
+    && actual.chat_mode === expected.chat_mode
+    && actual.role === expected.role
+    && actual.content === expected.content
+    && actual.message_digest === expected.message_digest;
 }
 
 function parseSnapshot(value: unknown, context: ChapterGenerationHistoryContext): ChapterGenerationHistorySnapshot {
@@ -304,10 +390,12 @@ export function createChapterGenerationHistoryHttpPort(
 
       async function request(
         path: string,
-        method: "GET" | "POST",
+        method: "GET" | "POST" | "PUT" | "DELETE",
         signal: AbortSignal,
         body?: unknown,
+        expectedStatus = 200,
       ): Promise<unknown> {
+        const isWrite = method !== "GET";
         if (signal.aborted || !isCurrent()) fail("not-sent", "历史请求未发送：当前页面或登录范围已变化。");
         const controller = new AbortController();
         const abortFromCaller = () => controller.abort(signal.reason);
@@ -354,17 +442,17 @@ export function createChapterGenerationHistoryHttpPort(
               }),
             ]);
           } catch {
-            fail(method === "POST" && dispatched.value ? "unknown" : "read-error",
-              method === "POST" && dispatched.value
-                ? (timedOut ? "选用请求等待超时，结果未知；请只读核对当前值。" : "选用请求已发送，结果未知；请只读核对当前值。")
+            fail(isWrite && dispatched.value ? "unknown" : "read-error",
+              isWrite && dispatched.value
+                ? (timedOut ? "请求等待超时，结果未知；请只读核对当前状态。" : "请求已发送，结果未知；请只读核对当前状态。")
                 : "无法读取生成历史。");
           }
           if (!isCurrent() || signal.aborted || controller.signal.aborted) {
-            fail(method === "POST" ? "unknown" : "read-error",
-              method === "POST" ? "请求已发送，但当前范围已变化；结果未知。" : "读取范围已变化，结果已忽略。");
+            fail(isWrite ? "unknown" : "read-error",
+              isWrite ? "请求已发送，但当前范围已变化；结果未知。" : "读取范围已变化，结果已忽略。");
           }
-          if (response.status === 401) fail("unauthorized", errorMessage(401, method === "POST" ? "write" : "read"), 401);
-          if (response.status !== 200) {
+          if (response.status === 401) fail("unauthorized", errorMessage(401, isWrite ? "write" : "read"), 401);
+          if (response.status !== expectedStatus) {
             const status = response.status;
             let detailCode: string | null = null;
             if (status === 422) {
@@ -378,30 +466,34 @@ export function createChapterGenerationHistoryHttpPort(
               }
             }
             await response.body?.cancel().catch(() => undefined);
-            if (method === "POST" && status >= 400 && status < 500 && status !== 408) {
+            if (isWrite && status >= 400 && status < 500 && status !== 408) {
               fail(status === 409 ? "conflict" : "rejected", errorMessage(status, "write", detailCode), status);
             }
-            if (method === "POST" && (status === 408 || status >= 500)) {
+            if (isWrite && (status === 408 || status >= 500)) {
               fail("unknown", errorMessage(status, "write"), status);
+            }
+            if (isWrite && response.ok) {
+              fail("unknown", "写入已响应，但HTTP状态不符合约定；请只读核对当前状态。", status);
             }
             fail(status === 409 ? "conflict" : "read-error", errorMessage(status, "read"), status);
           }
+          if (expectedStatus === 204) return undefined;
           let payload: unknown;
           try {
             payload = await response.json();
           } catch {
-            fail(method === "POST" ? "unknown" : "invalid-response",
-              method === "POST" ? "选用请求已响应，但回执无法读取；请只读核对当前值。" : "历史响应格式无法读取。", 200);
+            fail(isWrite ? "unknown" : "invalid-response",
+              isWrite ? "写入已响应，但回执无法读取；请只读核对当前状态。" : "历史响应格式无法读取。", expectedStatus);
           }
           if (!isCurrent() || signal.aborted) {
-            fail(method === "POST" ? "unknown" : "read-error",
-              method === "POST" ? "请求已发送，但当前范围已变化；结果未知。" : "读取范围已变化，结果已忽略。");
+            fail(isWrite ? "unknown" : "read-error",
+              isWrite ? "请求已发送，但当前范围已变化；结果未知。" : "读取范围已变化，结果已忽略。");
           }
           return payload;
         } catch (error) {
           if (error instanceof ChapterGenerationHistoryError) throw error;
-          if (method === "POST" && dispatched.value) {
-            fail("unknown", timedOut ? "选用请求等待超时，结果未知；请只读核对当前值。" : "选用请求已发送，结果未知；请只读核对当前值。");
+          if (isWrite && dispatched.value) {
+            fail("unknown", timedOut ? "请求等待超时，结果未知；请只读核对当前状态。" : "请求已发送，结果未知；请只读核对当前状态。");
           }
           fail("read-error", timedOut ? "读取历史超时。" : "无法读取生成历史。");
         } finally {
@@ -421,6 +513,31 @@ export function createChapterGenerationHistoryHttpPort(
         });
         if (captured.storyboardAssetId !== null) query.set("storyboard_asset_id", captured.storyboardAssetId);
         return `/chapters/${encodeURIComponent(captured.chapterId)}/generation-history?${query.toString()}`;
+      }
+
+      function messagePath(messageId: string, suffix = ""): string {
+        if (!isIdentifier(messageId)) fail("not-sent", "历史消息身份无法核对，未发送请求。");
+        const collection = captured.targetKind === "frame-preview" ? "chat-messages" : "asset-chat-messages";
+        return `/chapters/${encodeURIComponent(captured.chapterId)}/${collection}${suffix}/${encodeURIComponent(messageId)}`;
+      }
+
+      function requireCurrentWritableMessage(message: ChapterGenerationHistoryMessage): void {
+        const snapshot = currentSnapshot.value;
+        if (!isCurrent() || snapshot === null || !snapshot.writable || snapshot.target_proof === null
+          || !sameHistoryMessage(message, snapshot.messages.find((row) => row.id === message.id))) {
+          fail("not-sent", "历史消息或当前目标已变化，未发送写入请求。");
+        }
+      }
+
+      function requireSafeMediaUrl(value: string, outcome: "not-sent" | "unknown"): void {
+        if (value.trim() !== value || value === "" || CONTROL_CHARACTERS.test(value)) {
+          fail(outcome, outcome === "unknown" ? "转存已响应，但地址无法核对；不会自动重试。" : "媒体地址无法核对，未发送请求。");
+        }
+        try {
+          classifyMediaExportUrl(value, baseUrl);
+        } catch {
+          fail(outcome, outcome === "unknown" ? "转存已响应，但地址不符合安全要求；不会自动重试。" : "媒体地址不符合安全要求，未发送请求。");
+        }
       }
 
       return {
@@ -491,6 +608,35 @@ export function createChapterGenerationHistoryHttpPort(
             body,
           );
           return parseAdoptResult(payload, context, candidateUrl);
+        },
+        async retryOssUpload(message, signal): Promise<string> {
+          if (!isCurrent() || signal.aborted) fail("not-sent", "转存未发送：当前历史范围已变化。");
+          requireCurrentWritableMessage(message);
+          if (message.role !== "assistant") fail("not-sent", "只有生成的媒体消息可以转存。");
+          requireSafeMediaUrl(message.content, "not-sent");
+          const payload = await request("/upload/retry-oss", "POST", signal, { url: message.content });
+          if (!isRecord(payload) || typeof payload.url !== "string") {
+            fail("unknown", "转存请求已响应，但地址回执无法核对；不会自动重试。");
+          }
+          requireSafeMediaUrl(payload.url, "unknown");
+          return payload.url;
+        },
+        async updateMessageContent(message, content, signal): Promise<void> {
+          if (!isCurrent() || signal.aborted) fail("not-sent", "消息写回未发送：当前历史范围已变化。");
+          requireCurrentWritableMessage(message);
+          if (message.role !== "assistant") fail("not-sent", "只有生成的媒体消息可以写回转存地址。");
+          requireSafeMediaUrl(content, "not-sent");
+          const payload = await request(messagePath(message.id), "PUT", signal, { content });
+          try {
+            validateMessageUpdateAck(payload, context, message, content);
+          } catch {
+            fail("unknown", "消息PUT已响应，但回执无法核对；不会自动再次写入。");
+          }
+        },
+        async deleteMessage(message, signal): Promise<void> {
+          if (!isCurrent() || signal.aborted) fail("not-sent", "删除未发送：当前历史范围已变化。");
+          requireCurrentWritableMessage(message);
+          await request(messagePath(message.id, "/single"), "DELETE", signal, undefined, 204);
         },
         async readMedia(url, signal): Promise<Blob> {
           return await readMedia(url, captured.mode, signal);
