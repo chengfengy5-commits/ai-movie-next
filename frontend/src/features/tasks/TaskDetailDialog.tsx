@@ -9,15 +9,19 @@ import {
   type TaskRequestRecord,
 } from "../../shared/api/taskDetails";
 import { useSeriesDialogFocus } from "../series/useSeriesDialogFocus";
+import { TaskControlPanel } from "./TaskControlPanel";
 import "./taskDetailDialog.css";
 
 interface TaskDetailDialogProps {
   task: MyTaskRecord;
   userId: string;
   services: WorkspaceServices;
+  sessionGeneration?: number;
   openGeneration: number;
   onClose(): void;
   onUnauthorized(): void;
+  onCancelAttemptMayHaveReachedServer(): void;
+  onAutomaticObservationChange?: ((openGeneration: number, active: boolean) => void) | undefined;
 }
 
 interface ReadState<T> {
@@ -446,9 +450,12 @@ export function TaskDetailDialog({
   task,
   userId,
   services,
+  sessionGeneration = 0,
   openGeneration,
   onClose,
   onUnauthorized,
+  onCancelAttemptMayHaveReachedServer,
+  onAutomaticObservationChange,
 }: TaskDetailDialogProps) {
   const [receipt, setReceipt] = useState<ReadState<TaskReceipt>>(initialReadState);
   const [request, setRequest] = useState<ReadState<TaskRequestRecord>>(initialReadState);
@@ -519,9 +526,9 @@ export function TaskDetailDialog({
       receiptControllerRef.current = null;
       requestControllerRef.current = null;
     };
-  }, [openGeneration, services, task.id, userId]);
+  }, [openGeneration, services, sessionGeneration, task.id, userId]);
 
-  function refreshReceipt(): void {
+  async function refreshReceipt(): Promise<void> {
     receiptControllerRef.current?.abort();
     const controller = new AbortController();
     receiptControllerRef.current = controller;
@@ -531,7 +538,7 @@ export function TaskDetailDialog({
       refreshing: previous.snapshot !== null,
       error: null,
     }));
-    void loadReceipt(controller);
+    await loadReceipt(controller);
   }
 
   function refreshRequest(): void {
@@ -572,9 +579,20 @@ export function TaskDetailDialog({
           </button>
         </header>
         <p className="task-detail-readonly-note">
-          这里仅查看本人任务的服务器记录。关闭窗口或切换任务会停止未完成读取。
+          这里只读取本人任务的服务器记录。关闭窗口会停止本地读取；已发出的取消请求可能仍被服务端接收，重开后只核对，不会自动重发。
         </p>
         <div className="task-detail-sections">
+          <TaskControlPanel
+            onAutomaticObservationChange={onAutomaticObservationChange}
+            onCancelAttemptMayHaveReachedServer={onCancelAttemptMayHaveReachedServer}
+            openGeneration={openGeneration}
+            onRefreshReceipt={refreshReceipt}
+            onUnauthorized={onUnauthorized}
+            services={services}
+            sessionGeneration={sessionGeneration}
+            task={task}
+            userId={userId}
+          />
           <ResultPanel onRefresh={refreshReceipt} state={receipt} />
           {receipt.snapshot !== null && <HistoryTruthPanel truth={receipt.snapshot.historyTruth} />}
           <RequestPanel onRefresh={refreshRequest} state={request} />

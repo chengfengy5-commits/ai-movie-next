@@ -1,4 +1,4 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import { MY_TASK_PAGE_SIZE, projectMyTask, type MyTaskPage as MyTaskPageData } from "../../shared/api/myTasks";
@@ -7,6 +7,7 @@ import { TaskDetailDialog } from "./TaskDetailDialog";
 interface MyTasksPageProps {
   services: WorkspaceServices;
   userId: string;
+  sessionGeneration?: number;
   onBack(): void;
   onUnauthorized(): void;
 }
@@ -21,18 +22,20 @@ interface OwnedTaskPage {
   data: MyTaskPageData;
   services: WorkspaceServices;
   userId: string;
+  sessionGeneration: number;
 }
 
 interface TaskListOwner {
   services: WorkspaceServices;
   userId: string;
+  sessionGeneration: number;
   page: number;
   reloadKey: number;
 }
 
 const TASK_OBSERVATION_INTERVAL_MS = 3_000;
 const MAX_TASK_OBSERVATION_FAILURES = 3;
-const ACTIVE_TASK_STATUSES = new Set(["queued", "processing", "cancelling"]);
+const ACTIVE_TASK_STATUSES = new Set(["queued", "processing", "cancelling", "reconciling"]);
 
 function hasActiveTasks(page: MyTaskPageData): boolean {
   return page.tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status));
@@ -176,11 +179,19 @@ interface SelectedTaskDetail {
   task: MyTaskPageData["tasks"][number];
   services: WorkspaceServices;
   userId: string;
+  sessionGeneration: number;
   page: number;
   openGeneration: number;
+  automaticallyObserving: boolean;
 }
 
-export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTasksPageProps) {
+export function MyTasksPage({
+  services,
+  userId,
+  sessionGeneration = 0,
+  onBack,
+  onUnauthorized,
+}: MyTasksPageProps) {
   const [requestedPage, setRequestedPage] = useState(1);
   const [reloadKey, setReloadKey] = useState(0);
   const [pageSnapshot, setPageSnapshot] = useState<OwnedTaskPage | null>(null);
@@ -197,13 +208,21 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
   const observationFailureCountRef = useRef(0);
   const onUnauthorizedRef = useRef(onUnauthorized);
   onUnauthorizedRef.current = onUnauthorized;
-  const listOwnerRef = useRef<TaskListOwner>({ services, userId, page: requestedPage, reloadKey });
+  const listOwnerRef = useRef<TaskListOwner>({ services, userId, sessionGeneration, page: requestedPage, reloadKey });
   const listReadCancelRef = useRef<(() => void) | null>(null);
   const observationCancelRef = useRef<(() => void) | null>(null);
+  const reportDetailObservation = useCallback((openGeneration: number, active: boolean) => {
+    setSelectedTaskDetail((current) => {
+      if (current === null || current.openGeneration !== openGeneration
+        || current.automaticallyObserving === active) return current;
+      return { ...current, automaticallyObserving: active };
+    });
+  }, []);
 
   const pageData = pageSnapshot !== null
     && pageSnapshot.services === services
     && pageSnapshot.userId === userId
+    && pageSnapshot.sessionGeneration === sessionGeneration
     ? pageSnapshot.data
     : null;
 
@@ -217,13 +236,13 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
 
   useLayoutEffect(() => {
     invalidateListReads();
-    listOwnerRef.current = { services, userId, page: requestedPage, reloadKey };
+    listOwnerRef.current = { services, userId, sessionGeneration, page: requestedPage, reloadKey };
     observationFailureCountRef.current = 0;
     setLoading(true);
     setError(null);
     setObservationNotice(null);
     setObservationSuspended(false);
-  }, [reloadKey, requestedPage, services, userId]);
+  }, [reloadKey, requestedPage, services, sessionGeneration, userId]);
 
   useEffect(() => {
     const updateVisibility = () => setDocumentVisible(!document.hidden);
@@ -251,7 +270,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
 
     void services.listMyTasks(requestedPage, controller.signal).then((result) => {
       if (!isCurrent() || controller.signal.aborted) return;
-      setPageSnapshot({ data: result, services, userId });
+      setPageSnapshot({ data: result, services, userId, sessionGeneration });
       setLoading(false);
     }).catch((cause: unknown) => {
       if (!isCurrent() || controller.signal.aborted) return;
@@ -269,7 +288,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
     return () => {
       cancel();
     };
-  }, [reloadKey, requestedPage, services, userId]);
+  }, [reloadKey, requestedPage, services, sessionGeneration, userId]);
 
   const currentPageData = pageData?.page === requestedPage ? pageData : null;
 
@@ -277,6 +296,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
     if (
       !documentVisible
       || observationSuspended
+      || selectedTaskDetail?.automaticallyObserving === true
       || currentPageData === null
       || !hasActiveTasks(currentPageData)
     ) {
@@ -327,7 +347,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
         controller = null;
         observationFailureCountRef.current = 0;
         setObservationNotice(null);
-        setPageSnapshot({ data: result, services, userId });
+        setPageSnapshot({ data: result, services, userId, sessionGeneration });
         if (hasActiveTasks(result)) schedule(TASK_OBSERVATION_INTERVAL_MS);
       } catch (cause: unknown) {
         if (!isCurrent() || requestController.signal.aborted) return;
@@ -366,13 +386,15 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
     documentVisible,
     observationSuspended,
     requestedPage,
+    selectedTaskDetail,
     services,
+    sessionGeneration,
     userId,
   ]);
 
   useEffect(() => {
     setSelectedTaskDetail(null);
-  }, [requestedPage, services, userId]);
+  }, [requestedPage, services, sessionGeneration, userId]);
 
   function openTaskDetail(task: MyTaskPageData["tasks"][number]): void {
     detailOpenGenerationRef.current += 1;
@@ -380,8 +402,10 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
       task,
       services,
       userId,
+      sessionGeneration,
       page: requestedPage,
       openGeneration: detailOpenGenerationRef.current,
+      automaticallyObserving: false,
     });
   }
 
@@ -392,6 +416,19 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
     setError(null);
     setObservationNotice(null);
     setObservationSuspended(false);
+    setLoading(true);
+    setReloadKey((key) => key + 1);
+  }
+
+  function refreshAfterTaskControlAttempt(taskId: string): void {
+    if (selectedTaskDetail === null
+      || selectedTaskDetail.task.id !== taskId
+      || selectedTaskDetail.services !== services
+      || selectedTaskDetail.userId !== userId
+      || selectedTaskDetail.sessionGeneration !== sessionGeneration
+      || selectedTaskDetail.page !== requestedPage) return;
+    invalidateListReads();
+    setError(null);
     setLoading(true);
     setReloadKey((key) => key + 1);
   }
@@ -529,15 +566,19 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
 
       {selectedTaskDetail !== null
         && selectedTaskDetail.userId === userId
+        && selectedTaskDetail.sessionGeneration === sessionGeneration
         && selectedTaskDetail.services === services
         && selectedTaskDetail.page === requestedPage
         && (
           <TaskDetailDialog
             key={selectedTaskDetail.openGeneration}
             onClose={() => setSelectedTaskDetail(null)}
+            onAutomaticObservationChange={reportDetailObservation}
             onUnauthorized={onUnauthorized}
+            onCancelAttemptMayHaveReachedServer={() => refreshAfterTaskControlAttempt(selectedTaskDetail.task.id)}
             openGeneration={selectedTaskDetail.openGeneration}
             services={selectedTaskDetail.services}
+            sessionGeneration={selectedTaskDetail.sessionGeneration}
             task={selectedTaskDetail.task}
             userId={selectedTaskDetail.userId}
           />

@@ -1317,10 +1317,11 @@ function Dashboard() {
           })}
           {selectedView === "tasks" && (
             <MyTasksPage
-              key={state.user.id}
+              key={`${state.user.id}:${sessionGeneration}`}
               onBack={() => setSelectedView("series")}
               onUnauthorized={logoutFromWorkspace}
               services={services}
+              sessionGeneration={sessionGeneration}
               userId={state.user.id}
             />
           )}
