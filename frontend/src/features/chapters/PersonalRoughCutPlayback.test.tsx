@@ -92,22 +92,23 @@ function renderPlayback(options: {
 }
 
 describe("personal rough-cut playback queue", () => {
-  it("uses saved order and excludes rows with invalid, pending, missing, duplicate, or unsafe media", () => {
+  it("uses saved order, accepts signed remote URLs, and excludes invalid or unsafe media", () => {
     const value = snapshot([
       frame("saved-second", 8),
       frame("excluded", 1, { included: false }),
       frame("pending", 2, { pending: true }),
       frame("missing", 3, { preview_url: null }),
-      frame("remote", 4, { preview_url: "https://media.example.invalid/clip.mp4" }),
+      frame("remote", 4, { preview_url: "https://media.example.invalid/clip.mp4?sig=private" }),
       frame("duplicate", 5),
       frame("duplicate", 6),
       frame("   ", 7),
+      frame("protected-query", 9, { preview_url: "/uploads/clip.mp4?sig=must-not-downgrade" }),
       frame("saved-first", 0),
     ]);
 
     const queue = buildPersonalRoughCutPlaybackQueue(value, apiBaseUrl);
 
-    expect(queue.frames.map((row) => row.asset_id)).toEqual(["saved-second", "saved-first"]);
+    expect(queue.frames.map((row) => row.asset_id)).toEqual(["saved-second", "remote", "saved-first"]);
     expect(queue).toMatchObject({
       excludedCount: 1,
       pendingCount: 1,
@@ -153,6 +154,55 @@ describe("PersonalRoughCutPlayback", () => {
     fireEvent.ended(video);
     await waitFor(() => expect(read).toHaveBeenCalledTimes(2));
     expect(read.mock.calls[1]?.[0]).toBe("/uploads/second.mp4");
+  });
+
+  it("plays a signed remote URL from the queue using the reader's Blob", async () => {
+    const remoteUrl = "https://media.example.invalid/clip.mp4?sig=private";
+    const read = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob(["remote clip"]));
+    const { reader } = makeReader(read);
+    renderPlayback({
+      value: snapshot([frame("remote", 0, { preview_url: remoteUrl })]),
+      reader,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+
+    await waitFor(() => expect(read).toHaveBeenCalledWith(remoteUrl, expect.any(AbortSignal)));
+    const video = await screen.findByLabelText("当前镜头视频预览") as HTMLVideoElement;
+    await waitFor(() => expect(video.getAttribute("src")).toBe("blob:rough-cut-test/1"));
+    expect(video.controls).toBe(true);
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledOnce();
+  });
+
+  it("keeps retry, skip, and remote 401 recovery inside the active media attempt", async () => {
+    const firstUrl = "https://media.example.invalid/first.mp4?sig=one";
+    const secondUrl = "https://media.example.invalid/second.mp4?sig=two";
+    const read = vi.fn()
+      .mockRejectedValueOnce(new ApiError("network", "remote failed"))
+      .mockResolvedValueOnce(new Blob(["retried clip"]))
+      .mockRejectedValueOnce(new ApiError("http", "remote 401", null));
+    const { reader } = makeReader(read);
+    const onUnauthorized = vi.fn();
+    renderPlayback({
+      value: snapshot([
+        frame("first-remote", 0, { preview_url: firstUrl }),
+        frame("second-remote", 1, { preview_url: secondUrl }),
+      ]),
+      reader,
+      onUnauthorized,
+    });
+
+    fireEvent.click(screen.getByRole("button", { name: "从头试看" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("remote failed");
+    fireEvent.click(screen.getByRole("button", { name: "重试此镜" }));
+    const video = await screen.findByLabelText("当前镜头视频预览") as HTMLVideoElement;
+    await waitFor(() => expect(video.getAttribute("src")).toBe("blob:rough-cut-test/1"));
+    fireEvent.error(video);
+
+    fireEvent.click(await screen.findByRole("button", { name: "跳过并继续" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("remote 401");
+    expect(read.mock.calls.map(([url]) => url)).toEqual([firstUrl, firstUrl, secondUrl]);
+    expect(onUnauthorized).not.toHaveBeenCalled();
   });
 
   it.each(["ended", "error"] as const)(
