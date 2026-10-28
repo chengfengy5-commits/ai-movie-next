@@ -44,7 +44,7 @@ def build_task_observation_router(
     frame_optimize_cancellation: FrameOptimizeCancellationPort | None = None,
     haoai_group_cancellation: HaoaiGroupCancellationPort | None = None,
 ) -> APIRouter:
-    """Build the nine routes from explicitly supplied read/auth/cancel adapters."""
+    """Build task observation routes from explicit read/auth/cancel adapters."""
     router = APIRouter(prefix="/api/chat", tags=["task-observation"])
 
     async def trusted_actor(
@@ -89,6 +89,20 @@ def build_task_observation_router(
         actor: TrustedActor = Depends(account_actor),
     ) -> dict[str, Any]:
         return invoke(application.get_submission_receipt, actor, operation, idempotency_key)
+
+    @router.get("/tasks/{task_id}/controls")
+    def task_controls(
+        task_id: str,
+        actor: TrustedActor = Depends(active_actor),
+    ) -> dict[str, Any]:
+        return invoke(
+            application.get_task_controls,
+            actor,
+            task_id,
+            frame_review_cancellation,
+            frame_optimize_cancellation,
+            haoai_group_cancellation,
+        )
 
     # Keep the literal route before parameterized routes if the set grows.
     @router.get("/tasks/list")

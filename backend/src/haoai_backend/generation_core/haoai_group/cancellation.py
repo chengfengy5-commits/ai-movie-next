@@ -24,7 +24,9 @@ from haoai_backend.generation_core.base_schema import (
 )
 from haoai_backend.generation_core.haoai_group.persistence import (
     LockedHaoaiGroupGraph,
+    has_haoai_group_candidate,
     lock_haoai_group_graph,
+    read_haoai_group_graph,
 )
 from haoai_backend.generation_core.haoai_group.intents import (
     is_valid_started_group_submission,
@@ -44,6 +46,7 @@ from haoai_backend.generation_core.schema import (
     UnitFeeDecisionRow,
 )
 from haoai_backend.generation_runtime.registry import HAOAI_ATTEMPT_GROUP
+from haoai_backend.shared.identity import TrustedActor
 
 SessionFactory = Callable[[], Session]
 DbClock = Callable[[], datetime]
@@ -54,6 +57,13 @@ CancelOutcome = Literal[
     "retained",
     "pending",
     "terminal_projection",
+]
+ControlInspectionReason = Literal[
+    "not_selected",
+    "available",
+    "already_requested",
+    "terminal",
+    "unsafe_task_graph",
 ]
 _CANCEL_MARKER = re.compile(r"^user_cancelled:v1:[0-9a-f]{32}$")
 _TASK_CANCEL_RESULT = json.dumps(
@@ -91,6 +101,41 @@ class SqlAlchemyHaoaiGroupCancellation:
         self._db_clock = db_clock
         self._proof_authority = proof_authority
         self._id_factory = id_factory
+
+    def inspect_controls(
+        self, actor: TrustedActor, task_id: str
+    ) -> tuple[str | None, ControlInspectionReason]:
+        """Read a fresh owner-scoped Group snapshot without mutating or locking it."""
+
+        owner_id = getattr(actor, "user_id", None)
+        if not _valid_id(owner_id) or not _valid_id(task_id):
+            return None, "unsafe_task_graph"
+        session = self._session_factory()
+        try:
+            graph = read_haoai_group_graph(session, owner_id, task_id)
+            if graph is None:
+                if has_haoai_group_candidate(session, owner_id, task_id):
+                    return None, "unsafe_task_graph"
+                return None, "not_selected"
+
+            status = graph.task.get("status")
+            marker_state = _cancel_marker_state(graph)
+            if marker_state == "unsafe_task_graph":
+                return status if isinstance(status, str) else None, "unsafe_task_graph"
+            if status == "cancelling" or marker_state == "already_requested":
+                return status if isinstance(status, str) else None, "already_requested"
+            if status in {"completed", "failed"}:
+                return status, "terminal"
+            if status in {"queued", "processing", "reconciling"}:
+                return status, "available"
+            return status if isinstance(status, str) else None, "unsafe_task_graph"
+        except Exception:
+            return None, "unsafe_task_graph"
+        finally:
+            try:
+                session.rollback()
+            finally:
+                session.close()
 
     def cancel_owned(self, actor, task_id: str) -> CancelOutcome:
         """Commit cancellation only after proving the original Group and ledger."""
@@ -808,6 +853,32 @@ def _has_group_candidate(session: Session, owner_id: str, task_id: str) -> bool:
             for row in event_rows
         )
     )
+
+
+def _cancel_marker_state(
+    graph: LockedHaoaiGroupGraph,
+) -> Literal["none", "already_requested", "unsafe_task_graph"]:
+    task = graph.task
+    unit = graph.unit
+    task_at = task.get("user_cancelled_at")
+    unit_at = unit.get("user_cancelled_at")
+    task_marker = task.get("cancellation_reason")
+    unit_marker = unit.get("cancellation_reason")
+    has_any = any(
+        value is not None for value in (task_at, unit_at, task_marker, unit_marker)
+    )
+    if not has_any:
+        return "none"
+    if (
+        task_at is not None
+        and unit_at is not None
+        and task_at == unit_at
+        and isinstance(task_marker, str)
+        and task_marker == unit_marker
+        and _CANCEL_MARKER.fullmatch(task_marker) is not None
+    ):
+        return "already_requested"
+    return "unsafe_task_graph"
 
 
 def _lock_wallet(session: Session, owner_id: str) -> Mapping[str, object] | None:

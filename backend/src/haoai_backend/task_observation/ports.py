@@ -132,6 +132,19 @@ class HaoaiGroupCancellationPort(Protocol):
 
     def cancel_owned(self, actor: TrustedActor, task_id: str) -> str: ...
 
+    def inspect_controls(
+        self, actor: TrustedActor, task_id: str
+    ) -> tuple[
+        str | None,
+        Literal[
+            "not_selected",
+            "available",
+            "already_requested",
+            "terminal",
+            "unsafe_task_graph",
+        ],
+    ]: ...
+
 
 CancellationConnectionFactory: TypeAlias = Callable[
     [], AbstractContextManager[object]

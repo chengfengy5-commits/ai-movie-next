@@ -208,6 +208,126 @@ def test_cancel_rereads_database_clock_after_graph_locks(tmp_path, monkeypatch):
         environment.engine.dispose()
 
 
+def test_controls_inspect_group_graph_read_only_and_fail_closed_for_corruption(
+    tmp_path, monkeypatch
+):
+    environment = video_fixtures._video_environment(
+        monkeypatch, tmp_path, provider="haoai"
+    )
+    try:
+        task_id = group_fixtures._admit(
+            environment, "haoai-group-controls-read-only-001"
+        )
+        clock = [video_fixtures._NOW]
+        group_fixtures._setup_group(environment, task_id, clock)
+        with Session(environment.engine) as reader:
+            task_before = reader.execute(
+                select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+            ).mappings().one()
+            unit_before = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.__table__.c.task_id == task_id
+                )
+            ).mappings().one()
+
+        sessions = []
+
+        class ReadTrackingSession(Session):
+            def __init__(self, bind):
+                super().__init__(bind)
+                self.commit_count = 0
+                self.rollback_count = 0
+                self.for_update_queries = []
+                sessions.append(self)
+
+            def execute(self, statement, *args, **kwargs):
+                self.for_update_queries.append(
+                    getattr(statement, "_for_update_arg", None) is not None
+                )
+                return super().execute(statement, *args, **kwargs)
+
+            def commit(self):
+                self.commit_count += 1
+                return super().commit()
+
+            def rollback(self):
+                self.rollback_count += 1
+                return super().rollback()
+
+        cancellation = SqlAlchemyHaoaiGroupCancellation(
+            session_factory=lambda: ReadTrackingSession(environment.engine),
+            db_clock=lambda: clock[0],
+            proof_authority=environment.capabilities.proof_authority,
+            id_factory=lambda: "unused-control-inspection-id",
+        )
+        actor = TrustedActor(user_id=task_before["user_id"])
+
+        status, reason = cancellation.inspect_controls(actor, task_id)
+
+        assert status == task_before["status"]
+        assert reason == "available"
+        assert len(sessions) == 1
+        assert sessions[0].commit_count == 0
+        assert sessions[0].rollback_count >= 1
+        assert sessions[0].for_update_queries
+        assert not any(sessions[0].for_update_queries)
+        with Session(environment.engine) as reader:
+            task_after = reader.execute(
+                select(AITaskRow.__table__).where(AITaskRow.__table__.c.id == task_id)
+            ).mappings().one()
+            unit_after = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.__table__.c.task_id == task_id
+                )
+            ).mappings().one()
+        assert task_after["status"] == task_before["status"]
+        assert task_after["user_cancelled_at"] == task_before["user_cancelled_at"]
+        assert task_after["cancellation_reason"] == task_before["cancellation_reason"]
+        assert task_after["billing_status"] == task_before["billing_status"]
+        assert unit_after["user_cancelled_at"] == unit_before["user_cancelled_at"]
+        assert unit_after["cancellation_reason"] == unit_before["cancellation_reason"]
+        assert unit_after["billing_status"] == unit_before["billing_status"]
+
+        ordinary_task_id = "ordinary-video-control-001"
+        with Session(environment.engine) as writer:
+            writer.add(
+                AITaskRow(
+                    id=ordinary_task_id,
+                    user_id=actor.user_id,
+                    type="video-single",
+                    status="processing",
+                    message_id="ordinary-video-message-001",
+                    credit_cost=0,
+                    billing_status="unbilled",
+                    request_data="{}",
+                    progress=0,
+                    created_at=video_fixtures._NOW,
+                    updated_at=video_fixtures._NOW,
+                )
+            )
+            writer.commit()
+        assert cancellation.inspect_controls(actor, ordinary_task_id) == (
+            None,
+            "not_selected",
+        )
+
+        with Session(environment.engine) as writer:
+            writer.execute(
+                update(AITaskRow.__table__)
+                .where(AITaskRow.__table__.c.id == task_id)
+                .values(type="image-single")
+            )
+            writer.commit()
+        assert cancellation.inspect_controls(actor, task_id) == (
+            None,
+            "unsafe_task_graph",
+        )
+        assert all(session.commit_count == 0 for session in sessions)
+        assert all(not any(session.for_update_queries) for session in sessions)
+    finally:
+        environment.engine.dispose()
+
+
 @pytest.mark.parametrize("tamper", ("token", "reserved_at", "stopped_at"))
 def test_policy_event_rejects_reservation_or_stop_time_tampering(
     tmp_path, monkeypatch, tamper
@@ -771,17 +891,25 @@ def test_owned_http_cancel_routes_valid_group_to_owner_scoped_settlement(
             )
         )
 
-        async def send_cancel() -> httpx.Response:
+        async def send_controls_and_cancel() -> tuple[httpx.Response, httpx.Response]:
             transport = httpx.ASGITransport(app=app)
             async with httpx.AsyncClient(
                 transport=transport, base_url="http://testserver"
             ) as client:
-                return await client.post(
-                    f"/api/chat/batch-optimize/{task_id}/cancel"
+                controls = await client.get(
+                    f"/api/chat/tasks/{task_id}/controls"
                 )
+                cancel = await client.post(f"/api/chat/batch-optimize/{task_id}/cancel")
+                return controls, cancel
 
-        response = asyncio.run(send_cancel())
+        controls_response, response = asyncio.run(send_controls_and_cancel())
 
+        assert controls_response.status_code == 200
+        assert controls_response.json() == {
+            "task_id": task_id,
+            "status": "processing",
+            "cancel": {"allowed": True, "reason": "available"},
+        }
         assert response.status_code == 200
         assert response.json() == {"task_id": task_id, "status": "cancelling"}
         with Session(environment.engine) as reader:
