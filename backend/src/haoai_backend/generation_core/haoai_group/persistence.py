@@ -17,7 +17,10 @@ from haoai_backend.generation_core.base_schema import (
     TaskSubmissionRow,
     UserRow,
 )
-from haoai_backend.generation_core.schema import ExecutionAttemptGroupRow
+from haoai_backend.generation_core.schema import (
+    ExecutionAttemptGroupRow,
+    PolicyStopEventRow,
+)
 from haoai_backend.generation_credentials.haoai_group_execution_snapshot import (
     PersistedHaoaiGroupExecutionBinding,
     persisted_haoai_group_graph_matches,
@@ -46,25 +49,117 @@ def lock_haoai_group_graph(
 ) -> LockedHaoaiGroupGraph | None:
     """Lock and validate one Group using the common User→Task→graph order."""
 
+    return _load_haoai_group_graph(session, owner_id, task_id, lock_rows=True)
+
+
+def read_haoai_group_graph(
+    session: Session,
+    owner_id: str,
+    task_id: str,
+) -> LockedHaoaiGroupGraph | None:
+    """Read and validate one Group without acquiring row locks."""
+
+    return _load_haoai_group_graph(session, owner_id, task_id, lock_rows=False)
+
+
+def has_haoai_group_candidate(
+    session: Session,
+    owner_id: str,
+    task_id: str,
+) -> bool:
+    """Read only the narrow Group markers needed to reject malformed graphs."""
+
+    if not isinstance(session, Session) or not _nonempty(owner_id) or not _nonempty(task_id):
+        return False
+    task = session.execute(
+        select(AITaskRow.__table__.c.id, AITaskRow.__table__.c.request_data).where(
+            AITaskRow.__table__.c.id == task_id,
+            AITaskRow.__table__.c.user_id == owner_id,
+        )
+    ).mappings().one_or_none()
+    if task is None:
+        return False
+    request_data = _decode_json_object(task.get("request_data"))
+    if request_data is not None and (
+        request_data.get("step_graph_version") == HAOAI_ATTEMPT_GROUP.registry_version
+        or request_data.get("graph_version") == HAOAI_ATTEMPT_GROUP.registry_version
+    ):
+        return True
+
+    unit_rows = session.execute(
+        select(BillingUnitRow.__table__.c.id, BillingUnitRow.__table__.c.step_graph_version)
+        .where(BillingUnitRow.__table__.c.task_id == task_id)
+        .order_by(BillingUnitRow.__table__.c.id)
+    ).mappings().all()
+    if any(
+        row.get("step_graph_version") == HAOAI_ATTEMPT_GROUP.registry_version
+        for row in unit_rows
+    ):
+        return True
+    unit_ids = tuple(row["id"] for row in unit_rows)
+    if not unit_ids:
+        return False
+
+    groups = session.execute(
+        select(
+            ExecutionAttemptGroupRow.__table__.c.group_key,
+            ExecutionAttemptGroupRow.__table__.c.registry_version,
+        )
+        .where(ExecutionAttemptGroupRow.__table__.c.unit_id.in_(unit_ids))
+        .order_by(ExecutionAttemptGroupRow.__table__.c.unit_id)
+    ).mappings().all()
+    if any(
+        row.get("group_key") == HAOAI_ATTEMPT_GROUP.group_key
+        or row.get("registry_version") == HAOAI_ATTEMPT_GROUP.registry_version
+        for row in groups
+    ):
+        return True
+
+    events = session.execute(
+        select(
+            PolicyStopEventRow.__table__.c.group_key,
+            PolicyStopEventRow.__table__.c.policy_version,
+            PolicyStopEventRow.__table__.c.reason,
+        )
+        .where(PolicyStopEventRow.__table__.c.unit_id.in_(unit_ids))
+        .order_by(PolicyStopEventRow.__table__.c.event_id)
+    ).mappings().all()
+    return any(
+        row.get("group_key") == HAOAI_ATTEMPT_GROUP.group_key
+        or row.get("policy_version") == HAOAI_ATTEMPT_GROUP.stop_policy_version
+        or row.get("reason") == "auth_unavailable_12"
+        for row in events
+    )
+
+
+def _load_haoai_group_graph(
+    session: Session,
+    owner_id: str,
+    task_id: str,
+    *,
+    lock_rows: bool,
+) -> LockedHaoaiGroupGraph | None:
+
     if not isinstance(session, Session) or not _nonempty(owner_id) or not _nonempty(task_id):
         return None
-    owner = session.execute(
-        select(UserRow.__table__.c.id)
-        .where(UserRow.__table__.c.id == owner_id)
-        .with_for_update(skip_locked=True)
-    ).scalar_one_or_none()
+    owner_query = select(UserRow.__table__.c.id).where(UserRow.__table__.c.id == owner_id)
+    if lock_rows:
+        owner_query = owner_query.with_for_update(skip_locked=True)
+    owner = session.execute(owner_query).scalar_one_or_none()
     if owner is None:
         return None
 
-    task_row = session.execute(
+    task_query = (
         select(AITaskRow.__table__)
         .where(
             AITaskRow.__table__.c.id == task_id,
             AITaskRow.__table__.c.user_id == owner_id,
             AITaskRow.__table__.c.type == "video-single",
         )
-        .with_for_update(skip_locked=True)
-    ).mappings().one_or_none()
+    )
+    if lock_rows:
+        task_query = task_query.with_for_update(skip_locked=True)
+    task_row = session.execute(task_query).mappings().one_or_none()
     if task_row is None:
         return None
     task = dict(task_row)
@@ -72,23 +167,27 @@ def lock_haoai_group_graph(
     if request_data is None:
         return None
 
-    unit_rows = session.execute(
+    unit_query = (
         select(BillingUnitRow.__table__)
         .where(BillingUnitRow.__table__.c.task_id == task_id)
         .order_by(BillingUnitRow.__table__.c.id)
-        .with_for_update()
-    ).mappings().all()
+    )
+    if lock_rows:
+        unit_query = unit_query.with_for_update()
+    unit_rows = session.execute(unit_query).mappings().all()
     unit_ids = tuple(row["id"] for row in unit_rows)
     step_rows = (
         session.execute(
-            select(ExecutionStepRow.__table__)
-            .where(ExecutionStepRow.__table__.c.billing_unit_id.in_(unit_ids))
-            .order_by(
-                ExecutionStepRow.__table__.c.billing_unit_id,
-                ExecutionStepRow.__table__.c.step_order,
-                ExecutionStepRow.__table__.c.id,
+            _for_update(
+                select(ExecutionStepRow.__table__)
+                .where(ExecutionStepRow.__table__.c.billing_unit_id.in_(unit_ids))
+                .order_by(
+                    ExecutionStepRow.__table__.c.billing_unit_id,
+                    ExecutionStepRow.__table__.c.step_order,
+                    ExecutionStepRow.__table__.c.id,
+                ),
+                lock_rows,
             )
-            .with_for_update()
         ).mappings().all()
         if unit_ids
         else []
@@ -100,32 +199,37 @@ def lock_haoai_group_graph(
     submission_id = request_data.get("submission_id")
     if not _nonempty(submission_id):
         return None
-    parent_row = session.execute(
-        select(TaskSubmissionRow.__table__)
-        .where(TaskSubmissionRow.__table__.c.id == submission_id)
-        .with_for_update(skip_locked=True)
-    ).mappings().one_or_none()
+    parent_query = select(TaskSubmissionRow.__table__).where(
+        TaskSubmissionRow.__table__.c.id == submission_id
+    )
+    if lock_rows:
+        parent_query = parent_query.with_for_update(skip_locked=True)
+    parent_row = session.execute(parent_query).mappings().one_or_none()
     if parent_row is None:
         return None
     parent = dict(parent_row)
 
     step_ids = tuple(step.get("id") for step in steps)
-    external_rows = session.execute(
+    external_query = (
         select(ExternalSubmissionRow.__table__)
         .where(ExternalSubmissionRow.__table__.c.step_id.in_(step_ids))
         .order_by(ExternalSubmissionRow.__table__.c.step_id, ExternalSubmissionRow.__table__.c.id)
-        .with_for_update()
-    ).mappings().all()
+    )
+    if lock_rows:
+        external_query = external_query.with_for_update()
+    external_rows = session.execute(external_query).mappings().all()
 
-    group_row = session.execute(
+    group_query = (
         select(ExecutionAttemptGroupRow.__table__)
         .where(
             ExecutionAttemptGroupRow.__table__.c.unit_id == unit["id"],
             ExecutionAttemptGroupRow.__table__.c.group_key
             == HAOAI_ATTEMPT_GROUP.group_key,
         )
-        .with_for_update(skip_locked=True)
-    ).mappings().one_or_none()
+    )
+    if lock_rows:
+        group_query = group_query.with_for_update(skip_locked=True)
+    group_row = session.execute(group_query).mappings().one_or_none()
     if group_row is None:
         return None
     group = dict(group_row)
@@ -146,6 +250,10 @@ def lock_haoai_group_graph(
         request_data=request_data,
         binding=binding,
     )
+
+
+def _for_update(query, lock_rows: bool):
+    return query.with_for_update() if lock_rows else query
 
 
 def _binding_from_graph(

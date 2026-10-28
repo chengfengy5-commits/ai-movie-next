@@ -23,6 +23,8 @@ ai_tasks = Table(
     Column("billing_status", String(32), nullable=False),
     Column("created_at", DateTime, nullable=False),
     Column("updated_at", DateTime, nullable=False),
+    Column("user_cancelled_at", DateTime, nullable=True),
+    Column("cancellation_reason", String(64), nullable=True),
 )
 
 billing_units = Table(
@@ -34,6 +36,8 @@ billing_units = Table(
     Column("quoted_amount", Integer, nullable=False),
     Column("billing_status", String(32), nullable=False),
     Column("created_at", DateTime(timezone=True), nullable=False),
+    Column("user_cancelled_at", DateTime(timezone=True), nullable=True),
+    Column("cancellation_reason", String(64), nullable=True),
 )
 
 task_submissions = Table(

@@ -10,7 +10,7 @@ from haoai_backend.shared.identity import TrustedActor
 from haoai_backend.generation_runtime.registry import HAOAI_ATTEMPT_GROUP
 from haoai_backend.teams.policy import has_team_permission
 
-from .domain import TaskRecord
+from .domain import BillingUnitRecord, TaskRecord
 from .errors import (
     TaskObservationBadRequest,
     TaskObservationConflict,
@@ -41,7 +41,7 @@ from .ports import (
 from .receipts import build_submission_receipt, build_task_receipt
 
 T = TypeVar("T")
-TaskValue = Mapping[str, Any] | TaskRecord
+TaskValue = Mapping[str, Any] | BillingUnitRecord | TaskRecord
 
 
 def _open_uow(factory: UnitOfWorkFactory | None) -> TaskObservationUnitOfWork:
@@ -101,6 +101,256 @@ def get_task_receipt(
         return build_task_receipt(matches[0], uow)
 
     return _run_read_only(factory, operation)
+
+
+def get_task_controls(
+    factory: UnitOfWorkFactory | None,
+    actor: TrustedActor,
+    task_id: str,
+    frame_review_cancellation: FrameReviewCancellationPort | None = None,
+    frame_optimize_cancellation: FrameOptimizeCancellationPort | None = None,
+    haoai_group_cancellation: HaoaiGroupCancellationPort | None = None,
+) -> dict[str, Any]:
+    """Return a fresh, owner-scoped snapshot of the available cancel action."""
+
+    if factory is None:
+        raise TaskObservationUnavailable()
+
+    def operation(uow: TaskObservationUnitOfWork) -> dict[str, Any]:
+        task = uow.load_owned_task(actor.user_id, task_id)
+        if task is None:
+            raise TaskObservationNotFound("任务不存在")
+        try:
+            units = list(uow.list_task_billing_units(task_id))
+        except Exception:
+            return {
+                "task_id": _value(task, "id"),
+                "status": _value(task, "status"),
+                "task": task,
+                "units": (),
+                "request_data": _object_mapping(_value(task, "request_data")),
+                "graph_readable": False,
+            }
+        review_unit = None
+        if _value(task, "type") == "ai-review":
+            try:
+                review_unit = uow.unique_billing_unit(task_id)
+            except Exception:
+                return {
+                    "task_id": _value(task, "id"),
+                    "status": _value(task, "status"),
+                    "task": task,
+                    "units": tuple(units),
+                    "request_data": _object_mapping(_value(task, "request_data")),
+                    "review_unit": None,
+                    "graph_readable": False,
+                }
+        return {
+            "task_id": _value(task, "id"),
+            "status": _value(task, "status"),
+            "task": task,
+            "units": tuple(units),
+            "request_data": _object_mapping(_value(task, "request_data")),
+            "review_unit": review_unit,
+            "graph_readable": True,
+        }
+
+    snapshot = _run_read_only(factory, operation)
+    task = snapshot["task"]
+    request_data = snapshot["request_data"]
+    units = snapshot["units"]
+    status = snapshot["status"]
+
+    if haoai_group_cancellation is not None:
+        inspect_controls = getattr(haoai_group_cancellation, "inspect_controls", None)
+        if callable(inspect_controls):
+            try:
+                group_status, group_reason = inspect_controls(actor, task_id)
+            except Exception:
+                group_status, group_reason = None, "unsafe_task_graph"
+            if (
+                not isinstance(group_reason, str)
+                or group_reason
+                not in {
+                    "not_selected",
+                    "available",
+                    "already_requested",
+                    "terminal",
+                    "unsafe_task_graph",
+                }
+                or (group_status is not None and not isinstance(group_status, str))
+            ):
+                group_status, group_reason = None, "unsafe_task_graph"
+            if group_reason != "not_selected":
+                return _task_controls_response(
+                    task_id,
+                    group_status if group_status is not None else status,
+                    group_reason,
+                )
+        elif (
+            _registered_haoai_group_candidate(request_data)
+            or any(_haoai_group_unit_hint(unit) for unit in units)
+            or _value(task, "type") == "video-single"
+        ):
+            return _task_controls_response(task_id, status, "runtime_unavailable")
+
+    task_type = _value(task, "type")
+    group_hint = _registered_haoai_group_candidate(request_data)
+    group_unit_hint = any(_haoai_group_unit_hint(unit) for unit in units)
+    if group_hint or group_unit_hint:
+        if task_type == "video-single" and haoai_group_cancellation is None:
+            return _task_controls_response(task_id, status, "runtime_unavailable")
+        return _task_controls_response(task_id, status, "unsafe_task_graph")
+
+    if not snapshot["graph_readable"]:
+        return _task_controls_response(task_id, status, "unsafe_task_graph")
+
+    review_unit = None
+    if task_type == "ai-review":
+        review_unit = snapshot["review_unit"]
+        selected_review = _registered_frame_review_candidate(task_type, request_data) or (
+            review_unit is not None and _frame_review_unit_hint(review_unit)
+        )
+        if selected_review:
+            if not _request_matches_registered_control_graph(
+                request_data, "frame.review", "frame-review-v1"
+            ):
+                return _task_controls_response(task_id, status, "unsafe_task_graph")
+            if review_unit is None or not _valid_frame_review_unit(review_unit):
+                return _task_controls_response(task_id, status, "unsafe_task_graph")
+            reason = _registered_control_reason(
+                task, (review_unit,), frame_review_cancellation is not None
+            )
+            return _task_controls_response(task_id, status, reason)
+    elif _frame_review_task_hint(request_data) or any(
+        _frame_review_unit_hint(unit) for unit in units
+    ):
+        return _task_controls_response(task_id, status, "unsafe_task_graph")
+
+    if task_type == "batch-optimize":
+        request_selected = _registered_frame_optimize_candidate(request_data)
+        unit_selected = any(_frame_optimize_unit_hint(unit) for unit in units)
+        if request_selected or unit_selected:
+            if not _request_matches_registered_control_graph(
+                request_data, "frame.optimize", "frame-optimize-v1"
+            ):
+                return _task_controls_response(task_id, status, "unsafe_task_graph")
+            if not units or not all(_valid_frame_optimize_unit(unit) for unit in units):
+                return _task_controls_response(task_id, status, "unsafe_task_graph")
+            reason = _registered_control_reason(
+                task, units, frame_optimize_cancellation is not None
+            )
+            return _task_controls_response(task_id, status, reason)
+    elif _frame_optimize_task_hint(request_data) or any(
+        _frame_optimize_unit_hint(unit) for unit in units
+    ):
+        return _task_controls_response(task_id, status, "unsafe_task_graph")
+
+    if status == "cancelling" or _has_persisted_cancel_marker(task) or any(
+        _has_persisted_cancel_marker(unit) for unit in units
+    ):
+        return _task_controls_response(task_id, status, "already_requested")
+    if status in {"completed", "failed", "cancelled"}:
+        return _task_controls_response(task_id, status, "terminal")
+    return _task_controls_response(task_id, status, "unsupported_operation")
+
+
+def _registered_control_reason(
+    task: TaskValue,
+    units: Sequence[TaskValue],
+    runtime_available: bool,
+) -> str:
+    status = _value(task, "status")
+    if status == "cancelling" or _has_persisted_cancel_marker(task) or any(
+        _has_persisted_cancel_marker(unit) for unit in units
+    ):
+        return "already_requested"
+    if status in {"completed", "failed", "cancelled"}:
+        return "terminal"
+    if status not in {"queued", "processing", "reconciling"}:
+        return "unsafe_task_graph"
+    return "available" if runtime_available else "runtime_unavailable"
+
+
+def _task_controls_response(task_id: str, status: Any, reason: str) -> dict[str, Any]:
+    return {
+        "task_id": task_id,
+        "status": status,
+        "cancel": {"allowed": reason == "available", "reason": reason},
+    }
+
+
+def _request_matches_registered_control_graph(
+    request_data: Mapping[str, Any] | None,
+    operation: str,
+    graph_version: str,
+) -> bool:
+    if request_data is None:
+        return True
+    expected_values = {
+        "operation": operation,
+        "graph_version": graph_version,
+        "step_graph_version": graph_version,
+    }
+    return all(
+        request_data.get(field) is None or request_data.get(field) == expected
+        for field, expected in expected_values.items()
+    )
+
+
+def _has_persisted_cancel_marker(value: TaskValue) -> bool:
+    return _value(value, "user_cancelled_at") is not None or _value(
+        value, "cancellation_reason"
+    ) is not None
+
+
+def _frame_review_unit_hint(unit: TaskValue) -> bool:
+    return _value(unit, "operation") == "frame.review" or _value(
+        unit, "step_graph_version"
+    ) == "frame-review-v1"
+
+
+def _valid_frame_review_unit(unit: TaskValue) -> bool:
+    operation = _value(unit, "operation")
+    graph_version = _value(unit, "step_graph_version")
+    return (
+        _frame_review_unit_hint(unit)
+        and operation in {None, "frame.review"}
+        and graph_version in {None, "frame-review-v1"}
+    )
+
+
+def _valid_frame_optimize_unit(unit: TaskValue) -> bool:
+    operation = _value(unit, "operation")
+    graph_version = _value(unit, "step_graph_version")
+    return (
+        _frame_optimize_unit_hint(unit)
+        and operation in {None, "frame.optimize"}
+        and graph_version in {None, "frame-optimize-v1"}
+    )
+
+
+def _frame_review_task_hint(request_data: Mapping[str, Any] | None) -> bool:
+    return bool(
+        request_data
+        and (
+            request_data.get("operation") == "frame.review"
+            or request_data.get("graph_version") == "frame-review-v1"
+            or request_data.get("step_graph_version") == "frame-review-v1"
+        )
+    )
+
+
+def _frame_optimize_task_hint(request_data: Mapping[str, Any] | None) -> bool:
+    return bool(
+        request_data
+        and (
+            request_data.get("operation") == "frame.optimize"
+            or request_data.get("graph_version") == "frame-optimize-v1"
+            or request_data.get("step_graph_version") == "frame-optimize-v1"
+            or request_data.get("mode") == "frame_optimize"
+        )
+    )
 
 
 def get_submission_receipt(

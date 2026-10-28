@@ -120,7 +120,7 @@ def send_request(app: FastAPI, method: str, url: str, **kwargs: Any) -> httpx.Re
     return asyncio.run(perform())
 
 
-def test_router_registers_exact_nine_methods_and_keeps_literal_routes_first() -> None:
+def test_router_registers_task_controls_and_keeps_literal_routes_first() -> None:
     router = build_task_observation_router(
         uow_factory=None,
         resolve_account_actor=None,
@@ -131,6 +131,7 @@ def test_router_registers_exact_nine_methods_and_keeps_literal_routes_first() ->
 
     assert entries == {
         ("/api/chat/tasks", "GET"),
+        ("/api/chat/tasks/{task_id}/controls", "GET"),
         ("/api/chat/submissions/{operation}", "GET"),
         ("/api/chat/tasks/list", "GET"),
         ("/api/chat/tasks/{task_id}/request", "GET"),

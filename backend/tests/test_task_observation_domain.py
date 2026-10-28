@@ -96,7 +96,7 @@ def test_task_receipt_uses_present_unit_values_without_falsey_fallback() -> None
     assert set(receipt) == {
         "id", "type", "message_id", "status", "result", "billing_status",
         "quoted_amount", "progress", "progress_message", "external_task_id",
-        "external_provider", "created_at", "updated_at",
+        "external_provider", "created_at", "updated_at", "history_truth",
     }
     assert receipt["message_id"] is None
     assert receipt["billing_status"] == ""
@@ -104,6 +104,21 @@ def test_task_receipt_uses_present_unit_values_without_falsey_fallback() -> None
     assert receipt["progress"] == -2
     assert receipt["created_at"] == "2026-01-02T03:04:05"
     assert receipt["updated_at"] is None
+    history_truth = receipt["history_truth"]
+    assert set(history_truth) == {
+        "version", "source", "worker", "provider", "local_disposition", "billing_scope",
+    }
+    assert history_truth["version"] == 1
+    assert set(history_truth["billing_scope"]) == {
+        "unit_count", "legacy_quote_scope", "aggregated",
+    }
+    assert history_truth["billing_scope"] == {
+        "unit_count": None,
+        "legacy_quote_scope": "unknown",
+        "aggregated": False,
+    }
+    for section in ("source", "worker", "provider", "local_disposition"):
+        assert isinstance(history_truth[section], dict)
     assert reader.calls == [("first", "task-a")]
 
 

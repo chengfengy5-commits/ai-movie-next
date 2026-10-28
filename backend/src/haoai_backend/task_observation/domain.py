@@ -38,6 +38,10 @@ class BillingUnitRecord:
     quoted_amount: Any
     billing_status: Any
     created_at: datetime | None = None
+    operation: str | None = None
+    step_graph_version: str | None = None
+    user_cancelled_at: datetime | None = None
+    cancellation_reason: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

@@ -11,7 +11,7 @@ from types import MappingProxyType
 from typing import Final, Mapping
 
 from haoai_backend.generation_contracts.types import OperationPolicy
-from haoai_backend.generation_task_concurrency import (
+from haoai_backend.generation_contracts.task_policy import (
     IN_FLIGHT_STATES,
     SOURCE_WORKER_TYPES,
     task_type_for_operation,
