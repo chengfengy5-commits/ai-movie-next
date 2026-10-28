@@ -185,6 +185,16 @@ describe("chapter canvas graph projection", () => {
     expect(graph.edges.some((edge) => edge.id === "dangling")).toBe(false);
   });
 
+  it("keeps existing video nodes independent from generated graph relationships", () => {
+    const graph = buildCanvasGraph(chapter, [storyboard], [character], [], [], {}, "video-source-version");
+    const videoNodes = graph.nodes.filter((node) => node.kind === "video");
+
+    expect(videoNodes).toHaveLength(1);
+    for (const video of videoNodes) {
+      expect(graph.edges.some((edge) => edge.sourceRef === video.ref || edge.targetRef === video.ref)).toBe(false);
+    }
+  });
+
   it("keeps a numeric stable frame ID distinct from a colliding legacy frame index", () => {
     const sourceVersion = "8be1499c4eb8b1a1f8e20d020cd52796e938726f0a1889cfecc07641d8d28a57";
     const twoFrames = {
