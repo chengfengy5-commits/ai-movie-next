@@ -11,6 +11,7 @@ const actorId = series.user_id;
 const apiBaseUrl = "http://127.0.0.1:4175/api";
 const chapterId = "history-adoption-chapter";
 const mediaUrl = "http://127.0.0.1:4175/uploads/generated/adopted.png";
+const videoUrl = "http://127.0.0.1:4175/uploads/generated/adopted.mp4";
 const previousImageUrl = "https://cdn.example.test/assets/original.png";
 
 type AssetCategory = "characters" | "scenes" | "props";
@@ -71,10 +72,12 @@ function assetRecord(category: AssetCategory, id: string, imageUrl: string | nul
 
 function makeFixture(options: {
   readonly adoptionUrl?: string;
+  readonly adoptionMode?: "image" | "video";
   readonly malformedUpdateReceipt?: boolean;
   readonly timeoutStatus?: number;
 } = {}) {
-  const adoptionUrl = options.adoptionUrl ?? mediaUrl;
+  const adoptionMode = options.adoptionMode ?? "image";
+  const adoptionUrl = options.adoptionUrl ?? (adoptionMode === "image" ? mediaUrl : videoUrl);
   const storage = new MemoryStorage();
   storage.setItem(API_TOKEN_KEY, "history-adoption-token");
   storage.setItem(API_USER_KEY, JSON.stringify({ id: actorId }));
@@ -86,13 +89,22 @@ function makeFixture(options: {
     chapter_id: chapterId,
     asset_type: category.singular,
     asset_id: category.assetId,
-    chat_mode: "image",
+    chat_mode: adoptionMode,
     role: "assistant",
     content: adoptionUrl,
-    model_name: "synthetic-image-model",
+    model_name: `synthetic-${adoptionMode}-model`,
     created_at: "2026-10-26T04:00:00Z",
   }]));
   const calls: Array<{ readonly url: string; readonly method: string; readonly body: unknown }> = [];
+  let nextAssetRead: { readonly promise: Promise<void>; readonly requested: () => void } | null = null;
+  function deferNextAssetRead(): { readonly requested: Promise<void>; release(): void } {
+    let resolveRead: () => void = () => undefined;
+    let resolveRequested: () => void = () => undefined;
+    const promise = new Promise<void>((resolve) => { resolveRead = resolve; });
+    const requested = new Promise<void>((resolve) => { resolveRequested = resolve; });
+    nextAssetRead = { promise, requested: resolveRequested };
+    return { requested, release: resolveRead };
+  }
   const fetcher: typeof fetch = async (input, init = {}) => {
     const url = new URL(input instanceof URL ? input.href : String(input));
     const path = url.pathname.replace(/^\/api(?=\/)/u, "");
@@ -119,6 +131,12 @@ function makeFixture(options: {
     if (category !== undefined) {
       const current = assets.get(category.category)!;
       if (path === `/series/${series.id}/${category.category}` && method === "GET") {
+        const heldRead = nextAssetRead;
+        nextAssetRead = null;
+        if (heldRead !== null) {
+          heldRead.requested();
+          await heldRead.promise;
+        }
         return jsonResponse([current]);
       }
       if (path === `/${category.category}/${category.assetId}` && method === "PUT") {
@@ -142,10 +160,11 @@ function makeFixture(options: {
     if (path === `/chapters/${chapterId}/asset-chat-messages`) {
       const selected = categories.find((candidate) => candidate.singular === url.searchParams.get("asset_type"));
       if (method !== "GET" || selected === undefined || url.searchParams.get("asset_id") !== selected.assetId
-        || url.searchParams.get("chat_mode") !== "image") {
+        || !["image", "video"].includes(url.searchParams.get("chat_mode") ?? "")) {
         throw new Error(`Unexpected history request: ${method} ${url.href}`);
       }
-      return jsonResponse([messages.get(selected.singular)]);
+      const message = messages.get(selected.singular)!;
+      return jsonResponse(message.chat_mode === url.searchParams.get("chat_mode") ? [message] : []);
     }
 
     throw new Error(`Unexpected request: ${method} ${url.href}`);
@@ -153,7 +172,7 @@ function makeFixture(options: {
   const services = createApiServices(apiBaseUrl, { storage, fetcher, timeoutMs: 1_000 });
   const historyPort = services.assetGenerationHistory;
   if (historyPort === undefined) throw new Error("The API services did not create the history port.");
-  render(
+  const rendered = render(
     <AssetLibrary
       generationHistoryPort={historyPort}
       onBack={() => undefined}
@@ -163,21 +182,24 @@ function makeFixture(options: {
       userId={actorId}
     />,
   );
-  return { assets, calls, messages };
+  return { assets, calls, deferNextAssetRead, messages, unmount: rendered.unmount };
 }
 
-async function openCategoryHistory(category: typeof categories[number]): Promise<void> {
+async function openCategoryHistory(category: typeof categories[number], mode: "image" | "video" = "image"): Promise<void> {
   fireEvent.click(within(screen.getByRole("group", { name: "素材分类" })).getByRole("button", { name: new RegExp(category.label) }));
   fireEvent.click(await screen.findByRole("button", { name: "生成历史" }));
   const chapterSelect = await screen.findByLabelText("选择历史所属章节");
   await waitFor(() => expect(chapterSelect).not.toBeDisabled());
   fireEvent.change(chapterSelect, { target: { value: chapterId } });
-  await screen.findByRole("button", { name: `设为${category.label}图` });
+  if (mode === "video") fireEvent.click(screen.getByRole("button", { name: "视频" }));
+  await screen.findByRole("button", {
+    name: mode === "image" ? `设为${category.label}图` : `采用此视频作为${category.label}素材`,
+  });
 }
 
 afterEach(() => cleanup());
 
-describe("AssetGenerationHistory image adoption", () => {
+describe("AssetGenerationHistory media adoption", () => {
   it("updates character, scene, and prop images through their typed APIs and confirms each by a fresh directory read", async () => {
     const { assets, calls } = makeFixture();
 
@@ -203,6 +225,63 @@ describe("AssetGenerationHistory image adoption", () => {
       expect(await screen.findByAltText(`${assetName}图片`)).toHaveAttribute("src", mediaUrl);
     }
     expect(calls.filter((call) => call.method === "PUT")).toHaveLength(3);
+  });
+
+  it("adopts video history for character, scene, and prop assets and confirms each by a fresh directory read", async () => {
+    const { assets, calls } = makeFixture({ adoptionMode: "video" });
+
+    for (const category of categories) {
+      await openCategoryHistory(category, "video");
+      fireEvent.click(screen.getByRole("button", { name: `采用此视频作为${category.label}素材` }));
+      await screen.findByRole("group", { name: "确认采用历史视频" });
+      expect(calls.filter((call) => call.method === "PUT")).toHaveLength(categories.indexOf(category));
+      fireEvent.click(screen.getByRole("button", { name: "确认采用此视频" }));
+      await screen.findByText("视频已保存，并由独立目录读取确认。");
+
+      expect(assets.get(category.category)?.image_url).toBe(videoUrl);
+      const assetPath = `/api/series/${series.id}/${category.category}`;
+      const putPath = `/api/${category.category}/${category.assetId}`;
+      const putIndex = calls.findIndex((call) => new URL(call.url).pathname === putPath && call.method === "PUT");
+      expect(putIndex).toBeGreaterThanOrEqual(0);
+      expect(calls[putIndex]?.body).toEqual({ image_url: videoUrl });
+      expect(calls.some((call, index) => index > putIndex
+        && new URL(call.url).pathname === assetPath && call.method === "GET")).toBe(true);
+
+      fireEvent.click(screen.getByRole("button", { name: "关闭生成历史" }));
+      await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    }
+    expect(calls.filter((call) => call.method === "PUT")).toHaveLength(3);
+  });
+
+  it("keeps video writes single-shot after an uncertain response and only rereads the asset", async () => {
+    const { assets, calls } = makeFixture({ adoptionMode: "video", timeoutStatus: 408 });
+    const category = categories[0]!;
+    await openCategoryHistory(category, "video");
+    fireEvent.click(screen.getByRole("button", { name: `采用此视频作为${category.label}素材` }));
+    await screen.findByRole("group", { name: "确认采用历史视频" });
+
+    fireEvent.click(screen.getByRole("button", { name: "确认采用此视频" }));
+    await screen.findByText("保存请求已发出但结果未知；已停止自动操作，请只读核对素材目录。");
+    const putIndex = calls.findIndex((call) => call.method === "PUT");
+    expect(putIndex).toBeGreaterThanOrEqual(0);
+    expect(calls.filter((call) => call.method === "PUT")).toHaveLength(1);
+    expect(calls.slice(putIndex + 1).some((call) => new URL(call.url).pathname === `/api/series/${series.id}/characters`
+      && call.method === "GET")).toBe(true);
+    expect(assets.get(category.category)?.image_url).toBe(previousImageUrl);
+  });
+
+  it("does not continue a pending video adoption after its history dialog owner closes", async () => {
+    const { calls, deferNextAssetRead, unmount } = makeFixture({ adoptionMode: "video" });
+    const category = categories[0]!;
+    await openCategoryHistory(category, "video");
+    const heldRead = deferNextAssetRead();
+    fireEvent.click(screen.getByRole("button", { name: `采用此视频作为${category.label}素材` }));
+    await heldRead.requested;
+
+    unmount();
+    heldRead.release();
+    await waitFor(() => expect(screen.queryByRole("dialog")).toBeNull());
+    await waitFor(() => expect(calls.filter((call) => call.method === "PUT")).toHaveLength(0));
   });
 
   it("does not overwrite an image changed while the confirmation is open", async () => {

@@ -13,7 +13,7 @@
 }
 
 .admin-credit-sort-button:hover {
-  color: #d9d2f5;
+  color: var(--admin-accent-hover);
 }
 
 .admin-credit-filter {
@@ -22,16 +22,16 @@
   align-items: end;
   gap: 10px;
   padding: 14px;
-  border: 1px solid #29292f;
+  border: 1px solid var(--admin-line);
   border-radius: 10px;
-  background: #18181b;
+  background: var(--admin-surface);
 }
 
 .admin-credit-filter label {
   display: grid;
   min-width: min(100%, 240px);
   gap: 7px;
-  color: #c0c0c8;
+  color: var(--admin-text);
   font-size: 12px;
   font-weight: 600;
 }
@@ -40,16 +40,16 @@
 .admin-credit-form input {
   min-height: 40px;
   padding: 8px 11px;
-  border: 1px solid #393940;
+  border: 1px solid var(--admin-line);
   border-radius: 8px;
-  color: #e4e4e7;
-  background: #1a1a1e;
+  color: var(--admin-text);
+  background: var(--admin-surface-raised);
   font: inherit;
 }
 
 .admin-credit-filter input:focus,
 .admin-credit-form input:focus {
-  border-color: #8b5cf6;
+  border-color: var(--admin-accent-text);
   outline: none;
   box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.12);
 }
@@ -59,9 +59,9 @@
   width: min(100%, 620px);
   gap: 16px;
   padding: 22px;
-  border: 1px solid #2a2a30;
+  border: 1px solid var(--admin-line);
   border-radius: 11px;
-  background: #18181b;
+  background: var(--admin-surface);
 }
 
 .admin-credit-form .admin-field {
@@ -70,19 +70,19 @@
 }
 
 .admin-credit-form .admin-field > span {
-  color: #c0c0c8;
+  color: var(--admin-text);
   font-size: 12px;
   font-weight: 600;
 }
 
 .admin-credit-form .admin-field small {
-  color: #85838d;
+  color: var(--admin-muted);
   font-size: 11px;
 }
 
 .admin-credit-form input[readonly] {
-  color: #a4a3ad;
-  background: #141416;
+  color: var(--admin-muted);
+  background: var(--admin-surface-raised);
 }
 
 .admin-credit-actions {
@@ -94,7 +94,7 @@
 
 .admin-credit-notice {
   margin: 0;
-  color: #91d4aa;
+  color: var(--admin-success);
   font-size: 12px;
 }
 
@@ -102,10 +102,10 @@
   display: grid;
   gap: 10px;
   padding: 12px 14px;
-  border: 1px solid rgba(240, 113, 120, 0.35);
+  border: 1px solid var(--admin-danger-border);
   border-radius: 8px;
-  color: #f0a0a4;
-  background: rgba(140, 42, 49, 0.12);
+  color: var(--admin-danger);
+  background: var(--admin-danger-soft);
 }
 
 .admin-credit-error p {
@@ -113,9 +113,9 @@
 }
 
 .admin-credit-error.is-uncertain {
-  border-color: rgba(237, 185, 102, 0.35);
-  color: #e6c48e;
-  background: rgba(143, 103, 42, 0.12);
+  border-color: var(--admin-warning-border);
+  color: var(--admin-warning);
+  background: var(--admin-warning-soft);
 }
 
 .admin-credit-amount {
@@ -124,11 +124,11 @@
 }
 
 .admin-credit-amount.is-positive {
-  color: #91d4aa;
+  color: var(--admin-success);
 }
 
 .admin-credit-amount.is-negative {
-  color: #f0a0a4;
+  color: var(--admin-danger);
 }
 
 @media (max-width: 640px) {

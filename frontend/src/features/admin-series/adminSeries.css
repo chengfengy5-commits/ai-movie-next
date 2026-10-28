@@ -3,8 +3,8 @@
 .admin-series-actions, .admin-series-form-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 9px; }
 .admin-series-export-status { margin: -8px 0 12px; color: var(--admin-muted, #a1a1aa); font-size: 12px; }
 .admin-series-filters { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; margin: 16px 0; padding: 16px; border: 1px solid var(--admin-line, #2a2a30); border-radius: 11px; background: var(--admin-surface, #18181b); }
-.admin-series-filters label, .admin-series-field { display: grid; min-width: min(240px, 100%); flex: 1 1 200px; gap: 7px; color: #c0c0c8; font-size: 12px; font-weight: 600; }
-.admin-series-filters input, .admin-series-field input, .admin-series-field textarea { width: 100%; min-width: 0; min-height: 40px; padding: 9px 11px; border: 1px solid #393940; border-radius: 8px; color: var(--admin-text, #e4e4e7); background: #1a1a1e; font: inherit; font-weight: 400; }
+.admin-series-filters label, .admin-series-field { display: grid; min-width: min(240px, 100%); flex: 1 1 200px; gap: 7px; color: var(--admin-text, #e4e4e7); font-size: 12px; font-weight: 600; }
+.admin-series-filters input, .admin-series-field input, .admin-series-field textarea { width: 100%; min-width: 0; min-height: 40px; padding: 9px 11px; border: 1px solid var(--admin-line, #2a2a30); border-radius: 8px; color: var(--admin-text, #e4e4e7); background: var(--admin-surface-raised, #1e1e22); font: inherit; font-weight: 400; }
 .admin-series-field textarea { min-height: 110px; resize: vertical; line-height: 1.55; }
 .admin-series-filters input:focus, .admin-series-field input:focus, .admin-series-field textarea:focus { border-color: var(--admin-accent, #8b5cf6); outline: 3px solid rgba(139, 92, 246, .12); }
 .admin-series-table-wrap { max-width: 100%; overflow-x: auto; border: 1px solid var(--admin-line, #2a2a30); border-radius: 11px; }
@@ -19,10 +19,10 @@
 .admin-series-form { display: grid; gap: 15px; max-width: 860px; margin-top: 18px; padding: 20px; border: 1px solid var(--admin-line, #2a2a30); border-radius: 11px; background: var(--admin-surface, #18181b); }
 .admin-series-field { min-width: 0; }
 .admin-series-form-actions { padding-top: 4px; }
-.admin-series-error, .admin-series-unknown { margin: 0; padding: 12px 14px; border: 1px solid #693c42; border-radius: 9px; color: #e0a3a7; font-size: 12px; line-height: 1.65; }
-.admin-series-unknown { border-color: #725f37; color: #ddc58e; }
+.admin-series-error, .admin-series-unknown { margin: 0; padding: 12px 14px; border: 1px solid var(--admin-danger-border, #684046); border-radius: 9px; color: var(--admin-danger, #f07178); background: var(--admin-danger-soft, #352024); font-size: 12px; line-height: 1.65; }
+.admin-series-unknown { border-color: var(--admin-warning-border, #715b2c); color: var(--admin-warning, #f4cc78); background: var(--admin-warning-soft, #352d1c); }
 .admin-series-unknown p { margin: 7px 0; }
-.admin-series-snapshot { margin: 12px 0; padding: 12px; border-radius: 8px; background: rgba(24, 24, 27, .6); }
+.admin-series-snapshot { margin: 12px 0; padding: 12px; border-radius: 8px; background: var(--admin-surface-raised, #1e1e22); }
 .admin-series-snapshot dl { display: grid; gap: 7px; }
 .admin-series-snapshot dl > div { display: grid; grid-template-columns: 120px minmax(0, 1fr); gap: 10px; }
 .admin-series-snapshot dd { min-width: 0; margin: 0; overflow-wrap: anywhere; }

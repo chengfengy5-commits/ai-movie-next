@@ -17,7 +17,7 @@
   position: sticky;
   z-index: 1;
   top: 0;
-  background: #f8fbf9;
+  background: var(--surface);
 }
 
 .frame-asset-reference-panel-controls {
@@ -39,14 +39,14 @@
 }
 
 .frame-asset-reference-drag-handle:focus-visible {
-  outline: 2px solid #8cb8a8;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .frame-asset-reference-position-feedback,
 .frame-asset-reference-position-note {
   margin: 0;
-  color: #8a7651;
+  color: var(--warning);
   font-size: 10px;
   line-height: 1.55;
 }
@@ -61,13 +61,13 @@
 }
 
 .frame-asset-reference-scroll-viewport:focus-visible {
-  outline: 2px solid #8cb8a8;
+  outline: 2px solid var(--accent);
   outline-offset: 2px;
 }
 
 .frame-asset-reference-scroll-feedback {
   margin: 0;
-  color: #8a7651;
+  color: var(--warning);
   font-size: 10px;
   line-height: 1.55;
 }

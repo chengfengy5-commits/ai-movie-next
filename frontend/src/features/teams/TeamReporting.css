@@ -35,7 +35,9 @@
 
 .team-reporting-toolbar select,
 .team-reporting-date-filter input {
-  border: 1px solid #c9ccd1;
+  border: 1px solid var(--line-strong);
+  color: var(--ink);
+  background: var(--surface);
   border-radius: 0.35rem;
   font: inherit;
   min-height: 2.35rem;
@@ -58,7 +60,7 @@
 
 .team-reporting-task-summary span,
 .team-reporting-metrics > div {
-  background: #f5f6f8;
+  background: var(--surface-secondary);
   border-radius: 0.4rem;
   padding: 0.65rem 0.8rem;
 }
@@ -75,7 +77,7 @@
 
 .team-reporting-metrics dt,
 .team-reporting-task small {
-  color: #626973;
+  color: var(--muted);
   font-size: 0.82rem;
 }
 
@@ -91,7 +93,7 @@
 }
 
 .team-reporting-task {
-  border: 1px solid #e1e4e8;
+  border: 1px solid var(--line);
   border-radius: 0.45rem;
   display: grid;
   gap: 0.35rem;
@@ -132,14 +134,14 @@
 
 .team-reporting-table th,
 .team-reporting-table td {
-  border-bottom: 1px solid #e1e4e8;
+  border-bottom: 1px solid var(--line);
   padding: 0.6rem 0.7rem;
   text-align: left;
   vertical-align: top;
 }
 
 .team-reporting-table thead th {
-  background: #f5f6f8;
+  background: var(--surface-secondary);
   font-weight: 600;
 }
 
@@ -156,8 +158,9 @@
 }
 
 .team-reporting-model-chip {
-  background: #f5f6f8;
-  border: 1px solid #e1e4e8;
+  background: var(--surface-secondary);
+  border: 1px solid var(--line);
+  color: var(--ink);
   border-radius: 999px;
   cursor: pointer;
   font: inherit;

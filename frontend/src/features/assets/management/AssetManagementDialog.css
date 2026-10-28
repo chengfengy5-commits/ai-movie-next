@@ -9,24 +9,24 @@
 .asset-card-management-actions button {
   min-height: 30px;
   padding: 5px 10px;
-  border: 1px solid #dce7e4;
+  border: 1px solid var(--line);
   border-radius: 7px;
-  color: #286e64;
-  background: #f7fbfa;
+  color: var(--teal-deep);
+  background: var(--surface-subtle);
   cursor: pointer;
   font: inherit;
   font-size: 11px;
 }
 
 .asset-card-management-actions button:hover:not(:disabled) {
-  border-color: #a8cfc5;
-  background: #edf7f3;
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
 }
 
 .asset-card-management-actions .asset-card-delete {
-  color: #9b4944;
-  border-color: #ead8d5;
-  background: #fffafa;
+  color: var(--danger);
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
 }
 
 .asset-management-backdrop {
@@ -46,9 +46,9 @@
   max-height: min(88vh, 820px);
   flex-direction: column;
   overflow: hidden;
-  border: 1px solid #dfe9e6;
+  border: 1px solid var(--line);
   border-radius: 16px;
-  background: #fff;
+  background: var(--surface);
   box-shadow: 0 22px 70px rgba(16, 36, 34, 0.22);
 }
 
@@ -58,18 +58,18 @@
   justify-content: space-between;
   gap: 14px;
   padding: 21px 23px 15px;
-  border-bottom: 1px solid #edf1ef;
+  border-bottom: 1px solid var(--line);
 }
 
 .asset-management-header .eyebrow {
   margin: 0 0 6px;
-  color: #768781;
+  color: var(--muted);
   font-size: 11px;
 }
 
 .asset-management-header h2 {
   margin: 0;
-  color: #243639;
+  color: var(--ink);
   font-size: 20px;
 }
 
@@ -78,8 +78,8 @@
   height: 34px;
   border: 0;
   border-radius: 8px;
-  color: #6e7c79;
-  background: #f3f7f5;
+  color: var(--muted);
+  background: var(--surface-muted);
   cursor: pointer;
   font-size: 21px;
 }
@@ -95,13 +95,13 @@
 .asset-management-field {
   display: grid;
   gap: 7px;
-  color: #40514f;
+  color: var(--ink);
   font-size: 12px;
   font-weight: 650;
 }
 
 .asset-management-field b {
-  color: #a74742;
+  color: var(--danger);
 }
 
 .asset-management-field input,
@@ -109,10 +109,10 @@
   width: 100%;
   box-sizing: border-box;
   padding: 10px 11px;
-  border: 1px solid #dce5e2;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #293a38;
-  background: #fff;
+  color: var(--ink);
+  background: var(--surface);
   font: inherit;
   font-size: 13px;
   font-weight: 400;
@@ -125,20 +125,20 @@
 
 .asset-management-field input:focus,
 .asset-management-field textarea:focus {
-  border-color: #72aa9f;
+  border-color: var(--teal);
   outline: 3px solid rgba(91, 162, 147, 0.16);
 }
 
 .asset-management-delete-copy p {
   margin: 0;
-  color: #3e4f4d;
+  color: var(--ink);
   font-size: 13px;
   line-height: 1.7;
 }
 
 .asset-management-delete-copy .asset-management-note,
 .asset-management-note {
-  color: #71817d;
+  color: var(--muted);
   font-size: 11px;
 }
 
@@ -153,18 +153,18 @@
 }
 
 .asset-management-error {
-  color: #8f3f3b;
-  background: #fff2f0;
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .asset-management-warning {
-  color: #73552c;
-  background: #fff8e9;
+  color: var(--warning);
+  background: var(--warning-soft);
 }
 
 .asset-management-pending {
-  color: #346d64;
-  background: #eef7f4;
+  color: var(--info);
+  background: var(--info-soft);
 }
 
 .asset-management-footer {
@@ -173,7 +173,7 @@
   justify-content: flex-end;
   gap: 9px;
   padding: 14px 23px 20px;
-  border-top: 1px solid #edf1ef;
+  border-top: 1px solid var(--line);
 }
 
 .asset-management-footer button {

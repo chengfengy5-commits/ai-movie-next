@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { AdminFeature } from "../features/admin/AdminFeature";
+import { AppearanceProvider } from "../features/appearance/ThemeProvider";
+import { PublicSiteConfigProvider } from "../features/site-config/PublicSiteConfigProvider";
 import { ApiConfigurationError, resolveApiBaseUrl } from "../shared/api/config";
 import { AuthProvider } from "../features/auth/AuthProvider";
 import { ResetPasswordPage } from "../features/auth/ResetPasswordPage";
@@ -58,10 +60,13 @@ function AdminApiRequired() {
   );
 }
 
-export function App({ services: providedServices, resetPasswordTokenHolder }: AppProps) {
-  const [initialized] = useState(initializeServices);
-  const services = providedServices ?? initialized.services;
+interface AppRoutesProps {
+  services: WorkspaceServices | null;
+  initialized: ServiceInitialization;
+  resetPasswordTokenHolder: AppProps["resetPasswordTokenHolder"];
+}
 
+function AppRoutes({ services, initialized, resetPasswordTokenHolder }: AppRoutesProps) {
   if (window.location.pathname === "/reset-password.html") {
     return (
       <ResetPasswordPage
@@ -108,5 +113,28 @@ export function App({ services: providedServices, resetPasswordTokenHolder }: Ap
     <AuthProvider services={services}>
       <Workspace />
     </AuthProvider>
+  );
+}
+
+function AppContent(props: AppProps) {
+  const [initialized] = useState(initializeServices);
+  const services = props.services ?? initialized.services;
+
+  return (
+    <PublicSiteConfigProvider services={services}>
+      <AppRoutes
+        initialized={initialized}
+        resetPasswordTokenHolder={props.resetPasswordTokenHolder}
+        services={services}
+      />
+    </PublicSiteConfigProvider>
+  );
+}
+
+export function App(props: AppProps) {
+  return (
+    <AppearanceProvider>
+      <AppContent {...props} />
+    </AppearanceProvider>
   );
 }
