@@ -8,6 +8,7 @@ import {
 import {
   AssetGenerationHistoryError,
   type AssetGenerationHistoryMessage,
+  type AssetGenerationHistoryMode,
   type AssetGenerationHistoryPort,
   type AssetGenerationHistoryRunContext,
 } from "./assetGenerationHistory";
@@ -266,6 +267,126 @@ async function readImageResponse(
   }
 }
 
+export interface GenerationHistoryMediaReaderOptions {
+  readonly token: string;
+  readonly fetcher?: typeof fetch;
+  readonly imagePreviewTimeoutMs?: number;
+  isCurrent(): boolean;
+}
+
+export function createGenerationHistoryMediaReader(
+  apiBaseUrl: string,
+  options: GenerationHistoryMediaReaderOptions,
+): (url: string, mode: AssetGenerationHistoryMode, signal: AbortSignal) => Promise<Blob> {
+  const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
+  const imagePreviewTimeoutMs = options.imagePreviewTimeoutMs ?? IMAGE_PREVIEW_TIMEOUT_MS;
+  if (!Number.isFinite(imagePreviewTimeoutMs) || imagePreviewTimeoutMs <= 0) {
+    fail("read-error", "图片预览超时配置无效。");
+  }
+
+  function assertCurrent(signal: AbortSignal, dispatched: boolean): void {
+    if (signal.aborted || !options.isCurrent()) {
+      fail(dispatched ? "read-error" : "not-sent",
+        dispatched ? "登录或页面范围已变化，媒体读取结果已忽略。" : "登录或页面范围已变化，未读取媒体。");
+    }
+  }
+
+  async function readImage(route: MediaExportUrlRoute, signal: AbortSignal): Promise<Blob> {
+    assertCurrent(signal, false);
+    const timed = createTimedRequest(signal, imagePreviewTimeoutMs);
+    const headers: Record<string, string> = { Accept: Object.keys(CANONICAL_IMAGE_MIME).join(", ") };
+    if (route.kind === "protected-uploads") headers.Authorization = `Bearer ${options.token}`;
+    let response: Response | null = null;
+    try {
+      const responsePromise = fetcher(route.url, {
+        method: "GET",
+        headers,
+        signal: timed.controller.signal,
+        mode: route.kind === "protected-uploads" ? "same-origin" : "cors",
+        credentials: "omit",
+        cache: "no-store",
+        redirect: route.kind === "protected-uploads" ? "error" : "follow",
+        referrerPolicy: "no-referrer",
+      });
+      void responsePromise.then((lateResponse) => {
+        if (timed.controller.signal.aborted) void lateResponse.body?.cancel().catch(() => undefined);
+      }, () => undefined);
+      try {
+        response = await raceWithAbort(responsePromise, timed);
+      } catch {
+        fail("read-error", timed.didTimeout() ? "图片读取超时。" : "无法读取这张图片。");
+      }
+      assertCurrent(timed.controller.signal, true);
+      if (route.kind === "protected-uploads" && response.status === 401) {
+        await response.body?.cancel().catch(() => undefined);
+        fail("unauthorized", "登录状态已失效，请重新登录。", 401);
+      }
+      const contentType = response.headers.get("Content-Type") ?? "";
+      const mimeType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+      if (response.url === "") fail("read-error", "图片响应来源无法核对。");
+      let finalRoute: MediaExportUrlRoute;
+      try {
+        finalRoute = classifyMediaExportUrl(response.url, apiBaseUrl);
+      } catch {
+        fail("read-error", "图片来源跳转到不允许的地址。");
+      }
+      if (route.kind === "protected-uploads") {
+        if (finalRoute.kind !== "protected-uploads" || finalRoute.url !== route.url) {
+          fail("read-error", "受保护图片发生了未允许的跳转。");
+        }
+      } else if (finalRoute.kind !== "anonymous-public" || new URL(finalRoute.url).protocol !== "https:") {
+        fail("read-error", "公开图片发生了未允许的跳转。");
+      }
+      const blob = await readImageResponse(response, mimeType, timed.controller.signal, IMAGE_PREVIEW_MAX_BYTES);
+      assertCurrent(timed.controller.signal, true);
+      return blob;
+    } catch (error) {
+      if (error instanceof AssetGenerationHistoryError) throw error;
+      return fail("read-error", timed.didTimeout() ? "图片读取超时。" : "图片读取失败。");
+    } finally {
+      if (response?.body !== null && response?.body !== undefined && !response.bodyUsed) {
+        await response.body.cancel().catch(() => undefined);
+      }
+      timed.dispose();
+    }
+  }
+
+  return async (url, mode, signal): Promise<Blob> => {
+    assertCurrent(signal, false);
+    let route: MediaExportUrlRoute;
+    try {
+      route = classifyMediaExportUrl(url, apiBaseUrl);
+    } catch {
+      fail("read-error", "媒体来源地址不符合预览要求。");
+    }
+    if (route.kind === "anonymous-public" && new URL(route.url).protocol !== "https:") {
+      fail("read-error", "公开媒体预览只允许 HTTPS 来源。");
+    }
+    if (mode === "image") return await readImage(route, signal);
+    try {
+      const media = await readMediaExportSource({
+        mediaUrl: url,
+        apiBaseUrl,
+        token: options.token,
+        fetcher,
+        signal,
+      });
+      assertCurrent(signal, true);
+      return media.blob;
+    } catch (error) {
+      if (error instanceof AssetGenerationHistoryError) throw error;
+      if (route.kind === "protected-uploads"
+        && error instanceof MediaExportReaderError
+        && error.status === 401
+        && error.source === "application") {
+        fail("unauthorized", "登录状态已失效，请重新登录。", 401);
+      }
+      const status = error instanceof MediaExportReaderError ? error.status ?? null : null;
+      fail("read-error", "无法读取这段生成视频。", status);
+    }
+  };
+}
+
 export function createAssetGenerationHistoryHttpPort(
   apiBaseUrl: string,
   options: AssetGenerationHistoryHttpOptions = {},
@@ -444,70 +565,12 @@ export function createAssetGenerationHistoryHttpPort(
         return `/chapters/${encodeURIComponent(capturedChapterId)}/asset-chat-messages${suffix}/${encodeURIComponent(messageId)}`;
       }
 
-      async function readImage(
-        route: MediaExportUrlRoute,
-        signal: AbortSignal,
-      ): Promise<Blob> {
-        assertCurrent("read", false, signal);
-        const timed = createTimedRequest(signal, imagePreviewTimeoutMs);
-        const headers: Record<string, string> = { Accept: Object.keys(CANONICAL_IMAGE_MIME).join(", ") };
-        if (route.kind === "protected-uploads") headers.Authorization = `Bearer ${token}`;
-        const requestMode: RequestMode = route.kind === "protected-uploads" ? "same-origin" : "cors";
-        let response: Response | null = null;
-        try {
-          const responsePromise = fetcher(route.url, {
-            method: "GET",
-            headers,
-            signal: timed.controller.signal,
-            mode: requestMode,
-            credentials: "omit",
-            cache: "no-store",
-            redirect: route.kind === "protected-uploads" ? "error" : "follow",
-            referrerPolicy: "no-referrer",
-          });
-          void responsePromise.then((lateResponse) => {
-            if (timed.controller.signal.aborted) void lateResponse.body?.cancel().catch(() => undefined);
-          }, () => undefined);
-          try {
-            response = await raceWithAbort(responsePromise, timed);
-          } catch {
-            fail("read-error", timed.didTimeout() ? "图片读取超时。" : "无法读取这张图片。");
-          }
-          assertCurrent("read", true, timed.controller.signal);
-          if (route.kind === "protected-uploads" && response.status === 401) {
-            await response.body?.cancel().catch(() => undefined);
-            fail("unauthorized", "登录状态已失效，请重新登录。", 401);
-          }
-          const contentType = response.headers.get("Content-Type") ?? "";
-          const mimeType = contentType.split(";", 1)[0]?.trim().toLowerCase() ?? "";
-          const finalUrl = response.url;
-          if (finalUrl === "") fail("read-error", "图片响应来源无法核对。");
-          let finalRoute: MediaExportUrlRoute;
-          try {
-            finalRoute = classifyMediaExportUrl(finalUrl, baseUrl);
-          } catch {
-            fail("read-error", "图片来源跳转到不允许的地址。");
-          }
-          if (route.kind === "protected-uploads") {
-            if (finalRoute.kind !== "protected-uploads" || finalRoute.url !== route.url) {
-              fail("read-error", "受保护图片发生了未允许的跳转。");
-            }
-          } else if (finalRoute.kind !== "anonymous-public" || new URL(finalRoute.url).protocol !== "https:") {
-            fail("read-error", "公开图片发生了未允许的跳转。");
-          }
-          const blob = await readImageResponse(response, mimeType, timed.controller.signal, IMAGE_PREVIEW_MAX_BYTES);
-          assertCurrent("read", true, timed.controller.signal);
-          return blob;
-        } catch (error) {
-          if (error instanceof AssetGenerationHistoryError) throw error;
-          return fail("read-error", timed.didTimeout() ? "图片读取超时。" : "图片读取失败。");
-        } finally {
-          if (response?.body !== null && response?.body !== undefined && !response.bodyUsed) {
-            await response.body.cancel().catch(() => undefined);
-          }
-          timed.dispose();
-        }
-      }
+      const readMedia = createGenerationHistoryMediaReader(baseUrl, {
+        token,
+        fetcher,
+        imagePreviewTimeoutMs,
+        isCurrent,
+      });
 
       return {
         isCurrent,
@@ -516,38 +579,7 @@ export function createAssetGenerationHistoryHttpPort(
           return parseMessages(payload);
         },
         async readMedia(url, signal): Promise<Blob> {
-          assertCurrent("read", false, signal);
-          let route: MediaExportUrlRoute;
-          try {
-            route = classifyMediaExportUrl(url, baseUrl);
-          } catch {
-            fail("read-error", "媒体来源地址不符合预览要求。");
-          }
-          if (route.kind === "anonymous-public" && new URL(route.url).protocol !== "https:") {
-            fail("read-error", "公开媒体预览只允许 HTTPS 来源。");
-          }
-          if (capturedMode === "image") return await readImage(route, signal);
-          try {
-            const media = await readMediaExportSource({
-              mediaUrl: url,
-              apiBaseUrl: baseUrl,
-              token,
-              fetcher,
-              signal,
-            });
-            assertCurrent("read", true, signal);
-            return media.blob;
-          } catch (error) {
-            if (error instanceof AssetGenerationHistoryError) throw error;
-            if (route.kind === "protected-uploads"
-              && error instanceof MediaExportReaderError
-              && error.status === 401
-              && error.source === "application") {
-              fail("unauthorized", "登录状态已失效，请重新登录。", 401);
-            }
-            const status = error instanceof MediaExportReaderError ? error.status ?? null : null;
-            fail("read-error", "无法读取这段生成视频。", status);
-          }
+          return await readMedia(url, capturedMode, signal);
         },
         async retryOssUpload(url, signal): Promise<string> {
           const payload = await request("/upload/retry-oss", signal, {
