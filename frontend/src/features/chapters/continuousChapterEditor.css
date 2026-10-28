@@ -58,14 +58,14 @@
   box-shadow: 0 0 0 1px var(--accent, #6c5ce7);
 }
 
-.continuous-chapter-block.tone-0 { --frame-accent: #357a6b; --frame-surface: #f2f9f6; }
-.continuous-chapter-block.tone-1 { --frame-accent: #4774a5; --frame-surface: #f1f6fb; }
-.continuous-chapter-block.tone-2 { --frame-accent: #8a6b32; --frame-surface: #fbf8ef; }
-.continuous-chapter-block.tone-3 { --frame-accent: #8d5c72; --frame-surface: #fbf4f7; }
-.continuous-chapter-block.tone-4 { --frame-accent: #5b7580; --frame-surface: #f3f8f9; }
-.continuous-chapter-block.tone-5 { --frame-accent: #7a6a9c; --frame-surface: #f7f5fb; }
-.continuous-chapter-block.tone-6 { --frame-accent: #a05f43; --frame-surface: #fcf5f1; }
-.continuous-chapter-block.tone-7 { --frame-accent: #5e8251; --frame-surface: #f5f9f1; }
+.continuous-chapter-block.tone-0 { --frame-accent: var(--frame-tone-0-accent); --frame-surface: var(--frame-tone-0-surface); }
+.continuous-chapter-block.tone-1 { --frame-accent: var(--frame-tone-1-accent); --frame-surface: var(--frame-tone-1-surface); }
+.continuous-chapter-block.tone-2 { --frame-accent: var(--frame-tone-2-accent); --frame-surface: var(--frame-tone-2-surface); }
+.continuous-chapter-block.tone-3 { --frame-accent: var(--frame-tone-3-accent); --frame-surface: var(--frame-tone-3-surface); }
+.continuous-chapter-block.tone-4 { --frame-accent: var(--frame-tone-4-accent); --frame-surface: var(--frame-tone-4-surface); }
+.continuous-chapter-block.tone-5 { --frame-accent: var(--frame-tone-5-accent); --frame-surface: var(--frame-tone-5-surface); }
+.continuous-chapter-block.tone-6 { --frame-accent: var(--frame-tone-6-accent); --frame-surface: var(--frame-tone-6-surface); }
+.continuous-chapter-block.tone-7 { --frame-accent: var(--frame-tone-7-accent); --frame-surface: var(--frame-tone-7-surface); }
 
 .continuous-chapter-block-select {
   border: 0;

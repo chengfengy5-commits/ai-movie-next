@@ -2,10 +2,10 @@
   min-width: 0;
   margin: 0 0 16px;
   padding: 12px;
-  border: 1px solid #dce8e3;
+  border: 1px solid var(--line);
   border-radius: 9px;
-  color: #35484a;
-  background: #f8fbf9;
+  color: var(--ink);
+  background: var(--surface-subtle);
 }
 
 .frame-original-text-panel.is-floating {
@@ -37,7 +37,7 @@
 }
 
 .frame-original-text-panel-heading h3 {
-  color: #293b39;
+  color: var(--ink);
   font-size: 14px;
 }
 
@@ -60,7 +60,7 @@
 }
 
 .frame-original-text-drag-handle:focus-visible {
-  outline: 2px solid #8cb8a8;
+  outline: 2px solid var(--teal);
   outline-offset: 2px;
 }
 
@@ -68,7 +68,7 @@
 .frame-original-text-panel-feedback,
 .frame-original-text-panel-state {
   margin: 0;
-  color: #8a7651;
+  color: var(--warning);
   font-size: 11px;
   line-height: 1.55;
 }
@@ -77,7 +77,7 @@
   max-height: min(48vh, 420px);
   margin: 0;
   overflow: auto;
-  color: #35484a;
+  color: var(--ink);
   font: inherit;
   font-size: 12px;
   line-height: 1.65;

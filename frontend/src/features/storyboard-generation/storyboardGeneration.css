@@ -130,9 +130,9 @@
 }
 
 .storyboard-generation-dialog button.primary {
-  color: #fff;
-  background: var(--accent-primary, #5b5ce2);
-  border-color: var(--accent-primary, #5b5ce2);
+  color: var(--accent-on-fill);
+  background: var(--accent-fill);
+  border-color: var(--accent-fill);
 }
 
 .storyboard-generation-dialog button.secondary {

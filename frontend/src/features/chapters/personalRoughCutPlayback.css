@@ -46,7 +46,7 @@
 
 .personal-rough-cut-playback-error {
   margin: 0;
-  color: var(--color-danger, #a33434);
+  color: var(--danger);
 }
 
 .personal-rough-cut-playback-queue {

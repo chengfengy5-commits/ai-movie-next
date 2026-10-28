@@ -104,7 +104,7 @@
   padding: 9px 11px;
   border: 1px solid var(--admin-line, #2a2a30);
   border-radius: 9px;
-  background: #1a1a1e;
+  background: var(--admin-surface-raised, #1e1e22);
   color: var(--admin-text, #e4e4e7);
   font: inherit;
 }

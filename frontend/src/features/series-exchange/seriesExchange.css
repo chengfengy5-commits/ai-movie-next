@@ -132,9 +132,9 @@
 }
 
 .series-exchange-primary-button {
-  border-color: var(--accent, #5b63d3);
-  background: var(--accent, #5b63d3);
-  color: #fff;
+  border-color: var(--accent-fill);
+  background: var(--accent-fill);
+  color: var(--accent-on-fill);
 }
 
 .series-exchange-file-picker {
@@ -281,18 +281,18 @@
 
 .series-exchange-status.saved,
 .series-exchange-success {
-  color: #16804a;
+  color: var(--success);
 }
 
 .series-exchange-status.failed,
 .series-exchange-item-error,
 .series-exchange-error {
-  color: #b42318 !important;
+  color: var(--danger) !important;
 }
 
 .series-exchange-status.unknown,
 .series-exchange-warning {
-  color: #9a6700;
+  color: var(--warning);
 }
 
 .series-exchange-error,
@@ -304,6 +304,18 @@
   border-radius: 8px;
   background: var(--surface-muted, #f2f4f7);
   line-height: 1.5;
+}
+
+.series-exchange-error {
+  background: var(--danger-soft);
+}
+
+.series-exchange-warning {
+  background: var(--warning-soft);
+}
+
+.series-exchange-success {
+  background: var(--success-soft);
 }
 
 .series-exchange-notice {
