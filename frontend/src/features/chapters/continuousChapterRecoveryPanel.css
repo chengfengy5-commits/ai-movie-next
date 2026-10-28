@@ -1,0 +1,56 @@
+.continuous-chapter-recovery {
+  display: grid;
+  gap: 0.75rem;
+  margin: 1rem 0;
+  padding: 1rem;
+  border: 1px solid var(--line);
+  border-radius: 0.75rem;
+  color: var(--ink);
+  background: var(--surface);
+}
+
+.continuous-chapter-recovery h2,
+.continuous-chapter-recovery p {
+  margin: 0;
+}
+
+.continuous-chapter-recovery-alert {
+  color: var(--danger);
+}
+
+.continuous-chapter-recovery-help {
+  color: var(--muted);
+}
+
+.continuous-chapter-recovery-message {
+  color: var(--muted);
+}
+
+.continuous-chapter-recovery-draft {
+  display: grid;
+  gap: 0.75rem;
+  max-height: 24rem;
+  overflow: auto;
+  margin: 0;
+  padding-left: 1.5rem;
+}
+
+.continuous-chapter-recovery-draft pre {
+  margin: 0.25rem 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font: inherit;
+}
+
+.continuous-chapter-recovery-draft small {
+  display: block;
+  margin-top: 0.25rem;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
+.continuous-chapter-recovery-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+}

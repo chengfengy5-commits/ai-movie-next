@@ -384,11 +384,14 @@ export async function writeContinuousChapterJournal(
   journal: NewContinuousChapterOperationEnvelope | ContinuousChapterOperationEnvelope,
   lease: ContinuousChapterOperationLockLease,
   expectedCurrentIntegrity: string | null,
+  isCurrent?: () => boolean,
 ): Promise<ContinuousChapterOperationEnvelope> {
   assertLeaseForKey(lease, key);
+  assertJournalOwnerCurrent(isCurrent);
   const observedRaw = readJournalStorageValue(storage, key);
   const current = await readContinuousChapterJournalValue(observedRaw);
   lease.assertActive();
+  assertJournalOwnerCurrent(isCurrent);
   if (expectedCurrentIntegrity === null) {
     if (current !== null) throw new ContinuousChapterJournalConflictError();
   } else if (current === null || current.integrity_sha256 !== expectedCurrentIntegrity) {
@@ -422,11 +425,13 @@ export async function writeContinuousChapterJournal(
     throw error;
   }
   lease.assertActive();
+  assertJournalOwnerCurrent(isCurrent);
   // Web Locks serialize cooperating tabs; this reread only rejects stale owners.
   if (readJournalStorageValue(storage, key) !== observedRaw) {
     throw new ContinuousChapterJournalConflictError("本地原操作记录在核验期间发生变化；当前记录保持原样。");
   }
   lease.assertActive();
+  assertJournalOwnerCurrent(isCurrent);
   try {
     storage.setItem(key, serialized);
     if (storage.getItem(key) !== serialized) throw new Error("journal readback mismatch");
@@ -434,6 +439,7 @@ export async function writeContinuousChapterJournal(
     throw new ContinuousChapterJournalStorageError();
   }
   const verified = await readContinuousChapterJournal(storage, key);
+  assertJournalOwnerCurrent(isCurrent);
   if (verified?.integrity_sha256 !== sealed.integrity_sha256
     || verified.operation.operation_id !== sealed.operation.operation_id
     || verified.operation.request_body_json !== sealed.operation.request_body_json) {
@@ -447,9 +453,12 @@ export async function resolveContinuousChapterJournal(
   key: string,
   journal: ContinuousChapterOperationEnvelope,
   lease: ContinuousChapterOperationLockLease,
+  isCurrent?: () => boolean,
 ): Promise<void> {
   assertLeaseForKey(lease, key);
+  assertJournalOwnerCurrent(isCurrent);
   const current = await readContinuousChapterJournal(storage, key);
+  assertJournalOwnerCurrent(isCurrent);
   if (current === null || current.integrity_sha256 !== journal.integrity_sha256) {
     throw new ContinuousChapterJournalConflictError();
   }
@@ -461,18 +470,49 @@ export async function resolveContinuousChapterJournal(
     ...current,
     phase: "resolved_reviewed",
   };
-  const written = await writeContinuousChapterJournal(storage, key, tombstone, lease, current.integrity_sha256);
+  const written = await writeContinuousChapterJournal(storage, key, tombstone, lease, current.integrity_sha256, isCurrent);
+  assertJournalOwnerCurrent(isCurrent);
   const tombstoneRaw = JSON.stringify(written);
   const currentRaw = readJournalStorageValue(storage, key);
   if (currentRaw !== tombstoneRaw) throw new ContinuousChapterJournalConflictError();
   lease.assertActive();
+  assertJournalOwnerCurrent(isCurrent);
   if (readJournalStorageValue(storage, key) !== tombstoneRaw) throw new ContinuousChapterJournalConflictError();
   lease.assertActive();
+  assertJournalOwnerCurrent(isCurrent);
   try {
     storage.removeItem(key);
     if (storage.getItem(key) !== null) throw new Error("journal remove readback mismatch");
   } catch {
     throw new ContinuousChapterJournalStorageError("无法清除已审阅的原操作记录；原记录仍保留。");
+  }
+}
+
+export async function discardUndispatchedContinuousChapterJournal(
+  storage: StorageLike,
+  key: string,
+  journal: ContinuousChapterOperationEnvelope,
+  lease: ContinuousChapterOperationLockLease,
+  isCurrent: () => boolean,
+): Promise<void> {
+  assertLeaseForKey(lease, key);
+  assertJournalOwnerCurrent(isCurrent);
+  const observedRaw = readJournalStorageValue(storage, key);
+  const current = await readContinuousChapterJournalValue(observedRaw);
+  lease.assertActive();
+  assertJournalOwnerCurrent(isCurrent);
+  if (current === null || current.integrity_sha256 !== journal.integrity_sha256
+    || current.phase !== "captured_not_dispatched" || current.observation.receipt !== null) {
+    throw new ContinuousChapterJournalConflictError("原记录已变化；未清除当前记录。");
+  }
+  if (readJournalStorageValue(storage, key) !== observedRaw) throw new ContinuousChapterJournalConflictError();
+  lease.assertActive();
+  assertJournalOwnerCurrent(isCurrent);
+  try {
+    storage.removeItem(key);
+    if (storage.getItem(key) !== null) throw new Error("journal remove readback mismatch");
+  } catch {
+    throw new ContinuousChapterJournalStorageError("本地原操作记录未能安全清除；记录可能仍保留。");
   }
 }
 
@@ -699,6 +739,12 @@ function isJournalTerminalAndReviewed(journal: ContinuousChapterOperationEnvelop
 function assertLeaseForKey(lease: ContinuousChapterOperationLockLease, key: string): void {
   lease.assertActive();
   if (lease.storageKey !== key) throw new ContinuousChapterJournalLockError("本地操作锁不属于当前章节记录，未修改原记录。");
+}
+
+function assertJournalOwnerCurrent(isCurrent?: () => boolean): void {
+  if (isCurrent !== undefined && !isCurrent()) {
+    throw new ContinuousChapterJournalConflictError("当前页面身份已变化；原操作记录保持不变。");
+  }
 }
 
 function sameOriginalOperation(

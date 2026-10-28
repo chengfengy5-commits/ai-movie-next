@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { webcrypto } from "node:crypto";
 import { createElement, useLayoutEffect, useState, type ComponentProps } from "react";
 import type { Character, Chapter, ChapterEditLockAcquisition, ChapterEditLockLeaseHandle, ChapterEditLockState, CreateChapterInput, Scene, Series, StoryboardAsset, UpdateChapterInput } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
@@ -11,8 +12,17 @@ import {
   type PersonalProductionSnapshot,
 } from "../../shared/api/personalProductionNotes";
 import type { WorkspaceServices } from "../../shared/api/services";
-import { createApiServices } from "../../shared/api/services";
+import { createApiServices, createDemoServices } from "../../shared/api/services";
 import { API_TOKEN_KEY } from "../../shared/api/storage";
+import {
+  continuousOperationResultDigest,
+  continuousSourceSnapshotBinding,
+  continuousTargetManifestDigest,
+  type ContinuousChapterOperationKind,
+  type ContinuousChapterOperationRequest,
+  type ContinuousChapterOperationResponse,
+  type ContinuousChapterOperationReceipt,
+} from "../../shared/api/continuousChapterOperations";
 import type { CreatorModel, CreatorPrompt, CreatorSettingsServicePort } from "../../shared/api/creatorSettings";
 import type {
   StoryboardAssetGenerationServicePort,
@@ -32,12 +42,22 @@ import type {
 import frameOptimizeStatusWire from "../../testing/fixtures/frameOptimizeStatusWire.json";
 import type { StoryboardGenerationServicePort } from "../storyboard-generation/contracts";
 import { digestPersonalProductionMediaIdentity } from "./personal-production/mediaIdentity";
+import { buildGuardedChapterUpdate, createContinuousChapterDraft } from "./continuousChapterEditing";
 import {
   storyboardChapterStorageKey,
   storyboardPageSizeStorageKey,
 } from "./storyboardBrowsePreferences";
 import { demoSeries } from "../series/demoSeries";
+import { getDemoChapterData } from "./demoChapters";
 import { ChapterBrowser, type ChapterNavigationIntent } from "./ChapterBrowser";
+import {
+  continuousChapterOperationJournalKey,
+  continuousChapterOperationRoute,
+  createContinuousOperationJournalEnvelope,
+  freezeContinuousOperationRequest,
+  withContinuousChapterOperationLock,
+  writeContinuousChapterJournal,
+} from "./continuousChapterOperationJournal";
 import type {
   PersonalProductionNoteFrameTarget,
   PersonalProductionNoteReadIdentity,
@@ -327,6 +347,20 @@ function renderBrowser(
   return { ...view, onBack, onUnauthorized };
 }
 
+function renderContinuousBrowser(services: WorkspaceServices, userId = "demo-user") {
+  return render(
+    <ChapterBrowser
+      onBack={vi.fn()}
+      onUnauthorized={vi.fn()}
+      continuousPreviewActive
+      workbenchActive
+      series={series}
+      services={services}
+      userId={userId}
+    />,
+  );
+}
+
 function clearOriginalTextPanelPositions(): void {
   const prefix = "haoai.frame-original-reference-panel-position.v1:";
   for (const key of Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))) {
@@ -514,6 +548,110 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function installContinuousChapterOperationLock(available = true): void {
+  const descriptor = Object.getOwnPropertyDescriptor(navigator, "locks");
+  const value = available
+    ? { request: async (_name: string, _options: { mode: "exclusive"; ifAvailable: true }, callback: (lock: Lock | null) => unknown) => callback({} as Lock) }
+    : undefined;
+  Object.defineProperty(navigator, "locks", { configurable: true, value });
+  restoreOverrides.push(() => {
+    if (descriptor === undefined) Reflect.deleteProperty(navigator, "locks");
+    else Object.defineProperty(navigator, "locks", descriptor);
+  });
+}
+
+function installContinuousOperationCrypto(): void {
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "crypto");
+  Object.defineProperty(globalThis, "crypto", { configurable: true, value: webcrypto });
+  restoreOverrides.push(() => {
+    if (descriptor === undefined) Reflect.deleteProperty(globalThis, "crypto");
+    else Object.defineProperty(globalThis, "crypto", descriptor);
+  });
+}
+
+async function makeContinuousOperationResponse(
+  actorId: string,
+  seriesId: string,
+  chapterId: string,
+  operationId: string,
+  bodyJson: string,
+  result: Record<string, unknown>,
+): Promise<ContinuousChapterOperationResponse> {
+  const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+  const command = request.command;
+  const frozen = await freezeContinuousOperationRequest(request);
+  const sourceDigest = await continuousSourceSnapshotBinding(frozen.bodySha256);
+  const targetDigest = await continuousTargetManifestDigest(command.draft_frame_ids);
+  const resultIdentity: Record<string, unknown> = {
+    kind: command.kind,
+    series_id: seriesId,
+    chapter_id: chapterId,
+    draft_frame_ids: command.draft_frame_ids,
+    manifest_digest: targetDigest,
+    source_snapshot_digest: sourceDigest,
+  };
+  let targetDraftId: string | null = null;
+  if (command.kind === "save-chapter") {
+    resultIdentity.frame_storyboard_ids = command.content.map((frame) => (
+      Array.isArray(frame.storyboard) ? frame.storyboard : []
+    ));
+  } else {
+    targetDraftId = command.target_draft_id;
+    resultIdentity.asset_type = command.kind.slice("create-".length);
+    resultIdentity.target_draft_id = targetDraftId;
+    resultIdentity.asset_id = result.id;
+  }
+  const canonicalResponseJson = JSON.stringify(result);
+  const receipt: ContinuousChapterOperationReceipt = {
+    receipt_version: 1,
+    operation_id: operationId,
+    owner_id: actorId,
+    editor_session_id: request.editor_session_id,
+    series_id: seriesId,
+    chapter_id: chapterId,
+    command_kind: command.kind as ContinuousChapterOperationKind,
+    request_body_sha256: frozen.bodySha256,
+    source_snapshot_digest: sourceDigest,
+    target_draft_id: targetDraftId,
+    target_manifest_digest: targetDigest,
+    outcome: "committed",
+    http_status: 200,
+    result_identity: resultIdentity,
+    result,
+    canonical_response_json: canonicalResponseJson,
+    result_digest: await continuousOperationResultDigest(canonicalResponseJson),
+    committed_at: new Date().toISOString(),
+  };
+  return { receipt, result };
+}
+
+function attachContinuousChapterOperationPort(
+  services: WorkspaceServices,
+  submitOperation: (chapterId: string, operationId: string, bodyJson: string, signal: AbortSignal) => Promise<ContinuousChapterOperationResponse>,
+) {
+  const receipts = new Map<string, ContinuousChapterOperationReceipt>();
+  services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const, operationReceipt: 1 as const }));
+  const submit = vi.fn(async (chapterId: string, operationId: string, bodyJson: string, signal: AbortSignal) => {
+    const response = await submitOperation(chapterId, operationId, bodyJson, signal);
+    receipts.set(operationId, response.receipt);
+    return response;
+  });
+  const lookup = vi.fn(async (_chapterId: string, operationId: string, _signal: AbortSignal) => {
+    const receipt = receipts.get(operationId);
+    if (receipt === undefined) throw new ApiError("http", "原操作不存在", 404);
+    return { receipt };
+  });
+  Object.assign(services, { continuousChapterOperations: { submit, lookup } });
+  return { submit, lookup };
+}
+
+function clearContinuousChapterOperationJournals(): void {
+  const prefix = "haoai:continuous-chapter-pending:v1:";
+  for (const key of Array.from({ length: localStorage.length }, (_, index) => localStorage.key(index))) {
+    if (key?.startsWith(prefix)) localStorage.removeItem(key);
+  }
+}
+
 function captureButtonHandler(button: HTMLElement): () => void {
   const propsKey = Object.getOwnPropertyNames(button).find((key) => key.startsWith("__reactProps$"));
   if (propsKey === undefined) {
@@ -660,6 +798,7 @@ describe("read-only chapter browser", () => {
   afterEach(() => {
     for (const restore of restoreOverrides.splice(0).reverse()) restore();
     cleanup();
+    clearContinuousChapterOperationJournals();
     clearOriginalTextPanelPositions();
     personalNotesBridge.onLocateResume = null;
     personalNotesBridge.onResumeInvalidated = null;
@@ -677,6 +816,93 @@ describe("read-only chapter browser", () => {
     roughCutPanelBridge.lastTarget = null;
     roughCutPanelBridge.onFrameNavigationInvalidated = null;
     roughCutPanelBridge.lastInvalidation = null;
+  });
+
+  it("keeps local demo chapter editing available without a remote operation journal", async () => {
+    const user = userEvent.setup();
+    const demoChapterData = getDemoChapterData(series.id);
+    expect(demoChapterData).not.toBeNull();
+    const services = createDemoServices(window.localStorage);
+    expect(services.mode).toBe("demo");
+    expect(services.apiBaseUrl).toBeNull();
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "第一章 · 雾起 · 镜头 1" });
+    expect(screen.queryByRole("region", { name: "连续编辑操作恢复" })).not.toBeInTheDocument();
+    const editButton = within(frame).getByRole("button", { name: "编辑文字" });
+    expect(editButton).toBeEnabled();
+    await user.click(editButton);
+    expect(await screen.findByRole("dialog", { name: "编辑分镜文字" })).toBeInTheDocument();
+  });
+
+  it("keeps an unresolved API journal blocking edits when the service has no receipt port", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const current = chapter("chapter-api-journal-without-receipts", "旧 API 回执能力", [{
+      text: "原始正文",
+      storyboard: ["api-journal-without-receipts-frame"],
+    }]);
+    const storyboard = { ...asset("api-journal-without-receipts-frame", current.id), frame_index: 0 };
+    const base = makeServices([current], { [current.id]: [storyboard] }, false, true);
+    expect(base.services.mode).toBe("api");
+    expect(base.services.continuousChapterOperations).toBeUndefined();
+
+    const snapshot = createContinuousChapterDraft(current, [storyboard], null);
+    const update = buildGuardedChapterUpdate(snapshot, snapshot.frames);
+    if (update.content === undefined || update.chapter_edit_guard === undefined) {
+      throw new Error("The API journal fixture requires a guarded chapter update.");
+    }
+    const editorSessionId = crypto.randomUUID();
+    const operationId = crypto.randomUUID();
+    const draftFrameIds = snapshot.frames.map((frame) => frame.draftId);
+    const request: ContinuousChapterOperationRequest = {
+      protocol_version: 1,
+      editor_session_id: editorSessionId,
+      command: {
+        kind: "save-chapter",
+        content: update.content,
+        chapter_edit_guard: { ...update.chapter_edit_guard },
+        draft_frame_ids: draftFrameIds,
+      },
+    };
+    const frozen = await freezeContinuousOperationRequest(request);
+    const journalScope = { actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: current.id };
+    const [sourceSnapshotDigest, targetManifestDigest] = await Promise.all([
+      continuousSourceSnapshotBinding(frozen.bodySha256),
+      continuousTargetManifestDigest(draftFrameIds),
+    ]);
+    const key = continuousChapterOperationJournalKey(journalScope);
+    const journal = createContinuousOperationJournalEnvelope({
+      scope: journalScope,
+      editorSessionId,
+      documentId: crypto.randomUUID(),
+      authSessionGeneration: 1,
+      snapshot,
+      frames: snapshot.frames,
+      selectedDraftId: snapshot.frames[0]?.draftId ?? null,
+      operationId,
+      kind: "save-chapter",
+      targetDraftId: null,
+      draftFrameIds,
+      bodyJson: frozen.bodyJson,
+      bodySha256: frozen.bodySha256,
+      sourceSnapshotDigest,
+      targetManifestDigest,
+      phase: "dispatch_possible",
+      route: continuousChapterOperationRoute(current.id, operationId),
+    });
+    await withContinuousChapterOperationLock(key, (lease) => (
+      writeContinuousChapterJournal(window.localStorage, key, journal, lease, null)
+    ));
+
+    renderContinuousBrowser(base.services);
+
+    expect(await screen.findByRole("region", { name: "连续编辑操作恢复" })).toBeInTheDocument();
+    const frame = await screen.findByRole("article", { name: "旧 API 回执能力 · 镜头 1" });
+    expect(within(frame).getByRole("button", { name: "编辑文字" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "开启整章连续编辑" })).toBeDisabled();
   });
 
   it("opens the chapter asset extraction and confirmation flow from the chapter page", async () => {
@@ -6764,8 +6990,11 @@ describe("read-only chapter browser", () => {
     scrollTo.mockRestore();
   });
 
-  it("opens the real continuous editor, sends a guarded chapter update, and confirms it from a separate readback", async () => {
+  it("durably records a guarded save before one POST and requires fresh target review before release", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
     const user = userEvent.setup();
+    const teamSeries = { ...series, team_id: "team-continuous-resolve" };
     const current = chapter("chapter-continuous-consumer", "连续编辑章节", [{
       text: "第一段正文",
       original_text: "打开时原文",
@@ -6777,9 +7006,18 @@ describe("read-only chapter browser", () => {
     }]);
     const storyboardAsset = { ...asset("continuous-shot-1", current.id), frame_index: 0 };
     const base = makeServices([current], { [current.id]: [storyboardAsset] }, false, true);
-    const capability = vi.fn(async () => ({ chapterEditGuard: 1 as const }));
+    const ownedLock: ChapterEditLockState = {
+      locked: true,
+      user_id: "demo-user",
+      username: "演示创作者",
+      is_mine: true,
+      acquired_at: new Date(Date.now() - 1_000).toISOString(),
+      expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+    };
+    base.getChapterEditLock.mockImplementation(async (_chapterId, _signal, lease) => (
+      lease === undefined ? { locked: false } : ownedLock
+    ));
     const listCharacters = vi.fn(async () => [character("continuous-character-1", series.id, "门卫")]);
-    base.services.getContinuousChapterEditCapabilities = capability;
     base.services.listCharacters = listCharacters;
     base.services.listScenes = vi.fn(async () => []);
     base.services.listProps = vi.fn(async () => []);
@@ -6788,6 +7026,13 @@ describe("read-only chapter browser", () => {
     }));
     Object.assign(base.services, {
       assetMaintenance: { checkOrphans } as unknown as NonNullable<WorkspaceServices["assetMaintenance"]>,
+    });
+    const port = attachContinuousChapterOperationPort(base.services, async (chapterId, operationId, bodyJson) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save.");
+      const result = { ...current, id: chapterId, content: request.command.content as unknown as Chapter["content"] };
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? result : row));
+      return makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
     });
     const originalSelection = vi.fn();
 
@@ -6798,7 +7043,7 @@ describe("read-only chapter browser", () => {
         onContinuousOriginalChange={originalSelection}
         continuousPreviewActive
         workbenchActive
-        series={series}
+        series={teamSeries}
         services={base.services}
         userId="demo-user"
       />,
@@ -6807,7 +7052,7 @@ describe("read-only chapter browser", () => {
     await screen.findByRole("region", { name: "整章连续编辑入口" });
     await user.click(screen.getByRole("button", { name: "开启整章连续编辑" }));
     const editor = await screen.findByRole("region", { name: "整章连续编辑" });
-    expect(capability).toHaveBeenCalledTimes(1);
+    expect(base.services.getContinuousChapterEditCapabilities).toHaveBeenCalledOnce();
     expect(originalSelection).toHaveBeenLastCalledWith({ position: 1, status: "text", text: "打开时原文" });
     const text = within(editor).getByRole("textbox", { name: "第 1 段剧本文字" });
     await user.deselectOptions(within(editor).getByRole("listbox", { name: "第 1 段角色素材" }), "continuous-character-1");
@@ -6817,32 +7062,45 @@ describe("read-only chapter browser", () => {
     fireEvent.keyDown(text, { key: "z", ctrlKey: true, shiftKey: true });
     expect(text).toHaveValue("");
     await user.type(text, "改写后的正文");
-    expect(within(editor).getByText("1 个镜头 · 6 个文字字符")).toBeInTheDocument();
     fireEvent.keyDown(text, { key: "s", ctrlKey: true });
 
-    await waitFor(() => expect(base.updateChapter).toHaveBeenCalledTimes(1));
-    const update = base.updateChapter.mock.calls[0]?.[2];
-    expect(update?.chapter_edit_guard).toMatchObject({
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+    const [chapterId, operationId, bodyJson] = port.submit.mock.calls[0]!;
+    const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+    expect(chapterId).toBe(current.id);
+    expect(operationId).toMatch(/^[0-9a-f-]{36}$/u);
+    expect(request.command).toMatchObject({ kind: "save-chapter" });
+    if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save request.");
+    expect(request.command.chapter_edit_guard).toMatchObject({
       expected_chapter_id: current.id,
       expected_series_id: series.id,
       expected_content: current.content,
       frame_sources: [{ kind: "retained", source_index: 0, storyboard_id: "continuous-shot-1" }],
       deleted_source_indexes: [],
     });
-    expect(update?.content?.[0]).toMatchObject({
+    expect(request.command.content[0]).toMatchObject({
       text: "改写后的正文",
       original_text: "打开时原文",
       editor_unknown: { retain: true },
       storyboard: ["continuous-shot-1"],
+      character: [],
     });
-    expect(update?.content?.[0]?.character).toEqual([]);
+    expect(base.updateChapter).not.toHaveBeenCalled();
     await waitFor(() => expect(checkOrphans).toHaveBeenCalledWith(series.id, {
       items: [{ type: "character", id: "continuous-character-1" }],
     }, expect.any(AbortSignal)));
-    expect(await within(editor).findByText(/全剧集核对发现 1 项可能孤立素材。未自动删除/))
-      .toBeInTheDocument();
-    expect(base.updateChapter).toHaveBeenCalledTimes(1);
-    expect(base.listChapters.mock.calls.length).toBeGreaterThanOrEqual(3);
+    expect(await screen.findByRole("button", { name: "我已审阅已保存章节，解除本章冻结" })).toBeInTheDocument();
+    const storageKey = continuousChapterOperationJournalKey({
+      actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: current.id,
+    });
+    expect(JSON.parse(localStorage.getItem(storageKey) ?? "null").phase).toBe("receipt_committed_pending_target_read");
+
+    await user.click(screen.getByRole("button", { name: "我已审阅已保存章节，解除本章冻结" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "连续编辑操作恢复" })).not.toBeInTheDocument());
+    await waitFor(() => expect(screen.queryByRole("region", { name: "整章连续编辑" })).not.toBeInTheDocument());
+    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(base.releaseChapterEditLock).toHaveBeenCalledOnce();
+    expect(port.submit).toHaveBeenCalledOnce();
   });
 
   it("changes the asset selection on the frame whose select control fired", async () => {
@@ -6856,13 +7114,20 @@ describe("read-only chapter browser", () => {
       { ...asset("continuous-select-shot-2", current.id), frame_index: 1 },
     ];
     const base = makeServices([current], { [current.id]: storyboardAssets }, false, true);
-    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const }));
+    installContinuousChapterOperationLock();
     base.services.listCharacters = vi.fn(async () => [
       character("continuous-select-character-1", series.id, "第一段角色"),
       character("continuous-select-character-2", series.id, "第二段角色"),
     ]);
     base.services.listScenes = vi.fn(async () => []);
     base.services.listProps = vi.fn(async () => []);
+    const port = attachContinuousChapterOperationPort(base.services, async (chapterId, operationId, bodyJson) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save.");
+      const result = { ...current, id: chapterId, content: request.command.content as unknown as Chapter["content"] };
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? result : row));
+      return makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
+    });
 
     render(
       <ChapterBrowser
@@ -6885,14 +7150,443 @@ describe("read-only chapter browser", () => {
     expect(firstSelection).toHaveValue([]);
     expect(secondSelection).toHaveValue(["continuous-select-character-2"]);
     await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
-    await waitFor(() => expect(base.updateChapter).toHaveBeenCalledTimes(1));
-    expect(base.updateChapter.mock.calls[0]?.[2].content).toMatchObject([
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+    const request = JSON.parse(port.submit.mock.calls[0]![2]) as ContinuousChapterOperationRequest;
+    if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save request.");
+    expect(request.command.content).toMatchObject([
       { text: "第一段", character: [] },
       { text: "第二段", character: ["continuous-select-character-2"] },
     ]);
   });
 
-  it("attaches a delayed uncertain asset creation to its original draft after selecting another frame", async () => {
+  it("ignores a late target-read 401 after the continuous editor changes owner", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-late-target-401", "迟到的目标核对", [{
+      text: "原段落", storyboard: ["continuous-late-401-shot"], character: [], scene: [], prop: [],
+    }]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-late-401-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const pendingTargetDirectory = deferred<Chapter[]>();
+    const targetReadStarted = deferred<void>();
+    const initialListChapters = base.services.listChapters;
+    let postReturned = false;
+    let delayedTargetDirectoryClaimed = false;
+    Object.assign(base.services, {
+      listChapters: vi.fn(async (seriesId: string, signal: AbortSignal) => {
+        if (postReturned && !delayedTargetDirectoryClaimed) {
+          delayedTargetDirectoryClaimed = true;
+          targetReadStarted.resolve();
+          return pendingTargetDirectory.promise;
+        }
+        return initialListChapters(seriesId, signal);
+      }),
+    });
+    const port = attachContinuousChapterOperationPort(base.services, async (chapterId, operationId, bodyJson) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save.");
+      const result = { ...current, id: chapterId, content: request.command.content as unknown as Chapter["content"] };
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? result : row));
+      const response = await makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
+      postReturned = true;
+      return response;
+    });
+    const onUnauthorized = vi.fn();
+    const view = render(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={onUnauthorized}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="demo-user"
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.clear(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }));
+    await user.type(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }), "保存后核对");
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+    await targetReadStarted.promise;
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={onUnauthorized}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="new-user"
+      />,
+    );
+    await act(async () => {
+      pendingTargetDirectory.reject(new ApiError("http", "late unauthorized read", 401));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(onUnauthorized).not.toHaveBeenCalled();
+    expect(port.submit).toHaveBeenCalledOnce();
+  });
+
+  it("does not publish a recovered editor when the final target read resolves after a scope change", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-late-recovery-target", "迟到的恢复目标", [{
+      text: "原段落", storyboard: ["continuous-late-recovery-shot"], character: [], scene: [], prop: [],
+    }]);
+    const createdCharacter = character("continuous-late-recovery-character", series.id, "恢复角色");
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-late-recovery-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    let characterCreated = false;
+    base.services.listCharacters = vi.fn(async () => characterCreated ? [createdCharacter] : []);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const port = attachContinuousChapterOperationPort(base.services, async (chapterId, operationId, bodyJson) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "create-character") throw new Error("Expected a character creation.");
+      characterCreated = true;
+      const result = { id: createdCharacter.id, series_id: series.id };
+      return makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
+    });
+
+    const firstMount = renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.type(within(editor).getByRole("textbox", { name: "新增素材名称" }), "恢复角色");
+    await user.click(within(editor).getByRole("button", { name: "创建并关联角色" }));
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+    expect(await screen.findByRole("button", { name: "继续编辑已核对草稿" })).toBeEnabled();
+    firstMount.unmount();
+
+    const pendingTargetDirectory = deferred<Chapter[]>();
+    const finalRecoveryTargetReadStarted = deferred<void>();
+    const initialListChapters = base.services.listChapters;
+    let deferFinalRecoveryTargetRead = false;
+    let recoveryDirectoryReads = 0;
+    Object.assign(base.services, {
+      listChapters: vi.fn(async (seriesId: string, signal: AbortSignal) => {
+        if (deferFinalRecoveryTargetRead) {
+          recoveryDirectoryReads += 1;
+          if (recoveryDirectoryReads === 5) {
+            finalRecoveryTargetReadStarted.resolve();
+            return pendingTargetDirectory.promise;
+          }
+        }
+        return initialListChapters(seriesId, signal);
+      }),
+    });
+    const recoveredMount = renderContinuousBrowser(base.services);
+    await screen.findByRole("button", { name: "继续编辑已核对草稿" });
+    deferFinalRecoveryTargetRead = true;
+    await user.click(screen.getByRole("button", { name: "继续编辑已核对草稿" }));
+    await finalRecoveryTargetReadStarted.promise;
+    expect(recoveryDirectoryReads).toBe(5);
+
+    recoveredMount.rerender(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="new-user"
+      />,
+    );
+    pendingTargetDirectory.resolve(base.getCurrentChapters());
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(screen.queryByRole("region", { name: "整章连续编辑" })).not.toBeInTheDocument();
+    expect(port.submit).toHaveBeenCalledOnce();
+  });
+
+  it("keeps the reviewed journal when its clear waits for a lock past a scope change", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-clear-scope-race", "清理期间切换范围", [{
+      text: "原段落", storyboard: ["continuous-clear-scope-shot"], character: [], scene: [], prop: [],
+    }]);
+    const createdCharacter = character("continuous-clear-scope-character", series.id, "清理竞态角色");
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-clear-scope-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    let characterCreated = false;
+    base.services.listCharacters = vi.fn(async () => characterCreated ? [createdCharacter] : []);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const queuedClearStarted = deferred<void>();
+    const allowQueuedClear = deferred<void>();
+    let lockRequestCount = 0;
+    Object.defineProperty(navigator, "locks", {
+      configurable: true,
+      value: {
+        request: async (_name: string, _options: { mode: "exclusive"; ifAvailable: true }, callback: (lock: Lock | null) => unknown) => {
+          lockRequestCount += 1;
+          if (lockRequestCount === 2) {
+            queuedClearStarted.resolve();
+            await allowQueuedClear.promise;
+          }
+          return callback({} as Lock);
+        },
+      },
+    });
+    const port = attachContinuousChapterOperationPort(base.services, async (chapterId, operationId, bodyJson) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "create-character") throw new Error("Expected a character creation.");
+      characterCreated = true;
+      const result = { id: createdCharacter.id, series_id: series.id };
+      return makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
+    });
+    const view = renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.type(within(editor).getByRole("textbox", { name: "新增素材名称" }), "清理竞态角色");
+    await user.click(within(editor).getByRole("button", { name: "创建并关联角色" }));
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+    const storageKey = continuousChapterOperationJournalKey({
+      actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: current.id,
+    });
+    expect(await screen.findByRole("button", { name: "继续编辑已核对草稿" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "继续编辑已核对草稿" }));
+    await queuedClearStarted.promise;
+    expect(lockRequestCount).toBe(2);
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="new-user"
+      />,
+    );
+    allowQueuedClear.resolve();
+    await waitFor(() => expect(localStorage.getItem(storageKey)).not.toBeNull());
+
+    expect(JSON.parse(localStorage.getItem(storageKey) ?? "null").phase)
+      .toBe("receipt_committed_pending_target_read");
+    expect(port.submit).toHaveBeenCalledOnce();
+  });
+
+  it("does not remove a reviewed journal when its tombstone read finishes after a scope change", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-tombstone-scope-race", "结案校验期间切换范围", [{
+      text: "原段落", storyboard: ["continuous-tombstone-scope-shot"], character: [], scene: [], prop: [],
+    }]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-tombstone-scope-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const port = attachContinuousChapterOperationPort(base.services, async (chapterId, operationId, bodyJson) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save.");
+      const result = { ...current, id: chapterId, content: request.command.content as unknown as Chapter["content"] };
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? result : row));
+      return makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
+    });
+    const view = renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.clear(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }));
+    await user.type(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }), "已保存待审阅");
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+    const storageKey = continuousChapterOperationJournalKey({
+      actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: current.id,
+    });
+    expect(await screen.findByRole("button", { name: "我已审阅已保存章节，解除本章冻结" })).toBeEnabled();
+    const originalRaw = localStorage.getItem(storageKey);
+    if (originalRaw === null) throw new Error("The reviewed operation should still be journaled.");
+
+    const digestStarted = deferred<void>();
+    const delayedDigest = deferred<ArrayBuffer>();
+    const originalDigest = webcrypto.subtle.digest.bind(webcrypto.subtle);
+    let digestCalls = 0;
+    let heldDigest: Promise<ArrayBuffer> | null = null;
+    const digestSpy = vi.spyOn(webcrypto.subtle, "digest").mockImplementation((algorithm, data) => {
+      digestCalls += 1;
+      if (digestCalls === 2) {
+        heldDigest = originalDigest(algorithm, data);
+        digestStarted.resolve();
+        return delayedDigest.promise;
+      }
+      return originalDigest(algorithm, data);
+    });
+    restoreOverrides.push(() => digestSpy.mockRestore());
+    await user.click(screen.getByRole("button", { name: "我已审阅已保存章节，解除本章冻结" }));
+    await digestStarted.promise;
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="new-user"
+      />,
+    );
+    delayedDigest.resolve(await heldDigest!);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(localStorage.getItem(storageKey)).toBe(originalRaw);
+    expect(port.submit).toHaveBeenCalledOnce();
+  });
+
+  it("does not discard an undispatched journal when its integrity read finishes after a scope change", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-discard-scope-race", "未发送记录清理期间切换范围", [{
+      text: "原段落", storyboard: ["continuous-discard-scope-shot"], character: [], scene: [], prop: [],
+    }]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-discard-scope-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const port = attachContinuousChapterOperationPort(base.services, async () => {
+      throw new Error("The preflight conflict must prevent POST.");
+    });
+    const view = renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.clear(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }));
+    await user.type(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }), "保留未发送草稿");
+    base.setCurrentChapters([{
+      ...current,
+      content: [{ ...current.content![0]!, text: "另一个编辑者已经更新正文" }],
+    }]);
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    await screen.findByRole("button", { name: "放弃明确尚未发送的记录" });
+    const storageKey = continuousChapterOperationJournalKey({
+      actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: current.id,
+    });
+    const originalRaw = localStorage.getItem(storageKey);
+    if (originalRaw === null) throw new Error("The captured operation should remain journaled.");
+
+    const digestStarted = deferred<void>();
+    const delayedDigest = deferred<ArrayBuffer>();
+    const originalDigest = webcrypto.subtle.digest.bind(webcrypto.subtle);
+    let heldDigest: Promise<ArrayBuffer> | null = null;
+    const digestSpy = vi.spyOn(webcrypto.subtle, "digest").mockImplementationOnce((algorithm, data) => {
+      heldDigest = originalDigest(algorithm, data);
+      digestStarted.resolve();
+      return delayedDigest.promise;
+    });
+    restoreOverrides.push(() => digestSpy.mockRestore());
+    await user.click(screen.getByRole("button", { name: "放弃明确尚未发送的记录" }));
+    await digestStarted.promise;
+
+    view.rerender(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="new-user"
+      />,
+    );
+    delayedDigest.resolve(await heldDigest!);
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+
+    expect(localStorage.getItem(storageKey)).toBe(originalRaw);
+    expect(port.submit).not.toHaveBeenCalled();
+  });
+
+  it("recovers a lost acknowledgement by reading the original UUID after remount", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-unknown-recovery", "未知结果恢复", [{
+      text: "原段落",
+      storyboard: ["continuous-recovery-shot"],
+      character: [], scene: [], prop: [],
+    }]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-recovery-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    base.services.deleteFrame = vi.fn(async (_seriesId, _chapterId, _frameIndex) => current);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    let remoteReceipt: ContinuousChapterOperationReceipt | null = null;
+    const submit = vi.fn(async (chapterId: string, operationId: string, bodyJson: string) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save.");
+      const result = { ...current, id: chapterId, content: request.command.content as unknown as Chapter["content"] };
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? result : row));
+      remoteReceipt = (await makeContinuousOperationResponse(
+        "demo-user", series.id, chapterId, operationId, bodyJson, result,
+      )).receipt;
+      throw new ApiError("network", "响应丢失");
+    });
+    const lookup = vi.fn(async (_chapterId: string, _operationId: string, _signal: AbortSignal) => {
+      if (remoteReceipt === null) throw new ApiError("http", "原操作不存在", 404);
+      return { receipt: remoteReceipt };
+    });
+    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const, operationReceipt: 1 as const }));
+    Object.assign(base.services, { continuousChapterOperations: { submit, lookup } });
+
+    const firstMount = renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    const text = within(editor).getByRole("textbox", { name: "第 1 段剧本文字" });
+    await user.clear(text);
+    await user.type(text, "冻结的原草稿");
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    const [, operationId] = submit.mock.calls[0]!;
+    await screen.findByRole("region", { name: "连续编辑操作恢复" });
+    expect(screen.getByText("请求可能已发出，等待核对")).toBeInTheDocument();
+    expect(within(screen.getByRole("list", { name: "原连续编辑草稿" })).getByText("冻结的原草稿")).toBeInTheDocument();
+    const storageKey = continuousChapterOperationJournalKey({
+      actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: current.id,
+    });
+    expect(JSON.parse(localStorage.getItem(storageKey) ?? "null").phase).toBe("dispatch_possible");
+    firstMount.unmount();
+
+    renderContinuousBrowser(base.services);
+    expect(await screen.findByRole("region", { name: "连续编辑操作恢复" })).toBeInTheDocument();
+    expect(await screen.findByText("请求可能已发出，等待核对")).toBeInTheDocument();
+    expect(within(screen.getByRole("list", { name: "原连续编辑草稿" })).getByText("冻结的原草稿")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "编辑文字" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "在开头插入分镜" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "开启整章连续编辑" })).toBeDisabled();
+    await user.click(await screen.findByRole("button", { name: "重新读取原操作" }));
+    await waitFor(() => expect(lookup).toHaveBeenCalledOnce());
+    expect(lookup).toHaveBeenCalledWith(current.id, operationId, expect.any(AbortSignal));
+    expect(await screen.findByRole("button", { name: "我已审阅已保存章节，解除本章冻结" })).toBeEnabled();
+    expect(submit).toHaveBeenCalledOnce();
+    expect(JSON.parse(localStorage.getItem(storageKey) ?? "null").operation.operation_id).toBe(operationId);
+    await user.click(screen.getByRole("button", { name: "我已审阅已保存章节，解除本章冻结" }));
+    await waitFor(() => expect(screen.queryByRole("region", { name: "连续编辑操作恢复" })).not.toBeInTheDocument());
+    expect(localStorage.getItem(storageKey)).toBeNull();
+    expect(submit).toHaveBeenCalledOnce();
+  });
+
+  it("attaches a confirmed asset receipt to the exact original draft after explicit review", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
     const user = userEvent.setup();
     const current = chapter("chapter-continuous-asset-owner", "延迟素材创建", [
       { text: "原目标段", storyboard: ["continuous-owner-shot-1"], character: [], scene: [], prop: [] },
@@ -6903,16 +7597,19 @@ describe("read-only chapter browser", () => {
       { ...asset("continuous-owner-shot-2", current.id), frame_index: 1 },
     ];
     const base = makeServices([current], { [current.id]: storyboardAssets }, false, true);
-    const pendingCreate = deferred<Character>();
     const createdCharacter = character("continuous-created-character", series.id, "新角色");
     let directoryShowsCreatedCharacter = false;
-    const createCharacter = vi.fn(() => pendingCreate.promise);
     const listCharacters = vi.fn(async () => directoryShowsCreatedCharacter ? [createdCharacter] : []);
-    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const }));
     base.services.listCharacters = listCharacters;
     base.services.listScenes = vi.fn(async () => []);
     base.services.listProps = vi.fn(async () => []);
-    base.services.createCharacter = createCharacter;
+    const port = attachContinuousChapterOperationPort(base.services, async (chapterId, operationId, bodyJson) => {
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "create-character") throw new Error("Expected a character creation.");
+      directoryShowsCreatedCharacter = true;
+      const result = { id: createdCharacter.id, series_id: series.id };
+      return makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
+    });
 
     render(
       <ChapterBrowser
@@ -6930,21 +7627,141 @@ describe("read-only chapter browser", () => {
     const editor = await screen.findByRole("region", { name: "整章连续编辑" });
     await user.type(within(editor).getByRole("textbox", { name: "新增素材名称" }), "新角色");
     await user.click(within(editor).getByRole("button", { name: "创建并关联角色" }));
-    await waitFor(() => expect(createCharacter).toHaveBeenCalledTimes(1));
-    await user.click(within(editor).getByRole("button", { name: "第 2 段 · 原镜头 2" }));
-    expect(within(editor).getByRole("button", { name: "第 2 段 · 原镜头 2" })).toHaveAttribute("aria-pressed", "true");
+    await waitFor(() => expect(port.submit).toHaveBeenCalledOnce());
+    const [, , bodyJson] = port.submit.mock.calls[0]!;
+    const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+    expect(request.command).toMatchObject({ kind: "create-character", target_draft_id: "source:0" });
+    expect(screen.queryByRole("region", { name: "整章连续编辑" })).not.toBeInTheDocument();
+    expect(await screen.findByRole("button", { name: "继续编辑已核对草稿" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "继续编辑已核对草稿" }));
+    const recoveredEditor = await screen.findByRole("region", { name: "整章连续编辑" });
+    expect(within(recoveredEditor).getByRole("listbox", { name: "第 1 段角色素材" }))
+      .toHaveValue(["continuous-created-character"]);
+    expect(within(recoveredEditor).getByRole("listbox", { name: "第 2 段角色素材" })).toHaveValue([]);
+    expect(port.submit).toHaveBeenCalledOnce();
+  });
 
-    directoryShowsCreatedCharacter = true;
-    await act(async () => {
-      pendingCreate.reject(new ApiError("http", "创建响应未确认", 500));
-      await Promise.resolve();
+  it("blocks the actual submit when Web Locks cannot serialize the chapter", async () => {
+    installContinuousChapterOperationLock(false);
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-no-lock", "没有互斥能力", [{
+      text: "原始正文", storyboard: ["continuous-no-lock-shot"], character: [], scene: [], prop: [],
+    }]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-no-lock-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const submit = vi.fn(async () => { throw new Error("A POST must not start without Web Locks."); });
+    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const, operationReceipt: 1 as const }));
+    Object.assign(base.services, { continuousChapterOperations: { submit, lookup: vi.fn() } });
+
+    renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.type(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }), "改写");
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    expect(await within(editor).findByRole("status")).toHaveTextContent(/跨标签互斥/u);
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("blocks the actual POST when it cannot persist and read back the frozen operation", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-storage-failure", "原操作存储失败", [{
+      text: "原始正文", storyboard: ["continuous-storage-shot"], character: [], scene: [], prop: [],
+    }]);
+    const base = makeServices([current], {
+      [current.id]: [{ ...asset("continuous-storage-shot", current.id), frame_index: 0 }],
+    }, false, true);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const submit = vi.fn(async () => { throw new Error("POST must not start before durable readback."); });
+    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const, operationReceipt: 1 as const }));
+    Object.assign(base.services, { continuousChapterOperations: { submit, lookup: vi.fn() } });
+    const storage = {
+      getItem: vi.fn(() => null),
+      setItem: vi.fn(() => { throw new Error("QuotaExceededError"); }),
+      removeItem: vi.fn(),
+    };
+    Object.defineProperty(base.services, "continuousChapterOperationStorage", { configurable: true, value: storage });
+
+    renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.clear(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }));
+    await user.type(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }), "未能持久化的改稿");
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+
+    expect(await within(editor).findByRole("status")).toHaveTextContent(/本地原操作记录不可用/u);
+    expect(storage.setItem).toHaveBeenCalledOnce();
+    expect(submit).not.toHaveBeenCalled();
+  });
+
+  it("keeps a different chapter editable while another chapter has an unresolved operation", async () => {
+    installContinuousChapterOperationLock();
+    installContinuousOperationCrypto();
+    const user = userEvent.setup();
+    const pendingChapter = chapter("chapter-continuous-pending-owner", "待核对章节", [{
+      text: "待核对原文", storyboard: ["continuous-pending-owner-shot"], character: [], scene: [], prop: [],
+    }]);
+    const otherChapter = chapter("chapter-continuous-independent", "独立可编辑章节", [{
+      text: "另一章原文", storyboard: ["continuous-independent-shot"], character: [], scene: [], prop: [],
+    }], { order: 2 });
+    const base = makeServices([pendingChapter, otherChapter], {
+      [pendingChapter.id]: [{ ...asset("continuous-pending-owner-shot", pendingChapter.id), frame_index: 0 }],
+      [otherChapter.id]: [{ ...asset("continuous-independent-shot", otherChapter.id), frame_index: 0 }],
+    }, false, true);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const submit = vi.fn(async (chapterId: string, operationId: string, bodyJson: string) => {
+      if (chapterId === pendingChapter.id) throw new ApiError("network", "原请求响应丢失");
+      const request = JSON.parse(bodyJson) as ContinuousChapterOperationRequest;
+      if (request.command.kind !== "save-chapter") throw new Error("Expected a chapter save.");
+      const result = { ...otherChapter, content: request.command.content as unknown as Chapter["content"] };
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === chapterId ? result : row));
+      return makeContinuousOperationResponse("demo-user", series.id, chapterId, operationId, bodyJson, result);
     });
+    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const, operationReceipt: 1 as const }));
+    Object.assign(base.services, { continuousChapterOperations: {
+      submit,
+      lookup: vi.fn(async () => { throw new ApiError("http", "原操作尚无回执", 404); }),
+    } });
 
-    await waitFor(() => expect(within(editor).getByRole("listbox", { name: "第 1 段角色素材" }))
-      .toHaveValue(["continuous-created-character"]));
-    expect(within(editor).getByRole("listbox", { name: "第 2 段角色素材" })).toHaveValue([]);
-    expect(createCharacter).toHaveBeenCalledTimes(1);
-    expect(await within(editor).findByText("已核对并关联角色素材。")).toBeInTheDocument();
+    renderContinuousBrowser(base.services);
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    let editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.clear(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }));
+    await user.type(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }), "待核对的已冻结草稿");
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledOnce());
+    expect(await screen.findByRole("region", { name: "连续编辑操作恢复" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /独立可编辑章节/u }));
+    expect(screen.getAllByRole("heading", { name: "独立可编辑章节" })).toHaveLength(2);
+    await waitFor(() => expect(screen.getByRole("button", { name: "开启整章连续编辑" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "开启整章连续编辑" }));
+    editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    expect(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" })).toHaveValue("另一章原文");
+    await user.clear(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }));
+    await user.type(within(editor).getByRole("textbox", { name: "第 1 段剧本文字" }), "独立章节可以继续编辑");
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    await waitFor(() => expect(submit).toHaveBeenCalledTimes(2));
+
+    const pendingKey = continuousChapterOperationJournalKey({
+      actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: pendingChapter.id,
+    });
+    const otherKey = continuousChapterOperationJournalKey({
+      actorId: "demo-user", apiBaseUrl, seriesId: series.id, chapterId: otherChapter.id,
+    });
+    expect(submit.mock.calls.map(([chapterId]) => chapterId)).toEqual([pendingChapter.id, otherChapter.id]);
+    expect(JSON.parse(localStorage.getItem(pendingKey) ?? "null").phase).toBe("dispatch_possible");
+    await waitFor(() => {
+      expect(JSON.parse(localStorage.getItem(otherKey) ?? "null").phase)
+        .toBe("receipt_committed_pending_target_read");
+    });
   });
 
 });
