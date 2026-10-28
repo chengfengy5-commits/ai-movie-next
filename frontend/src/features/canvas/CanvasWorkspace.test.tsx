@@ -213,6 +213,12 @@ function pointerUpOn(target: Element | null, viewport: HTMLElement, pointerId: n
   }
 }
 
+function clickCanvasEdge(target: Element, viewport: HTMLElement, pointerId: number): void {
+  fireEvent.pointerDown(target, { pointerId, button: 0, clientX: 0, clientY: 0 });
+  fireEvent.pointerUp(viewport, { pointerId, button: 0, clientX: 0, clientY: 0 });
+  fireEvent.click(target);
+}
+
 function stubChapterGenerationHistoryMediaReader(readMedia: ChapterGenerationHistoryRun["readMedia"]) {
   const captured = { context: null as ChapterGenerationHistoryContext | null };
   const run = { isCurrent: () => true, readMedia } as unknown as ChapterGenerationHistoryRun;
@@ -393,6 +399,113 @@ describe("CanvasWorkspace", () => {
     expect(screen.getByRole("article", { name: "林澜" }).className).toContain("is-selected");
     expect(screen.getByRole("region", { name: "选中内容信息" })
       .querySelector(".canvas-selected-information-kind")?.textContent).toBe("角色素材");
+  });
+
+  it("replaces a selected node with a manually clicked edge", async () => {
+    const targetRef = `frame-index:${sourceSnapshot.version}:0`;
+    const initialDocument: CanvasDocument = {
+      ...document,
+      manualEdges: [{ id: "manual-edge-a", sourceRef: "character:character-a", targetRef, relation: "manual" }],
+    };
+    const { container, port } = setup(undefined, false, initialDocument);
+    await screen.findByLabelText("林澜");
+
+    const character = screen.getByLabelText("林澜");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    const edge = container.querySelector("path.is-manual");
+    expect(edge).not.toBeNull();
+    fireEvent.click(character);
+    expect(character.classList).toContain("is-selected");
+
+    clickCanvasEdge(edge!, viewport, 71);
+
+    expect(character.classList).not.toContain("is-selected");
+    expect(edge?.getAttribute("stroke")).toBe("#7c3aed");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    expect(port.save).not.toHaveBeenCalled();
+  });
+
+  it("clears a selected edge on node pointerdown before a drag can suppress click", async () => {
+    const targetRef = `frame-index:${sourceSnapshot.version}:0`;
+    const initialDocument: CanvasDocument = {
+      ...document,
+      manualEdges: [{ id: "manual-edge-a", sourceRef: "character:character-a", targetRef, relation: "manual" }],
+    };
+    const { container, port } = setup(undefined, false, initialDocument);
+    await screen.findByLabelText("林澜");
+
+    const character = screen.getByLabelText("林澜");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    const edge = container.querySelector("path.is-manual");
+    expect(edge).not.toBeNull();
+    clickCanvasEdge(edge!, viewport, 72);
+    expect(edge?.getAttribute("stroke")).toBe("#7c3aed");
+
+    fireEvent.pointerDown(character, { pointerId: 73, button: 0, clientX: 0, clientY: 0 });
+    expect(character.classList).toContain("is-selected");
+    expect(edge?.getAttribute("stroke")).not.toBe("#7c3aed");
+    fireEvent.pointerUp(viewport, { pointerId: 73, button: 0, clientX: 0, clientY: 0 });
+
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    expect(port.save).not.toHaveBeenCalled();
+  });
+
+  it("clears selection on left blank panning and preserves it on right-button down", async () => {
+    const targetRef = `frame-index:${sourceSnapshot.version}:0`;
+    const initialDocument: CanvasDocument = {
+      ...document,
+      manualEdges: [{ id: "manual-edge-a", sourceRef: "character:character-a", targetRef, relation: "manual" }],
+    };
+    const { container, port } = setup(undefined, false, initialDocument);
+    await screen.findByLabelText("林澜");
+
+    const character = screen.getByLabelText("林澜");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    const edge = container.querySelector("path.is-manual");
+    expect(edge).not.toBeNull();
+    fireEvent.click(character);
+    fireEvent.pointerDown(viewport, { pointerId: 74, button: 2, clientX: 0, clientY: 0 });
+    expect(character.classList).toContain("is-selected");
+    fireEvent.pointerUp(viewport, { pointerId: 74, button: 2, clientX: 0, clientY: 0 });
+    fireEvent.pointerDown(viewport, { pointerId: 75, button: 0, clientX: 0, clientY: 0 });
+    expect(character.classList).not.toContain("is-selected");
+    fireEvent.pointerUp(viewport, { pointerId: 75, button: 0, clientX: 0, clientY: 0 });
+
+    clickCanvasEdge(edge!, viewport, 76);
+    expect(edge?.getAttribute("stroke")).toBe("#7c3aed");
+    fireEvent.pointerDown(viewport, { pointerId: 77, button: 2, clientX: 0, clientY: 0 });
+    expect(edge?.getAttribute("stroke")).toBe("#7c3aed");
+    fireEvent.pointerUp(viewport, { pointerId: 77, button: 2, clientX: 0, clientY: 0 });
+    fireEvent.pointerDown(viewport, { pointerId: 78, button: 0, clientX: 0, clientY: 0 });
+    expect(edge?.getAttribute("stroke")).not.toBe("#7c3aed");
+    fireEvent.pointerUp(viewport, { pointerId: 78, button: 0, clientX: 0, clientY: 0 });
+
+    expect(screen.getByRole("button", { name: "删除选中" })).toBeDisabled();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+    expect(port.save).not.toHaveBeenCalled();
+  });
+
+  it("clears an edge selection when a newly created note becomes selected", async () => {
+    const targetRef = `frame-index:${sourceSnapshot.version}:0`;
+    const initialDocument: CanvasDocument = {
+      ...document,
+      manualEdges: [{ id: "manual-edge-a", sourceRef: "character:character-a", targetRef, relation: "manual" }],
+    };
+    const { container, port } = setup(undefined, false, initialDocument);
+    await screen.findByLabelText("林澜");
+
+    const edge = container.querySelector("path.is-manual");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    expect(edge).not.toBeNull();
+    clickCanvasEdge(edge!, viewport, 79);
+    expect(edge?.getAttribute("stroke")).toBe("#7c3aed");
+
+    fireEvent.click(screen.getByRole("button", { name: "新增便签" }));
+
+    expect(container.querySelector(".canvas-node.is-selected")).not.toBeNull();
+    expect(edge?.getAttribute("stroke")).not.toBe("#7c3aed");
+    expect(screen.getByRole("button", { name: "撤销" })).toBeEnabled();
+    expect(port.save).not.toHaveBeenCalled();
   });
 
   it("resolves a selected video's stable owning frame without adding a graph edge", async () => {
