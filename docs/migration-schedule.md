@@ -742,3 +742,9 @@ Root1195完整复核3个产品/测试文件，冻结SHA与当前差异一致。A
 冻结后5项定向用例通过、36项跳过；TypeScript和Vite构建通过（341 modules，既有chunk体积警告）。测试夹具可选字段错误、首次Vite配置加载器临时目录权限错误的原始日志保留，修正后验证通过。本批为代码和轻量验证交付，未做浏览器/E2E或部署；U07旧交互完整对照（含Escape）与整体验收仍待。剩余仍11开发/10接入/51验证接受，类别重叠不相加。
 
 证据：E/`1209/final-v2/manifest.json`、E/`1214/canvas-review-final.json`及发布后E/`1214/publish-result.json`。
+
+### 2026-10-28 Root1217：画布 Escape 取消手势与选择
+
+Escape 优先取消端口拖线或两步连线并清除节点、边选择，再由下一次 Escape 进入原关闭逻辑。子对话框先关闭自身，显式关闭按钮和未保存内容提示保持原路径。取消后的 pointerup 不产生连线，不追加历史或保存，也不丢失草稿。
+
+7 项直接相关用例通过、36 项跳过，TypeScript 与隔离输出 Vite 构建通过（341 modules，既有 chunk 提示）。Root 完整两文件差异复核通过。没有执行浏览器/E2E、外部服务或部署；完整旧交互对照及媒体兼容仍待。剩余仍为 11 开发/10 接入/51 验证验收，口径重叠不相加。证据 E/1215/final-manifest-v1.json、E/1217/canvas-review-final.json，提交推送以 E/1217/publish-result.json 为准。
