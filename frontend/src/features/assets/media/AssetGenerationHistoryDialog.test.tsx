@@ -315,6 +315,47 @@ describe("AssetGenerationHistoryDialog", () => {
     expect(mediaCalls).toHaveLength(2);
   });
 
+  it("restarts the same URL preview when a new owner run replaces the history snapshot", async () => {
+    const mediaSignals: AbortSignal[] = [];
+    let historyReads = 0;
+    let mediaReads = 0;
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input.href : String(input);
+      if (url.includes("/asset-chat-messages?") && (init.method ?? "GET") === "GET") {
+        historyReads += 1;
+        return jsonResponse([message(originalUrl)]);
+      }
+      if (url === originalUrl && (init.method ?? "GET") === "GET") {
+        mediaReads += 1;
+        if (init.signal instanceof AbortSignal) mediaSignals.push(init.signal);
+        if (mediaReads === 1) return await new Promise<Response>((_resolve, reject) => {
+          init.signal?.addEventListener("abort", () => reject(new DOMException("aborted", "AbortError")), { once: true });
+        });
+        return pngResponse(url);
+      }
+      throw new Error(`Unexpected request: ${init.method ?? "GET"} ${url}`);
+    };
+
+    renderHistory(fetcher);
+    fireEvent.change(await screen.findByLabelText("选择历史所属章节"), { target: { value: chapterId } });
+    await screen.findByRole("button", { name: "转存到 OSS" });
+    fireEvent.click(screen.getByRole("button", { name: "预览图片" }));
+    await screen.findByText("正在读取媒体…");
+    expect(mediaReads).toBe(1);
+
+    fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+
+    await waitFor(() => expect(historyReads).toBe(2));
+    await screen.findByRole("button", { name: "预览图片" });
+    expect(mediaReads).toBe(1);
+    await waitFor(() => expect(mediaSignals[0]?.aborted).toBe(true));
+
+    fireEvent.click(screen.getByRole("button", { name: "预览图片" }));
+    await waitFor(() => expect(mediaReads).toBe(2));
+    expect(mediaSignals[1]?.aborted).toBe(false);
+    await screen.findByRole("img", { name: "林照生成图片" });
+  });
+
   it("downloads a public HTTPS image through the history reader with an identity-based filename", async () => {
     const imageUrl = "https://media.example.test/generated/history-image.png";
     const calls: Array<{ readonly url: string; readonly init: RequestInit }> = [];

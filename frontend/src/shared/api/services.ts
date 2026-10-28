@@ -25,6 +25,8 @@ import { createFusedGenerationHttp } from "./fusedGenerationHttp";
 import type { FusedGenerationPort } from "./fusedGeneration";
 import { createAssetGenerationHistoryHttpPort } from "./assetGenerationHistoryHttp";
 import type { AssetGenerationHistoryPort } from "./assetGenerationHistory";
+import { createChapterGenerationHistoryHttpPort } from "./chapterGenerationHistoryHttp";
+import type { ChapterGenerationHistoryPort } from "./chapterGenerationHistory";
 import { createChatAssistantHttpPort } from "./chatAssistantHttp";
 import type { ChatAssistantPort } from "./chatAssistant";
 import { createCanvasOwnedImageHttpPort } from "./canvasOwnedImageHttp";
@@ -252,6 +254,7 @@ export interface WorkspaceServices {
   readonly assetReplacement?: AssetReplacementPort;
   readonly assetImageUpload?: AssetImageUploadPort;
   readonly assetGenerationHistory?: AssetGenerationHistoryPort;
+  readonly chapterGenerationHistory?: ChapterGenerationHistoryPort;
   readonly characterAudio?: CharacterAudioPort;
   readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
@@ -3333,6 +3336,12 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     assetGenerationHistory: createAssetGenerationHistoryHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    chapterGenerationHistory: createChapterGenerationHistoryHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,
