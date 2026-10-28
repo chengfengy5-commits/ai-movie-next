@@ -11,6 +11,7 @@ import {
 } from "../../../shared/api/assetGenerationHistory";
 import { classifyMediaExportUrl, type MediaExportUrlRoute } from "../../../shared/api/mediaExportReader";
 import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
+import { GenerationHistoryMediaPreview } from "./GenerationHistoryMediaPreview";
 
 import "./assetGenerationHistory.css";
 
@@ -402,81 +403,6 @@ function idStillPresent(messages: readonly AssetGenerationHistoryMessage[], mess
   return messages.some((message) => message.id === messageId);
 }
 
-function GenerationHistoryMediaPreview({
-  assetName,
-  entry,
-  mode,
-  onUnauthorized,
-  run,
-}: {
-  assetName: string;
-  entry: HistoryEntry;
-  mode: AssetGenerationHistoryMode;
-  onUnauthorized(): void;
-  run: AssetGenerationHistoryRun;
-}) {
-  const [objectUrl, setObjectUrl] = useState<string | null>(null);
-  const [failureMessage, setFailureMessage] = useState<string | null>(null);
-  const route = entry.mediaRoute;
-  const onUnauthorizedRef = useRef(onUnauthorized);
-  onUnauthorizedRef.current = onUnauthorized;
-
-  useEffect(() => {
-    setFailureMessage(null);
-    if (route === null) {
-      setObjectUrl(null);
-      return;
-    }
-    const controller = new AbortController();
-    let active = true;
-    let createdUrl: string | null = null;
-    setObjectUrl(null);
-    void run.readMedia(route.url, controller.signal).then((blob) => {
-      if (!active || controller.signal.aborted || !run.isCurrent()) return;
-      createdUrl = URL.createObjectURL(blob);
-      setObjectUrl(createdUrl);
-    }).catch((error: unknown) => {
-      if (!active || controller.signal.aborted || !run.isCurrent()) return;
-      const sessionExpired = unauthorized(error);
-      if (sessionExpired) onUnauthorizedRef.current();
-      setFailureMessage(sessionExpired ? errorMessage(error, "read") : "媒体读取或解码失败。");
-    });
-    return () => {
-      active = false;
-      controller.abort();
-      if (createdUrl !== null) URL.revokeObjectURL(createdUrl);
-    };
-  }, [route, run]);
-
-  if (route === null || entry.unsafeMedia) {
-    return <p className="asset-generation-history-media-state">媒体地址不符合安全预览要求。</p>;
-  }
-  const src = objectUrl;
-  if (failureMessage !== null) return <p className="asset-generation-history-media-state">{failureMessage}</p>;
-  if (src === null) return <p className="asset-generation-history-media-state" role="status">正在读取媒体…</p>;
-  if (mode === "video") {
-    return (
-      <video
-        aria-label={assetName + "生成视频"}
-        controls
-        onError={() => setFailureMessage("媒体读取或解码失败。")}
-        playsInline
-        preload="metadata"
-        src={src}
-      />
-    );
-  }
-  return (
-    <img
-      alt={assetName + "生成图片"}
-      loading="lazy"
-      onError={() => setFailureMessage("媒体读取或解码失败。")}
-      referrerPolicy="no-referrer"
-      src={src}
-    />
-  );
-}
-
 export function AssetGenerationHistoryDialog({
   actorId,
   assetId,
@@ -500,6 +426,8 @@ export function AssetGenerationHistoryDialog({
   const [historyPage, setHistoryPage] = useState(0);
   const [activePreviewMessageId, setActivePreviewMessageId] = useState<string | null>(null);
   const [historyState, setHistoryState] = useState<HistoryState>({ status: "idle" });
+  const previewRunIdsRef = useRef(new WeakMap<AssetGenerationHistoryRun, number>());
+  const nextPreviewRunIdRef = useRef(0);
   const [actionNotice, setActionNotice] = useState<ActionNotice | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<string | null>(null);
   const [mediaAdoptionConfirmation, setMediaAdoptionConfirmation] = useState<MediaAdoptionConfirmation | null>(null);
@@ -626,6 +554,23 @@ export function AssetGenerationHistoryDialog({
     && historyState.run.isCurrent()
     ? historyState
     : null;
+  let currentPreviewRunId = 0;
+  if (currentHistory !== null) {
+    currentPreviewRunId = previewRunIdsRef.current.get(currentHistory.run) ?? 0;
+    if (currentPreviewRunId === 0) {
+      currentPreviewRunId = ++nextPreviewRunIdRef.current;
+      previewRunIdsRef.current.set(currentHistory.run, currentPreviewRunId);
+    }
+  }
+  const currentPreviewOwnerKey = currentHistory === null ? "" : [
+    actorId,
+    apiBaseUrl ?? "",
+    seriesId,
+    assetId,
+    currentHistory.chapterId,
+    currentHistory.mode,
+    currentPreviewRunId,
+  ].join("\u0000");
   const currentHistoryError = historyState.status === "error"
     && historyState.chapterId === selectedChapterId
     && historyState.mode === mode
@@ -1210,11 +1155,14 @@ export function AssetGenerationHistoryDialog({
                             previewIsActive ? (
                               <>
                                 <GenerationHistoryMediaPreview
+                                  key={`${currentPreviewOwnerKey}\u0000${messageId}`}
                                   assetName={assetName}
-                                  entry={entry}
                                   mode={mode}
+                                  isCurrent={currentHistory.run.isCurrent}
+                                  mediaUrl={entry.mediaRoute?.url ?? null}
                                   onUnauthorized={() => unauthorizedRef.current()}
-                                  run={currentHistory.run}
+                                  readMedia={currentHistory.run.readMedia}
+                                  unsafeMedia={entry.unsafeMedia}
                                 />
                                 <button
                                   aria-label={`关闭${mediaPreviewLabel(mode)}预览`}

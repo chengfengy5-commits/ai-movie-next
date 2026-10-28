@@ -13,6 +13,8 @@ import type {
 } from "../../shared/api/contracts";
 import type { AssetOrphanCandidate } from "../../shared/api/assetMaintenance";
 import type { FusedGenerationMemberType } from "../../shared/api/fusedGeneration";
+import { ChapterGenerationHistoryError } from "../../shared/api/chapterGenerationHistory";
+import type { ChapterGenerationHistorySnapshot } from "../../shared/api/chapterGenerationHistory";
 import type { PersonalProductionSnapshot } from "../../shared/api/personalProductionNotes";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
@@ -66,6 +68,13 @@ import {
   type PersonalRoughCutReadIdentity,
 } from "./PersonalRoughCutPanel";
 import { MediaExportDialog } from "./media-export/MediaExportDialog";
+import {
+  ChapterGenerationHistorySession,
+} from "./generation-history/ChapterGenerationHistorySession";
+import type {
+  ChapterGenerationHistoryOwner as GenerationHistoryOwner,
+  ChapterGenerationHistoryWriteLease,
+} from "./generation-history/useChapterGenerationHistoryOwner";
 import {
   findChapterFramePosition,
   findUniqueChapterStoryboardAsset,
@@ -249,6 +258,16 @@ interface MediaExportDialogOwner {
   readonly sourceMode: "chapter" | "rough-cut";
   readonly roughCutSnapshot: PersonalRoughCutSnapshot | null;
   isSourceCurrent(): boolean;
+}
+
+interface ActiveChapterGenerationHistoryOwner extends GenerationHistoryOwner {
+  readonly scope: ChapterBrowserScope;
+  readonly chapter: Chapter;
+  readonly sourceFingerprint: string;
+  readonly expectedFrame: StoryboardFrame;
+  readonly requestGeneration: number;
+  readonly openEpoch: number;
+  readonly teamId: string | null;
 }
 
 type ChapterEditLockIdentity = { acquiredAt: string; userId: string } | null;
@@ -816,6 +835,21 @@ function storyboardFrameId(frame: StoryboardFrame | undefined): string | null {
   return typeof first === "string" && first.trim() !== "" ? first : null;
 }
 
+function chapterGenerationHistorySourceFingerprint(chapter: Chapter, frameIndex: number): string | null {
+  if (!Array.isArray(chapter.content) || frameIndex < 0 || frameIndex >= chapter.content.length) return null;
+  try {
+    const content = chapter.content.map((frame, index) => {
+      if (index !== frameIndex || typeof frame !== "object" || frame === null || Array.isArray(frame)) return frame;
+      const source = { ...frame } as Record<string, unknown>;
+      delete source.preview;
+      return source;
+    });
+    return JSON.stringify(content) ?? null;
+  } catch {
+    return null;
+  }
+}
+
 function frameSourceVersion(chapter: Chapter, frame: StoryboardFrame): string {
   return `${chapter.updated_at}:${JSON.stringify(frame)}`;
 }
@@ -952,6 +986,12 @@ export function ChapterBrowser({
   const [frameTextEditor, setFrameTextEditor] = useState<FrameTextEditorContext | null>(null);
   const frameTextEditorRef = useRef<FrameTextEditorContext | null>(null);
   frameTextEditorRef.current = frameTextEditor;
+  const [chapterGenerationHistoryOwner, setChapterGenerationHistoryOwner] =
+    useState<ActiveChapterGenerationHistoryOwner | null>(null);
+  const chapterGenerationHistoryOwnerRef = useRef<ActiveChapterGenerationHistoryOwner | null>(null);
+  chapterGenerationHistoryOwnerRef.current = chapterGenerationHistoryOwner;
+  const chapterGenerationHistoryOpenEpoch = useRef(0);
+  const chapterGenerationHistoryBlockRef = useRef<string | null>(null);
   const [continuousChapterEditor, setContinuousChapterEditor] = useState<ContinuousChapterEditorContext | null>(null);
   const continuousChapterEditorRef = useRef<ContinuousChapterEditorContext | null>(null);
   continuousChapterEditorRef.current = continuousChapterEditor;
@@ -1094,6 +1134,9 @@ export function ChapterBrowser({
     setChaptersLoading(true);
     setChaptersError(null);
     setChapterManagement(null);
+    chapterGenerationHistoryOwnerRef.current = null;
+    chapterGenerationHistoryOpenEpoch.current += 1;
+    setChapterGenerationHistoryOwner(null);
     setStoryboardGenerationDialog(null);
     frameReviewDialogRef.current = null;
     frameReviewVerifiedSourceRef.current = null;
@@ -1173,6 +1216,14 @@ export function ChapterBrowser({
     frameAssetReferenceOwnerRef.current = null;
     setFrameAssetReferenceOwner(null);
   }, []);
+
+  function closeChapterGenerationHistory(expectedOwner?: ActiveChapterGenerationHistoryOwner): void {
+    const current = chapterGenerationHistoryOwnerRef.current;
+    if (current === null || (expectedOwner !== undefined && current !== expectedOwner)) return;
+    chapterGenerationHistoryOpenEpoch.current += 1;
+    chapterGenerationHistoryOwnerRef.current = null;
+    setChapterGenerationHistoryOwner(null);
+  }
 
   const closeChapterProductionChecklist = useCallback((expectedContext?: ChapterProductionChecklistContext) => {
     const context = productionChecklistContextRef.current;
@@ -2685,6 +2736,197 @@ export function ChapterBrowser({
     setFrameAssetReferenceOwner(owner);
   }
 
+  function isChapterGenerationHistoryOwnerCurrent(owner: ActiveChapterGenerationHistoryOwner): boolean {
+    const directory = chapterDirectoryRef.current;
+    const matchingChapters = directory.chapters?.filter((chapter) => chapter.id === owner.chapter.id) ?? [];
+    const currentChapter = matchingChapters.length === 1 ? matchingChapters[0] : null;
+    const currentFrame = currentChapter?.content?.[owner.frameIndex];
+    return chapterGenerationHistoryOwnerRef.current === owner
+      && owner.openEpoch === chapterGenerationHistoryOpenEpoch.current
+      && owner.sessionGeneration === sessionGenerationRef.current
+      && owner.requestGeneration === chapterRequestGeneration.current
+      && owner.requestGeneration === directory.requestGeneration
+      && owner.apiBaseUrl === owner.scope.services.apiBaseUrl
+      && owner.port === owner.scope.services.chapterGenerationHistory
+      && sameChapterBrowserScope(owner.scope, activeScopeRef.current)
+      && sameChapterBrowserScope(directory.scope, owner.scope)
+      && selectedChapterIdRef.current === owner.chapter.id
+      && currentChapter != null
+      && currentChapter.series_id === owner.seriesId
+      && currentFrame !== undefined
+      && storyboardFrameId(currentFrame) === owner.storyboardAssetId
+      && chapterGenerationHistorySourceFingerprint(currentChapter, owner.frameIndex) === owner.sourceFingerprint;
+  }
+
+  async function prepareChapterGenerationHistoryWrite(
+    owner: ActiveChapterGenerationHistoryOwner,
+    signal: AbortSignal,
+    isCurrent: () => boolean,
+  ): Promise<ChapterGenerationHistoryWriteLease> {
+    const assertCurrent = () => {
+      if (signal.aborted || !isCurrent() || !isChapterGenerationHistoryOwnerCurrent(owner)) {
+        throw new ChapterGenerationHistoryError("not-sent", "当前章节或登录范围已变化，未发送选用请求。");
+      }
+      const blocked = chapterGenerationHistoryBlockRef.current;
+      if (blocked !== null) throw new ChapterGenerationHistoryError("not-sent", blocked);
+    };
+    assertCurrent();
+    if (owner.teamId === null) {
+      return { identity: null, release: async () => undefined };
+    }
+
+    const { getChapterEditLock, acquireChapterEditLock, releaseChapterEditLock } = owner.scope.services;
+    if (getChapterEditLock === undefined || acquireChapterEditLock === undefined || releaseChapterEditLock === undefined) {
+      throw new ChapterGenerationHistoryError("not-sent", "团队章节锁能力未就绪，未发送选用请求。");
+    }
+
+    const existing = await getChapterEditLock(owner.chapterId, signal);
+    assertCurrent();
+    if (existing.locked) {
+      if (!validOwnedChapterLock(existing, owner.actorId)) {
+        throw new ChapterGenerationHistoryError("rejected", existing.username
+          ? `当前章节由 ${existing.username} 编辑，不能选用历史结果。`
+          : "当前章节由其他创作者编辑，不能选用历史结果。", 409);
+      }
+      const identity = chapterEditLockIdentity(existing);
+      if (identity === null) {
+        throw new ChapterGenerationHistoryError("not-sent", "当前章节锁缺少稳定身份，未发送选用请求。");
+      }
+      return { identity: { user_id: identity.userId, acquired_at: identity.acquiredAt }, release: async () => undefined };
+    }
+
+    let lease: ChapterEditLockLeaseHandle | null = null;
+    try {
+      const acquisition = await acquireChapterEditLock(owner.chapterId, signal);
+      lease = acquisition.lease;
+      assertCurrent();
+      if (!acquisition.state.locked
+        || typeof acquisition.state.expires_at !== "string"
+        || utcTimestampMilliseconds(acquisition.state.expires_at) <= Date.now()) {
+        throw new ChapterGenerationHistoryError("rejected", acquisition.state.message ?? "未能取得有效章节编辑锁。", 409);
+      }
+      const verified = await getChapterEditLock(owner.chapterId, signal, lease ?? undefined);
+      assertCurrent();
+      if (!validOwnedChapterLock(verified, owner.actorId)) {
+        throw new ChapterGenerationHistoryError("rejected", "取得编辑锁后无法核对当前账号、所有权和有效期限。", 409);
+      }
+      const lock = chapterEditLockIdentity(verified);
+      if (lock === null) {
+        throw new ChapterGenerationHistoryError("not-sent", "取得的章节锁缺少稳定身份，未发送选用请求。");
+      }
+      const capturedLease = lease;
+      let released = false;
+      return {
+        identity: { user_id: lock.userId, acquired_at: lock.acquiredAt },
+        release: async () => {
+          if (released || capturedLease === null) return;
+          released = true;
+          await releaseChapterEditLock(owner.chapterId, new AbortController().signal, capturedLease);
+        },
+      };
+    } catch (error) {
+      if (lease !== null) {
+        await releaseChapterEditLock(owner.chapterId, new AbortController().signal, lease).catch(() => undefined);
+      }
+      throw error;
+    }
+  }
+
+  async function refreshChapterGenerationHistoryTarget(
+    owner: ActiveChapterGenerationHistoryOwner,
+    signal: AbortSignal,
+    isCurrent: () => boolean,
+    snapshot: ChapterGenerationHistorySnapshot,
+  ): Promise<void> {
+    if (signal.aborted || !isCurrent() || !isChapterGenerationHistoryOwnerCurrent(owner)
+      || snapshot.target_proof === null) {
+      throw new ChapterGenerationHistoryError("read-error", "当前章节范围已变化，未刷新页面数据。");
+    }
+    const [directory, assets] = await Promise.all([
+      owner.scope.services.listChapters(owner.seriesId, signal),
+      owner.scope.services.listStoryboardAssets(owner.seriesId, owner.chapterId, signal),
+    ]);
+    if (signal.aborted || !isCurrent() || !isChapterGenerationHistoryOwnerCurrent(owner)) {
+      throw new ChapterGenerationHistoryError("read-error", "当前章节范围已变化，未刷新页面数据。");
+    }
+    const matches = directory.filter((chapter) => chapter.id === owner.chapterId && chapter.series_id === owner.seriesId);
+    if (matches.length !== 1
+      || chapterGenerationHistorySourceFingerprint(matches[0]!, owner.frameIndex) !== owner.sourceFingerprint) {
+      throw new ChapterGenerationHistoryError("conflict", "刷新时发现镜头来源已变化；未将历史结果应用到其他镜头。", 409);
+    }
+
+    if (snapshot.target_kind === "frame-preview") {
+      const preview = matches[0]!.content?.[snapshot.frame_index]?.preview;
+      if ((preview ?? null) !== snapshot.target_proof.media_url) {
+        throw new ChapterGenerationHistoryError("conflict", "章节预览字段与独立核对结果不一致。", 409);
+      }
+    } else {
+      const storyboardId = snapshot.storyboard_asset_id;
+      const sameIdFrames = matches[0]!.content?.filter((frame) => storyboardFrameId(frame) === storyboardId) ?? [];
+      const sameIdAssets = assets.filter((asset) => asset.id === storyboardId);
+      if (sameIdFrames.length !== 1 || sameIdAssets.length !== 1
+        || sameIdAssets[0]?.series_id !== owner.seriesId
+        || sameIdAssets[0]?.chapter_id !== owner.chapterId
+        || sameIdAssets[0]?.frame_index !== snapshot.frame_index
+        || sameIdAssets[0]?.image_url !== snapshot.target_proof.media_url) {
+        throw new ChapterGenerationHistoryError("conflict", "刷新时发现故事板素材对应关系已变化。", 409);
+      }
+    }
+
+    applyFreshChapterDirectory(directory, owner.scope);
+    refreshAssetsAfterFrameRead(owner.chapterId, assets);
+  }
+
+  function openFrameGenerationHistory(frame: StoryboardFrame, frameIndex: number): void {
+    const directory = chapterDirectoryRef.current;
+    if (selectedChapter === null || !Number.isSafeInteger(frameIndex) || frameIndex < 0
+      || selectedChapter.content?.[frameIndex] !== frame
+      || !sameChapterBrowserScope(directory.scope, currentScope)
+      || directory.requestGeneration !== chapterRequestGeneration.current
+      || directory.chapters !== chapters
+      || directory.chapters?.filter((chapter) => chapter.id === selectedChapter.id).length !== 1
+      || selectedChapter.series_id !== series.id) {
+      return;
+    }
+    const sourceFingerprint = chapterGenerationHistorySourceFingerprint(selectedChapter, frameIndex);
+    if (sourceFingerprint === null) {
+      setChapterMutationNotice("当前镜头结构无法安全核对，未打开生成历史。");
+      return;
+    }
+    const openEpoch = ++chapterGenerationHistoryOpenEpoch.current;
+    let owner: ActiveChapterGenerationHistoryOwner;
+    owner = {
+      ownerKey: [userId, services.apiBaseUrl ?? "", series.id, selectedChapter.id, frameIndex, chapterRequestGeneration.current, openEpoch].join("\u0000"),
+      actorId: userId,
+      seriesId: series.id,
+      chapterId: selectedChapter.id,
+      chapterTitle: displayChapterTitle(selectedChapter),
+      frameIndex,
+      storyboardAssetId: storyboardFrameId(frame),
+      apiBaseUrl: services.apiBaseUrl,
+      sessionGeneration,
+      requestGeneration: chapterRequestGeneration.current,
+      port: services.chapterGenerationHistory,
+      scope: currentScope,
+      chapter: selectedChapter,
+      sourceFingerprint,
+      expectedFrame: frame,
+      openEpoch,
+      teamId: typeof series.team_id === "string" && series.team_id !== "" ? series.team_id : null,
+      isOwnerCurrent: () => isChapterGenerationHistoryOwnerCurrent(owner),
+      isAdoptionAllowed: () => isChapterGenerationHistoryOwnerCurrent(owner)
+        && chapterGenerationHistoryBlockRef.current === null,
+      adoptionBlockMessage: () => chapterGenerationHistoryBlockRef.current,
+      prepareWrite: (signal, isCurrent) => prepareChapterGenerationHistoryWrite(owner, signal, isCurrent),
+      refreshAfterAdoption: (signal, isCurrent, snapshot) => refreshChapterGenerationHistoryTarget(owner, signal, isCurrent, snapshot),
+      onUnauthorized: () => {
+        if (isChapterGenerationHistoryOwnerCurrent(owner)) unauthorizedHandlerRef.current();
+      },
+    };
+    chapterGenerationHistoryOwnerRef.current = owner;
+    setChapterGenerationHistoryOwner(owner);
+  }
+
   function openChapterProductionChecklist(): void {
     if (selectedChapter === null || chapterPanelsOpen || chapterManagement !== null || chaptersLoading) return;
     const context: ChapterProductionChecklistContext = {
@@ -3040,6 +3282,13 @@ export function ChapterBrowser({
       setFrameOptimizeDialog(null);
     }
   }, [selectedChapterId]);
+
+  useLayoutEffect(() => {
+    const owner = chapterGenerationHistoryOwnerRef.current;
+    if (owner !== null && (owner.chapter.id !== selectedChapterId || !isChapterGenerationHistoryOwnerCurrent(owner))) {
+      closeChapterGenerationHistory(owner);
+    }
+  }, [chapters, selectedChapterId, series.id, services, userId, sessionGeneration]);
 
   useEffect(() => () => {
     invalidateFrameEditingWorkflowRef.current({ updateState: false });
@@ -5796,6 +6045,16 @@ export function ChapterBrowser({
     : currentContinuousJournalState(currentScope, selectedChapterId);
   const continuousJournalBlocksChapter = selectedChapterId !== null && continuousJournalPanelState.status !== "empty";
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen || productionChecklistOpen;
+  const generationHistoryBlockReason = !series.can_enter
+    ? "当前账号没有修改此剧集的权限。"
+    : continuousJournalBlocksChapter
+      ? "本章节存在尚未核对的编辑操作，完成核对前不能选用历史结果。"
+      : frameTextEditor !== null || frameStructureEditor !== null || continuousChapterEditor !== null || frameEditOpening
+        ? "请先结束当前未保存的镜头编辑，再选用历史结果。"
+        : chapterOrderEditor !== null || chapterManagement !== null
+          ? "请先完成当前章节操作，再选用历史结果。"
+          : null;
+  chapterGenerationHistoryBlockRef.current = generationHistoryBlockReason;
   const chapterManagementBlocked = chapterPanelsOpen
     || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null
     || continuousChapterEditor !== null || frameEditOpening
@@ -7598,6 +7857,14 @@ export function ChapterBrowser({
                                   type="button"
                                 >{frameEditOpening ? "正在核对…" : "编辑文字"}</button>
                               )}
+                              {services.chapterGenerationHistory !== undefined && sourceFrame !== undefined && (
+                                <button
+                                  className="text-button frame-generation-history-open-button"
+                                  disabled={chapterManagementBlocked || chapterManagement !== null || chaptersLoading}
+                                  onClick={() => openFrameGenerationHistory(sourceFrame, frame.position - 1)}
+                                  type="button"
+                                >生成历史</button>
+                              )}
                               {canReviewFrame && sourceFrame !== undefined && storyboardAssetId !== null && (
                                 <button
                                   className="text-button frame-review-open-button"
@@ -7918,6 +8185,14 @@ export function ChapterBrowser({
           )}
         </div>
       </div>
+      {chapterGenerationHistoryOwner !== null
+        && isChapterGenerationHistoryOwnerCurrent(chapterGenerationHistoryOwner) && (
+        <ChapterGenerationHistorySession
+          key={chapterGenerationHistoryOwner.ownerKey}
+          onClose={() => closeChapterGenerationHistory(chapterGenerationHistoryOwner)}
+          owner={chapterGenerationHistoryOwner}
+        />
+      )}
       {mediaExportOwner !== null && isMediaExportOwnerCurrent(mediaExportOwner) && (
         <MediaExportDialog
           key={`${mediaExportOwner.scope.userId}:${mediaExportOwner.scope.seriesId}:${mediaExportOwner.chapter.id}:${mediaExportOwner.requestGeneration}:${mediaExportOwner.sourceMode}`}

@@ -5,6 +5,12 @@ import { webcrypto } from "node:crypto";
 import { createElement, useLayoutEffect, useState, type ComponentProps } from "react";
 import type { Character, Chapter, ChapterEditLockAcquisition, ChapterEditLockLeaseHandle, ChapterEditLockState, CreateChapterInput, Scene, Series, StoryboardAsset, UpdateChapterInput } from "../../shared/api/contracts";
 import { ApiError } from "../../shared/api/errors";
+import type {
+  ChapterGenerationHistoryContext,
+  ChapterGenerationHistoryMessage,
+  ChapterGenerationHistoryPort,
+  ChapterGenerationHistorySnapshot,
+} from "../../shared/api/chapterGenerationHistory";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import type { PersonalRoughCutFrameTarget, PersonalRoughCutReadIdentity } from "./PersonalRoughCutPanel";
 import {
@@ -113,6 +119,114 @@ vi.mock("./PersonalProductionNotesPanel", async (importOriginal) => {
       });
     },
   };
+});
+
+describe("frame generation history entry", () => {
+  it("opens from a real frame, reads without a lock, and confirms once before refreshing the chapter", async () => {
+    const user = userEvent.setup();
+    const candidateUrl = "https://cdn.example.test/history/selected.png?signature=kept";
+    const target = chapter("chapter-generation-history-entry", "生成历史入口", [
+      { text: "历史镜头正文", storyboard: ["history-storyboard-entry"] },
+    ]);
+    const base = makeServices([target], {
+      [target.id]: [{ ...asset("history-storyboard-entry", target.id), frame_index: 0 }],
+    }, false, true);
+    const selectedSeries: Series = { ...series, team_id: "history-team-entry", can_enter: true };
+    const message: ChapterGenerationHistoryMessage = {
+      id: "history-message-entry",
+      chapter_id: target.id,
+      frame_index: 0,
+      asset_type: null,
+      asset_id: null,
+      chat_mode: "image",
+      role: "assistant",
+      content: candidateUrl,
+      model_name: "history-test-model",
+      created_at: "2026-10-28T10:00:00Z",
+      message_digest: "d".repeat(64),
+    };
+    let targetUrl: string | null = null;
+    const makeSnapshot = (context: ChapterGenerationHistoryContext): ChapterGenerationHistorySnapshot => ({
+      protocol_version: 1,
+      series_id: context.seriesId,
+      chapter_id: context.chapterId,
+      target_kind: context.targetKind,
+      storyboard_asset_id: context.storyboardAssetId,
+      frame_index: context.frameIndex,
+      chat_mode: context.mode,
+      writable: true,
+      read_only_reason: null,
+      target_proof: { mapping_digest: "a".repeat(64), target_digest: "b".repeat(64), media_url: targetUrl },
+      messages: [message],
+    });
+    const readSnapshot = vi.fn(async (context: ChapterGenerationHistoryContext) => makeSnapshot(context));
+    const adopt = vi.fn(async (context: ChapterGenerationHistoryContext) => {
+      targetUrl = candidateUrl;
+      base.setCurrentChapters(base.getCurrentChapters().map((row) => row.id === target.id
+        ? { ...row, content: row.content?.map((frame, index) => index === 0 ? { ...frame, preview: candidateUrl } : frame) ?? null }
+        : row));
+      return {
+        protocol_version: 1 as const,
+        outcome: "applied" as const,
+        series_id: context.seriesId,
+        chapter_id: context.chapterId,
+        target_kind: context.targetKind,
+        storyboard_asset_id: context.storyboardAssetId!,
+        frame_index: context.frameIndex,
+        target_proof: { mapping_digest: "a".repeat(64), target_digest: "c".repeat(64), media_url: candidateUrl },
+      };
+    });
+    const readMedia = vi.fn(async (_url: string, _signal: AbortSignal) => new Blob([new Uint8Array([0x89, 0x50, 0x4e, 0x47])], { type: "image/png" }));
+    const historyPort: ChapterGenerationHistoryPort = {
+      beginRun(context) {
+        return {
+          isCurrent: context.isContextCurrent,
+          readSnapshot: (signal) => {
+            if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+            return readSnapshot(context);
+          },
+          adopt: async (_input, signal) => {
+            if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+            return await adopt(context);
+          },
+          readMedia: (url, signal) => {
+            if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));
+            return readMedia(url, signal);
+          },
+        };
+      },
+    };
+    Object.assign(base.services, { chapterGenerationHistory: historyPort });
+    base.getChapterEditLock
+      .mockResolvedValueOnce({ locked: false })
+      .mockResolvedValueOnce({
+        locked: true,
+        user_id: "demo-user",
+        username: "演示创作者",
+        is_mine: true,
+        acquired_at: "2026-10-28T10:01:00Z",
+        expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),
+      });
+
+    renderBrowser(base.services, vi.fn(), vi.fn(), selectedSeries);
+    await user.click(await screen.findByRole("button", { name: "生成历史" }));
+    expect(await screen.findByRole("heading", { name: "生成历史" })).toBeInTheDocument();
+    await waitFor(() => expect(readSnapshot).toHaveBeenCalledTimes(1));
+    expect(base.getChapterEditLock).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole("button", { name: "选用此图片结果" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "确认替换镜头预览" })).toBeEnabled());
+    expect(base.getChapterEditLock).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "确认替换镜头预览" }));
+
+    await waitFor(() => expect(adopt).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(base.listChapters).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(base.listStoryboardAssets).toHaveBeenCalledTimes(2));
+    expect(base.getChapterEditLock).toHaveBeenCalledTimes(2);
+    expect(base.acquireChapterEditLock).toHaveBeenCalledTimes(1);
+    expect(base.releaseChapterEditLock).toHaveBeenCalledTimes(1);
+    expect(base.getCurrentChapters()[0]?.content?.[0]?.preview).toBe(candidateUrl);
+  });
 });
 
 vi.mock("./PersonalRoughCutPanel", async (importOriginal) => {
