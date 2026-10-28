@@ -71,6 +71,39 @@ interface PendingCandidate {
   readonly baseline: ChapterGenerationHistorySnapshot;
 }
 
+type PendingHistoryAction =
+  | {
+    readonly kind: "transfer";
+    readonly run: ChapterGenerationHistoryRun;
+    readonly message: ChapterGenerationHistoryMessage;
+    readonly baseline: ChapterGenerationHistorySnapshot;
+    readonly transferredUrl: null;
+    readonly acknowledged: false;
+  }
+  | {
+    readonly kind: "transfer-result";
+    readonly run: ChapterGenerationHistoryRun;
+    readonly message: ChapterGenerationHistoryMessage;
+    readonly baseline: ChapterGenerationHistorySnapshot;
+    readonly transferredUrl: string;
+    readonly acknowledged: true;
+  }
+  | {
+    readonly kind: "message-update";
+    readonly run: ChapterGenerationHistoryRun;
+    readonly message: ChapterGenerationHistoryMessage;
+    readonly baseline: ChapterGenerationHistorySnapshot;
+    readonly transferredUrl: string;
+    readonly acknowledged: boolean;
+  }
+  | {
+    readonly kind: "delete";
+    readonly run: ChapterGenerationHistoryRun;
+    readonly message: ChapterGenerationHistoryMessage;
+    readonly baseline: ChapterGenerationHistorySnapshot;
+    readonly acknowledged: boolean;
+  };
+
 function errorText(error: unknown, fallback: string): string {
   if (error instanceof ChapterGenerationHistoryError) return error.message || fallback;
   if (error instanceof ApiError) return error.detail ?? error.message ?? fallback;
@@ -182,6 +215,117 @@ function sameOperationTarget(
     && expected.target_proof.mapping_digest === observed.target_proof.mapping_digest;
 }
 
+function sameHistoryScope(
+  expected: ChapterGenerationHistorySnapshot,
+  observed: ChapterGenerationHistorySnapshot,
+): boolean {
+  return expected.series_id === observed.series_id
+    && expected.chapter_id === observed.chapter_id
+    && expected.target_kind === observed.target_kind
+    && expected.storyboard_asset_id === observed.storyboard_asset_id
+    && expected.frame_index === observed.frame_index
+    && expected.chat_mode === observed.chat_mode;
+}
+
+function sameHistoryTarget(
+  expected: ChapterGenerationHistorySnapshot,
+  observed: ChapterGenerationHistorySnapshot,
+): boolean {
+  return sameOperationTarget(expected, observed)
+    && expected.target_proof?.target_digest === observed.target_proof?.target_digest
+    && expected.target_proof?.media_url === observed.target_proof?.media_url;
+}
+
+function sameMessageTarget(
+  expected: ChapterGenerationHistoryMessage,
+  observed: ChapterGenerationHistoryMessage | null | undefined,
+): boolean {
+  return observed != null
+    && expected.id === observed.id
+    && expected.chapter_id === observed.chapter_id
+    && expected.frame_index === observed.frame_index
+    && expected.asset_type === observed.asset_type
+    && expected.asset_id === observed.asset_id
+    && expected.chat_mode === observed.chat_mode
+    && expected.role === observed.role;
+}
+
+function sameMessage(
+  expected: ChapterGenerationHistoryMessage,
+  observed: ChapterGenerationHistoryMessage | null | undefined,
+): boolean {
+  return sameMessageTarget(expected, observed)
+    && expected.message_digest === observed?.message_digest
+    && expected.content === observed?.content;
+}
+
+function messageHasContent(
+  expected: ChapterGenerationHistoryMessage,
+  observed: ChapterGenerationHistoryMessage | null | undefined,
+  content: string,
+): boolean {
+  return sameMessageTarget(expected, observed) && observed?.content === content;
+}
+
+function safeFilenamePart(value: string, fallback: string): string {
+  const safe = value
+    .replace(/[<>:"/\\|?*\u0000-\u001f\u007f-\u009f]/gu, "_")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .replace(/[. ]+$/gu, "")
+    .slice(0, 80);
+  return safe === "" ? fallback : safe;
+}
+
+function historyDownloadFilename(
+  chapterTitle: string,
+  frameIndex: number,
+  message: ChapterGenerationHistoryMessage,
+  mode: ChapterGenerationHistoryMode,
+  blob: Blob,
+): string | null {
+  const mimeType = blob.type.split(";", 1)[0]?.trim().toLowerCase() ?? "";
+  const extensions = mode === "image"
+    ? { "image/jpeg": "jpg", "image/png": "png", "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp" }
+    : { "video/mp4": "mp4", "video/webm": "webm", "video/quicktime": "mov", "video/x-msvideo": "avi", "video/x-matroska": "mkv", "video/x-m4v": "m4v", "video/ogg": "ogv" };
+  const extension = extensions[mimeType as keyof typeof extensions];
+  if (extension === undefined) return null;
+  return `${safeFilenamePart(chapterTitle, "章节")}-镜头${frameIndex + 1}-${safeFilenamePart(message.id, "history")}.${extension}`;
+}
+
+function startHistoryBlobDownload(blob: Blob, filename: string, isCurrent: () => boolean): boolean {
+  if (!isCurrent()) return false;
+  const objectUrl = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      URL.revokeObjectURL(objectUrl);
+    } finally {
+      anchor.remove();
+    }
+  };
+  try {
+    anchor.href = objectUrl;
+    anchor.download = filename;
+    anchor.rel = "noopener";
+    anchor.style.display = "none";
+    document.body.appendChild(anchor);
+    if (!isCurrent()) {
+      release();
+      return false;
+    }
+    anchor.click();
+    globalThis.setTimeout(release, 1000);
+    return true;
+  } catch {
+    release();
+    throw new Error("浏览器未能启动此文件下载。");
+  }
+}
+
 export function useChapterGenerationHistoryOwner(owner: ChapterGenerationHistoryOwner) {
   const [targetKind, setTargetKind] = useState<ChapterGenerationHistoryTargetKind>("frame-preview");
   const [mode, setMode] = useState<ChapterGenerationHistoryMode>("image");
@@ -190,11 +334,13 @@ export function useChapterGenerationHistoryOwner(owner: ChapterGenerationHistory
   const historyRef = useRef<HistoryData>(history);
   const [confirmation, setConfirmation] = useState<ChapterGenerationHistoryConfirmation | null>(null);
   const confirmationRef = useRef<ChapterGenerationHistoryConfirmation | null>(confirmation);
+  const [deleteConfirmationMessageId, setDeleteConfirmationMessageId] = useState<string | null>(null);
   const [notice, setNotice] = useState<ChapterGenerationHistoryNotice | null>(null);
   const noticeRef = useRef<ChapterGenerationHistoryNotice | null>(notice);
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const pendingCandidateRef = useRef<PendingCandidate | null>(null);
+  const pendingHistoryActionRef = useRef<PendingHistoryAction | null>(null);
   const requestSequence = useRef(0);
   const activeActionController = useRef<AbortController | null>(null);
 
@@ -222,12 +368,138 @@ export function useChapterGenerationHistoryOwner(owner: ChapterGenerationHistory
     setBusy(next);
   }, []);
 
+  function assignSnapshot(run: ChapterGenerationHistoryRun, snapshot: ChapterGenerationHistorySnapshot): void {
+    const entries = snapshotEntries(snapshot, mode, owner.apiBaseUrl);
+    const lastPage = Math.max(0, Math.ceil(entries.length / HISTORY_PAGE_SIZE) - 1);
+    setPage((currentPage) => Math.min(currentPage, lastPage));
+    assignHistory({ status: "ready", snapshot, entries, run });
+  }
+
+  function beginAction(
+    current: HistoryReady,
+    progressMessage: string,
+  ): { readonly controller: AbortController; readonly isCurrent: () => boolean } | null {
+    if (busyRef.current || noticeRef.current?.kind === "unknown"
+      || !owner.isOwnerCurrent() || !current.run.isCurrent()) return null;
+    const controller = new AbortController();
+    activeActionController.current = controller;
+    setBusyState(true);
+    assignNotice({ kind: "progress", message: progressMessage, canVerify: false });
+    const isCurrent = () => !controller.signal.aborted
+      && owner.isOwnerCurrent()
+      && current.run.isCurrent()
+      && activeActionController.current === controller;
+    return { controller, isCurrent };
+  }
+
+  async function reconcilePendingHistoryAction(
+    pending: PendingHistoryAction,
+    signal: AbortSignal,
+    isCurrent: () => boolean,
+  ): Promise<void> {
+    try {
+      const snapshot = await pending.run.readSnapshot(signal);
+      if (!isCurrent()) return;
+      assignSnapshot(pending.run, snapshot);
+      const currentMessage = messageInSnapshot(snapshot, pending.message.id);
+      if (!sameHistoryTarget(pending.baseline, snapshot)) {
+        assignNotice({
+          kind: "unknown",
+          message: "目标映射已变化，无法确认这次操作结果；没有重复发送请求。",
+          canVerify: true,
+        });
+        return;
+      }
+
+      if (pending.kind === "delete") {
+        if (currentMessage === null) {
+          pendingHistoryActionRef.current = null;
+          setDeleteConfirmationMessageId(null);
+          assignNotice({
+            kind: "success",
+            message: pending.acknowledged
+              ? "删除已响应，独立读取确认这条历史消息已不存在。"
+              : "当前历史消息已不存在；无法确认本次删除是否完成，没有重复删除。",
+            canVerify: false,
+          });
+        } else {
+          assignNotice({
+            kind: "unknown",
+            message: sameMessage(pending.message, currentMessage)
+              ? "删除结果仍未确认，消息仍可见；不会自动再次删除。"
+              : "消息内容已变化，无法确认删除结果；不会自动再次删除。",
+            canVerify: true,
+          });
+        }
+        return;
+      }
+
+      if (pending.kind === "message-update") {
+        if (messageHasContent(pending.message, currentMessage, pending.transferredUrl)) {
+          pendingHistoryActionRef.current = null;
+          assignNotice({
+            kind: "success",
+            message: pending.acknowledged
+              ? "转存后的地址已由独立读取确认写回原消息。"
+              : "当前原消息已核对为转存地址；无法证明先前写回是否完成，没有重复写入。",
+            canVerify: false,
+          });
+        } else {
+          assignNotice({
+            kind: "unknown",
+            message: currentMessage === null
+              ? "原消息已不存在，无法确认写回结果；不会自动再次写入。"
+              : sameMessage(pending.message, currentMessage)
+                ? "原消息仍保持原内容，PUT结果未知；不会自动再次写入。"
+                : "原消息已有其他变化，PUT结果未知；不会自动再次写入。",
+            canVerify: true,
+          });
+        }
+        return;
+      }
+
+      if (pending.kind === "transfer-result") {
+        if (pending.transferredUrl === pending.message.content && sameMessage(pending.message, currentMessage)) {
+          pendingHistoryActionRef.current = null;
+          assignNotice({
+            kind: "success",
+            message: "转存服务返回原地址，独立读取确认原消息保持不变。",
+            canVerify: false,
+          });
+        } else {
+          assignNotice({
+            kind: "unknown",
+            message: "转存地址已返回，但原消息当前状态无法核对；没有自动写回或重发转存。",
+            canVerify: true,
+          });
+        }
+        return;
+      }
+
+      assignNotice({
+        kind: "unknown",
+        message: currentMessage === null
+          ? "转存请求结果未知，原消息已不存在；没有地址可写回，也不会重发。"
+          : sameMessage(pending.message, currentMessage)
+            ? "转存请求结果未知，原消息仍是原地址；无法核对转存后的地址，不会重发或写回。"
+            : "转存请求结果未知且原消息已变化；不会重发转存或覆盖新内容。",
+        canVerify: true,
+      });
+    } catch (error) {
+      if (!isCurrent()) return;
+      if (isUnauthorized(error)) owner.onUnauthorized();
+      assignNotice({ kind: "unknown", message: errorText(error, "只读核对失败；不会重发写入请求。"), canVerify: true });
+    }
+  }
+
   useEffect(() => {
     const sequence = ++requestSequence.current;
     const controller = new AbortController();
     assignHistory({ status: "loading" });
     assignConfirmation(null);
+    setDeleteConfirmationMessageId(null);
     pendingCandidateRef.current = null;
+    pendingHistoryActionRef.current = null;
     assignNotice(null);
     setPage(0);
     if (owner.port === undefined) {
@@ -290,6 +562,267 @@ export function useChapterGenerationHistoryOwner(owner: ChapterGenerationHistory
     }
     return currentRun.readMedia(url, signal);
   }, [currentRun, owner]);
+
+  async function downloadMessage(message: ChapterGenerationHistoryMessage): Promise<void> {
+    const current = historyRef.current;
+    if (current.status !== "ready" || message.role !== "assistant"
+      || !sameMessage(message, messageInSnapshot(current.snapshot, message.id))) return;
+    const initialEntry = current.entries.find((entry) => entry.message.id === message.id);
+    if (initialEntry?.mediaUrl === null || initialEntry === undefined || initialEntry.unsafeMedia) return;
+    const action = beginAction(current, "正在核对历史消息并读取媒体；尚未启动浏览器下载。");
+    if (action === null) return;
+    try {
+      const fresh = await current.run.readSnapshot(action.controller.signal);
+      if (!action.isCurrent()) return;
+      const freshMessage = messageInSnapshot(fresh, message.id);
+      if (!sameHistoryScope(current.snapshot, fresh) || !sameMessage(message, freshMessage)) {
+        assignSnapshot(current.run, fresh);
+        assignNotice({ kind: "error", message: "历史消息已变化，未启动下载。", canVerify: false });
+        return;
+      }
+      assignSnapshot(current.run, fresh);
+      const freshEntry = safeMediaEntry(freshMessage!, fresh, mode, owner.apiBaseUrl);
+      if (freshEntry.mediaUrl === null || freshEntry.unsafeMedia) {
+        assignNotice({ kind: "error", message: "媒体地址无法安全读取，未启动下载。", canVerify: false });
+        return;
+      }
+      const blob = await current.run.readMedia(freshEntry.mediaUrl, action.controller.signal);
+      if (!action.isCurrent()) return;
+      const filename = historyDownloadFilename(owner.chapterTitle, owner.frameIndex, freshMessage!, mode, blob);
+      if (filename === null) {
+        assignNotice({ kind: "error", message: "读取成功，但媒体类型不受支持，未启动下载。", canVerify: false });
+        return;
+      }
+      if (!startHistoryBlobDownload(blob, filename, action.isCurrent)) return;
+      assignNotice({ kind: "success", message: "已交给浏览器下载；本地无法确认文件是否已写入磁盘。", canVerify: false });
+    } catch (error) {
+      if (!action.isCurrent()) return;
+      if (isUnauthorized(error)) owner.onUnauthorized();
+      assignNotice({ kind: "error", message: errorText(error, "媒体读取失败，未启动下载。"), canVerify: false });
+    } finally {
+      if (activeActionController.current === action.controller) activeActionController.current = null;
+      if (owner.isOwnerCurrent()) setBusyState(false);
+    }
+  }
+
+  function currentWritableMessage(message: ChapterGenerationHistoryMessage): HistoryReady | null {
+    const current = historyRef.current;
+    if (busyRef.current || noticeRef.current?.kind === "unknown") return null;
+    if (current.status !== "ready" || !owner.isOwnerCurrent() || !owner.isAdoptionAllowed()) {
+      assignNotice({
+        kind: "error",
+        message: owner.adoptionBlockMessage() ?? "当前编辑状态不允许修改历史消息。",
+        canVerify: false,
+      });
+      return null;
+    }
+    if (!current.snapshot.writable || current.snapshot.target_proof === null
+      || !sameMessage(message, messageInSnapshot(current.snapshot, message.id))) {
+      assignNotice({ kind: "error", message: "历史目标或消息无法唯一核对，未发送写入请求。", canVerify: false });
+      return null;
+    }
+    return current;
+  }
+
+  function prepareDelete(message: ChapterGenerationHistoryMessage): void {
+    if (currentWritableMessage(message) === null) return;
+    setDeleteConfirmationMessageId(message.id);
+    assignNotice(null);
+  }
+
+  function cancelDelete(): void {
+    if (!busyRef.current && noticeRef.current?.kind !== "unknown") setDeleteConfirmationMessageId(null);
+  }
+
+  async function reconcileActionImmediately(
+    pending: PendingHistoryAction,
+    action: { readonly controller: AbortController; readonly isCurrent: () => boolean },
+  ): Promise<void> {
+    pendingHistoryActionRef.current = pending;
+    await reconcilePendingHistoryAction(pending, action.controller.signal, action.isCurrent);
+  }
+
+  async function confirmDelete(): Promise<void> {
+    const messageId = deleteConfirmationMessageId;
+    const initial = historyRef.current;
+    if (messageId === null || initial.status !== "ready") return;
+    const message = messageInSnapshot(initial.snapshot, messageId);
+    if (message === null) {
+      setDeleteConfirmationMessageId(null);
+      assignNotice({ kind: "error", message: "这条历史消息已不在当前列表中，请重新读取。", canVerify: false });
+      return;
+    }
+    const current = currentWritableMessage(message);
+    if (current === null) return;
+    const action = beginAction(current, "正在取得编辑权限并核对历史消息；尚未发送删除请求。");
+    if (action === null) return;
+    setDeleteConfirmationMessageId(null);
+    let lease: ChapterGenerationHistoryWriteLease | null = null;
+    let baseline = current.snapshot;
+    try {
+      lease = await owner.prepareWrite(action.controller.signal, action.isCurrent);
+      if (!action.isCurrent() || !owner.isAdoptionAllowed()) {
+        throw new ChapterGenerationHistoryError("not-sent", owner.adoptionBlockMessage() ?? "当前编辑范围已变化，未删除。");
+      }
+      const fresh = await current.run.readSnapshot(action.controller.signal);
+      if (!action.isCurrent()) return;
+      const latestMessage = messageInSnapshot(fresh, message.id);
+      if (!sameHistoryTarget(current.snapshot, fresh) || !sameMessage(message, latestMessage)) {
+        assignSnapshot(current.run, fresh);
+        throw new ChapterGenerationHistoryError("conflict", "目标或历史消息已变化，未发送删除。", 409);
+      }
+      baseline = fresh;
+      assignSnapshot(current.run, fresh);
+      try {
+        await current.run.deleteMessage(message, action.controller.signal);
+      } catch (error) {
+        const uncertain = error instanceof ChapterGenerationHistoryError
+          && (error.kind === "unknown" || (error.kind === "rejected" && error.status === 404));
+        if (!uncertain) throw error;
+        await reconcileActionImmediately({
+          kind: "delete",
+          run: current.run,
+          message,
+          baseline,
+          acknowledged: false,
+        }, action);
+        return;
+      }
+      await reconcileActionImmediately({
+        kind: "delete",
+        run: current.run,
+        message,
+        baseline,
+        acknowledged: true,
+      }, action);
+    } catch (error) {
+      if (!action.isCurrent()) return;
+      if (isUnauthorized(error)) owner.onUnauthorized();
+      assignNotice(historyNotice(error));
+    } finally {
+      if (lease !== null) {
+        try {
+          await lease.release();
+        } catch {
+          if (action.isCurrent() && noticeRef.current?.kind !== "unknown") {
+            assignNotice({ kind: "error", message: "删除状态已核对，但本次取得的章节编辑锁未能释放。", canVerify: false });
+          }
+        }
+      }
+      if (activeActionController.current === action.controller) activeActionController.current = null;
+      if (owner.isOwnerCurrent()) setBusyState(false);
+    }
+  }
+
+  async function transferMessage(message: ChapterGenerationHistoryMessage): Promise<void> {
+    const current = currentWritableMessage(message);
+    if (current === null || message.role !== "assistant") return;
+    const entry = current.entries.find((item) => item.message.id === message.id);
+    if (entry?.mediaUrl === null || entry === undefined || entry.unsafeMedia) return;
+    const action = beginAction(current, "正在取得编辑权限并核对原消息；尚未发送转存请求。");
+    if (action === null) return;
+    let lease: ChapterGenerationHistoryWriteLease | null = null;
+    let baseline = current.snapshot;
+    let transferStarted = false;
+    let transferCompleted = false;
+    try {
+      lease = await owner.prepareWrite(action.controller.signal, action.isCurrent);
+      if (!action.isCurrent() || !owner.isAdoptionAllowed()) {
+        throw new ChapterGenerationHistoryError("not-sent", owner.adoptionBlockMessage() ?? "当前编辑范围已变化，未转存。");
+      }
+      const fresh = await current.run.readSnapshot(action.controller.signal);
+      if (!action.isCurrent()) return;
+      const latestMessage = messageInSnapshot(fresh, message.id);
+      if (!sameHistoryTarget(current.snapshot, fresh) || !sameMessage(message, latestMessage)) {
+        assignSnapshot(current.run, fresh);
+        throw new ChapterGenerationHistoryError("conflict", "目标或历史消息已变化，未发送转存。", 409);
+      }
+      baseline = fresh;
+      assignSnapshot(current.run, fresh);
+
+      transferStarted = true;
+      const transferredUrl = await current.run.retryOssUpload(message, action.controller.signal);
+      transferCompleted = true;
+      if (!action.isCurrent()) return;
+      if (transferredUrl === message.content) {
+        await reconcileActionImmediately({
+          kind: "transfer-result",
+          run: current.run,
+          message,
+          baseline,
+          transferredUrl,
+          acknowledged: true,
+        }, action);
+        return;
+      }
+
+      const beforeUpdate = await current.run.readSnapshot(action.controller.signal);
+      if (!action.isCurrent()) return;
+      const messageBeforeUpdate = messageInSnapshot(beforeUpdate, message.id);
+      if (!sameHistoryTarget(baseline, beforeUpdate) || !sameMessage(message, messageBeforeUpdate)) {
+        assignSnapshot(current.run, beforeUpdate);
+        assignNotice({ kind: "error", message: "OSS 已返回新地址，但原消息已变化；没有写回或重试。", canVerify: false });
+        return;
+      }
+      baseline = beforeUpdate;
+      assignSnapshot(current.run, beforeUpdate);
+      try {
+        await current.run.updateMessageContent(message, transferredUrl, action.controller.signal);
+      } catch (error) {
+        if (!(error instanceof ChapterGenerationHistoryError) || error.kind !== "unknown") throw error;
+        await reconcileActionImmediately({
+          kind: "message-update",
+          run: current.run,
+          message,
+          baseline,
+          transferredUrl,
+          acknowledged: false,
+        }, action);
+        return;
+      }
+      await reconcileActionImmediately({
+        kind: "message-update",
+        run: current.run,
+        message,
+        baseline,
+        transferredUrl,
+        acknowledged: true,
+      }, action);
+    } catch (error) {
+      if (!action.isCurrent()) return;
+      if (transferStarted && error instanceof ChapterGenerationHistoryError && error.kind === "unknown") {
+        await reconcileActionImmediately({
+          kind: "transfer",
+          run: current.run,
+          message,
+          baseline,
+          transferredUrl: null,
+          acknowledged: false,
+        }, action);
+      } else {
+        if (isUnauthorized(error)) owner.onUnauthorized();
+        assignNotice({
+          kind: "error",
+          message: transferCompleted
+            ? `转存已成功，但原消息更新未完成：${errorText(error, "没有自动重试。")}`
+            : errorText(error, "转存失败，原消息未更新。"),
+          canVerify: false,
+        });
+      }
+    } finally {
+      if (lease !== null) {
+        try {
+          await lease.release();
+        } catch {
+          if (action.isCurrent() && noticeRef.current?.kind !== "unknown") {
+            assignNotice({ kind: "error", message: "消息状态已核对，但本次取得的章节编辑锁未能释放。", canVerify: false });
+          }
+        }
+      }
+      if (activeActionController.current === action.controller) activeActionController.current = null;
+      if (owner.isOwnerCurrent()) setBusyState(false);
+    }
+  }
 
   const visibleHistory = useMemo<ChapterGenerationHistoryLoadState>(() => {
     if (history.status !== "ready") return history;
@@ -376,9 +909,27 @@ export function useChapterGenerationHistoryOwner(owner: ChapterGenerationHistory
   }, [assignConfirmation]);
 
   const verifyUnknown = useCallback((): void => {
-    const pending = pendingCandidateRef.current;
+    const pendingAction = pendingHistoryActionRef.current;
     const current = historyRef.current;
-    if (busyRef.current || pending === null || current.status !== "ready" || !owner.isOwnerCurrent()) return;
+    if (busyRef.current || current.status !== "ready" || !owner.isOwnerCurrent()) return;
+    if (pendingAction !== null) {
+      if (current.run !== pendingAction.run || !pendingAction.run.isCurrent()) return;
+      const controller = new AbortController();
+      activeActionController.current = controller;
+      setBusyState(true);
+      assignNotice({ kind: "progress", message: "正在只读核对原历史消息；不会重复发送写入请求。", canVerify: false });
+      const operationIsCurrent = () => !controller.signal.aborted
+        && owner.isOwnerCurrent()
+        && pendingAction.run.isCurrent()
+        && activeActionController.current === controller;
+      void reconcilePendingHistoryAction(pendingAction, controller.signal, operationIsCurrent).finally(() => {
+        if (activeActionController.current === controller) activeActionController.current = null;
+        if (owner.isOwnerCurrent()) setBusyState(false);
+      });
+      return;
+    }
+    const pending = pendingCandidateRef.current;
+    if (pending === null) return;
     const controller = new AbortController();
     activeActionController.current = controller;
     setBusyState(true);
@@ -607,6 +1158,7 @@ export function useChapterGenerationHistoryOwner(owner: ChapterGenerationHistory
     writable,
     readOnlyReason,
     confirmation,
+    deleteConfirmationMessageId,
     busy,
     notice,
     previewAssetName: `镜头 ${owner.frameIndex + 1}`,
@@ -616,6 +1168,11 @@ export function useChapterGenerationHistoryOwner(owner: ChapterGenerationHistory
     onModeChange,
     onPageChange,
     onPrepareAdoption: prepareAdoption,
+    onDownload: downloadMessage,
+    onTransfer: transferMessage,
+    onPrepareDelete: prepareDelete,
+    onCancelDelete: cancelDelete,
+    onConfirmDelete: confirmDelete,
     onCancelConfirmation: cancelConfirmation,
     onConfirmAdoption: confirmAdoption,
     onVerifyUnknown: verifyUnknown,

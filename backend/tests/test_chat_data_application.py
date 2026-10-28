@@ -155,3 +155,58 @@ def test_update_missing_message_precedes_conditional_chapter_access() -> None:
     ]
     assert not any(event[0] == "chapter" for event in uow.events)
     assert ("rollback",) in uow.events
+
+
+def test_update_rejects_an_orphan_message_when_its_parent_chapter_is_missing() -> None:
+    uow = RecordingUnitOfWork()
+    message = ChatMessageRecord(
+        id="orphan-message",
+        chapter_id="missing-chapter",
+        frame_index=0,
+        asset_type=None,
+        asset_id=None,
+        chat_mode="image",
+        role="assistant",
+        content="https://media.example.test/old.png",
+        model_name="test-model",
+        created_at=datetime(2026, 10, 28, 12, 0),
+    )
+    uow.messages[(message.id, message.chapter_id)] = message
+
+    with pytest.raises(ChatDataNotFound, match="章节不存在"):
+        application.update_chat_message(
+            lambda: uow,
+            TrustedActor("user-a"),
+            message.chapter_id,
+            message.id,
+            "https://media.example.test/replacement.png",
+        )
+
+    assert uow.events[:3] == [
+        ("ensure_clean",),
+        ("load_message", message.id, message.chapter_id),
+        ("chapter", message.chapter_id),
+    ]
+    assert not any(event[0] in {"update", "commit"} for event in uow.events)
+    assert uow.events[-2:] == [("rollback",), ("close",)]
+
+
+def test_asset_history_rejects_orphan_parent_before_listing_messages() -> None:
+    uow = RecordingUnitOfWork()
+
+    with pytest.raises(ChatDataNotFound, match="章节不存在"):
+        application.get_asset_chat_messages(
+            lambda: uow,
+            TrustedActor("user-a"),
+            "missing-chapter",
+            "storyboard",
+            "asset-orphan",
+            chat_mode="image",
+        )
+
+    assert uow.events[:2] == [
+        ("ensure_clean",),
+        ("chapter", "missing-chapter"),
+    ]
+    assert not any(event[0] == "list_asset" for event in uow.events)
+    assert uow.events[-2:] == [("rollback",), ("close",)]

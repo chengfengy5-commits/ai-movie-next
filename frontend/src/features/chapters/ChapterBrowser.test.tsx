@@ -122,6 +122,8 @@ vi.mock("./PersonalProductionNotesPanel", async (importOriginal) => {
 });
 
 describe("frame generation history entry", () => {
+  afterEach(() => cleanup());
+
   it("opens from a real frame, reads without a lock, and confirms once before refreshing the chapter", async () => {
     const user = userEvent.setup();
     const candidateUrl = "https://cdn.example.test/history/selected.png?signature=kept";
@@ -188,6 +190,16 @@ describe("frame generation history entry", () => {
           adopt: async (_input, signal) => {
             if (signal.aborted) throw new DOMException("Aborted", "AbortError");
             return await adopt(context);
+          },
+          retryOssUpload: async (_message, signal) => {
+            if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+            return candidateUrl;
+          },
+          updateMessageContent: async (_message, _content, signal) => {
+            if (signal.aborted) throw new DOMException("Aborted", "AbortError");
+          },
+          deleteMessage: async (_message, signal) => {
+            if (signal.aborted) throw new DOMException("Aborted", "AbortError");
           },
           readMedia: (url, signal) => {
             if (signal.aborted) return Promise.reject(new DOMException("Aborted", "AbortError"));

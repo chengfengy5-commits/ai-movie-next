@@ -29,7 +29,7 @@ export interface ChapterGenerationHistoryConfirmation {
   readonly alreadyCurrent: boolean;
 }
 
-export type ChapterGenerationHistoryNoticeKind = "success" | "error" | "unknown";
+export type ChapterGenerationHistoryNoticeKind = "success" | "error" | "progress" | "unknown";
 
 export interface ChapterGenerationHistoryNotice {
   readonly kind: ChapterGenerationHistoryNoticeKind;
@@ -49,6 +49,7 @@ interface ChapterGenerationHistoryDialogProps {
   readonly writable: boolean;
   readonly readOnlyReason: string | null;
   readonly confirmation: ChapterGenerationHistoryConfirmation | null;
+  readonly deleteConfirmationMessageId: string | null;
   readonly busy: boolean;
   readonly notice: ChapterGenerationHistoryNotice | null;
   readonly previewAssetName: string;
@@ -60,6 +61,11 @@ interface ChapterGenerationHistoryDialogProps {
   readonly onModeChange: (mode: ChapterGenerationHistoryMode) => void;
   readonly onPageChange: (page: number) => void;
   readonly onPrepareAdoption: (message: ChapterGenerationHistoryMessage) => void;
+  readonly onDownload: (message: ChapterGenerationHistoryMessage) => void;
+  readonly onTransfer: (message: ChapterGenerationHistoryMessage) => void;
+  readonly onPrepareDelete: (message: ChapterGenerationHistoryMessage) => void;
+  readonly onCancelDelete: () => void;
+  readonly onConfirmDelete: () => void;
   readonly onCancelConfirmation: () => void;
   readonly onConfirmAdoption: () => void;
   readonly onVerifyUnknown: () => void;
@@ -98,6 +104,7 @@ export function ChapterGenerationHistoryDialog({
   writable,
   readOnlyReason,
   confirmation,
+  deleteConfirmationMessageId,
   busy,
   notice,
   previewAssetName,
@@ -109,6 +116,11 @@ export function ChapterGenerationHistoryDialog({
   onModeChange,
   onPageChange,
   onPrepareAdoption,
+  onDownload,
+  onTransfer,
+  onPrepareDelete,
+  onCancelDelete,
+  onConfirmDelete,
   onCancelConfirmation,
   onConfirmAdoption,
   onVerifyUnknown,
@@ -186,7 +198,7 @@ export function ChapterGenerationHistoryDialog({
         </p>
 
         {notice !== null && (
-          <div className={`chapter-generation-history-notice ${notice.kind}`} role={notice.kind === "unknown" ? "alert" : "status"}>
+          <div className={`chapter-generation-history-notice ${notice.kind}`} role={notice.kind === "unknown" || notice.kind === "error" ? "alert" : "status"}>
             <p>{notice.message}</p>
             {notice.canVerify && (
               <button className="secondary-button" disabled={busy} onClick={onVerifyUnknown} type="button">
@@ -267,6 +279,39 @@ export function ChapterGenerationHistoryDialog({
                             onClick={() => onPrepareAdoption(message)}
                             type="button"
                           >{selected ? "已核对候选" : `选用此${modeLabel(mode)}结果`}</button>
+                          {entry.mediaUrl !== null && (
+                            <>
+                              <button
+                                className="secondary-button"
+                                disabled={busy || notice?.kind === "unknown"}
+                                onClick={() => onDownload(message)}
+                                type="button"
+                              >下载</button>
+                              <button
+                                className="secondary-button"
+                                disabled={!canChoose}
+                                onClick={() => onTransfer(message)}
+                                type="button"
+                              >转存到 OSS</button>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      <div className="chapter-generation-history-actions">
+                        <button
+                          className="danger-button"
+                          disabled={!writable || busy || notice?.kind === "unknown"}
+                          onClick={() => onPrepareDelete(message)}
+                          type="button"
+                        >删除记录</button>
+                      </div>
+                      {deleteConfirmationMessageId === message.id && (
+                        <div className="chapter-generation-history-delete-confirmation" role="group" aria-label="确认删除历史消息">
+                          <p>确认删除这条历史消息？只删除该条记录，不会修改章节或素材中的媒体字段。</p>
+                          <div className="series-dialog-actions">
+                            <button className="secondary-button" disabled={busy} onClick={onCancelDelete} type="button">取消</button>
+                            <button className="danger-button" disabled={busy || notice?.kind === "unknown"} onClick={onConfirmDelete} type="button">确认删除历史消息</button>
+                          </div>
                         </div>
                       )}
                     </li>
