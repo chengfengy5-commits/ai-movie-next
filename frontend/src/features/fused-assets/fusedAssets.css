@@ -53,7 +53,7 @@
   max-height: 24rem;
   overflow: hidden;
   color: var(--muted);
-  background: #f3f5f6;
+  background: var(--surface-muted);
 }
 
 .fused-asset-image img {
@@ -84,25 +84,25 @@
   padding: 0.25rem 0.55rem;
   border-radius: 999px;
   color: var(--muted);
-  background: #edf0f2;
+  background: var(--surface-muted);
   font-size: 0.78rem;
   font-weight: 650;
 }
 
 .fused-asset-status-completed {
-  color: #17664e;
-  background: #e6f5ee;
+  color: var(--success);
+  background: var(--success-soft);
 }
 
 .fused-asset-status-failed {
-  color: #9c3d3d;
-  background: #fff0ee;
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .fused-asset-status-pending,
 .fused-asset-status-processing {
-  color: #875b12;
-  background: #fff6df;
+  color: var(--warning);
+  background: var(--warning-soft);
 }
 
 .fused-asset-details {
@@ -135,31 +135,31 @@
   margin: 0;
   padding: 0.75rem 0.9rem;
   border-radius: 0.7rem;
-  background: #f3f5f6;
+  background: var(--surface-muted);
   overflow-wrap: anywhere;
 }
 
 .fused-asset-error,
 .fused-asset-feedback-failure {
-  color: #8d3535;
-  background: #fff0ee;
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .fused-assets-alert {
-  color: #8d3535;
-  border: 1px solid #f0cfca;
-  background: #fff8f7;
+  color: var(--danger);
+  border: 1px solid var(--danger-border);
+  background: var(--danger-soft);
 }
 
 .fused-asset-feedback-success {
-  color: #17664e;
-  background: #e6f5ee;
+  color: var(--success);
+  background: var(--success-soft);
 }
 
 .fused-asset-feedback-unknown,
 .fused-asset-feedback-saving {
-  color: #805710;
-  background: #fff6df;
+  color: var(--warning);
+  background: var(--warning-soft);
 }
 
 .fused-asset-rename-form {
@@ -182,13 +182,13 @@
   border: 1px solid var(--line);
   border-radius: 0.65rem;
   color: var(--ink);
-  background: #fff;
+  background: var(--surface);
   font: inherit;
   font-weight: 450;
 }
 
 .fused-asset-rename-form input:focus-visible {
-  outline: 3px solid rgba(34, 155, 137, 0.28);
+  outline: 3px solid color-mix(in srgb, var(--teal) 28%, transparent);
   outline-offset: 1px;
   border-color: var(--teal);
 }
@@ -251,7 +251,7 @@
   border: 1px solid var(--line);
   border-radius: 0.65rem;
   color: var(--ink);
-  background: #fff;
+  background: var(--surface);
   font: inherit;
   font-weight: 450;
 }
@@ -284,7 +284,7 @@
 }
 
 .fused-generation-missing {
-  color: #8d3535;
+  color: var(--danger);
   font-size: 0.82rem;
 }
 
@@ -316,7 +316,7 @@
   gap: 0.6rem;
   padding: 0.55rem 0.7rem;
   border-radius: 0.6rem;
-  background: #f3f5f6;
+  background: var(--surface-muted);
 }
 
 .fused-generation-custom-list span {
@@ -338,24 +338,24 @@
   margin: 0;
   padding: 0.7rem 0.8rem;
   border-radius: 0.65rem;
-  background: #f3f5f6;
+  background: var(--surface-muted);
   overflow-wrap: anywhere;
 }
 
 .fused-generation-success {
-  color: #17664e;
-  background: #e6f5ee;
+  color: var(--success);
+  background: var(--success-soft);
 }
 
 .fused-generation-failure,
 .fused-generation-alert {
-  color: #8d3535;
-  background: #fff0ee;
+  color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .fused-generation-unknown {
-  color: #805710;
-  background: #fff6df;
+  color: var(--warning);
+  background: var(--warning-soft);
 }
 
 .fused-generation-state {

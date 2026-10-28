@@ -4,6 +4,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createElement, useEffect } from "react";
 import { AuthProvider, useAuth } from "../features/auth/AuthProvider";
 import { Workspace } from "./Workspace";
+import { AppearanceProvider } from "../features/appearance/ThemeProvider";
 import { createApiServices, createDemoServices, type WorkspaceServices } from "../shared/api/services";
 import { demoSeries } from "../features/series/demoSeries";
 import {
@@ -593,9 +594,11 @@ function teamDirectoryItem(id: string, name: string): MyTeam {
 
 function renderWorkspace(services: WorkspaceServices) {
   return render(
-    <AuthProvider services={services}>
-      <Workspace />
-    </AuthProvider>,
+    <AppearanceProvider>
+      <AuthProvider services={services}>
+        <Workspace />
+      </AuthProvider>
+    </AppearanceProvider>,
   );
 }
 
@@ -892,6 +895,24 @@ describe("read-only workspace", () => {
     assetNavigationProbe.sourcePanelCloseCallback = null;
   });
 
+  it("exposes the saved appearance preference in the workspace sidebar", async () => {
+    const user = userEvent.setup();
+    const services = createDemoServices(window.localStorage);
+    await services.login({ username: "demo", password: "demo123" }, new AbortController().signal);
+    renderWorkspace(services);
+
+    await screen.findByRole("region", { name: "我的剧集" });
+    const appearance = screen.getByRole("combobox", { name: "外观" });
+    expect(appearance).toHaveValue("light");
+    expect(within(appearance).getAllByRole("option").map((option) => option.textContent))
+      .toEqual(["明亮", "深色", "跟随系统"]);
+
+    await user.selectOptions(appearance, "dark");
+
+    await waitFor(() => expect(document.documentElement).toHaveAttribute("data-theme", "dark"));
+    expect(window.localStorage.getItem("hao-theme")).toBe("dark");
+  });
+
   it("opens the user-facing AI generation page from the main workspace navigation", async () => {
     const user = userEvent.setup();
     const services = createDemoServices(window.localStorage);
@@ -1172,12 +1193,14 @@ describe("read-only workspace", () => {
     const listSeries = vi.spyOn(services, "listSeries");
 
     render(
-      <AuthProvider services={services}>
-        <>
-          <Workspace />
-          <AuthenticatedUserSnapshot />
-        </>
-      </AuthProvider>,
+      <AppearanceProvider>
+        <AuthProvider services={services}>
+          <>
+            <Workspace />
+            <AuthenticatedUserSnapshot />
+          </>
+        </AuthProvider>
+      </AppearanceProvider>,
     );
 
     await screen.findByRole("heading", { name: "我的剧集" });
@@ -6645,14 +6668,14 @@ describe("read-only workspace", () => {
     expect(pendingUnload.defaultPrevented).toBe(true);
 
     portRef.current = undefined;
-    view.rerender(<AuthProvider services={services}><Workspace /></AuthProvider>);
+    view.rerender(<AppearanceProvider><AuthProvider services={services}><Workspace /></AuthProvider></AppearanceProvider>);
     expect(screen.queryByRole("dialog", { name: "分享到团队" })).not.toBeInTheDocument();
     const retiredUnload = new Event("beforeunload", { cancelable: true });
     window.dispatchEvent(retiredUnload);
     expect(retiredUnload.defaultPrevented).toBe(false);
 
     portRef.current = { ...originalPort, shareSeries: vi.fn(originalPort.shareSeries) };
-    view.rerender(<AuthProvider services={services}><Workspace /></AuthProvider>);
+    view.rerender(<AppearanceProvider><AuthProvider services={services}><Workspace /></AuthProvider></AppearanceProvider>);
     await user.selectOptions(await screen.findByLabelText("分享给团队"), "removed-port-team");
     const newScopeUnload = new Event("beforeunload", { cancelable: true });
     window.dispatchEvent(newScopeUnload);

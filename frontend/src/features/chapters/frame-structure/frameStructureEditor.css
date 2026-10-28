@@ -7,13 +7,13 @@
   min-width: 0;
   margin: 0;
   padding: 10px;
-  border: 1px solid #e2ebe7;
+  border: 1px solid var(--line);
   border-radius: 8px;
 }
 
 .frame-reference-choices legend {
   padding: 0 5px;
-  color: #405557;
+  color: var(--ink);
   font-size: 12px;
   font-weight: 650;
 }
@@ -33,17 +33,17 @@
   gap: 7px;
   padding: 6px;
   border-radius: 6px;
-  color: #405557;
+  color: var(--ink);
   font-size: 12px;
 }
 
 .frame-reference-choice:has(input:checked) {
-  background: #eff7f3;
+  background: var(--soft-teal);
 }
 
 .frame-reference-choice input {
   flex: 0 0 auto;
-  accent-color: #39786a;
+  accent-color: var(--teal);
 }
 
 .frame-reference-choice span {
@@ -57,7 +57,7 @@
 .frame-structure-delete-warning,
 .frame-structure-status {
   margin: 0;
-  color: #627572;
+  color: var(--muted);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -65,15 +65,15 @@
 .frame-structure-delete-warning {
   padding: 12px;
   border-radius: 8px;
-  color: #735d37;
-  background: #fbf8f0;
+  color: var(--warning);
+  background: var(--warning-soft);
 }
 
 .frame-structure-status {
   padding: 10px 12px;
   border-radius: 7px;
-  color: #4e6661;
-  background: #f4f8f6;
+  color: var(--warning);
+  background: var(--warning-soft);
 }
 
 .frame-structure-editor-actions {
@@ -84,9 +84,9 @@
   display: grid;
   gap: 8px;
   padding: 14px;
-  border: 1px solid #d7b47a;
+  border: 1px solid var(--warning-border);
   border-radius: 9px;
-  background: #fffaf0;
+  background: var(--warning-surface);
 }
 
 .frame-structure-discard-confirmation h3,
@@ -95,12 +95,12 @@
 }
 
 .frame-structure-discard-confirmation h3 {
-  color: #574322;
+  color: var(--warning-strong);
   font-size: 14px;
 }
 
 .frame-structure-discard-confirmation p {
-  color: #735d37;
+  color: var(--warning);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -115,7 +115,7 @@
 }
 
 .frame-structure-delete {
-  color: #9b5146;
+  color: var(--danger);
 }
 
 @media (max-width: 600px) {

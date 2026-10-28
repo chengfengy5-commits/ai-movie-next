@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { AdminFeature } from "../features/admin/AdminFeature";
+import { AppearanceProvider } from "../features/appearance/ThemeProvider";
 import { ApiConfigurationError, resolveApiBaseUrl } from "../shared/api/config";
 import { AuthProvider } from "../features/auth/AuthProvider";
 import { ResetPasswordPage } from "../features/auth/ResetPasswordPage";
@@ -58,7 +59,7 @@ function AdminApiRequired() {
   );
 }
 
-export function App({ services: providedServices, resetPasswordTokenHolder }: AppProps) {
+function AppContent({ services: providedServices, resetPasswordTokenHolder }: AppProps) {
   const [initialized] = useState(initializeServices);
   const services = providedServices ?? initialized.services;
 
@@ -108,5 +109,13 @@ export function App({ services: providedServices, resetPasswordTokenHolder }: Ap
     <AuthProvider services={services}>
       <Workspace />
     </AuthProvider>
+  );
+}
+
+export function App(props: AppProps) {
+  return (
+    <AppearanceProvider>
+      <AppContent {...props} />
+    </AppearanceProvider>
   );
 }

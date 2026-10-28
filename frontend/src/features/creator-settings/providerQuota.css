@@ -2,19 +2,19 @@
   display: grid;
   gap: 14px;
   padding: 18px;
-  border: 1px solid #dce2ea;
+  border: 1px solid var(--line);
   border-radius: 12px;
-  background: #f8fafc;
-  color: #26313d;
+  background: var(--surface-secondary);
+  color: var(--ink);
 }
 
 .provider-quota-editor {
   display: grid;
   gap: 12px;
   padding: 15px;
-  border: 1px solid #cad7e8;
+  border: 1px solid var(--line);
   border-radius: 10px;
-  background: #fff;
+  background: var(--surface);
 }
 
 .provider-quota-editor-heading,
@@ -28,14 +28,14 @@
 
 .provider-quota-editor-heading h3 {
   margin: 0;
-  color: #1d2732;
+  color: var(--ink);
   font-size: 16px;
 }
 
 .provider-quota-editor-heading p,
 .provider-quota-editor-hint {
   margin: 5px 0 0;
-  color: #647080;
+  color: var(--muted);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -49,7 +49,7 @@
 .provider-quota-editor-fields label {
   display: grid;
   gap: 5px;
-  color: #455261;
+  color: var(--muted);
   font-size: 12px;
 }
 
@@ -59,9 +59,9 @@
   min-height: 36px;
   box-sizing: border-box;
   padding: 7px 9px;
-  border: 1px solid #cbd3de;
+  border: 1px solid var(--line-strong);
   border-radius: 7px;
-  color: #26313d;
+  color: var(--ink);
   font: inherit;
 }
 
@@ -74,13 +74,13 @@
 
 .provider-quota-editor-error {
   margin: 0;
-  color: #8a3025;
+  color: var(--danger);
   font-size: 12px;
 }
 
 .provider-quota-editor-message {
   margin: 0;
-  color: #304e7f;
+  color: var(--info);
   font-size: 12px;
   line-height: 1.5;
 }
@@ -98,21 +98,21 @@
 .provider-quota-panel button {
   min-height: 36px;
   padding: 7px 11px;
-  border: 1px solid #cbd3de;
+  border: 1px solid var(--line-strong);
   border-radius: 8px;
-  background: #fff;
+  background: var(--surface);
   color: inherit;
   font: inherit;
   cursor: pointer;
 }
 
 .provider-quota-panel button:hover:not(:disabled) {
-  background: #f0f4f8;
+  background: var(--surface-secondary);
 }
 
 .provider-quota-panel button:focus-visible,
 .provider-quota-panel a:focus-visible {
-  outline: 3px solid #a7c8ff;
+  outline: 3px solid color-mix(in srgb, var(--accent) 30%, transparent);
   outline-offset: 2px;
 }
 
@@ -132,13 +132,13 @@
 
 .provider-quota-panel-header h2 {
   margin: 0;
-  color: #1d2732;
+  color: var(--ink);
   font-size: 18px;
 }
 
 .provider-quota-panel-header p {
   margin: 6px 0 0;
-  color: #647080;
+  color: var(--muted);
   font-size: 13px;
   line-height: 1.5;
 }
@@ -158,7 +158,7 @@
 }
 
 .provider-quota-panel-account-actions > span {
-  color: #647080;
+  color: var(--muted);
   font-size: 12px;
 }
 
@@ -167,10 +167,10 @@
   display: grid;
   gap: 10px;
   padding: 12px;
-  border: 1px solid #e5cc88;
+  border: 1px solid var(--warning-border);
   border-radius: 8px;
-  background: #fff7df;
-  color: #624b19;
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .provider-quota-panel-unknown p,
@@ -181,7 +181,7 @@
 
 .provider-quota-card-actions {
   padding-top: 4px;
-  border-top: 1px solid #edf0f4;
+  border-top: 1px solid var(--line);
 }
 
 .provider-quota-card-actions button {
@@ -198,23 +198,23 @@
 
 .provider-quota-panel-summary span {
   padding: 4px 9px;
-  border: 1px solid #e0e5eb;
+  border: 1px solid var(--line);
   border-radius: 999px;
-  background: #fff;
-  color: #4a5664;
+  background: var(--surface);
+  color: var(--muted);
   font-size: 12px;
 }
 
 .provider-quota-panel-summary .is-warn {
-  border-color: #e5cc88;
-  background: #fff7df;
-  color: #785611;
+  border-color: var(--warning-border);
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .provider-quota-panel-summary .is-error {
-  border-color: #e7b4ae;
-  background: #fff1ef;
-  color: #8a3025;
+  border-color: var(--danger-border);
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .provider-quota-panel-message,
@@ -222,14 +222,14 @@
   margin: 0;
   padding: 11px 13px;
   border-radius: 8px;
-  background: #eef4ff;
-  color: #304e7f;
+  background: var(--info-soft);
+  color: var(--info);
   line-height: 1.5;
 }
 
 .provider-quota-panel-error {
-  background: #fff1ef;
-  color: #8a3025;
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .provider-quota-panel-grid {
@@ -244,27 +244,27 @@
   gap: 11px;
   min-width: 0;
   padding: 15px;
-  border: 1px solid #dfe4eb;
+  border: 1px solid var(--line);
   border-radius: 10px;
-  background: #fff;
+  background: var(--surface);
 }
 
 .provider-quota-card.is-loading {
-  background: #fbfcfe;
+  background: var(--surface-secondary);
 }
 
 .provider-quota-card.is-disabled {
-  background: #f3f5f7;
-  color: #66717e;
+  background: var(--surface-secondary);
+  color: var(--muted);
 }
 
 .provider-quota-card.is-error {
-  border-color: #e7c3bf;
+  border-color: var(--danger-border);
 }
 
 .provider-quota-card.is-warn {
-  border-color: #e5cc88;
-  background: #fffdf7;
+  border-color: var(--warning-border);
+  background: var(--warning-surface);
 }
 
 .provider-quota-card-header {
@@ -279,14 +279,14 @@
 
 .provider-quota-card-header strong {
   overflow: hidden;
-  color: #202a35;
+  color: var(--ink);
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .provider-quota-card-header small {
   overflow: hidden;
-  color: #75808e;
+  color: var(--muted);
   font-size: 11px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -294,7 +294,7 @@
 
 .provider-quota-card-header a {
   flex: 0 0 auto;
-  color: #315f9e;
+  color: var(--accent-strong);
   font-size: 12px;
   text-decoration: none;
 }
@@ -304,17 +304,17 @@
 }
 
 .provider-quota-card-status {
-  color: #596574;
+  color: var(--muted);
   font-size: 12px;
   font-weight: 700;
 }
 
 .provider-quota-card.is-warn .provider-quota-card-status {
-  color: #785611;
+  color: var(--warning);
 }
 
 .provider-quota-card.is-error .provider-quota-card-status {
-  color: #8a3025;
+  color: var(--danger);
 }
 
 .provider-quota-card-main {
@@ -324,7 +324,7 @@
 }
 
 .provider-quota-card-main strong {
-  color: #202a35;
+  color: var(--ink);
   font-size: 25px;
   font-variant-numeric: tabular-nums;
   line-height: 1.2;
@@ -332,7 +332,7 @@
 }
 
 .provider-quota-card-main span {
-  color: #647080;
+  color: var(--muted);
   font-size: 12px;
   line-height: 1.45;
 }
@@ -341,13 +341,13 @@
   display: flex;
   flex-wrap: wrap;
   gap: 5px 12px;
-  color: #647080;
+  color: var(--muted);
   font-size: 11px;
   line-height: 1.4;
 }
 
 .provider-quota-card footer {
-  color: #7a8592;
+  color: var(--muted);
   font-size: 11px;
   text-align: right;
 }

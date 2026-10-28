@@ -43,7 +43,7 @@
   display: grid;
   min-width: 0;
   gap: 7px;
-  color: #c0c0c8;
+  color: var(--admin-text, #e4e4e7);
   font-size: 12px;
   font-weight: 600;
 }
@@ -54,10 +54,10 @@
   min-width: 0;
   min-height: 40px;
   padding: 9px 11px;
-  border: 1px solid #393940;
+  border: 1px solid var(--admin-line, #2a2a30);
   border-radius: 8px;
   color: var(--admin-text, #e4e4e7);
-  background: #1a1a1e;
+  background: var(--admin-surface-raised, #1e1e22);
   font: inherit;
   font-weight: 400;
   transition: border-color 140ms ease, box-shadow 140ms ease;
@@ -78,7 +78,7 @@
 
 .admin-system-config-field input:disabled,
 .admin-system-config-field textarea:disabled {
-  color: #a3a3aa;
+  color: var(--admin-muted, #898992);
   cursor: not-allowed;
   opacity: 0.72;
 }
@@ -88,7 +88,7 @@
   min-height: 40px;
   align-items: center;
   gap: 10px;
-  color: #c0c0c8;
+  color: var(--admin-text, #e4e4e7);
   font-size: 12px;
   font-weight: 600;
 }
@@ -96,7 +96,7 @@
 .admin-system-config-toggle input {
   width: 18px;
   height: 18px;
-  accent-color: #a994ff;
+  accent-color: var(--admin-accent-text);
 }
 
 .admin-system-config-field-note {
@@ -110,32 +110,36 @@
 .admin-system-config-readback {
   margin: 12px 0;
   padding: 12px 14px;
-  border: 1px solid #34323a;
+  border: 1px solid var(--admin-line, #2a2a30);
   border-radius: 9px;
-  color: #c4c1cb;
-  background: #19191d;
+  color: var(--admin-text, #e4e4e7);
+  background: var(--admin-surface-raised, #1e1e22);
   font-size: 12px;
   line-height: 1.65;
 }
 
 .admin-system-config-notice {
-  border-color: #335e4b;
-  color: #a5d6b6;
+  border-color: var(--admin-success-border, #335e4b);
+  color: var(--admin-success, #7bd3a0);
+  background: var(--admin-success-soft, #19392a);
 }
 
 .admin-system-config-error {
-  border-color: #693c42;
-  color: #e0a3a7;
+  border-color: var(--admin-danger-border, #684046);
+  color: var(--admin-danger, #f07178);
+  background: var(--admin-danger-soft, #352024);
 }
 
 .admin-system-config-unknown {
-  border-color: #725f37;
-  color: #ddc58e;
+  border-color: var(--admin-warning-border, #715b2c);
+  color: var(--admin-warning, #f4cc78);
+  background: var(--admin-warning-soft, #352d1c);
 }
 
 .admin-system-config-readback {
-  border-color: #38556b;
-  color: #c1d9ec;
+  border-color: var(--admin-info-border, #38556b);
+  color: var(--admin-info, #c1d9ec);
+  background: var(--admin-info-soft, #1d2b37);
 }
 
 .admin-system-config-unknown p {
@@ -157,7 +161,7 @@
   grid-template-columns: minmax(140px, 0.7fr) minmax(0, 2fr);
   gap: 10px;
   padding-top: 8px;
-  border-top: 1px solid rgba(193, 217, 236, 0.16);
+  border-top: 1px solid var(--admin-info-border, #38556b);
 }
 
 .admin-system-config-readback dt {

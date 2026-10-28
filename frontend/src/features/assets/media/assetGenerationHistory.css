@@ -164,7 +164,7 @@
   place-items: center;
   overflow: hidden;
   border-radius: 8px;
-  background: #e9edf1;
+  background: var(--surface-muted);
 }
 
 .asset-generation-history-preview img,
@@ -232,14 +232,18 @@
 }
 
 .asset-generation-history-notice.success {
-  background: #f0f7f2;
-  color: #245b35;
+  background: var(--success-soft);
+  color: var(--success);
 }
 
-.asset-generation-history-notice.error,
+.asset-generation-history-notice.error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
 .asset-generation-history-notice.unknown {
-  background: #fff4ed;
-  color: #8a3d1d;
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .asset-card-generation-history-action {

@@ -13,10 +13,10 @@
   align-items: center;
   justify-content: center;
   padding: 0 10px;
-  border: 1px solid #b9d9d1;
+  border: 1px solid var(--line-strong);
   border-radius: 7px;
-  color: #286c61;
-  background: #f5faf8;
+  color: var(--teal-deep);
+  background: var(--surface-subtle);
   font-size: 11px;
   font-weight: 650;
   white-space: nowrap;
@@ -57,17 +57,17 @@
 .series-workbench-left-tabs button {
   min-height: 32px;
   padding: 0 10px;
-  border: 1px solid #dce7e4;
+  border: 1px solid var(--line);
   border-radius: 7px;
-  color: #52666a;
-  background: #fff;
+  color: var(--ink);
+  background: var(--surface);
   font-size: 11px;
 }
 
 .series-workbench-left-tabs button[aria-pressed="true"] {
-  border-color: #82b9ad;
-  color: #145f56;
-  background: #eef8f4;
+  border-color: var(--teal);
+  color: var(--teal-deep);
+  background: var(--soft-teal);
 }
 
 .series-workbench-surface.mode-workbench > .series-workbench-left,
@@ -107,17 +107,17 @@
 .series-workbench-route-tabs button {
   min-height: 34px;
   padding: 0 12px;
-  border: 1px solid #dce7e4;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #52666a;
-  background: #fff;
+  color: var(--ink);
+  background: var(--surface);
   font-size: 12px;
 }
 
 .series-workbench-route-tabs button[aria-pressed="true"] {
-  border-color: #82b9ad;
-  color: #145f56;
-  background: #eef8f4;
+  border-color: var(--teal);
+  color: var(--teal-deep);
+  background: var(--soft-teal);
 }
 
 .series-workbench-separator {
@@ -138,7 +138,7 @@
   bottom: 0;
   left: 3px;
   width: 2px;
-  background: #dce6e3;
+  background: var(--line);
   content: "";
 }
 
@@ -149,7 +149,7 @@
 
 .series-workbench-notice {
   margin: 0 0 10px;
-  color: #756139;
+  color: var(--warning);
   font-size: 11px;
 }
 
@@ -177,9 +177,9 @@
 .frame-resource-group {
   min-width: 85px;
   padding: 7px;
-  border: 1px solid #edf1ef;
+  border: 1px solid var(--line);
   border-radius: 7px;
-  background: #fafcfb;
+  background: var(--surface-subtle);
 }
 
 .frame-resource-fused-actions {
@@ -204,20 +204,20 @@
 
 .frame-resource-fused-action small {
   max-width: 180px;
-  color: #778889;
+  color: var(--muted);
   font-size: 9px;
 }
 
 .frame-resource-group h4 {
   margin: 0 0 6px;
-  color: #49615f;
+  color: var(--ink);
   font-size: 10px;
 }
 
 .frame-resource-state,
 .frame-resource-row {
   margin: 0;
-  color: #7b8a8b;
+  color: var(--muted);
   font-size: 9px;
   line-height: 1.45;
   overflow-wrap: anywhere;
@@ -241,7 +241,7 @@
 .frame-resource-row .text-button {
   min-height: 0;
   padding: 0;
-  color: #286b62;
+  color: var(--teal-deep);
   font-size: 9px;
   line-height: 1.45;
   text-align: left;
@@ -251,7 +251,7 @@
 .frame-resource-row.missing,
 .frame-resource-row.ambiguous,
 .frame-resource-row.invalid {
-  color: #9b6a53;
+  color: var(--warning);
 }
 
 @media (max-width: 768px) {

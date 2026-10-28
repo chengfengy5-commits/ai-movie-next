@@ -4,7 +4,7 @@
   width: min(100%, 1120px);
   margin: 0 auto;
   padding: 28px;
-  color: #20252d;
+  color: var(--ink);
 }
 
 .creator-settings-page button,
@@ -17,23 +17,23 @@
 .creator-settings-page button {
   min-height: 38px;
   padding: 8px 12px;
-  border: 1px solid #d4d9e0;
+  border: 1px solid var(--line-strong);
   border-radius: 8px;
-  background: #fff;
-  color: #28313d;
+  background: var(--surface);
+  color: var(--ink);
   cursor: pointer;
 }
 
 .creator-settings-page button:hover:not(:disabled) {
-  border-color: #78869a;
-  background: #f7f9fc;
+  border-color: var(--accent);
+  background: var(--surface-secondary);
 }
 
 .creator-settings-page button:focus-visible,
 .creator-settings-page input:focus-visible,
 .creator-settings-page select:focus-visible,
 .creator-settings-page textarea:focus-visible {
-  outline: 3px solid #a7c8ff;
+  outline: 3px solid color-mix(in srgb, var(--accent) 30%, transparent);
   outline-offset: 2px;
 }
 
@@ -62,7 +62,7 @@
 .creator-settings-header h1,
 .creator-settings-editor h2 {
   margin: 0;
-  color: #18202b;
+  color: var(--ink);
 }
 
 .creator-settings-header h1 {
@@ -72,7 +72,7 @@
 
 .creator-settings-eyebrow {
   margin: 0 0 7px;
-  color: #6d7887;
+  color: var(--muted);
   font-size: 12px;
   font-weight: 700;
   letter-spacing: .05em;
@@ -80,7 +80,7 @@
 
 .creator-settings-description,
 .creator-settings-hint {
-  color: #647080;
+  color: var(--muted);
   line-height: 1.55;
 }
 
@@ -96,7 +96,7 @@
 .creator-settings-tabs {
   display: flex;
   gap: 6px;
-  border-bottom: 1px solid #dce1e8;
+  border-bottom: 1px solid var(--line);
 }
 
 .creator-settings-tabs button {
@@ -104,12 +104,12 @@
   border: 0;
   border-radius: 8px 8px 0 0;
   background: transparent;
-  color: #637083;
+  color: var(--muted);
 }
 
 .creator-settings-tabs button.selected {
-  border-bottom: 3px solid #416dba;
-  color: #244f9b;
+  border-bottom: 3px solid var(--accent);
+  color: var(--accent-strong);
   font-weight: 700;
 }
 
@@ -118,24 +118,24 @@
   margin: 0;
   padding: 11px 13px;
   border-radius: 8px;
-  background: #eef4ff;
-  color: #304e7f;
+  background: var(--info-soft);
+  color: var(--info);
   line-height: 1.5;
 }
 
 .creator-settings-error {
-  background: #fff1ef;
-  color: #8a3025;
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .creator-settings-verification {
   flex-wrap: wrap;
   justify-content: flex-start;
   padding: 11px 13px;
-  border: 1px solid #e2c879;
+  border: 1px solid var(--warning-border);
   border-radius: 9px;
-  background: #fff9e8;
-  color: #674f12;
+  background: var(--warning-soft);
+  color: var(--warning);
 }
 
 .creator-settings-verification small {
@@ -146,16 +146,16 @@
 .creator-settings-toolbar {
   flex-wrap: wrap;
   padding: 14px;
-  border: 1px solid #e0e5eb;
+  border: 1px solid var(--line);
   border-radius: 11px;
-  background: #fafbfd;
+  background: var(--surface-secondary);
 }
 
 .creator-settings-toolbar label,
 .creator-settings-fields label {
   display: grid;
   gap: 6px;
-  color: #4e5968;
+  color: var(--muted);
   font-size: 13px;
   font-weight: 600;
 }
@@ -166,10 +166,10 @@
 .creator-settings-fields textarea {
   width: 100%;
   min-width: 0;
-  border: 1px solid #cbd2dc;
+  border: 1px solid var(--line-strong);
   border-radius: 8px;
-  background: #fff;
-  color: #20252d;
+  background: var(--surface);
+  color: var(--ink);
 }
 
 .creator-settings-toolbar select,
@@ -213,9 +213,9 @@
 .creator-settings-empty {
   margin: 0;
   padding: 22px;
-  border: 1px dashed #cfd6df;
+  border: 1px dashed var(--line-strong);
   border-radius: 10px;
-  color: #6a7583;
+  color: var(--muted);
   text-align: center;
 }
 
@@ -225,13 +225,13 @@
   gap: 12px;
   align-items: center;
   padding: 14px;
-  border: 1px solid #dfe4ea;
+  border: 1px solid var(--line);
   border-radius: 10px;
-  background: #fff;
+  background: var(--surface);
 }
 
 .creator-settings-card.system {
-  background: #f8f9fb;
+  background: var(--surface-secondary);
 }
 
 .creator-settings-card-main {
@@ -246,7 +246,7 @@
 
 .creator-settings-card-main span,
 .creator-settings-card-main small {
-  color: #667282;
+  color: var(--muted);
   font-size: 12px;
 }
 
@@ -270,8 +270,8 @@
   flex-wrap: wrap;
   gap: 8px;
   padding-top: 10px;
-  border-top: 1px solid #eceff3;
-  color: #714a18;
+  border-top: 1px solid var(--line);
+  color: var(--warning);
   font-size: 13px;
 }
 
@@ -279,8 +279,8 @@
   flex-wrap: wrap;
   padding: 12px 14px;
   border-radius: 9px;
-  background: #eef4ff;
-  color: #39557e;
+  background: var(--info-soft);
+  color: var(--info);
   font-size: 13px;
   line-height: 1.5;
 }
@@ -293,9 +293,9 @@
   display: grid;
   gap: 16px;
   padding: 20px;
-  border: 1px solid #cfd8e4;
+  border: 1px solid var(--line);
   border-radius: 12px;
-  background: #fff;
+  background: var(--surface);
   box-shadow: 0 10px 28px rgb(24 42 68 / 8%);
 }
 
@@ -310,7 +310,7 @@
 }
 
 .creator-settings-fields small {
-  color: #667282;
+  color: var(--muted);
   font-size: 12px;
   font-weight: 400;
   line-height: 1.45;
@@ -339,13 +339,13 @@
 }
 
 .creator-settings-connection-success {
-  background: #edf8f0;
-  color: #23633a;
+  background: var(--success-soft);
+  color: var(--success);
 }
 
 .creator-settings-connection-error {
-  background: #fff1ef;
-  color: #8a3025;
+  background: var(--danger-soft);
+  color: var(--danger);
 }
 
 .creator-settings-editor-actions {

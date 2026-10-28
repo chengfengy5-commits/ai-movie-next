@@ -36,7 +36,7 @@
 .admin-membership-checkbox input {
   width: 18px;
   height: 18px;
-  accent-color: #a994ff;
+  accent-color: var(--admin-accent-text);
 }
 
 .admin-membership-notice,
@@ -45,32 +45,36 @@
 .admin-membership-receipt {
   margin: 12px 0;
   padding: 12px 14px;
-  border: 1px solid #34323a;
+  border: 1px solid var(--admin-line);
   border-radius: 9px;
-  color: #c4c1cb;
-  background: #19191d;
+  color: var(--admin-muted);
+  background: var(--admin-surface-raised);
   font-size: 12px;
   line-height: 1.65;
 }
 
 .admin-membership-notice {
-  border-color: #335e4b;
-  color: #a5d6b6;
+  border-color: var(--admin-success-border);
+  color: var(--admin-success);
+  background: var(--admin-success-soft);
 }
 
 .admin-membership-error {
-  border-color: #693c42;
-  color: #e0a3a7;
+  border-color: var(--admin-danger-border);
+  color: var(--admin-danger);
+  background: var(--admin-danger-soft);
 }
 
 .admin-membership-unknown {
-  border-color: #725f37;
-  color: #ddc58e;
+  border-color: var(--admin-warning-border);
+  color: var(--admin-warning);
+  background: var(--admin-warning-soft);
 }
 
 .admin-membership-receipt {
-  border-color: #4c4270;
-  color: #c7b7ff;
+  border-color: var(--admin-line);
+  color: var(--admin-accent-text);
+  background: var(--admin-surface);
 }
 
 .admin-membership-unknown p,
@@ -80,7 +84,7 @@
 
 .admin-membership-receipt code {
   user-select: text;
-  color: #eee8ff;
+  color: var(--admin-text);
   font-size: 13px;
 }
 
