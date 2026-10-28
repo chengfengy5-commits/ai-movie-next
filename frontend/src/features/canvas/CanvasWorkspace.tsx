@@ -431,6 +431,33 @@ interface DragState {
   startDocument: CanvasDocument | null;
 }
 
+interface CanvasPointerPoint {
+  x: number;
+  y: number;
+}
+
+interface ManualPortDragState {
+  pointerId: number;
+  sourceRef: string;
+  sourceSide: "left" | "right";
+  sourcePoint: CanvasPointerPoint;
+  pointerPoint: CanvasPointerPoint;
+  sourceVersion: string;
+  sourceSnapshot: CanvasSourceSnapshot;
+  scopeKey: string;
+  serviceIdentity: object;
+  startingDocument: CanvasDocument;
+}
+
+function manualPortEdgePath(state: ManualPortDragState): string {
+  const { sourcePoint, pointerPoint } = state;
+  const bend = Math.max(24, Math.abs(pointerPoint.x - sourcePoint.x) * 0.5);
+  return "M " + sourcePoint.x + " " + sourcePoint.y
+    + " C " + (sourcePoint.x + bend) + " " + sourcePoint.y
+    + ", " + (pointerPoint.x - bend) + " " + pointerPoint.y
+    + ", " + pointerPoint.x + " " + pointerPoint.y;
+}
+
 const FILTERS: Array<{ id: "all" | CanvasNodeKind; label: string }> = [
   { id: "all", label: "全部" }, { id: "character", label: "角色" },
   { id: "scene", label: "场景" }, { id: "prop", label: "道具" },
@@ -549,6 +576,12 @@ export function CanvasWorkspace({
   const [closePrompt, setClosePrompt] = useState(false);
   const [closeBusy, setCloseBusy] = useState(false);
   const [drag, setDrag] = useState<DragState | null>(null);
+  const [portDrag, setPortDrag] = useState<ManualPortDragState | null>(null);
+  const portDragRef = useRef<ManualPortDragState | null>(null);
+  function updatePortDrag(next: ManualPortDragState | null): void {
+    portDragRef.current = next;
+    setPortDrag(next);
+  }
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const scopeEpochRef = useRef(0);
   const generationWorkspaceEpochRef = useRef(0);
@@ -861,30 +894,171 @@ export function CanvasWorkspace({
     }
   }
 
+  function canStartManualPortDrag(): boolean {
+    return !connecting && drag === null && sourceEditorRef.current === null
+      && !sourceLoading && !sourceWritesBlocked && !sourceOutcomeUnresolved
+      && !sourceMutationPendingRef.current && !sourceReadbackPending
+      && unknownSourceIntentRef.current === null && !generationBusyRef.current
+      && !generationMutationPendingRef.current && generationIntentRef.current === null
+      && !imageGenerationBlockedRef.current && !imageGenerationUnresolvedRef.current
+      && !imageGenerationBusyRef.current && documentState.writable
+      && documentState.document !== null
+      && documentState.status !== "loading" && documentState.status !== "saving"
+      && documentState.status !== "unsupported" && documentState.status !== "unknown"
+      && documentState.status !== "conflict";
+  }
+
+  function worldPointerPoint(clientX: number, clientY: number): CanvasPointerPoint | null {
+    const element = viewportRef.current;
+    if (element === null || viewport.zoom <= 0) return null;
+    const bounds = element.getBoundingClientRect();
+    return {
+      x: (clientX - bounds.left - viewport.x) / viewport.zoom,
+      y: (clientY - bounds.top - viewport.y) / viewport.zoom,
+    };
+  }
+
+  function portAnchor(node: CanvasGraphNode, side: "left" | "right", element: HTMLElement): CanvasPointerPoint {
+    const bounds = element.getBoundingClientRect();
+    if (bounds.width > 0 && bounds.height > 0) {
+      const point = worldPointerPoint(bounds.left + bounds.width / 2, bounds.top + bounds.height / 2);
+      if (point !== null) return point;
+    }
+    return {
+      x: side === "left" ? node.x : node.x + node.width,
+      y: node.y + node.height / 2,
+    };
+  }
+
+  function manualPortDragIsCurrent(state: ManualPortDragState): boolean {
+    const currentSnapshot = sourcesRef.current;
+    return portDragRef.current === state
+      && state.scopeKey === scopeKey
+      && state.serviceIdentity === serviceIdentity
+      && state.sourceSnapshot === currentSnapshot
+      && state.sourceVersion === currentSnapshot?.version
+      && currentSnapshot !== null && sourceSnapshotMatchesScope(currentSnapshot)
+      && documentState.document === state.startingDocument
+      && canStartManualPortDrag();
+  }
+
+  function releasePortPointer(pointerId: number): void {
+    const element = viewportRef.current;
+    if (element?.hasPointerCapture?.(pointerId)) element.releasePointerCapture?.(pointerId);
+  }
+
+  function cancelManualPortDrag(pointerId?: number): boolean {
+    const current = portDragRef.current;
+    if (current === null || (pointerId !== undefined && current.pointerId !== pointerId)) return false;
+    updatePortDrag(null);
+    releasePortPointer(current.pointerId);
+    return true;
+  }
+
+  function connectNodeFromClick(node: CanvasGraphNode): void {
+    selectCanvasNode(node.ref);
+    if (!connecting) return;
+    if (connectionSource === null) {
+      setConnectionSource(node.ref);
+      return;
+    }
+    if (connectionSource === node.ref) return;
+    const currentDocument = documentState.document;
+    if (currentDocument !== null) {
+      const currentEdges = Array.isArray(currentDocument.manualEdges) ? currentDocument.manualEdges : [];
+      const duplicate = currentEdges.some((edge) => edge !== null && typeof edge === "object"
+        && "sourceRef" in edge && "targetRef" in edge
+        && edge.sourceRef === connectionSource && edge.targetRef === node.ref);
+      if (!duplicate) {
+        applyDocument(addCanvasItem(currentDocument, "manualEdges", {
+          id: itemId(), sourceRef: connectionSource, targetRef: node.ref, relation: "manual",
+        }));
+      }
+    }
+    setConnectionSource(null);
+    setConnecting(false);
+  }
+
+  function beginManualPortDrag(
+    event: ReactPointerEvent<HTMLButtonElement>,
+    node: CanvasGraphNode,
+    side: "left" | "right",
+  ): void {
+    event.preventDefault();
+    event.stopPropagation();
+    if (event.button !== 0) return;
+    if (connecting) {
+      connectNodeFromClick(node);
+      return;
+    }
+    if (portDragRef.current !== null || !canStartManualPortDrag()) return;
+    const matches = graph.nodes.filter((candidate) => candidate.ref === node.ref);
+    const snapshot = sourcesRef.current;
+    const startingDocument = documentState.document;
+    const pointerPoint = worldPointerPoint(event.clientX, event.clientY);
+    if (matches.length !== 1 || snapshot === null || startingDocument === null || pointerPoint === null) return;
+    const viewportElement = viewportRef.current;
+    viewportElement?.setPointerCapture?.(event.pointerId);
+    updatePortDrag({
+      pointerId: event.pointerId,
+      sourceRef: node.ref,
+      sourceSide: side,
+      sourcePoint: portAnchor(node, side, event.currentTarget),
+      pointerPoint,
+      sourceVersion: snapshot.version,
+      sourceSnapshot: snapshot,
+      scopeKey,
+      serviceIdentity,
+      startingDocument,
+    });
+    selectCanvasNode(null);
+    setSelectedEdge(null);
+  }
+
+  function finishManualPortDrag(event: ReactPointerEvent<HTMLElement>): boolean {
+    const current = portDragRef.current;
+    if (current === null || event.pointerId !== current.pointerId) return false;
+
+    const hit = typeof document.elementFromPoint === "function"
+      ? document.elementFromPoint(event.clientX, event.clientY)
+      : event.target;
+    const hitPort = hit instanceof Element ? hit.closest<HTMLElement>("[data-canvas-port-ref]") : null;
+    const eventPort = event.target instanceof Element
+      ? event.target.closest<HTMLElement>("[data-canvas-port-ref]")
+      : null;
+    const targetPort = hitPort ?? eventPort;
+    const targetRef = targetPort?.getAttribute("data-canvas-port-ref") ?? null;
+    const sourceMatches = graph.nodes.filter((candidate) => candidate.ref === current.sourceRef);
+    const targetMatches = targetRef === null ? [] : graph.nodes.filter((candidate) => candidate.ref === targetRef);
+    const currentDocument = documentState.document;
+    const sameDirectionExists = currentDocument !== null && Array.isArray(currentDocument.manualEdges)
+      && currentDocument.manualEdges.some((edge) => isRecord(edge)
+        && edge.sourceRef === current.sourceRef && edge.targetRef === targetRef);
+    const mayConnect = manualPortDragIsCurrent(current)
+      && sourceMatches.length === 1 && targetMatches.length === 1
+      && targetRef !== null && targetRef !== current.sourceRef
+      && currentDocument !== null && !sameDirectionExists;
+
+    cancelManualPortDrag(current.pointerId);
+    if (!mayConnect || currentDocument === null || targetRef === null) return true;
+    applyDocument(addCanvasItem(currentDocument, "manualEdges", {
+      id: itemId(), sourceRef: current.sourceRef, targetRef, relation: "manual",
+    }));
+    return true;
+  }
+
   function beginDrag(event: ReactPointerEvent<HTMLElement>, node: CanvasGraphNode | null): void {
+    if (portDragRef.current !== null) {
+      event.stopPropagation();
+      return;
+    }
     if (node !== null) {
       event.stopPropagation();
-      selectCanvasNode(node.ref);
       if (connecting) {
-        if (connectionSource === null) setConnectionSource(node.ref);
-        else if (connectionSource !== node.ref) {
-          const document = documentState.document;
-          if (document !== null) {
-            const currentEdges = Array.isArray(document.manualEdges) ? document.manualEdges : [];
-            const duplicate = currentEdges.some((edge) => edge !== null && typeof edge === "object"
-              && "sourceRef" in edge && "targetRef" in edge
-              && edge.sourceRef === connectionSource && edge.targetRef === node.ref);
-            if (!duplicate) {
-              applyDocument(addCanvasItem(document, "manualEdges", {
-                id: itemId(), sourceRef: connectionSource, targetRef: node.ref, relation: "manual",
-              }));
-            }
-          }
-          setConnectionSource(null);
-          setConnecting(false);
-        }
+        connectNodeFromClick(node);
         return;
       }
+      selectCanvasNode(node.ref);
     }
     if (event.button !== 0) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
@@ -901,6 +1075,19 @@ export function CanvasWorkspace({
   }
 
   function movePointer(event: ReactPointerEvent<HTMLElement>): void {
+    const currentPortDrag = portDragRef.current;
+    if (currentPortDrag !== null) {
+      if (event.pointerId !== currentPortDrag.pointerId) return;
+      event.preventDefault();
+      event.stopPropagation();
+      if (!manualPortDragIsCurrent(currentPortDrag)) {
+        cancelManualPortDrag(currentPortDrag.pointerId);
+        return;
+      }
+      const point = worldPointerPoint(event.clientX, event.clientY);
+      if (point !== null) updatePortDrag({ ...currentPortDrag, pointerPoint: point });
+      return;
+    }
     if (sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationMutationPendingRef.current || drag === null || event.pointerId !== drag.pointerId) return;
     const dx = (event.clientX - drag.startX) / (drag.node === null ? 1 : viewport.zoom);
     const dy = (event.clientY - drag.startY) / (drag.node === null ? 1 : viewport.zoom);
@@ -928,8 +1115,28 @@ export function CanvasWorkspace({
     }
   }
 
+  useEffect(() => {
+    const current = portDragRef.current;
+    if (current !== null && !manualPortDragIsCurrent(current)) cancelManualPortDrag(current.pointerId);
+  }, [
+    connecting, documentState.document, documentState.status, documentState.writable, drag,
+    generationBusy, generationIntent, imageGenerationBlocked, scopeKey, serviceIdentity, sourceEditor,
+    sourceLoading, sourceOutcomeUnresolved, sourceReadbackPending, sourceWritesBlocked, sources,
+    unknownSourceIntent, cancelManualPortDrag, manualPortDragIsCurrent,
+  ]);
+
+  useEffect(() => () => {
+    const current = portDragRef.current;
+    portDragRef.current = null;
+    const element = viewportRef.current;
+    if (current !== null && element?.hasPointerCapture?.(current.pointerId)) {
+      element.releasePointerCapture?.(current.pointerId);
+    }
+  }, []);
+
   function zoomAt(event: WheelEvent<HTMLDivElement>): void {
     event.preventDefault();
+    if (portDragRef.current !== null) return;
     const element = viewportRef.current;
     if (element === null) return;
     const rect = element.getBoundingClientRect();
@@ -3310,8 +3517,11 @@ export function CanvasWorkspace({
           className="canvas-viewport"
           onPointerDown={(event) => beginDrag(event, null)}
           onPointerMove={movePointer}
-          onPointerUp={(event) => finishDrag(event.pointerId)}
-          onPointerCancel={() => { if (drag !== null) finishDrag(drag.pointerId); }}
+          onPointerUp={(event) => { if (!finishManualPortDrag(event)) finishDrag(event.pointerId); }}
+          onPointerCancel={(event) => {
+            if (!cancelManualPortDrag(event.pointerId) && drag?.pointerId === event.pointerId) finishDrag(event.pointerId);
+          }}
+          onLostPointerCapture={(event) => cancelManualPortDrag(event.pointerId)}
           onWheel={zoomAt}
           ref={viewportRef}
           role="region"
@@ -3343,17 +3553,48 @@ export function CanvasWorkspace({
                     />
                   );
                 })}
+                {portDrag !== null && (
+                  <path
+                    aria-hidden="true"
+                    className="canvas-edge canvas-edge-temporary"
+                    d={manualPortEdgePath(portDrag)}
+                  />
+                )}
               </svg>
               {visibleNodes.map((node) => (
                 <article
                   aria-label={node.title}
                   className={"canvas-node canvas-node-" + node.kind + (selectedNode === node.ref ? " is-selected" : "") + (connecting ? " is-connectable" : "")}
                   key={node.key}
-                  onClick={() => { selectCanvasNode(node.ref); setSelectedEdge(null); }}
+                  onClick={() => {
+                    if (connecting) connectNodeFromClick(node);
+                    else { selectCanvasNode(node.ref); setSelectedEdge(null); }
+                  }}
                   onPointerDown={(event) => beginDrag(event, node)}
                   style={{ left: node.x, top: node.y, width: node.width, minHeight: node.height }}
                   tabIndex={0}
                 >
+                  {(["left", "right"] as const).map((side) => (
+                    <button
+                      aria-label={connecting
+                        ? `${node.title}${side === "left" ? "左" : "右"}侧端口，选择节点连线`
+                        : `从${node.title}${side === "left" ? "左" : "右"}侧端口拖动连线`}
+                      className={`canvas-port canvas-port-${side}`}
+                      data-canvas-port-ref={node.ref}
+                      data-canvas-port-side={side}
+                      disabled={!connecting && !canStartManualPortDrag()}
+                      key={side}
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        if (connecting) connectNodeFromClick(node);
+                        else { selectCanvasNode(node.ref); setSelectedEdge(null); }
+                      }}
+                      onPointerDown={(event) => beginManualPortDrag(event, node, side)}
+                      type="button"
+                    >
+                      +
+                    </button>
+                  ))}
                   <strong className="canvas-node-title">{node.title}</strong>
                   {node.imageUrl !== null && <CanvasMediaPreview imageUrl={node.imageUrl} key={scopeKey + ":" + node.imageUrl} port={port} scopeKey={scopeKey} />}
                   {node.itemCollection !== undefined ? (

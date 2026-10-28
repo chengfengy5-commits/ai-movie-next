@@ -398,6 +398,14 @@
   stroke-dasharray: 7 5;
 }
 
+.canvas-edge-temporary {
+  stroke: var(--violet);
+  stroke-dasharray: 6 3;
+  opacity: 0.85;
+  pointer-events: none;
+  cursor: default;
+}
+
 .canvas-node {
   position: absolute;
   z-index: 1;
@@ -406,7 +414,7 @@
   gap: 8px;
   box-sizing: border-box;
   padding: 12px;
-  overflow: hidden;
+  overflow: visible;
   border: 1px solid var(--line);
   border-radius: 12px;
   background: var(--surface);
@@ -422,6 +430,49 @@
 
 .canvas-node.is-connectable {
   cursor: crosshair;
+}
+
+.canvas-port {
+  position: absolute;
+  z-index: 3;
+  top: 50%;
+  display: grid;
+  width: 22px;
+  height: 22px;
+  place-items: center;
+  padding: 0;
+  transform: translateY(-50%);
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: var(--surface);
+  box-shadow: 0 1px 4px rgb(15 23 42 / 20%);
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: crosshair;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s, border-color 0.15s;
+}
+
+.canvas-port-left { left: -11px; }
+.canvas-port-right { right: -11px; }
+
+.canvas-node:hover .canvas-port,
+.canvas-node:focus-within .canvas-port,
+.canvas-port:focus-visible,
+.canvas-port:active {
+  opacity: 1;
+}
+
+.canvas-port:hover:not(:disabled),
+.canvas-port:focus-visible {
+  border-color: var(--violet);
+  background: var(--violet);
+  color: #fff;
+}
+
+.canvas-port:disabled {
+  cursor: not-allowed;
 }
 
 .canvas-node-title {
