@@ -882,16 +882,24 @@ function SystemConfigForm({
           </div>
           <ConfigField label="前端地址" value={draft.frontend_url} disabled={isFrozen}
             onChange={(value) => changeDraft("frontend_url", value)} />
-          <p className="admin-system-config-field-note">认证链接使用显式 runtime 配置；保存此项不代表现有链接立即变化。</p>
+          <p className="admin-system-config-field-note">
+            生成新密码重置链接时优先使用应用显式设置的前端地址；未设置时再读取此数据库值。保存后只影响后续新链接，已发送的链接不变。
+          </p>
           <ConfigTextArea label="允许的来源地址" value={draft.allowed_origins} disabled={isFrozen}
             onChange={(value) => changeDraft("allowed_origins", value)} rows={2} />
-          <p className="admin-system-config-field-note">当前 CORS 使用显式配置；保存此项不代表来源规则已热更新。</p>
+          <p className="admin-system-config-field-note">
+            浏览器跨域来源规则在 API 服务启动时读取；保存后需重启服务，新的来源规则才会生效。
+          </p>
           <ConfigField label="上传目录（文件读取时使用）" value={draft.upload_dir} disabled={isFrozen}
             onChange={(value) => changeDraft("upload_dir", value)} />
-          <p className="admin-system-config-field-note">文件读取路径会动态查询此值；保存不代表所有上传流程切换目录。</p>
+          <p className="admin-system-config-field-note">
+            文件读取时会动态查询此目录；仅使用这一读取路径的功能受影响，不代表所有上传流程都会改用该目录。
+          </p>
           <ConfigField label="Worker 最大并发" value={draft.worker_max_concurrency} disabled={isFrozen}
             onChange={(value) => changeDraft("worker_max_concurrency", value)} />
-          <p className="admin-system-config-field-note">当前未发现此字段接入 Worker 启动并发；保存只更新配置值。</p>
+          <p className="admin-system-config-field-note">
+            启用 Worker 的主机在启动时读取此上限；正数会覆盖环境并发设置，保存后需重启 Worker 服务才会更新。未启用 Worker 时不生效。
+          </p>
         </section>
 
         <footer className="admin-form-actions admin-system-config-actions">

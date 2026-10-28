@@ -4,6 +4,7 @@ import type { AppMode } from "../../shared/api/config";
 import type { Credentials, User } from "../../shared/api/contracts";
 import type { AccountAccessService } from "../../shared/api/accountAccess";
 import { ForgotPasswordForm, RegistrationForm, useUnsavedAccountForm } from "./AccountAccessForms";
+import { usePublicSiteConfig } from "../site-config/PublicSiteConfigProvider";
 
 interface LoginPageProps {
   mode: AppMode;
@@ -34,6 +35,7 @@ function loginMessage(error: ApiError | null): string | null {
 }
 
 export function LoginPage({ mode, error, accountAccess, onSubmit }: LoginPageProps) {
+  const { siteTagline } = usePublicSiteConfig();
   const [entryPage, setEntryPage] = useState<EntryPage>("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -92,7 +94,7 @@ export function LoginPage({ mode, error, accountAccess, onSubmit }: LoginPagePro
       ? "创建账号"
       : "找回密码";
   const description = entryPage === "login"
-    ? "登录后查看你的剧集与协作项目。"
+    ? siteTagline
     : entryPage === "register"
       ? "填写邮箱验证码，创建你的创作账号。"
       : "填写账号和注册邮箱，申请密码重置链接。";
