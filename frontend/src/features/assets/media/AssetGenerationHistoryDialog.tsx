@@ -14,27 +14,27 @@ import { useSeriesDialogFocus } from "../../series/useSeriesDialogFocus";
 
 import "./assetGenerationHistory.css";
 
-export type AssetGenerationHistoryImageAdoptionInspection =
-  | { readonly status: "ready"; readonly imageUrl: string | null }
+export type AssetGenerationHistoryMediaAdoptionInspection =
+  | { readonly status: "ready"; readonly mediaUrl: string | null }
   | { readonly status: "conflict" }
   | { readonly status: "not-current" };
 
-export type AssetGenerationHistoryImageAdoptionOutcome =
+export type AssetGenerationHistoryMediaAdoptionOutcome =
   | "applied"
   | "already-applied"
   | "conflict"
   | "unknown"
   | "not-current";
 
-export interface AssetGenerationHistoryImageAdoptionPort {
+export interface AssetGenerationHistoryMediaAdoptionPort {
   inspect(
     signal: AbortSignal,
     isOperationCurrent: () => boolean,
-  ): Promise<AssetGenerationHistoryImageAdoptionInspection>;
+  ): Promise<AssetGenerationHistoryMediaAdoptionInspection>;
   apply(
-    input: { readonly expectedImageUrl: string | null; readonly imageUrl: string; readonly signal: AbortSignal },
+    input: { readonly expectedMediaUrl: string | null; readonly mediaUrl: string; readonly signal: AbortSignal },
     isOperationCurrent: () => boolean,
-  ): Promise<AssetGenerationHistoryImageAdoptionOutcome>;
+  ): Promise<AssetGenerationHistoryMediaAdoptionOutcome>;
 }
 
 interface AssetGenerationHistoryDialogProps {
@@ -47,7 +47,7 @@ interface AssetGenerationHistoryDialogProps {
   onClose(): void;
   onUnauthorized(): void;
   port: AssetGenerationHistoryPort;
-  imageAdoptionPort?: AssetGenerationHistoryImageAdoptionPort | undefined;
+  mediaAdoptionPort?: AssetGenerationHistoryMediaAdoptionPort | undefined;
   seriesId: string;
   seriesName: string;
   isCurrent(): boolean;
@@ -81,10 +81,16 @@ type ActionNotice =
   | { readonly messageId: string; readonly kind: "downloading" | "transferring"; readonly message: string }
   | { readonly messageId: string; readonly kind: "cancelled" | "unknown" | "error" | "success"; readonly message: string };
 
-interface ImageAdoptionConfirmation {
+type MediaAdoptionNotice = {
+  readonly kind: "unknown" | "error" | "success";
+  readonly message: string;
+};
+
+interface MediaAdoptionConfirmation {
   readonly messageId: string;
-  readonly imageUrl: string;
-  readonly expectedImageUrl: string | null;
+  readonly mode: AssetGenerationHistoryMode;
+  readonly mediaUrl: string;
+  readonly expectedMediaUrl: string | null;
 }
 
 interface ActiveTransfer {
@@ -200,6 +206,80 @@ function prepareEntries(
 
 function mediaPreviewLabel(mode: AssetGenerationHistoryMode): string {
   return mode === "image" ? "图片" : "视频";
+}
+
+function assetTypeLabel(assetType: AssetGenerationHistoryAssetType): string {
+  switch (assetType) {
+    case "character": return "角色";
+    case "scene": return "场景";
+    case "prop": return "道具";
+  }
+}
+
+function imageAssetLabel(assetType: AssetGenerationHistoryAssetType): string {
+  return `${assetTypeLabel(assetType)}图`;
+}
+
+function adoptionActionLabel(mode: AssetGenerationHistoryMode, assetType: AssetGenerationHistoryAssetType): string {
+  return mode === "image" ? `设为${imageAssetLabel(assetType)}` : `采用此视频作为${assetTypeLabel(assetType)}素材`;
+}
+
+function adoptionConfirmationLabel(mode: AssetGenerationHistoryMode, assetType: AssetGenerationHistoryAssetType): string {
+  return mode === "image" ? `确认设为${imageAssetLabel(assetType)}` : "确认采用此视频";
+}
+
+function adoptionPreparationNotice(mode: AssetGenerationHistoryMode, replacing: boolean): string {
+  if (mode === "image") {
+    return replacing
+      ? "已核对原生成记录和当前素材。确认后会再次读取并替换当前图片。"
+      : "已核对原生成记录和当前素材。确认后会再次读取并保存这张图片。";
+  }
+  return replacing
+    ? "已核对原生成记录和当前素材。确认后会再次读取并替换当前素材。"
+    : "已核对原生成记录和当前素材。确认后会再次读取并采用这段视频。";
+}
+
+function adoptionOutcomeNotice(
+  mode: AssetGenerationHistoryMode,
+  outcome: AssetGenerationHistoryMediaAdoptionOutcome,
+): MediaAdoptionNotice | null {
+  if (outcome === "not-current") return null;
+  if (outcome === "unknown") {
+    return { kind: "unknown", message: "保存请求已发出但结果未知；已停止自动操作，请只读核对素材目录。" };
+  }
+  if (outcome === "conflict") {
+    return {
+      kind: "error",
+      message: mode === "image"
+        ? "当前素材图片已变化，未覆盖新图片。请重新打开历史后确认。"
+        : "当前素材已变化，未覆盖新内容。请重新打开历史后确认。",
+    };
+  }
+  if (mode === "image") {
+    return {
+      kind: "success",
+      message: outcome === "applied"
+        ? "素材图片已保存，并由独立目录读取确认。"
+        : "当前素材图片已是这张图片，目录读取已确认。",
+    };
+  }
+  return {
+    kind: "success",
+    message: outcome === "applied"
+      ? "视频已保存，并由独立目录读取确认。"
+      : "当前素材已是这段视频，目录读取已确认。",
+  };
+}
+
+function adoptionConfirmationPrompt(confirmation: MediaAdoptionConfirmation): string {
+  if (confirmation.mode === "image") {
+    return confirmation.expectedMediaUrl === null
+      ? "将这张图片设为当前素材图。"
+      : "将用这张生成图片替换当前素材图。";
+  }
+  return confirmation.expectedMediaUrl === null
+    ? "将这段视频作为当前素材。"
+    : "将用这段视频替换当前素材内容。";
 }
 
 function safeFilenamePart(value: string, fallback: string): string {
@@ -407,7 +487,7 @@ export function AssetGenerationHistoryDialog({
   onClose,
   onUnauthorized,
   port,
-  imageAdoptionPort,
+  mediaAdoptionPort,
   seriesId,
   seriesName,
   isCurrent,
@@ -422,7 +502,7 @@ export function AssetGenerationHistoryDialog({
   const [historyState, setHistoryState] = useState<HistoryState>({ status: "idle" });
   const [actionNotice, setActionNotice] = useState<ActionNotice | null>(null);
   const [deleteConfirmation, setDeleteConfirmation] = useState<string | null>(null);
-  const [imageAdoptionConfirmation, setImageAdoptionConfirmation] = useState<ImageAdoptionConfirmation | null>(null);
+  const [mediaAdoptionConfirmation, setMediaAdoptionConfirmation] = useState<MediaAdoptionConfirmation | null>(null);
   const [busyMessageId, setBusyMessageId] = useState<string | null>(null);
   const parentCurrentRef = useRef(isCurrent);
   parentCurrentRef.current = isCurrent;
@@ -478,7 +558,7 @@ export function AssetGenerationHistoryDialog({
 
   useEffect(() => {
     setDeleteConfirmation(null);
-    setImageAdoptionConfirmation(null);
+    setMediaAdoptionConfirmation(null);
     setHistoryPage(0);
     setActivePreviewMessageId(null);
     if (selectedChapterId === "") {
@@ -848,9 +928,10 @@ export function AssetGenerationHistoryDialog({
     }
   }
 
-  async function prepareImageAdoption(entry: HistoryEntry): Promise<void> {
-    if (mode !== "image" || entry.mediaRoute === null || imageAdoptionPort === undefined
+  async function prepareMediaAdoption(entry: HistoryEntry): Promise<void> {
+    if (entry.mediaRoute === null || mediaAdoptionPort === undefined
       || !beginAction(entry.message.id) || currentHistory === null) return;
+    const adoptionMode = mode;
     const run = currentHistory.run;
     const messageId = entry.message.id;
     const controller = createController();
@@ -859,27 +940,38 @@ export function AssetGenerationHistoryDialog({
       const original = await verifyOriginal(run, entry);
       if (original === null || !matchesLoadedEntry(run, entry)) {
         if (selectedContextIsCurrent(run)) {
-          setActionNotice({ messageId, kind: "error", message: "原消息已变化或身份无法唯一核对，未准备替换素材图。" });
+          setActionNotice({
+            messageId,
+            kind: "error",
+            message: adoptionMode === "image"
+              ? "原消息已变化或身份无法唯一核对，未准备替换素材图。"
+              : "原消息已变化或身份无法唯一核对，未准备采用这段视频。",
+          });
         }
         return;
       }
-      const inspection = await imageAdoptionPort.inspect(controller.signal, () => matchesLoadedEntry(run, entry));
+      const inspection = await mediaAdoptionPort.inspect(controller.signal, () => matchesLoadedEntry(run, entry));
       if (!matchesLoadedEntry(run, entry) || inspection.status === "not-current") return;
       if (inspection.status === "conflict") {
-        setActionNotice({ messageId, kind: "error", message: "当前素材身份或图片已变化，请重新打开历史后操作。" });
+        setActionNotice({
+          messageId,
+          kind: "error",
+          message: adoptionMode === "image"
+            ? "当前素材身份或图片已变化，请重新打开历史后操作。"
+            : "当前素材身份或内容已变化，请重新打开历史后操作。",
+        });
         return;
       }
-      setImageAdoptionConfirmation({
+      setMediaAdoptionConfirmation({
         messageId,
-        imageUrl: original.content,
-        expectedImageUrl: inspection.imageUrl,
+        mode: adoptionMode,
+        mediaUrl: original.content,
+        expectedMediaUrl: inspection.mediaUrl,
       });
       setActionNotice({
         messageId,
         kind: "success",
-        message: inspection.imageUrl === null
-          ? "已核对原生成记录和当前素材。确认后会再次读取并保存这张图片。"
-          : "已核对原生成记录和当前素材。确认后会再次读取并替换当前图片。",
+        message: adoptionPreparationNotice(adoptionMode, inspection.mediaUrl !== null),
       });
     } catch (error) {
       if (!matchesLoadedEntry(run, entry)) return;
@@ -892,10 +984,10 @@ export function AssetGenerationHistoryDialog({
     }
   }
 
-  async function confirmImageAdoption(entry: HistoryEntry): Promise<void> {
-    const confirmation = imageAdoptionConfirmation;
-    if (mode !== "image" || entry.mediaRoute === null || imageAdoptionPort === undefined
-      || confirmation?.messageId !== entry.message.id
+  async function confirmMediaAdoption(entry: HistoryEntry): Promise<void> {
+    const confirmation = mediaAdoptionConfirmation;
+    if (entry.mediaRoute === null || mediaAdoptionPort === undefined
+      || confirmation?.messageId !== entry.message.id || confirmation.mode !== mode
       || !beginAction(entry.message.id) || currentHistory === null) return;
     const run = currentHistory.run;
     const messageId = entry.message.id;
@@ -903,38 +995,32 @@ export function AssetGenerationHistoryDialog({
     actionControllerRef.current = controller;
     try {
       const original = await verifyOriginal(run, entry);
-      if (original === null || original.content !== confirmation.imageUrl || !matchesLoadedEntry(run, entry)) {
+      if (original === null || original.content !== confirmation.mediaUrl || !matchesLoadedEntry(run, entry)) {
         if (selectedContextIsCurrent(run)) {
-          setImageAdoptionConfirmation(null);
-          setActionNotice({ messageId, kind: "error", message: "原生成记录已变化，未修改素材图片。" });
+          setMediaAdoptionConfirmation(null);
+          setActionNotice({
+            messageId,
+            kind: "error",
+            message: confirmation.mode === "image"
+              ? "原生成记录已变化，未修改素材图片。"
+              : "原生成记录已变化，未修改素材。",
+          });
         }
         return;
       }
-      const outcome = await imageAdoptionPort.apply({
-        expectedImageUrl: confirmation.expectedImageUrl,
-        imageUrl: original.content,
+      const outcome = await mediaAdoptionPort.apply({
+        expectedMediaUrl: confirmation.expectedMediaUrl,
+        mediaUrl: original.content,
         signal: controller.signal,
       }, () => matchesLoadedEntry(run, entry));
       if (!matchesLoadedEntry(run, entry) || outcome === "not-current") return;
-      setImageAdoptionConfirmation(null);
-      switch (outcome) {
-        case "applied":
-          setActionNotice({ messageId, kind: "success", message: "素材图片已保存，并由独立目录读取确认。" });
-          break;
-        case "already-applied":
-          setActionNotice({ messageId, kind: "success", message: "当前素材图片已是这张图片，目录读取已确认。" });
-          break;
-        case "conflict":
-          setActionNotice({ messageId, kind: "error", message: "当前素材图片已变化，未覆盖新图片。请重新打开历史后确认。" });
-          break;
-        case "unknown":
-          setActionNotice({ messageId, kind: "unknown", message: "保存请求已发出但结果未知；已停止自动操作，请只读核对素材目录。" });
-          break;
-      }
+      setMediaAdoptionConfirmation(null);
+      const notice = adoptionOutcomeNotice(confirmation.mode, outcome);
+      if (notice !== null) setActionNotice({ messageId, ...notice });
     } catch (error) {
       if (!matchesLoadedEntry(run, entry)) return;
       if (unauthorized(error)) unauthorizedRef.current();
-      setImageAdoptionConfirmation(null);
+      setMediaAdoptionConfirmation(null);
       setActionNotice({ messageId, kind: "error", message: errorMessage(error, "write") });
     } finally {
       endAction(messageId);
@@ -953,14 +1039,14 @@ export function AssetGenerationHistoryDialog({
   function refreshHistory(): void {
     if (busyMessageId !== null) return;
     setActionNotice(null);
-    setImageAdoptionConfirmation(null);
+    setMediaAdoptionConfirmation(null);
     setHistoryRefresh((value) => value + 1);
   }
 
   function changeHistoryPage(page: number): void {
     if (busyMessageId !== null || page < 0 || page >= pageCount || page === currentPage) return;
     setActivePreviewMessageId(null);
-    setImageAdoptionConfirmation(null);
+    setMediaAdoptionConfirmation(null);
     setHistoryPage(page);
   }
 
@@ -1159,14 +1245,14 @@ export function AssetGenerationHistoryDialog({
                       <p className="asset-generation-history-time">{displayTime(entry.message.created_at)}</p>
                       {isMedia && (
                         <div className="asset-generation-history-actions">
-                          {mode === "image" && imageAdoptionPort !== undefined && (
+                          {mediaAdoptionPort !== undefined && (
                             <button
                               className="secondary-button"
                               disabled={busyMessageId !== null}
-                              onClick={() => void prepareImageAdoption(entry)}
+                              onClick={() => void prepareMediaAdoption(entry)}
                               type="button"
                             >
-                              设为{assetType === "character" ? "角色图" : assetType === "scene" ? "场景图" : "道具图"}
+                              {adoptionActionLabel(mode, assetType)}
                             </button>
                           )}
                           <button
@@ -1203,26 +1289,28 @@ export function AssetGenerationHistoryDialog({
                           )}
                         </div>
                       )}
-                      {imageAdoptionConfirmation?.messageId === messageId && (
-                        <div className="asset-generation-history-confirm" role="group" aria-label="确认设置素材图片">
+                      {mediaAdoptionConfirmation?.messageId === messageId && (
+                        <div
+                          className="asset-generation-history-confirm"
+                          role="group"
+                          aria-label={mediaAdoptionConfirmation.mode === "image" ? "确认设置素材图片" : "确认采用历史视频"}
+                        >
                           <span>
-                            {imageAdoptionConfirmation.expectedImageUrl === null
-                              ? "将这张图片设为当前素材图。"
-                              : "将用这张生成图片替换当前素材图。"}
+                            {adoptionConfirmationPrompt(mediaAdoptionConfirmation)}
                           </span>
                           <button
                             className="primary-button"
                             disabled={busyMessageId !== null}
-                            onClick={() => void confirmImageAdoption(entry)}
+                            onClick={() => void confirmMediaAdoption(entry)}
                             type="button"
                           >
-                            确认设为{assetType === "character" ? "角色图" : assetType === "scene" ? "场景图" : "道具图"}
+                            {adoptionConfirmationLabel(mediaAdoptionConfirmation.mode, assetType)}
                           </button>
                           <button
                             className="secondary-button"
                             disabled={busyMessageId !== null}
                             onClick={() => {
-                              setImageAdoptionConfirmation(null);
+                              setMediaAdoptionConfirmation(null);
                               setActionNotice(null);
                             }}
                             type="button"
