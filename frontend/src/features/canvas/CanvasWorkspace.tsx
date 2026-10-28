@@ -562,6 +562,7 @@ export function CanvasWorkspace({
   const sourceBindingDraftRef = useRef(false);
   const [filter, setFilter] = useState<"all" | CanvasNodeKind>("all");
   const [selectedNode, setSelectedNode] = useState<string | null>(null);
+  const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
   const selectedNodeRef = useRef<string | null>(selectedNode);
   selectedNodeRef.current = selectedNode;
   const selectedNodeAttemptRef = useRef(0);
@@ -569,8 +570,8 @@ export function CanvasWorkspace({
     if (selectedNodeRef.current !== ref) selectedNodeAttemptRef.current += 1;
     selectedNodeRef.current = ref;
     setSelectedNode(ref);
+    if (ref !== null) setSelectedEdge(null);
   }
-  const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
   const [connectionSource, setConnectionSource] = useState<string | null>(null);
   const [closePrompt, setClosePrompt] = useState(false);
@@ -870,7 +871,6 @@ export function CanvasWorkspace({
     }
     const target = matches[0]!;
     setFilter("all");
-    setSelectedEdge(null);
     selectCanvasNode(target.ref);
 
     const viewportElement = viewportRef.current;
@@ -1052,6 +1052,7 @@ export function CanvasWorkspace({
       event.stopPropagation();
       return;
     }
+    if (event.button !== 0) return;
     if (node !== null) {
       event.stopPropagation();
       if (connecting) {
@@ -1059,8 +1060,10 @@ export function CanvasWorkspace({
         return;
       }
       selectCanvasNode(node.ref);
+    } else {
+      selectCanvasNode(null);
+      setSelectedEdge(null);
     }
-    if (event.button !== 0) return;
     event.currentTarget.setPointerCapture?.(event.pointerId);
     setDrag({
       pointerId: event.pointerId,
@@ -3564,7 +3567,11 @@ export function CanvasWorkspace({
                       className={edge.manual ? "canvas-edge is-manual" : "canvas-edge"}
                       d={"M " + x1 + " " + y1 + " C " + (x1 + bend) + " " + y1 + ", " + (x2 - bend) + " " + y2 + ", " + x2 + " " + y2}
                       key={edge.id}
-                      onClick={() => edge.manual && setSelectedEdge(edge.id)}
+                      onClick={() => {
+                        if (!edge.manual) return;
+                        selectCanvasNode(null);
+                        setSelectedEdge(edge.id);
+                      }}
                       stroke={selectedEdge === edge.id ? "#7c3aed" : undefined}
                     />
                   );
@@ -3584,7 +3591,7 @@ export function CanvasWorkspace({
                   key={node.key}
                   onClick={() => {
                     if (connecting) connectNodeFromClick(node);
-                    else { selectCanvasNode(node.ref); setSelectedEdge(null); }
+                    else selectCanvasNode(node.ref);
                   }}
                   onPointerDown={(event) => beginDrag(event, node)}
                   style={{ left: node.x, top: node.y, width: node.width, minHeight: node.height }}
@@ -3603,7 +3610,7 @@ export function CanvasWorkspace({
                       onClick={(event) => {
                         event.stopPropagation();
                         if (connecting) connectNodeFromClick(node);
-                        else { selectCanvasNode(node.ref); setSelectedEdge(null); }
+                        else selectCanvasNode(node.ref);
                       }}
                       onPointerDown={(event) => beginManualPortDrag(event, node, side)}
                       type="button"

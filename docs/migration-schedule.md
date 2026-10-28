@@ -1,8 +1,10 @@
 # HaoAI-next 完整剩余工作清单与排期
 
-更新日期：2026-10-27（北京时间）
+更新日期：2026-10-28（北京时间）
 
 本文依据已确认的 main 基线、历史开发分支和已接受收据校准完整剩余范围。它是唯一的迁移清单，不是新的架构设计，也不代表整站功能已验收。
+
+当前原动作剩余：**10 行开发、10 行接线、51 行验证/接受**（Root1222，类别重叠，不相加）。本次仅闭合 U07.1 的原开发动作，U07.2 完整编辑交互、U05.5 共享 HLS/m3u8 媒体兼容以及全部验收义务继续保留。下文较早计数按其历史时点解释。
 
 ## 当前基线与计数口径
 
@@ -215,7 +217,7 @@ family仍各自串行轮询，缺少dispatcher，因此容量高于已启用fami
 
 | ID | 交付内容 | 实现 | 接入 | 验证/验收 | 下一步 |
 | --- | --- | --- | --- | --- | --- |
-| U07.1 | 图结构、缩放平移、节点/边选择和布局 | P | C | V=P / A=U；章节图、布局、缩放平移及节点/边选择已接入，完整旧行为对照和浏览器矩阵仍待 | 补齐旧图编辑行为与真实章节/素材图、多用户、键盘和窄屏浏览器验收。 |
+| U07.1 | 图结构、缩放平移、节点/边选择和布局 | C | C | V=P / A=U；原图结构/视口/适应视图/选择/信息面板开发动作已由 Root1222 对账闭合，定向验证通过 | 真实章节/素材图、多用户、键盘和窄屏浏览器验收仍待；完整编辑交互见 U07.2，HLS/m3u8 兼容见 U05.5。 |
 | U07.2 | 节点编辑、手动连线、卡片/便签和撤销重做 | P | P | V=P / A=U；本地便签、卡片、手动关系和 50 步 undo 已接入；CAV02 来源后端已实现 GET/POST、8类命令、事务/CAS与受控创建撤销，Root659完整复核/修复复核及Root660冻结27文件223项通过。665已发布真实Workspace来源消费者，677已发布新增素材与媒体绑定修复；Root676冻结11文件367项及TSC/生产构建通过。688已发布旧index布局/手工边显示兼容和经证明的插帧连续性（含重复媒体槽与无媒体章节）；Root686复核、Root687-02冻结12个前端文件388项及TSC/生产构建通过。首次687的387项通过、1项旧断言失败保留为历史。CAV03/04和整行验收仍待 | 完成选中状态、未知字段、会话/锁边界、CAV03/04及整行验收；补齐真实浏览器接受。 |
 | U07.3 | 画布文档/视口保存、版本冲突和失败恢复 | C | C | V=P / A=U；opt-in guarded-v1 SQL id/version CAS、2 秒防抖和配对 receipt 已接入；unknown/conflict 会停止自动保存。840已将legacy blind-writer版本递增迁为基于数据库当前列的原子表达式，保留blind last-write-wins与id-only UPDATE；Root842真实临时PostgreSQL验证guarded v2→迟到legacy v3、旧v2 CAS拒绝、两个读取v1的legacy writer先后成功到v2/v3及0→2、-4→-3。该revision并发语义修订已同步当前repo spec；整行、完整浏览器失败恢复和部署混布接受仍待 | 保留guarded-v1的id/chapter/series/version CAS与配对receipt；继续完整失败恢复/浏览器验收、旧部署进程混布和剩余PG并发矩阵，不把legacy writer缺口重复列为未实现，也不因这组受控PG场景关闭整行。 |
 | U07.4 | 画布触发生成及 owned 结果应用 | P | P | V=P / A=U；authority/result reader 与 writer 已有。Root698复核并由Root699/700发布严格no-ID准入→producer→worker→owned receipt→P5 writer路径；no-ID生产路径已交付。Root714发布typed `canvasResultApplications` port，Root718发布只读application查询GET；Root728发布服务器canonical章节事实，Root732发布owned候选typed client，Root740发布generation PUT typed client，Root743发布索引候选HTTP、receipt projection、显式有界历史回补与v2 migration/readiness实现，Root747发布producer/P5三类素材完整digest一致修复。相应局部门禁分别为42后端/163前端、205前端、222前端、412后端、516后端项；范围重叠，不相加。C730 generation PUT服务端已由Root752-03发布；Root751-02相关后端冻结集合670项通过、0项跳过，首次668/670的旧inventory guard失败保留为历史。H742五路径UI已由Root749-02冻结复验240项通过并包含候选查询、原key PUT、unknown显式重试和锁获取；765/768/771的发布与分层验证见上节，现已接通无参考图、默认关闭的`image.single`路径。Root809发布每轮1–4个顺序提交的独立`image.single`任务（非`image.batch`），逐项冻结请求body/key并复核锁与target，保留部分回执；unknown只按原key核对/恢复，不自动补发后续未发送项，首张明确拒绝时保留表单。Root812参考图后端已发布；H813已发布React参考图候选选择、本地多图上传、配置/文件安全校验及准备后typed请求接线，unknown按冻结refs/body/key显式恢复（验证范围及限制见最新进展）。Root825发布统一用户任务准入，按五类AITask与四种在途状态计数；image.batch按N个任务、frame.optimize按1个任务核算，默认限额0且非正数关闭。其他原host provider及视频/批量host仍待接入；并发准入不代表batch host已完成，媒体传输2槽也不是用户任务并发上限。CAV04单图路径、owned图片读取与Canvas预览UI已接线；H791已接入可选提示词模板，H798/799已接入可选尺寸选择（详见最新进展）；H829已接入已受理`image.single`只读有界观察与原key恢复；Root849发布H846本轮completed任务的显式结果入口，按原`task_id`过滤当前已加载owned候选并由用户显式翻页/刷新、手动触发P5应用；unknown sibling仍拦截，详情见最新进展。U07.4为P/P、V=P/A=U。Canvas目标锁/CAS竞争及其他family完整PG矩阵、生产DB migration/backfill、真实Provider/Worker/R2生成到owned候选并应用的端到端验收、其他生成host的视频/批量、真实浏览器、用户暂缓的E2E及部署验收仍待 | 完成真实Provider/Worker/R2生成到owned候选并应用的端到端验收；验证owner、完成任务、当前权限、稳定目标/CAS和重复应用不增revision；补生产DB migration/backfill、真实浏览器验收、用户暂缓的E2E及部署接受。 |
@@ -754,3 +756,11 @@ Escape 优先取消端口拖线或两步连线并清除节点、边选择，再�
 任务中心在当前页存在排队、处理中或取消中的任务时，每次请求完成后等待3秒读取列表；保留现有卡片和独立打开的详情。终态停止轮询，后台标签暂停；账号、分页、服务或刷新变化阻断旧回包。连续失败退避并在3次后停止，手工刷新可恢复。回调函数身份改变不会启动额外请求，401使用最新回调。
 
 12项页面定向用例通过、8项跳过，Root完整两文件差异复核通过。合并最新画布主线后两文件SHA保持一致，整合TypeScript及Vite构建通过（341 modules，既有chunk警告），没有重复运行源码未变的定向测试。只交付任务列表观察，不据此关闭任务取消、恢复及U10.2整项；剩余11开发/10接入/51验证验收，类别重叠。端对端、真实外部服务与部署未执行。证据E/1213/manifest-final.json、E/1219/integrated-manifest.json、E/1219/publish-result.json。
+
+### 2026-10-28 Root1222：画布选择行为补齐与 U07.1 原开发动作闭合
+
+选择节点（含拖动、关联定位和新建便签）统一清除已选边；选择手工边清节点；左键空白平移清两者，右键不改变选择。选择本身不修改布局、历史或保存。4个行为在原代码上复现失败，修复后17项直接相关用例通过、30项跳过；合并当前主线后源码SHA不变，TypeScript和Vite通过（341 modules，既有chunk提示）。
+
+Root按1137原动作“迁移框图/节点边/视口、选中、适应视图与信息面板”复核：既有图/视图与章节接线、1208信息面板及导航、1214端口拖线、1217 Escape以及本次选择修复共同覆盖该开发动作。仅将U07.1开发P改C（接线原已C）；剩余降为10开发/10接线/51验证接受，三类重叠。不是U07.2全部编辑交互或全站完成；HLS/m3u8、真实浏览器/多用户/窄屏、A01–A39整项接受及部署仍待，E2E继续暂缓。
+
+证据E/1218/remaining-scope-readonly-audit.json、E/1220/final-manifest-v1.json、E/1222/canvas-review-final.json；发布以E/1222/publish-result.json为准。
