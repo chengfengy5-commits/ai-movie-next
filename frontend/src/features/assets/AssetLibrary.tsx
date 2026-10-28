@@ -35,7 +35,7 @@ import {
 } from "./media/CharacterAudioDialog";
 import {
   AssetGenerationHistoryDialog,
-  type AssetGenerationHistoryImageAdoptionPort,
+  type AssetGenerationHistoryMediaAdoptionPort,
 } from "./media/AssetGenerationHistoryDialog";
 import type {
   AssetImageDirectory,
@@ -1316,9 +1316,9 @@ export function AssetLibrary({
     return target;
   }
 
-  function generationHistoryImageAdoptionPort(
+  function generationHistoryMediaAdoptionPort(
     request: AssetGenerationHistoryRequest,
-  ): AssetGenerationHistoryImageAdoptionPort | undefined {
+  ): AssetGenerationHistoryMediaAdoptionPort | undefined {
     const supportsUpdate = request.category === "characters"
       ? services.updateCharacter !== undefined
       : request.category === "scenes"
@@ -1356,24 +1356,24 @@ export function AssetLibrary({
         : null;
     };
 
-    const updateImage = async (imageUrl: string, signal: AbortSignal): Promise<void> => {
+    const updateAssetMedia = async (mediaUrl: string, signal: AbortSignal): Promise<void> => {
       switch (request.category) {
         case "characters": {
           const update = services.updateCharacter;
-          if (update === undefined) throw new Error("角色图片更新接口不可用。");
-          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: imageUrl }, signal);
+          if (update === undefined) throw new Error("素材更新接口不可用。");
+          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: mediaUrl }, signal);
           return;
         }
         case "scenes": {
           const update = services.updateScene;
-          if (update === undefined) throw new Error("场景图片更新接口不可用。");
-          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: imageUrl }, signal);
+          if (update === undefined) throw new Error("素材更新接口不可用。");
+          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: mediaUrl }, signal);
           return;
         }
         case "props": {
           const update = services.updateProp;
-          if (update === undefined) throw new Error("道具图片更新接口不可用。");
-          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: imageUrl }, signal);
+          if (update === undefined) throw new Error("素材更新接口不可用。");
+          await update.call(services, request.scope.seriesId, request.asset.id, { image_url: mediaUrl }, signal);
         }
       }
     };
@@ -1391,28 +1391,28 @@ export function AssetLibrary({
         if (items === null) return { status: "not-current" };
         const target = findUniqueTarget(items);
         if (target === null) return { status: "conflict" };
-        const expectedImageUrl = request.asset.image_url;
+        const expectedMediaUrl = request.asset.image_url;
         publishGenerationHistoryAssets(request, items);
-        if (target.image_url !== expectedImageUrl) return { status: "conflict" };
-        return { status: "ready", imageUrl: target.image_url };
+        if (target.image_url !== expectedMediaUrl) return { status: "conflict" };
+        return { status: "ready", mediaUrl: target.image_url };
       },
       async apply(input, isHistoryCurrent) {
         const items = await listFresh(input.signal, isHistoryCurrent);
         if (items === null) return "not-current";
         const target = findUniqueTarget(items);
         if (target === null) return "conflict";
-        if (target.image_url !== input.expectedImageUrl) {
+        if (target.image_url !== input.expectedMediaUrl) {
           publishGenerationHistoryAssets(request, items);
-          return target.image_url === input.imageUrl ? "already-applied" : "conflict";
+          return target.image_url === input.mediaUrl ? "already-applied" : "conflict";
         }
-        if (target.image_url === input.imageUrl) {
+        if (target.image_url === input.mediaUrl) {
           publishGenerationHistoryAssets(request, items);
           return "already-applied";
         }
         if (!isOperationCurrent(input.signal, isHistoryCurrent)) return "not-current";
 
         try {
-          await updateImage(input.imageUrl, input.signal);
+          await updateAssetMedia(input.mediaUrl, input.signal);
         } catch (error) {
           if (!isOperationCurrent(input.signal, isHistoryCurrent)) return "not-current";
           if (definitelyRejected(error)) throw error;
@@ -1430,7 +1430,7 @@ export function AssetLibrary({
         }
         const updatedTarget = publishGenerationHistoryAssets(request, updatedItems);
         if (updatedTarget === null) return "unknown";
-        return updatedTarget.image_url === input.imageUrl ? "applied" : "unknown";
+        return updatedTarget.image_url === input.mediaUrl ? "applied" : "unknown";
       },
     };
   }
@@ -2818,7 +2818,7 @@ export function AssetLibrary({
           onUnauthorized={() => {
             if (isCurrentGenerationHistory(generationHistoryRequest)) unauthorizedHandlerRef.current();
           }}
-          imageAdoptionPort={generationHistoryImageAdoptionPort(generationHistoryRequest)}
+          mediaAdoptionPort={generationHistoryMediaAdoptionPort(generationHistoryRequest)}
           port={generationHistoryRequest.port}
           seriesId={series.id}
           seriesName={series.name}

@@ -52,7 +52,7 @@
 
 .admin-tasks-notice {
   margin: 0;
-  color: #91d6af;
+  color: var(--admin-success, #7bd3a0);
 }
 
 .admin-tasks-table-wrap {

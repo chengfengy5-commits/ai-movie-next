@@ -86,7 +86,7 @@
   place-items: center;
   overflow: hidden;
   border-radius: 8px;
-  background: #e9edf1;
+  background: var(--surface-muted);
 }
 
 .asset-image-preview-image {
@@ -157,7 +157,8 @@
   gap: 8px;
   padding: 10px 12px;
   border-radius: 8px;
-  background: #f2f7f3;
+  background: var(--success-soft);
+  color: var(--success);
 }
 
 .asset-image-upload-confirmation p {

@@ -1,0 +1,273 @@
+.chapter-generation-history-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgb(18 25 34 / 58%);
+}
+
+.chapter-generation-history-dialog {
+  display: flex;
+  width: min(980px, 100%);
+  max-height: min(92vh, 920px);
+  flex-direction: column;
+  gap: 0;
+  overflow: hidden;
+  border: 1px solid var(--border-color, #d8dee8);
+  border-radius: 16px;
+  background: var(--surface, #fff);
+  color: var(--text-primary, #18212d);
+  box-shadow: 0 24px 80px rgb(13 24 36 / 24%);
+}
+
+.chapter-generation-history-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 18px 22px;
+  border-bottom: 1px solid var(--border-color, #d8dee8);
+}
+
+.chapter-generation-history-heading .eyebrow {
+  margin: 0 0 6px;
+  color: var(--text-muted, #647184);
+  font-size: 12px;
+}
+
+.chapter-generation-history-heading h2 {
+  margin: 0;
+}
+
+.chapter-generation-history-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding: 14px 22px 8px;
+}
+
+.chapter-generation-history-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px;
+  border: 1px solid var(--border-color, #d8dee8);
+  border-radius: 9px;
+  background: var(--surface-muted, #f3f5f8);
+}
+
+.chapter-generation-history-switch button {
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-muted, #647184);
+  cursor: pointer;
+  font: inherit;
+}
+
+.chapter-generation-history-switch button.active {
+  background: var(--surface, #fff);
+  color: var(--text-primary, #18212d);
+  box-shadow: 0 1px 3px rgb(13 24 36 / 12%);
+}
+
+.chapter-generation-history-destination,
+.chapter-generation-history-readonly,
+.chapter-generation-history-notice,
+.chapter-generation-history-confirmation {
+  margin: 0 22px 12px;
+  color: var(--text-muted, #647184);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.chapter-generation-history-readonly {
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: var(--warning-soft, #fff7e9);
+  color: var(--warning, #9a5b0a);
+}
+
+.chapter-generation-history-notice,
+.chapter-generation-history-confirmation {
+  display: grid;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--border-color, #d8dee8);
+  border-radius: 10px;
+  background: var(--surface-muted, #f3f5f8);
+}
+
+.chapter-generation-history-notice p,
+.chapter-generation-history-confirmation p {
+  margin: 0;
+}
+
+.chapter-generation-history-notice.unknown {
+  border-color: var(--warning, #b86b16);
+  color: var(--warning, #9a5b0a);
+}
+
+.chapter-generation-history-notice.error {
+  border-color: var(--danger, #a72d37);
+  color: var(--danger, #a72d37);
+}
+
+.chapter-generation-history-notice.success {
+  border-color: var(--success, #1c7651);
+  color: var(--success, #1c7651);
+}
+
+.chapter-generation-history-notice.progress {
+  color: var(--text-muted, #647184);
+}
+
+.chapter-generation-history-body {
+  display: grid;
+  gap: 12px;
+  min-height: 120px;
+  overflow-y: auto;
+  padding: 8px 22px 18px;
+}
+
+.chapter-generation-history-body > p {
+  margin: 0;
+  color: var(--text-muted, #647184);
+  font-size: 13px;
+}
+
+.chapter-generation-history-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr));
+  gap: 14px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.chapter-generation-history-item {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--border-color, #d8dee8);
+  border-radius: 12px;
+  background: var(--surface, #fff);
+}
+
+.chapter-generation-history-preview {
+  display: grid;
+  min-height: 160px;
+  place-items: center;
+  overflow: hidden;
+  border-radius: 8px;
+  background: var(--surface-muted, #f3f5f8);
+}
+
+.chapter-generation-history-preview img,
+.chapter-generation-history-preview video {
+  display: block;
+  width: 100%;
+  max-height: 360px;
+  object-fit: contain;
+}
+
+.chapter-generation-history-time,
+.chapter-generation-history-model,
+.chapter-generation-history-unavailable {
+  margin: 0;
+  color: var(--text-muted, #647184);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
+.chapter-generation-history-prompt {
+  display: grid;
+  gap: 4px;
+  padding: 8px;
+  border-radius: 8px;
+  background: var(--surface-muted, #f3f5f8);
+  font-size: 12px;
+}
+
+.chapter-generation-history-prompt span {
+  color: var(--text-muted, #647184);
+  font-weight: 650;
+}
+
+.chapter-generation-history-prompt p {
+  max-height: 120px;
+  overflow: auto;
+  margin: 0;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
+}
+
+.chapter-generation-history-actions,
+.chapter-generation-history-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.chapter-generation-history-pagination span {
+  color: var(--text-muted, #647184);
+  font-size: 13px;
+}
+
+.chapter-generation-history-confirmation {
+  margin-top: 0;
+  margin-bottom: 18px;
+  border-color: var(--border-color, #d8dee8);
+  color: var(--text-primary, #18212d);
+}
+
+.chapter-generation-history-delete-confirmation {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--danger, #a72d37);
+  border-radius: 10px;
+  background: var(--surface-muted, #f3f5f8);
+  color: var(--text-primary, #18212d);
+}
+
+.chapter-generation-history-delete-confirmation p {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+@media (max-width: 640px) {
+  .chapter-generation-history-backdrop {
+    align-items: stretch;
+    padding: 8px;
+  }
+
+  .chapter-generation-history-dialog {
+    max-height: 96vh;
+    border-radius: 12px;
+  }
+
+  .chapter-generation-history-heading,
+  .chapter-generation-history-toolbar,
+  .chapter-generation-history-body {
+    padding-right: 14px;
+    padding-left: 14px;
+  }
+
+  .chapter-generation-history-destination,
+  .chapter-generation-history-readonly,
+  .chapter-generation-history-notice,
+  .chapter-generation-history-confirmation {
+    margin-right: 14px;
+    margin-left: 14px;
+  }
+}

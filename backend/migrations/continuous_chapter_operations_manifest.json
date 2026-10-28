@@ -1,0 +1,14 @@
+{
+  "format_version": 1,
+  "migrations": [
+    {
+      "version": "0005_continuous_chapter_operations",
+      "file": "0005_continuous_chapter_operations.sql",
+      "sha256": "97e6c591b6361dcb659819f81b97adf61e3e8ae9e7e169d3abf60c328c9f7c2d",
+      "tables": [
+        "continuous_chapter_operation_schema_migrations",
+        "continuous_chapter_operation_receipts"
+      ]
+    }
+  ]
+}

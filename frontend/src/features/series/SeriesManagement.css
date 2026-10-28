@@ -12,10 +12,10 @@
 .series-mutation-notice {
   margin: 12px 0 0;
   padding: 10px 13px;
-  border: 1px solid #cfe5dc;
+  border: 1px solid var(--success-border);
   border-radius: 8px;
-  color: #28695e;
-  background: #f2faf6;
+  color: var(--success);
+  background: var(--success-soft);
   font-size: 11px;
   line-height: 1.55;
 }
@@ -25,10 +25,10 @@
 .series-card-actions .series-share-action {
   min-height: 30px;
   padding: 0 10px;
-  border: 1px solid #dce7e2;
+  border: 1px solid var(--line);
   border-radius: 7px;
-  color: #526864;
-  background: #fff;
+  color: var(--ink);
+  background: var(--surface);
   font-size: 10px;
   font-weight: 620;
 }
@@ -36,28 +36,28 @@
 .series-card-actions .series-edit-action:hover,
 .series-card-actions .series-delete-action:hover,
 .series-card-actions .series-share-action:hover {
-  border-color: #a9d0c6;
-  background: #f3f9f6;
+  border-color: var(--line-strong);
+  background: var(--surface-muted);
 }
 
 .series-card-actions .series-delete-action {
-  border-color: #ead8d5;
-  color: #985b51;
+  border-color: var(--danger-border);
+  color: var(--danger);
 }
 
 .series-card-actions .series-delete-action:hover {
-  border-color: #d8b0a8;
-  background: #fff8f6;
+  border-color: var(--danger);
+  background: var(--danger-soft);
 }
 
 .series-card-actions .series-share-action {
-  border-color: #d2def2;
-  color: #3d5c91;
+  border-color: var(--info-border);
+  color: var(--info);
 }
 
 .series-card-actions .series-share-action:hover {
-  border-color: #adc2e4;
-  background: #f4f7fc;
+  border-color: var(--info-border);
+  background: var(--info-soft);
 }
 
 .series-empty-create {
@@ -80,9 +80,9 @@
   max-height: min(92vh, 850px);
   overflow-y: auto;
   padding: 24px;
-  border: 1px solid #e2e9e5;
+  border: 1px solid var(--line);
   border-radius: 14px;
-  background: #fff;
+  background: var(--surface);
   box-shadow: 0 24px 70px rgba(29, 52, 46, 0.22);
 }
 
@@ -96,24 +96,24 @@
 
 .series-dialog-heading .eyebrow {
   margin: 0 0 5px;
-  color: #6e8b82;
+  color: var(--muted);
   font-size: 10px;
   letter-spacing: 0.08em;
 }
 
 .series-dialog-heading h2 {
   margin: 0;
-  color: #293b39;
+  color: var(--ink);
   font-size: 20px;
 }
 
 .series-dialog .icon-button {
   width: 34px;
   height: 34px;
-  border: 1px solid #e0e8e4;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #6b7a76;
-  background: #fff;
+  color: var(--muted);
+  background: var(--surface);
   font-size: 21px;
 }
 
@@ -127,7 +127,7 @@
 .series-delete-confirmation {
   display: grid;
   gap: 7px;
-  color: #425552;
+  color: var(--ink);
   font-size: 11px;
   font-weight: 650;
 }
@@ -139,10 +139,10 @@
   width: 100%;
   min-height: 38px;
   padding: 9px 11px;
-  border: 1px solid #d8e2de;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #2c3d3a;
-  background: #fff;
+  color: var(--ink);
+  background: var(--surface);
   font: inherit;
   font-size: 12px;
   font-weight: 450;
@@ -158,29 +158,29 @@
 .series-editor-form select:focus-visible,
 .series-delete-confirmation input:focus-visible,
 .series-dialog button:focus-visible {
-  outline: 3px solid #a5d8cd;
+  outline: 3px solid var(--accent-soft);
   outline-offset: 2px;
 }
 
 .series-editor-form small {
-  color: #788986;
+  color: var(--muted);
   font-size: 10px;
   font-weight: 450;
   line-height: 1.5;
 }
 
 .series-editor-form .series-field-warning {
-  color: #946b42;
+  color: var(--warning);
 }
 
 .series-editor-form input[type="file"] {
   max-width: 100%;
-  color: #60716d;
+  color: var(--muted);
   font-size: 10px;
 }
 
 .series-field-label {
-  color: #425552;
+  color: var(--ink);
   font-size: 11px;
   font-weight: 650;
 }
@@ -190,7 +190,7 @@
   max-height: 170px;
   object-fit: cover;
   border-radius: 8px;
-  background: #f3f6f4;
+  background: var(--surface-muted);
 }
 
 .series-clear-cover {
@@ -198,7 +198,7 @@
 }
 
 .series-dialog-status {
-  color: #6e7d79;
+  color: var(--muted);
   font-size: 12px;
 }
 
@@ -208,16 +208,16 @@
   align-items: center;
   gap: 10px;
   margin: 0;
-  color: #9a514c;
+  color: var(--danger);
   font-size: 11px;
   line-height: 1.5;
 }
 
 .series-dialog-error[role="alert"] {
   padding: 10px 12px;
-  border: 1px solid #eed8d5;
+  border: 1px solid var(--danger-border);
   border-radius: 8px;
-  background: #fff9f8;
+  background: var(--danger-soft);
 }
 
 .series-verification {
@@ -225,10 +225,10 @@
   justify-items: start;
   gap: 8px;
   padding: 12px;
-  border: 1px solid #e5e9df;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #64726e;
-  background: #fbfcf8;
+  color: var(--ink);
+  background: var(--surface-subtle);
   font-size: 10px;
   line-height: 1.6;
 }
@@ -251,13 +251,13 @@
 }
 
 .series-verification dt {
-  color: #81908a;
+  color: var(--muted);
 }
 
 .series-verification dd {
   overflow-wrap: anywhere;
   margin: 0;
-  color: #3c504a;
+  color: var(--ink);
 }
 
 .series-dialog-actions {
@@ -274,17 +274,18 @@
 }
 
 .danger-button {
-  border: 1px solid #a8564d;
+  border: 1px solid var(--danger-fill);
   border-radius: 8px;
-  color: #fff;
-  background: #ae5e54;
+  color: var(--danger-on-fill);
+  background: var(--danger-fill);
   font: inherit;
   font-size: 11px;
   font-weight: 650;
 }
 
 .danger-button:hover:not(:disabled) {
-  background: #994b43;
+  background: var(--danger-fill-hover);
+  border-color: var(--danger-fill-hover);
 }
 
 .danger-button:disabled,
@@ -295,13 +296,13 @@
 
 .series-delete-copy {
   margin: 0 0 18px;
-  color: #6f7b78;
+  color: var(--muted);
   font-size: 12px;
   line-height: 1.7;
 }
 
 .series-delete-copy strong {
-  color: #344640;
+  color: var(--ink);
 }
 
 .series-delete-confirmation {
@@ -338,7 +339,7 @@
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  color: #785b37;
+  color: var(--warning);
   font-size: 11px;
   line-height: 1.5;
 }
@@ -355,7 +356,7 @@
 }
 
 .series-retry-confirmation input:focus-visible {
-  outline: 3px solid #a5d8cd;
+  outline: 3px solid var(--accent-soft);
   outline-offset: 2px;
 }
 
@@ -364,7 +365,7 @@
   overflow: auto;
   margin: 8px 0 0;
   padding-left: 20px;
-  color: #526864;
+  color: var(--ink);
   font-size: 10px;
   line-height: 1.6;
 }
@@ -379,7 +380,7 @@
 }
 
 .series-share-form label {
-  color: #526864;
+  color: var(--ink);
   font-size: 12px;
   font-weight: 650;
 }
@@ -388,10 +389,10 @@
   width: 100%;
   min-height: 38px;
   padding: 0 10px;
-  border: 1px solid #d7e1dc;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #334b46;
-  background: #fff;
+  color: var(--ink);
+  background: var(--surface);
   font: inherit;
 }
 
@@ -409,7 +410,7 @@
 
 .series-share-dialog .team-series-share-name {
   margin: 0;
-  color: #334b46;
+  color: var(--ink);
   font-weight: 650;
 }
 
@@ -417,10 +418,10 @@
   display: grid;
   gap: 8px;
   padding: 12px;
-  border: 1px solid #e9c99b;
+  border: 1px solid var(--warning-border);
   border-radius: 8px;
-  color: #73552e;
-  background: #fffaf1;
+  color: var(--warning);
+  background: var(--warning-soft);
   font-size: 12px;
   line-height: 1.5;
 }

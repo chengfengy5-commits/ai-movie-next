@@ -61,6 +61,21 @@ function renderEditor(fetcher: AdminFetcher) {
 }
 
 describe("admin system config editor", () => {
+  it("explains when public URL and service startup settings take effect", async () => {
+    const fetcher = vi.fn<AdminFetcher>(async () => jsonResponse(config()));
+    renderEditor(fetcher);
+
+    await screen.findByLabelText("Worker 最大并发");
+    expect(screen.getByText(/生成新密码重置链接时优先使用应用显式设置的前端地址/))
+      .toHaveTextContent("后续新链接");
+    expect(screen.getByText(/浏览器跨域来源规则在 API 服务启动时读取/))
+      .toHaveTextContent("重启服务");
+    expect(screen.getByText(/文件读取时会动态查询此目录/))
+      .toHaveTextContent("不代表所有上传流程");
+    expect(screen.getByText(/启用 Worker 的主机在启动时读取此上限/))
+      .toHaveTextContent("重启 Worker 服务");
+  });
+
   it("keeps an empty legacy list read-only and retries only the list GET", async () => {
     const user = userEvent.setup();
     const fetcher = vi.fn<AdminFetcher>(async () => jsonResponse({ data: [], total: 0 }));

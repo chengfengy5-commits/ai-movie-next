@@ -148,8 +148,8 @@
 }
 
 .account-security-primary {
-  background: var(--accent-strong, #24577c);
-  color: #fff;
+  background: var(--accent-fill);
+  color: var(--accent-on-fill);
 }
 
 .account-security-secondary {

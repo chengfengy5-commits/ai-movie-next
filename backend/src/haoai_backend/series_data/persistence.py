@@ -12,6 +12,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from haoai_backend.authentication.avatar import resolve_avatar_url
+from haoai_backend.asset_data.persistence import SqlAlchemyAssetDataUnitOfWork
+from haoai_backend.asset_data.presentation import asset_response
+from haoai_backend.asset_data.schemas import CharacterCreate, PropCreate, SceneCreate
 from haoai_backend.series_access.application import require_series_access
 from haoai_backend.series_access.domain import ActorIdentity, parse_team_permissions
 from haoai_backend.series_access.errors import SeriesAccessDenied, SeriesNotFound
@@ -28,6 +31,8 @@ from .chapter_edit_guard import (
     strict_json_equal,
     validate_frame_sources,
 )
+from .continuous_operation_receipts import operation_receipts
+from .continuous_operation_schema import check_continuous_operation_schema
 from .ports import SeriesDataUnitOfWork
 from .schemas import ChapterEditGuard
 from .storyboard import chat_index_mapping
@@ -71,6 +76,38 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
     def ensure_clean(self) -> None:
         if self._session.new or self._session.dirty or self._session.deleted:
             raise RuntimeError("series-data requires a clean request-scoped Session")
+
+    def continuous_operation_schema_ready(self) -> bool:
+        return check_continuous_operation_schema(self._session.connection()).status == "ready"
+
+    def begin_continuous_operation(self) -> None:
+        self._session.begin()
+        if self._session.get_bind().dialect.name == "sqlite":
+            self._session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+    def continuous_operation_savepoint(self):
+        return self._session.begin_nested()
+
+    def get_continuous_operation_receipt(
+        self,
+        owner_id: str,
+        operation_id: str,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None:
+        statement = select(operation_receipts).where(
+            operation_receipts.c.owner_id == owner_id,
+            operation_receipts.c.operation_id == operation_id,
+        )
+        if for_update:
+            statement = statement.with_for_update()
+        row = self._session.execute(statement).mappings().first()
+        return dict(row) if row is not None else None
+
+    def insert_continuous_operation_receipt(self, values: Any) -> None:
+        result = self._session.execute(insert(operation_receipts).values(**dict(values)))
+        if result.rowcount != 1:
+            raise RuntimeError("continuous operation receipt insert did not affect one row")
 
     def require_access(self, actor: TrustedActor, series_id: str) -> None:
         try:
@@ -371,12 +408,15 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
         content: list[dict[str, Any]],
         guard: ChapterEditGuard,
         now: datetime,
+        *,
+        caller_owned_transaction: bool = False,
     ) -> ChapterRecord:
-        """Conditionally update a complete chapter in one series-data transaction."""
-        self._session.begin()
-        dialect = self._session.get_bind().dialect.name
-        if dialect == "sqlite":
-            self._session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        """Conditionally update a complete chapter, optionally leaving commit to the caller."""
+        if caller_owned_transaction:
+            if not self._session.in_transaction():
+                raise RuntimeError("caller-owned chapter edit requires an active transaction")
+        else:
+            self.begin_continuous_operation()
 
         try:
             locator = self._session.execute(
@@ -582,17 +622,190 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
             ).mappings().first()
             if result is None:
                 raise SeriesDataNotFound("章节不存在")
-            self._session.commit()
+            if not caller_owned_transaction:
+                self._session.commit()
             return _chapter_record(result)
         except ChapterEditGuardInvalid as exc:
-            self._session.rollback()
+            if not caller_owned_transaction:
+                self._session.rollback()
             raise SeriesDataBadRequest(str(exc)) from exc
         except ChapterEditGuardConflict as exc:
-            self._session.rollback()
+            if not caller_owned_transaction:
+                self._session.rollback()
             raise SeriesDataConflict(str(exc)) from exc
         except Exception:
-            self._session.rollback()
+            if not caller_owned_transaction:
+                self._session.rollback()
             raise
+
+    def stage_update_chapter_guarded(
+        self,
+        actor: TrustedActor,
+        chapter_id: str,
+        content: list[dict[str, Any]],
+        guard: ChapterEditGuard,
+        now: datetime,
+    ) -> ChapterRecord:
+        return self.update_chapter_guarded(
+            actor,
+            chapter_id,
+            content,
+            guard,
+            now,
+            caller_owned_transaction=True,
+        )
+
+    def stage_create_continuous_asset(
+        self,
+        actor: TrustedActor,
+        series_id: str,
+        chapter_id: str,
+        asset_kind: str,
+        values: Any,
+        source_context: ChapterEditGuard,
+        now: datetime,
+    ) -> dict[str, Any]:
+        if not self._session.in_transaction():
+            raise RuntimeError("continuous asset creation requires an active transaction")
+        if asset_kind not in {"character", "scene", "prop"}:
+            raise SeriesDataBadRequest("连续编辑只支持创建角色、场景或道具")
+        if (
+            source_context.expected_chapter_id != chapter_id
+            or source_context.expected_series_id != series_id
+        ):
+            raise SeriesDataBadRequest("素材来源章节或剧集与路径不一致")
+        self._verify_continuous_operation_source(actor, chapter_id, source_context, now)
+
+        input_models = {
+            "character": CharacterCreate,
+            "scene": SceneCreate,
+            "prop": PropCreate,
+        }
+        asset_input = input_models[asset_kind].model_validate(dict(values))
+        asset_values = asset_input.model_dump()
+        asset_values["series_id"] = series_id
+        asset_uow = SqlAlchemyAssetDataUnitOfWork(
+            self._session,
+            now=lambda: now,
+            new_id=self._new_id,
+        )
+        row = asset_uow.create_asset(asset_kind, asset_values)
+        self.verify_continuous_operation_lock(
+            actor,
+            series_id,
+            chapter_id,
+            source_context,
+            self._now(),
+        )
+        return asset_response(asset_kind, row)
+
+    def verify_continuous_operation_lock(
+        self,
+        actor: TrustedActor,
+        series_id: str,
+        chapter_id: str,
+        guard: ChapterEditGuard,
+        now: datetime,
+    ) -> None:
+        series_row = self._session.execute(
+            select(series.c.id, series.c.team_id).where(series.c.id == series_id).with_for_update()
+        ).mappings().first()
+        if series_row is None:
+            raise SeriesDataNotFound("剧集不存在")
+        lock_row = self._session.execute(
+            select(chapter_locks)
+            .where(chapter_locks.c.chapter_id == chapter_id)
+            .with_for_update()
+        ).mappings().first()
+        lock_identity = guard.expected_lock_identity
+        if series_row["team_id"]:
+            acquired_at = _parse_lock_timestamp(lock_identity.acquired_at) if lock_identity else None
+            if (
+                lock_row is None
+                or lock_identity is None
+                or lock_row["user_id"] != actor.user_id
+                or lock_identity.user_id != actor.user_id
+                or _as_utc_naive(lock_row["acquired_at"]) != acquired_at
+                or _as_utc_naive(lock_row["expires_at"]) <= _as_utc_naive(now)
+            ):
+                raise SeriesDataConflict("编辑锁已变化或在操作完成前过期")
+        elif lock_identity is not None:
+            raise SeriesDataBadRequest("个人剧集不能提交团队编辑锁身份")
+
+    def _verify_continuous_operation_source(
+        self,
+        actor: TrustedActor,
+        chapter_id: str,
+        guard: ChapterEditGuard,
+        now: datetime,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]] | None]:
+        locator = self._session.execute(
+            select(chapters.c.series_id).where(chapters.c.id == chapter_id)
+        ).scalar_one_or_none()
+        if locator is None:
+            raise SeriesDataNotFound("章节不存在")
+        series_row = self._session.execute(
+            select(series).where(series.c.id == locator).with_for_update()
+        ).mappings().first()
+        if series_row is None:
+            raise SeriesDataNotFound("剧集不存在")
+        chapter_row = self._session.execute(
+            select(chapters).where(chapters.c.id == chapter_id).with_for_update()
+        ).mappings().first()
+        if chapter_row is None:
+            raise SeriesDataNotFound("章节不存在")
+        if chapter_row["series_id"] != locator:
+            raise SeriesDataConflict("章节所属剧集已变化")
+        self.require_access(actor, locator)
+
+        if guard.expected_chapter_id != chapter_id or guard.expected_series_id != locator:
+            raise SeriesDataConflict("章节或剧集身份与编辑基线不一致")
+        if guard.expected_order != chapter_row["order"]:
+            raise SeriesDataConflict("章节顺序已变化")
+        old_frames = decode_chapter_content(chapter_row["content"])
+        if not strict_json_equal(old_frames, guard.expected_content):
+            raise SeriesDataConflict("章节内容已变化")
+
+        baseline_rows = self._session.execute(
+            select(storyboard_assets)
+            .where(storyboard_assets.c.chapter_id == chapter_id)
+            .order_by(storyboard_assets.c.id)
+            .with_for_update()
+        ).mappings().all()
+        expected_rows = sorted(
+            (item.id, item.series_id, item.chapter_id, item.frame_index)
+            for item in guard.expected_storyboards
+        )
+        actual_rows = sorted(
+            (row["id"], row["series_id"], row["chapter_id"], row["frame_index"])
+            for row in baseline_rows
+        )
+        if expected_rows != actual_rows:
+            raise SeriesDataConflict("分镜素材目录已变化")
+        rows_by_id = {row["id"]: row for row in baseline_rows}
+        if len(rows_by_id) != len(baseline_rows):
+            raise SeriesDataConflict("分镜素材编号重复，无法安全执行")
+        for frame_index, frame in enumerate(old_frames or []):
+            storyboard_id = _guard_storyboard_id(frame)
+            if storyboard_id is None:
+                continue
+            row = rows_by_id.get(storyboard_id)
+            if (
+                row is None
+                or row["series_id"] != locator
+                or row["chapter_id"] != chapter_id
+                or row["frame_index"] != frame_index
+            ):
+                raise SeriesDataConflict("原镜头分镜素材身份或位置已变化")
+
+        self.verify_continuous_operation_lock(
+            actor,
+            locator,
+            chapter_id,
+            guard,
+            self._now(),
+        )
+        return dict(chapter_row), old_frames
 
     def delete_frame_first_phase(self, chapter: ChapterRecord, actor: TrustedActor, frame_index: int, frames: list[Any]) -> ChapterRecord:
         encoded = serialize_content(frames, ensure_ascii=False)

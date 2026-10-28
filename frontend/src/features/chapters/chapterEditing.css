@@ -10,7 +10,7 @@
 
 .chapter-editing-help {
   margin: 0 0 14px;
-  color: #738582;
+  color: var(--muted);
   font-size: 12px;
   line-height: 1.6;
 }
@@ -30,20 +30,20 @@
   gap: 10px;
   min-height: 48px;
   padding: 6px 9px;
-  border: 1px solid #e4ece9;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #34484a;
+  color: var(--ink);
   outline: none;
 }
 
 .chapter-order-item:focus-visible,
 .chapter-order-item.active {
-  border-color: #83b8a9;
+  border-color: var(--teal);
   box-shadow: 0 0 0 2px rgba(62, 139, 119, 0.12);
 }
 
 .chapter-order-position {
-  color: #718985;
+  color: var(--muted);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
@@ -61,22 +61,22 @@
 .chapter-order-controls button {
   min-height: 32px;
   padding: 0 9px;
-  border: 1px solid #dce8e3;
+  border: 1px solid var(--line);
   border-radius: 6px;
-  color: #376d62;
-  background: #fff;
+  color: var(--teal-deep);
+  background: var(--surface);
   font-size: 11px;
 }
 
 .chapter-order-controls button:disabled {
-  color: #a1aeab;
+  color: var(--muted);
   cursor: not-allowed;
 }
 
 .frame-text-editor-label {
   display: grid;
   gap: 8px;
-  color: #405557;
+  color: var(--ink);
   font-size: 12px;
   font-weight: 650;
 }
@@ -85,10 +85,10 @@
   width: 100%;
   min-height: 160px;
   padding: 11px 12px;
-  border: 1px solid #dce7e3;
+  border: 1px solid var(--line);
   border-radius: 8px;
-  color: #35484a;
-  background: #fbfdfc;
+  color: var(--ink);
+  background: var(--surface-subtle);
   font: inherit;
   font-size: 13px;
   font-weight: 400;
@@ -97,7 +97,7 @@
 }
 
 .frame-text-editor-label textarea:focus-visible {
-  border-color: #69a28f;
+  border-color: var(--teal);
   outline: 3px solid rgba(62, 139, 119, 0.13);
 }
 
@@ -106,15 +106,15 @@
   margin: 0 0 14px;
   padding: 10px 12px;
   border-radius: 7px;
-  color: #735d37;
-  background: #fbf8f0;
+  color: var(--warning);
+  background: var(--warning-soft);
   font-size: 12px;
   line-height: 1.6;
 }
 
 .frame-text-server-value {
-  color: #4e6661;
-  background: #f4f8f6;
+  color: var(--ink);
+  background: var(--surface-muted);
 }
 
 .frame-text-server-value strong {
@@ -172,7 +172,7 @@
 .frame-text-edit-button {
   min-height: 30px;
   padding: 0 5px;
-  color: #39786a;
+  color: var(--teal-deep);
   font-size: 10px;
   white-space: nowrap;
 }

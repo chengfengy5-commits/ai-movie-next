@@ -25,6 +25,8 @@ import { createFusedGenerationHttp } from "./fusedGenerationHttp";
 import type { FusedGenerationPort } from "./fusedGeneration";
 import { createAssetGenerationHistoryHttpPort } from "./assetGenerationHistoryHttp";
 import type { AssetGenerationHistoryPort } from "./assetGenerationHistory";
+import { createChapterGenerationHistoryHttpPort } from "./chapterGenerationHistoryHttp";
+import type { ChapterGenerationHistoryPort } from "./chapterGenerationHistory";
 import { createChatAssistantHttpPort } from "./chatAssistantHttp";
 import type { ChatAssistantPort } from "./chatAssistant";
 import { createCanvasOwnedImageHttpPort } from "./canvasOwnedImageHttp";
@@ -221,10 +223,16 @@ import {
   MOCK_USER_KEY,
   type StorageLike,
 } from "./storage";
+import {
+  parseContinuousChapterOperationLookup,
+  parseContinuousChapterOperationResponse,
+  type ContinuousChapterOperationsPort,
+} from "./continuousChapterOperations";
 
 export interface WorkspaceServices {
   readonly mode: AppMode;
   readonly apiBaseUrl: string | null;
+  readonly continuousChapterOperationStorage?: StorageLike;
   readonly accountAccess?: AccountAccessService;
   readonly accountProfile?: AccountProfileServicePort;
   readonly accountMembership?: AccountMembershipServicePort;
@@ -246,6 +254,7 @@ export interface WorkspaceServices {
   readonly assetReplacement?: AssetReplacementPort;
   readonly assetImageUpload?: AssetImageUploadPort;
   readonly assetGenerationHistory?: AssetGenerationHistoryPort;
+  readonly chapterGenerationHistory?: ChapterGenerationHistoryPort;
   readonly characterAudio?: CharacterAudioPort;
   readonly storyboardAssetGeneration?: StoryboardAssetGenerationServicePort;
   readonly canvasData?: CanvasDataPort;
@@ -262,7 +271,11 @@ export interface WorkspaceServices {
   readonly userPreferences?: UserPreferencesPort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
-  getContinuousChapterEditCapabilities?(signal: AbortSignal): Promise<{ readonly chapterEditGuard: 1 }>;
+  getContinuousChapterEditCapabilities?(signal: AbortSignal): Promise<{
+    readonly chapterEditGuard: 1;
+    readonly operationReceipt?: 1;
+  }>;
+  readonly continuousChapterOperations?: ContinuousChapterOperationsPort;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
   getChapterEditLock?(
@@ -2127,6 +2140,8 @@ type ApiEndpoint =
   | "uploadSeriesCover"
   | "chapters"
   | "chapterEditGuardCapabilities"
+  | "continuousChapterOperationSubmit"
+  | "continuousChapterOperationLookup"
   | "createChapter"
   | "reorderChapters"
   | "getChapterEditLock"
@@ -2192,6 +2207,33 @@ interface ApiRequestDefinition {
   expectedStatus?: number;
 }
 
+const rawJsonBodyText = Symbol("continuous-operation-raw-json");
+const continuousOperationResponseStatus = Symbol("continuous-operation-http-status");
+type RawJsonRequestBody = { readonly [rawJsonBodyText]: string };
+type ContinuousOperationStatusPayload = { readonly [continuousOperationResponseStatus]?: number };
+
+function rawJsonRequestBody(bodyJson: string): RawJsonRequestBody {
+  return { [rawJsonBodyText]: bodyJson };
+}
+
+function isRawJsonRequestBody(body: object | FormData | RawJsonRequestBody): body is RawJsonRequestBody {
+  return rawJsonBodyText in body && typeof (body as RawJsonRequestBody)[rawJsonBodyText] === "string";
+}
+
+function addContinuousOperationResponseStatus(value: unknown, status: number): unknown {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return value;
+  Object.defineProperty(value, continuousOperationResponseStatus, { value: status, enumerable: false });
+  return value;
+}
+
+function requireContinuousOperationResponseStatus(value: unknown): number {
+  if (typeof value === "object" && value !== null) {
+    const status = (value as ContinuousOperationStatusPayload)[continuousOperationResponseStatus];
+    if (Number.isInteger(status)) return status!;
+  }
+  throw new InvalidResponseError("连续编辑原操作缺少实际 HTTP 响应状态。");
+}
+
 function apiRequestDefinition(
   endpoint: ApiEndpoint,
   identifiers?: {
@@ -2206,6 +2248,7 @@ function apiRequestDefinition(
     promptId?: string;
     sessionId?: string;
     providerQuotaAccountId?: string;
+    operationId?: string;
   },
 ): ApiRequestDefinition {
   if (endpoint === "login") {
@@ -2316,6 +2359,15 @@ function apiRequestDefinition(
   }
   if (endpoint === "chapterEditGuardCapabilities") {
     return { path: "/chapters/continuous-edit/capabilities", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "continuousChapterOperationSubmit" || endpoint === "continuousChapterOperationLookup") {
+    const chapterId = encodeApiPathId(identifiers?.chapterId, "章节");
+    const operationId = encodeApiPathId(identifiers?.operationId, "原操作");
+    return {
+      path: `/chapters/${chapterId}/continuous-edit/operations/${operationId}`,
+      method: endpoint === "continuousChapterOperationSubmit" ? "POST" : "GET",
+      expectedStatus: 200,
+    };
   }
   if (endpoint === "frameOptimizeSubmit") {
     return { path: "/chat/frame-optimize", method: "POST", expectedStatus: 200 };
@@ -2579,7 +2631,7 @@ export function createApiServices(
     endpoint: ApiEndpoint,
     token: string | null,
     signal: AbortSignal,
-    body?: object | FormData,
+    body?: object | FormData | RawJsonRequestBody,
     identifiers?: {
       seriesId?: string;
       chapterId?: string;
@@ -2592,6 +2644,7 @@ export function createApiServices(
       promptId?: string;
       sessionId?: string;
       providerQuotaAccountId?: string;
+      operationId?: string;
     },
     requestBaseUrl = apiBaseUrl,
     requestTimeoutMs = timeoutMs,
@@ -2601,6 +2654,9 @@ export function createApiServices(
     const timed = timeoutSignal(signal, requestTimeoutMs);
     const headers = new Headers({ Accept: "application/json" });
     const multipartBody = typeof FormData !== "undefined" && body instanceof FormData ? body : undefined;
+    const rawJson = body !== undefined && multipartBody === undefined && isRawJsonRequestBody(body)
+      ? body[rawJsonBodyText]
+      : undefined;
     if (body !== undefined && multipartBody === undefined) {
       headers.set("Content-Type", "application/json");
     }
@@ -2621,7 +2677,7 @@ export function createApiServices(
       response = await fetcher(url, {
         method: requestDefinition.method,
         headers,
-        ...(body === undefined ? {} : { body: multipartBody ?? JSON.stringify(body) }),
+        ...(body === undefined ? {} : { body: multipartBody ?? rawJson ?? JSON.stringify(body) }),
         signal: timed.signal,
         credentials: "omit",
         cache: "no-store",
@@ -2699,6 +2755,9 @@ export function createApiServices(
       throw new ApiError("timeout", "请求超时，请稍后重试。");
     }
     if (!response.ok) {
+      if (endpoint === "continuousChapterOperationSubmit" && (response.status === 400 || response.status === 409)) {
+        return addContinuousOperationResponseStatus(payload, response.status);
+      }
       const detail = parseErrorDetail(payload);
       throw new ApiError(
         "http",
@@ -2707,7 +2766,9 @@ export function createApiServices(
         detail,
       );
     }
-    return payload;
+    return endpoint === "continuousChapterOperationSubmit" || endpoint === "continuousChapterOperationLookup"
+      ? addContinuousOperationResponseStatus(payload, response.status)
+      : payload;
   }
 
   function saveAuthenticatedUser(token: string, user: User): void {
@@ -2719,7 +2780,7 @@ export function createApiServices(
     endpoint: ApiEndpoint,
     token: string,
     signal: AbortSignal,
-    body?: object | FormData,
+    body?: object | FormData | RawJsonRequestBody,
     identifiers?: {
       seriesId?: string;
       chapterId?: string;
@@ -2732,6 +2793,7 @@ export function createApiServices(
       promptId?: string;
       sessionId?: string;
       providerQuotaAccountId?: string;
+      operationId?: string;
     },
     requestTimeoutMs?: number,
   ): Promise<unknown> {
@@ -3132,6 +3194,31 @@ export function createApiServices(
   return {
     mode: "api",
     apiBaseUrl,
+    continuousChapterOperationStorage: storage,
+    continuousChapterOperations: {
+      async submit(chapterId, operationId, bodyJson, signal) {
+        const token = requireApiToken(storage);
+        const payload = await requestForCurrentApiSession(
+          "continuousChapterOperationSubmit",
+          token,
+          signal,
+          rawJsonRequestBody(bodyJson),
+          { chapterId, operationId },
+        );
+        return parseContinuousChapterOperationResponse(payload, requireContinuousOperationResponseStatus(payload));
+      },
+      async lookup(chapterId, operationId, signal) {
+        const token = requireApiToken(storage);
+        const payload = await requestForCurrentApiSession(
+          "continuousChapterOperationLookup",
+          token,
+          signal,
+          undefined,
+          { chapterId, operationId },
+        );
+        return parseContinuousChapterOperationLookup(payload, requireContinuousOperationResponseStatus(payload));
+      },
+    },
     createMediaExportSession(isCurrent) {
       const token = requireApiToken(storage);
       return captureMediaExportSession({
@@ -3249,6 +3336,12 @@ export function createApiServices(
       pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
     }),
     assetGenerationHistory: createAssetGenerationHistoryHttpPort(apiBaseUrl, {
+      storage,
+      fetcher,
+      timeoutMs,
+      pageUrl: typeof window === "undefined" ? "http://127.0.0.1/" : window.location.href,
+    }),
+    chapterGenerationHistory: createChapterGenerationHistoryHttpPort(apiBaseUrl, {
       storage,
       fetcher,
       timeoutMs,
@@ -3470,8 +3563,15 @@ export function createApiServices(
         || (features as Record<string, unknown>).chapter_edit_guard !== 1) {
         throw new InvalidResponseError("当前服务未声明支持安全的整章编辑保存。");
       }
+      const operationReceipt = (features as Record<string, unknown>).continuous_edit_operation_receipt;
+      if (operationReceipt !== undefined && operationReceipt !== 1) {
+        throw new InvalidResponseError("连续编辑原操作能力声明格式无效。");
+      }
       ensureCurrentApiSession(storage, token, signal);
-      return { chapterEditGuard: 1 as const };
+      return {
+        chapterEditGuard: 1 as const,
+        ...(operationReceipt === 1 ? { operationReceipt: 1 as const } : {}),
+      };
     },
     async createChapter(seriesId, input, signal) {
       const token = requireApiToken(storage);

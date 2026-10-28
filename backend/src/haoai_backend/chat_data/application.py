@@ -71,8 +71,9 @@ def update_chat_message(
         if message is None:
             raise ChatDataNotFound("消息不存在")
         series_id = uow.load_chapter_series_id(path_chapter_id)
-        if series_id is not None:
-            uow.require_access(actor, series_id)
+        if series_id is None:
+            raise ChatDataNotFound("章节不存在")
+        uow.require_access(actor, series_id)
         if message.content != content:
             uow.update_chat_message_content(message_id, path_chapter_id, content)
         uow.commit()
@@ -96,8 +97,9 @@ def get_asset_chat_messages(
     uow = _open(factory)
     try:
         series_id = uow.load_chapter_series_id(chapter_id)
-        if series_id is not None:
-            uow.require_access(actor, series_id)
+        if series_id is None:
+            raise ChatDataNotFound("章节不存在")
+        uow.require_access(actor, series_id)
         return [
             chat_message_payload(row)
             for row in uow.list_asset_chat_messages(chapter_id, asset_type, asset_id, chat_mode)
