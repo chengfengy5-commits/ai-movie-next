@@ -13,6 +13,10 @@ import {
   type TaskRequestRecord,
 } from "../../shared/api/taskDetails";
 import { MyTasksPage } from "./MyTasksPage";
+import {
+  createTaskControlPendingScope,
+  writeTaskControlPendingMarker,
+} from "./taskControlPending";
 
 const user: User = {
   id: "fixture-user",
@@ -81,12 +85,14 @@ function renderPage(
   services: WorkspaceServices,
   onBack = vi.fn(),
   onUnauthorized = vi.fn(),
+  sessionGeneration = 0,
 ) {
   const view = render(
     <MyTasksPage
       onBack={onBack}
       onUnauthorized={onUnauthorized}
       services={services}
+      sessionGeneration={sessionGeneration}
       userId={user.id}
     />,
   );
@@ -107,6 +113,7 @@ describe("read-only task page", () => {
   afterEach(() => {
     cleanup();
     vi.useRealTimers();
+    window.localStorage.clear();
   });
 
   it("observes active task progress serially, keeps the open detail stable, and stops at terminal status", async () => {
@@ -131,6 +138,8 @@ describe("read-only task page", () => {
 
     await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
     expect(listMyTasks).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("dialog", { name: "任务详情" })).toBeInTheDocument();
+    expect(screen.getByText("详情独立来源")).toBeInTheDocument();
     const pollSignal = listMyTasks.mock.calls[1]?.[1];
     expect(pollSignal).toBeInstanceOf(AbortSignal);
     await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
@@ -151,6 +160,26 @@ describe("read-only task page", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
     expect(listMyTasks).toHaveBeenCalledTimes(3);
     expect(getTaskReceipt).toHaveBeenCalledTimes(1);
+  });
+
+  it("automatically observes reconciling tasks and stops after a terminal update", async () => {
+    vi.useFakeTimers();
+    const reconciling = task("task-reconciling", { status: "reconciling", progress: 73 });
+    const completed = task("task-reconciling", { status: "completed", progress: 100 });
+    const listMyTasks = vi.fn()
+      .mockResolvedValueOnce(page(1, [reconciling]))
+      .mockResolvedValueOnce(page(1, [completed]));
+    renderPage(servicesFor(listMyTasks));
+
+    await act(async () => { await Promise.resolve(); });
+    expect(listMyTasks).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("article", { name: "图片，已完成" })).toBeInTheDocument();
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
   });
 
   it("keeps callback-only rerenders from starting a competing list read", async () => {
@@ -194,6 +223,65 @@ describe("read-only task page", () => {
     });
     expect(firstUnauthorized).not.toHaveBeenCalled();
     expect(latestUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
+  it("refreshes the task list after cancel without closing the open detail", async () => {
+    window.localStorage.clear();
+    const queued = task("task-page-cancel", { status: "queued", chapter_title: "取消前的列表快照" });
+    const completed = task("task-page-cancel", { status: "completed", chapter_title: "独立核对后的列表快照" });
+    const listMyTasks = vi.fn()
+      .mockResolvedValueOnce(page(1, [queued]))
+      .mockResolvedValueOnce(page(1, [completed]));
+    const getTaskControls = vi.fn()
+      .mockResolvedValueOnce({ taskId: queued.id, status: "queued", cancel: { allowed: true, reason: "available" } })
+      .mockResolvedValueOnce({ taskId: queued.id, status: "queued", cancel: { allowed: true, reason: "available" } })
+      .mockResolvedValueOnce({ taskId: queued.id, status: "completed", cancel: { allowed: false, reason: "terminal" } });
+    const cancelTask = vi.fn(async () => ({ taskId: queued.id, status: "cancelling" }));
+    const base = servicesFor(listMyTasks);
+    const services = { ...base, getTaskControls, cancelTask };
+    renderPage(services);
+
+    await screen.findByText("取消前的列表快照");
+    fireEvent.click(screen.getByRole("button", { name: "查看详情：图片" }));
+    await screen.findByRole("dialog", { name: "任务详情" });
+    await screen.findByText("queued");
+    fireEvent.click(screen.getByRole("button", { name: "请求取消" }));
+    fireEvent.click(screen.getByRole("button", { name: "确认并请求取消" }));
+
+    await screen.findByText("独立核对后的列表快照");
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+    expect(cancelTask).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("dialog", { name: "任务详情" })).toBeInTheDocument();
+  });
+
+  it("lets an open detail own task observation instead of polling the same task in the list", async () => {
+    vi.useFakeTimers();
+    const active = task("task-detail-observer", { status: "processing" });
+    const listMyTasks = vi.fn(async () => page(1, [active]));
+    const scope = createTaskControlPendingScope(user.id, "http://127.0.0.1:4175/api", active.id);
+    if (scope === null) throw new Error("Expected a valid task marker scope.");
+    writeTaskControlPendingMarker(scope);
+    const getTaskControls = vi.fn(async () => ({
+      taskId: active.id,
+      status: "processing",
+      cancel: { allowed: false, reason: "already_requested" as const },
+    }));
+    const api = { ...servicesFor(listMyTasks), getTaskControls };
+
+    renderPage(api);
+    await act(async () => { await Promise.resolve(); });
+    fireEvent.click(screen.getByRole("button", { name: "查看详情：图片" }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(getTaskControls).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(getTaskControls).toHaveBeenCalledTimes(2);
+    expect(listMyTasks).toHaveBeenCalledTimes(1);
+    expect(screen.getByRole("dialog", { name: "任务详情" })).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole("button", { name: "关闭任务详情" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
   });
 
   it("lets manual reread supersede an in-flight observation and ignores its late success", async () => {
@@ -271,6 +359,37 @@ describe("read-only task page", () => {
     await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
     expect(onUnauthorized).toHaveBeenCalledTimes(1);
     expect(newList).toHaveBeenCalledTimes(2);
+  });
+
+  it("isolates the same user's page snapshot when the session generation changes", async () => {
+    const stalePage = deferred<MyTaskPage>();
+    const currentPage = deferred<MyTaskPage>();
+    const listMyTasks = vi.fn()
+      .mockReturnValueOnce(stalePage.promise)
+      .mockReturnValueOnce(currentPage.promise);
+    const api = servicesFor(listMyTasks);
+    const view = renderPage(api, vi.fn(), vi.fn(), 1);
+    await waitFor(() => expect(listMyTasks).toHaveBeenCalledTimes(1));
+
+    view.rerender(
+      <MyTasksPage
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        services={api}
+        sessionGeneration={2}
+        userId={user.id}
+      />,
+    );
+    await waitFor(() => expect(listMyTasks).toHaveBeenCalledTimes(2));
+    expect(listMyTasks.mock.calls[0]?.[1].aborted).toBe(true);
+
+    await act(async () => {
+      stalePage.resolve(page(1, [task("previous-session", { chapter_title: "旧会话任务" })]));
+      currentPage.resolve(page(1, [task("current-session", { chapter_title: "当前会话任务" })]));
+      await Promise.all([stalePage.promise, currentPage.promise]);
+    });
+    expect(screen.getByText("当前会话任务")).toBeInTheDocument();
+    expect(screen.queryByText("旧会话任务")).not.toBeInTheDocument();
   });
 
   it("retains the last snapshot through bounded observation failures and resumes by manual reread", async () => {

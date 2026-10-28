@@ -132,6 +132,12 @@ import { demoTaskRecords, getDemoMyTaskPage } from "../../features/tasks/demoTas
 import { MY_TASK_PAGE_SIZE, parseMyTaskPage, type MyTaskPage } from "./myTasks";
 import { parseTaskReceipt, parseTaskRequestRecord, type TaskReceipt, type TaskRequestRecord } from "./taskDetails";
 import {
+  parseTaskCancelAcknowledgement,
+  parseTaskControls,
+  type TaskCancelAcknowledgement,
+  type TaskControls,
+} from "./taskControls";
+import {
   InvalidCreatorSettingsResponseError,
   parseCreatorModel,
   parseCreatorModelList,
@@ -351,6 +357,8 @@ export interface WorkspaceServices {
   listMyTasks(page: number, signal: AbortSignal): Promise<MyTaskPage>;
   getTaskReceipt?(taskId: string, signal: AbortSignal): Promise<TaskReceipt>;
   getTaskRequest?(taskId: string, signal: AbortSignal): Promise<TaskRequestRecord>;
+  getTaskControls?(taskId: string, signal: AbortSignal): Promise<TaskControls>;
+  cancelTask?(taskId: string, signal: AbortSignal): Promise<TaskCancelAcknowledgement>;
   readonly storyboardGeneration?: StoryboardGenerationServicePort;
   readonly frameReview?: FrameReviewServicePort;
   readonly frameOptimize?: FrameOptimizeServicePort;
@@ -2126,6 +2134,8 @@ type ApiEndpoint =
   | "streamTwoPassStoryboard"
   | "twoPassSubmission"
   | "twoPassTask"
+  | "taskControls"
+  | "taskCancel"
   | "frameReviewCapabilities"
   | "frameReviewSubmit"
   | "frameReviewTask"
@@ -2339,6 +2349,14 @@ function apiRequestDefinition(
   if (endpoint === "twoPassTask") {
     const query = new URLSearchParams({ task_id: identifiers?.taskId ?? "" });
     return { path: "/chat/tasks?" + query.toString(), method: "GET" };
+  }
+  if (endpoint === "taskControls") {
+    const taskId = encodeApiPathId(identifiers?.taskId, "任务");
+    return { path: "/chat/tasks/" + taskId + "/controls", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "taskCancel") {
+    const taskId = encodeApiPathId(identifiers?.taskId, "任务");
+    return { path: "/chat/batch-optimize/" + taskId + "/cancel", method: "POST", expectedStatus: 200 };
   }
   if (endpoint === "frameReviewCapabilities") {
     return { path: "/chat/frame-review/capabilities", method: "GET", expectedStatus: 200 };
@@ -4061,6 +4079,24 @@ export function createApiServices(
       const requestRecord = parseTaskRequestRecord(value, taskId);
       ensureCurrentApiSession(storage, token, signal);
       return requestRecord;
+    },
+    async getTaskControls(taskId, signal) {
+      const token = requireApiToken(storage);
+      const controls = parseTaskControls(
+        await requestForCurrentApiSession("taskControls", token, signal, undefined, { taskId }),
+        taskId,
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return controls;
+    },
+    async cancelTask(taskId, signal) {
+      const token = requireApiToken(storage);
+      const acknowledgement = parseTaskCancelAcknowledgement(
+        await requestForCurrentApiSession("taskCancel", token, signal, undefined, { taskId }),
+        taskId,
+      );
+      ensureCurrentApiSession(storage, token, signal);
+      return acknowledgement;
     },
     storyboardGeneration,
     async exportSeries(seriesId, signal) {

@@ -1802,6 +1802,49 @@ describe("API services", () => {
     });
   });
 
+  it("reads task cancellation controls before and after the existing one-shot cancel endpoint", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "current-session-token");
+    const taskId = "task/with space";
+    const calls: Array<{ url: URL; init: RequestInit }> = [];
+    const responses = [
+      jsonResponse({ task_id: taskId, status: "processing", cancel: { allowed: true, reason: "available" } }),
+      jsonResponse({ task_id: taskId, status: "completed" }),
+      jsonResponse({ task_id: taskId, status: "completed", cancel: { allowed: false, reason: "terminal" } }),
+    ];
+    const fetcher: typeof fetch = async (input, init = {}) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input);
+      calls.push({ url, init });
+      const next = responses.shift();
+      if (next === undefined) throw new Error("Unexpected extra task control request.");
+      return next;
+    };
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const getControls = services.getTaskControls;
+    const cancelTask = services.cancelTask;
+    if (getControls === undefined || cancelTask === undefined) {
+      throw new Error("Task controls API is unavailable.");
+    }
+    const signal = new AbortController().signal;
+
+    await expect(getControls(taskId, signal)).resolves.toMatchObject({
+      taskId, status: "processing", cancel: { allowed: true, reason: "available" },
+    });
+    await expect(cancelTask(taskId, signal)).resolves.toEqual({ taskId, status: "completed" });
+    await expect(getControls(taskId, signal)).resolves.toMatchObject({
+      taskId, status: "completed", cancel: { allowed: false, reason: "terminal" },
+    });
+
+    expect(calls.map(({ url, init }) => [init.method, url.pathname])).toEqual([
+      ["GET", "/api/chat/tasks/task%2Fwith%20space/controls"],
+      ["POST", "/api/chat/batch-optimize/task%2Fwith%20space/cancel"],
+      ["GET", "/api/chat/tasks/task%2Fwith%20space/controls"],
+    ]);
+    expect(calls[1]?.init.body).toBeUndefined();
+    expect(calls.every(({ init }) => new Headers(init.headers).get("Authorization") === "Bearer current-session-token"))
+      .toBe(true);
+  });
+
   it("routes frame optimize submission and observation through their distinct endpoints", async () => {
     const storage = new MemoryStorage();
     storage.setItem(API_TOKEN_KEY, "creative-token");
