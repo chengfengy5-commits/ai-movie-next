@@ -102,6 +102,7 @@ function setup(
   initialDocument = document,
   sourcePort?: CanvasSourcePort,
   serviceOverrides: WorkspaceServiceOverrides = {},
+  writable = true,
 ) {
   let persistedDocument = initialDocument;
   const port: CanvasDataPort = {
@@ -112,7 +113,7 @@ function setup(
       document_json: persistedDocument,
       updated_by: "actor-a",
       updated_at: "2026-01-01T00:00:00Z",
-      save_capability: "guarded-v1" as const,
+      ...(writable ? { save_capability: "guarded-v1" as const } : {}),
     })),
     save: save ?? vi.fn(async (_chapterId, nextDocument, guard) => {
       persistedDocument = nextDocument;
@@ -179,6 +180,8 @@ function workspaceElement(
     onClose(): void;
     onUnauthorized(): void;
     onSourceChanged(chapterId: string): void;
+    userId?: string;
+    sessionGeneration?: number;
   },
 ) {
   return (
@@ -190,10 +193,24 @@ function workspaceElement(
       port={options.port}
       series={series}
       services={services}
-      sessionGeneration={4}
-      userId="actor-a"
+      sessionGeneration={options.sessionGeneration ?? 4}
+      userId={options.userId ?? "actor-a"}
     />
   );
+}
+
+function pointerUpOn(target: Element | null, viewport: HTMLElement, pointerId: number): void {
+  const descriptor = Object.getOwnPropertyDescriptor(document, "elementFromPoint");
+  Object.defineProperty(document, "elementFromPoint", {
+    configurable: true,
+    value: () => target,
+  });
+  try {
+    fireEvent.pointerUp(target instanceof HTMLElement ? target : viewport, { pointerId, clientX: 0, clientY: 0 });
+  } finally {
+    if (descriptor === undefined) Reflect.deleteProperty(document, "elementFromPoint");
+    else Object.defineProperty(document, "elementFromPoint", descriptor);
+  }
 }
 
 function stubChapterGenerationHistoryMediaReader(readMedia: ChapterGenerationHistoryRun["readMedia"]) {
@@ -214,6 +231,153 @@ afterEach(() => {
 });
 
 describe("CanvasWorkspace", () => {
+  it("connects nodes by port drag in world coordinates and uses one history entry and the existing save port", async () => {
+    const initialDocument: CanvasDocument = {
+      ...document,
+      viewport: { x: -120, y: -55, zoom: 1.5 },
+    };
+    const workspace = setup(undefined, false, initialDocument);
+    await screen.findByLabelText("林澜");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    vi.spyOn(viewport, "getBoundingClientRect").mockReturnValue({
+      x: 70, y: 90, left: 70, top: 90, right: 870, bottom: 690, width: 800, height: 600,
+      toJSON: () => ({}),
+    });
+    const sourceNode = screen.getByLabelText("林澜");
+    const sourcePort = screen.getByRole("button", { name: "从林澜右侧端口拖动连线" });
+    const targetPort = screen.getByRole("button", { name: "从分镜 1左侧端口拖动连线" });
+    const originalSceneTransform = workspace.container.querySelector(".canvas-scene")?.getAttribute("style");
+
+    fireEvent.pointerDown(sourcePort, { pointerId: 31, button: 0, clientX: 385, clientY: 200 });
+    const temporaryPath = workspace.container.querySelector(".canvas-edge-temporary")?.getAttribute("d");
+    expect(temporaryPath).toContain("M 290 110");
+    fireEvent.pointerMove(viewport, { pointerId: 31, clientX: 800, clientY: 250 });
+    expect(workspace.container.querySelector(".canvas-edge-temporary")?.getAttribute("d")).not.toBe(temporaryPath);
+    pointerUpOn(targetPort, viewport, 31);
+
+    await waitFor(() => expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(1));
+    expect(workspace.container.querySelector(".canvas-edge-temporary")).toBeNull();
+    expect((sourceNode as HTMLElement).style.left).toBe("40px");
+    expect((sourceNode as HTMLElement).style.top).toBe("50px");
+    expect(workspace.container.querySelector(".canvas-scene")?.getAttribute("style")).toBe(originalSceneTransform);
+
+    const undo = screen.getByRole("button", { name: "撤销" });
+    const redo = screen.getByRole("button", { name: "重做" });
+    fireEvent.click(undo);
+    await waitFor(() => expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(0));
+    expect(undo).toBeDisabled();
+    fireEvent.click(redo);
+    await waitFor(() => expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(1));
+    fireEvent.click(screen.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(workspace.port.save).toHaveBeenCalledOnce());
+    const savedDocument = vi.mocked(workspace.port.save).mock.calls[0]?.[1];
+    expect(savedDocument?.manualEdges).toEqual([expect.objectContaining({
+      sourceRef: "character:character-a",
+      targetRef: `frame-index:${sourceSnapshot.version}:0`,
+      relation: "manual",
+    })]);
+    expect(savedDocument?.unknown).toEqual({ preserve: true });
+  });
+
+  it("cancels blank, self, duplicate, and pointer-cancelled port gestures while allowing the reverse direction", async () => {
+    const targetRef = `frame-index:${sourceSnapshot.version}:0`;
+    const workspace = setup(undefined, false, {
+      ...document,
+      manualEdges: [{ id: "existing", sourceRef: "character:character-a", targetRef, relation: "manual", future: true }],
+    });
+    await screen.findByLabelText("林澜");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    const characterRight = screen.getByRole("button", { name: "从林澜右侧端口拖动连线" });
+    const characterLeft = screen.getByRole("button", { name: "从林澜左侧端口拖动连线" });
+    const frameRight = screen.getByRole("button", { name: "从分镜 1右侧端口拖动连线" });
+    const frameLeft = screen.getByRole("button", { name: "从分镜 1左侧端口拖动连线" });
+
+    fireEvent.pointerDown(characterRight, { pointerId: 41, button: 0, clientX: 0, clientY: 0 });
+    pointerUpOn(null, viewport, 41);
+    fireEvent.pointerDown(characterRight, { pointerId: 42, button: 0, clientX: 0, clientY: 0 });
+    pointerUpOn(characterLeft, viewport, 42);
+    fireEvent.pointerDown(characterRight, { pointerId: 43, button: 0, clientX: 0, clientY: 0 });
+    pointerUpOn(frameLeft, viewport, 43);
+    expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(1);
+    expect(workspace.container.querySelector(".canvas-edge-temporary")).toBeNull();
+    expect(screen.getByRole("button", { name: "撤销" })).toBeDisabled();
+
+    fireEvent.pointerDown(characterRight, { pointerId: 44, button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerCancel(viewport, { pointerId: 44 });
+    expect(workspace.container.querySelector(".canvas-edge-temporary")).toBeNull();
+    expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(1);
+
+    fireEvent.pointerDown(characterRight, { pointerId: 45, button: 0, clientX: 0, clientY: 0 });
+    const lostCapture = new Event("lostpointercapture", { bubbles: true });
+    Object.defineProperty(lostCapture, "pointerId", { value: 45 });
+    fireEvent(viewport, lostCapture);
+    expect(workspace.container.querySelector(".canvas-edge-temporary")).toBeNull();
+    expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(1);
+
+    fireEvent.pointerDown(frameRight, { pointerId: 46, button: 0, clientX: 0, clientY: 0 });
+    pointerUpOn(characterLeft, viewport, 46);
+    await waitFor(() => expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(2));
+    fireEvent.click(screen.getByRole("button", { name: "保存布局" }));
+    await waitFor(() => expect(workspace.port.save).toHaveBeenCalledOnce());
+    const savedDocument = vi.mocked(workspace.port.save).mock.calls[0]?.[1];
+    expect(savedDocument?.manualEdges).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "existing", future: true, sourceRef: "character:character-a", targetRef }),
+      expect.objectContaining({ sourceRef: targetRef, targetRef: "character:character-a", relation: "manual" }),
+    ]));
+  });
+
+  it("disables port writes for read-only documents and cancels an active drag after scope changes", async () => {
+    const readOnly = setup(undefined, false, document, undefined, {}, false);
+    await screen.findByLabelText("林澜");
+    const readOnlyPort = screen.getByRole("button", { name: "从林澜右侧端口拖动连线" });
+    expect(readOnlyPort).toBeDisabled();
+    expect(readOnly.container.querySelector(".canvas-edge-temporary")).toBeNull();
+    expect(readOnly.port.save).not.toHaveBeenCalled();
+    readOnly.unmount();
+
+    const workspace = setup();
+    await screen.findByLabelText("林澜");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    const sourcePort = screen.getByRole("button", { name: "从林澜右侧端口拖动连线" });
+    fireEvent.pointerDown(sourcePort, { pointerId: 46, button: 0, clientX: 0, clientY: 0 });
+    expect(workspace.container.querySelector(".canvas-edge-temporary")).not.toBeNull();
+    workspace.rerender(workspaceElement(workspace.services, {
+      port: workspace.port,
+      onClose: workspace.onClose,
+      onUnauthorized: workspace.onUnauthorized,
+      onSourceChanged: workspace.onSourceChanged,
+      userId: "actor-b",
+      sessionGeneration: 5,
+    }));
+    await waitFor(() => expect(workspace.container.querySelector(".canvas-edge-temporary")).toBeNull());
+    pointerUpOn(screen.getByRole("button", { name: "从分镜 1左侧端口拖动连线" }), viewport, 46);
+    expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(0);
+    expect(workspace.port.save).not.toHaveBeenCalled();
+  });
+
+  it("cancels a port drag when the existing canvas writer becomes uncertain", async () => {
+    const save = vi.fn<CanvasDataPort["save"]>().mockRejectedValue(new CanvasDataError("unknown", "unknown"));
+    const workspace = setup(save);
+    await screen.findByLabelText("林澜");
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    const character = screen.getByLabelText("林澜");
+    fireEvent.pointerDown(character, { pointerId: 47, button: 0, clientX: 0, clientY: 0 });
+    fireEvent.pointerMove(viewport, { pointerId: 47, clientX: 80, clientY: 40 });
+    fireEvent.pointerUp(viewport, { pointerId: 47 });
+    await waitFor(() => expect((character as HTMLElement).style.left).toBe("120px"));
+
+    fireEvent.pointerDown(screen.getByRole("button", { name: "从林澜右侧端口拖动连线" }), {
+      pointerId: 48, button: 0, clientX: 0, clientY: 0,
+    });
+    expect(workspace.container.querySelector(".canvas-edge-temporary")).not.toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "保存布局" }));
+    await screen.findByText(/保存结果尚未确认/);
+    expect(workspace.container.querySelector(".canvas-edge-temporary")).toBeNull();
+    pointerUpOn(screen.getByRole("button", { name: "从分镜 1左侧端口拖动连线" }), viewport, 48);
+    expect(workspace.container.querySelectorAll("path.is-manual")).toHaveLength(0);
+    expect(save).toHaveBeenCalledOnce();
+  });
+
   it("shows selected frame information and navigates to a related asset", async () => {
     setup();
     await screen.findByText("门前的来信");
@@ -570,7 +734,8 @@ describe("CanvasWorkspace", () => {
     await waitFor(() => expect(screen.getByText("已保存")).toBeTruthy());
 
     fireEvent.click(screen.getByLabelText("分镜 1"));
-    fireEvent.click(screen.getByRole("button", { name: "编辑分镜文字" }));
+    const selectedInformation = screen.getByRole("region", { name: "选中内容信息" });
+    fireEvent.click(within(selectedInformation).getByRole("button", { name: "编辑分镜文字" }));
     const frameEditor = await screen.findByRole("dialog", { name: "编辑分镜文字" });
     fireEvent.change(within(frameEditor).getByLabelText("镜头文字"), { target: { value: "更新文字但保留媒体绑定" } });
     fireEvent.click(within(frameEditor).getByRole("button", { name: "保存文字" }));
@@ -988,6 +1153,80 @@ describe("CanvasWorkspace", () => {
     expect(screen.queryByRole("heading", { name: "关闭创作画布" })).toBeNull();
   });
 
+  it("clears selected nodes and manual edges before the next Escape closes a clean canvas", async () => {
+    const targetRef = `frame-index:${sourceSnapshot.version}:0`;
+    const { container, onClose, port } = setup(undefined, false, {
+      ...document,
+      manualEdges: [{ id: "manual-edge-a", sourceRef: "character:character-a", targetRef, relation: "manual" }],
+    });
+    await screen.findByText("门前的来信");
+    const undo = screen.getByRole("button", { name: "撤销" });
+    expect(undo).toBeDisabled();
+
+    const character = screen.getByLabelText("林澜");
+    fireEvent.click(character);
+    expect(character.classList).toContain("is-selected");
+    fireEvent.keyDown(window.document, { key: "Escape" });
+    expect(character.classList).not.toContain("is-selected");
+    expect(onClose).not.toHaveBeenCalled();
+
+    const manualEdge = container.querySelector("path.is-manual");
+    expect(manualEdge).not.toBeNull();
+    fireEvent.click(manualEdge!);
+    expect(manualEdge?.getAttribute("stroke")).toBe("#7c3aed");
+    fireEvent.keyDown(window.document, { key: "Escape" });
+    expect(manualEdge?.getAttribute("stroke")).not.toBe("#7c3aed");
+    expect(onClose).not.toHaveBeenCalled();
+    expect(undo).toBeDisabled();
+    expect(port.save).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(window.document, { key: "Escape" });
+    expect(onClose).toHaveBeenCalledOnce();
+    expect(screen.queryByRole("heading", { name: "关闭创作画布" })).toBeNull();
+  });
+
+  it("cancels link and port gestures on Escape without losing a dirty draft or writing on pointerup", async () => {
+    const initialDocument: CanvasDocument = {
+      ...document,
+      notes: [{ id: "note-a", text: "原稿", x: 400, y: 300, width: 230, height: 145 }],
+    };
+    const { container, onClose, port } = setup(undefined, false, initialDocument);
+    await screen.findByText("门前的来信");
+    const note = screen.getByLabelText("便签文字") as HTMLTextAreaElement;
+    fireEvent.change(note, { target: { value: "待保存草稿" } });
+    const undo = screen.getByRole("button", { name: "撤销" });
+    const undoWasDisabled = (undo as HTMLButtonElement).disabled;
+
+    fireEvent.click(screen.getByRole("button", { name: "手动连线" }));
+    fireEvent.pointerDown(screen.getByLabelText("林澜"), { pointerId: 61, button: 0 });
+    expect(screen.getByText("已选起点，请选择终点。")).toBeTruthy();
+    fireEvent.keyDown(window.document, { key: "Escape" });
+    expect(screen.queryByText("已选起点，请选择终点。")).toBeNull();
+    expect(screen.getByRole("button", { name: "手动连线" }).getAttribute("aria-pressed")).toBe("false");
+    expect(onClose).not.toHaveBeenCalled();
+    expect(note.value).toBe("待保存草稿");
+    expect(port.save).not.toHaveBeenCalled();
+
+    const viewport = screen.getByRole("region", { name: "画布工作区" });
+    fireEvent.pointerDown(screen.getByRole("button", { name: "从林澜右侧端口拖动连线" }), {
+      pointerId: 62, button: 0, clientX: 0, clientY: 0,
+    });
+    expect(container.querySelector(".canvas-edge-temporary")).not.toBeNull();
+    fireEvent.keyDown(window.document, { key: "Escape" });
+    expect(container.querySelector(".canvas-edge-temporary")).toBeNull();
+    pointerUpOn(screen.getByRole("button", { name: "从分镜 1左侧端口拖动连线" }), viewport, 62);
+    expect(container.querySelectorAll("path.is-manual")).toHaveLength(0);
+    expect(note.value).toBe("待保存草稿");
+    expect(onClose).not.toHaveBeenCalled();
+    expect(port.save).not.toHaveBeenCalled();
+    expect((undo as HTMLButtonElement).disabled).toBe(undoWasDisabled);
+
+    fireEvent.keyDown(window.document, { key: "Escape" });
+    expect(screen.getByRole("heading", { name: "关闭创作画布" })).toBeTruthy();
+    expect(screen.getByText(/还有未确认的画布编辑/)).toBeTruthy();
+    expect(onClose).not.toHaveBeenCalled();
+  });
+
   it.each(["text", "asset", "media"] as const)(
     "keeps Escape, focus, and canvas shortcuts inside the %s source child dialog",
     async (childKind) => {
@@ -1010,9 +1249,10 @@ describe("CanvasWorkspace", () => {
         await user.click(screen.getByRole("article", { name: "便签" }));
         await user.click(screen.getByRole("button", { name: "新增角色素材" }));
       } else {
-        await user.click(screen.getByLabelText("分镜 1"));
-        await user.click(screen.getByRole("button", {
-          name: childKind === "text" ? "编辑分镜文字" : "设置镜头预览 URL",
+        await user.click(screen.getByLabelText(childKind === "text" ? "分镜 1" : "分镜预览"));
+        const selectedInformation = screen.getByRole("region", { name: "选中内容信息" });
+        await user.click(within(selectedInformation).getByRole("button", {
+          name: childKind === "text" ? "编辑分镜文字" : "编辑媒体来源",
         }));
       }
 
@@ -1036,15 +1276,22 @@ describe("CanvasWorkspace", () => {
       await user.keyboard("f");
       expect(port.save).not.toHaveBeenCalled();
       expect(sourcePort.write).not.toHaveBeenCalled();
-      expect(screen.getByText("保留的便签")).toBeTruthy();
+      expect(screen.getAllByText("保留的便签").length).toBeGreaterThan(0);
       expect(screen.getByText("100%")).toBeTruthy();
 
       await user.keyboard("{Escape}");
       await waitFor(() => expect(screen.queryByRole("dialog", { name: childDialogName })).toBeNull());
       expect(screen.getAllByRole("dialog")).toHaveLength(1);
       expect(onClose).not.toHaveBeenCalled();
-      expect(screen.getByText("保留的便签")).toBeTruthy();
+      expect(screen.getAllByText("保留的便签").length).toBeGreaterThan(0);
 
+      const selectedNode = childKind === "asset"
+        ? screen.getByRole("article", { name: "便签" })
+        : screen.getByLabelText(childKind === "media" ? "分镜预览" : "分镜 1");
+      expect(selectedNode.classList).toContain("is-selected");
+      await user.keyboard("{Escape}");
+      expect(selectedNode.classList).not.toContain("is-selected");
+      expect(onClose).not.toHaveBeenCalled();
       await user.keyboard("{Escape}");
       expect(onClose).toHaveBeenCalledOnce();
     },
