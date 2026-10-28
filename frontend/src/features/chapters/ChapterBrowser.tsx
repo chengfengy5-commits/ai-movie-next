@@ -6045,6 +6045,13 @@ export function ChapterBrowser({
     : currentContinuousJournalState(currentScope, selectedChapterId);
   const continuousJournalBlocksChapter = selectedChapterId !== null && continuousJournalPanelState.status !== "empty";
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen || productionChecklistOpen;
+  const chapterEditingOrGenerationBlocked = chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null
+    || continuousChapterEditor !== null || frameEditOpening
+    || storyboardGenerationDialog !== null || frameReviewDialog !== null
+    || frameOptimizeDialog !== null || frameOptimizeOpening
+    || storyboardAssetExtractionDialog !== null || storyboardAssetExtractionOpening;
+  const chapterReadOnlyPanelNavigationBlocked = productionChecklistOpen || chapterManagement !== null
+    || chapterEditingOrGenerationBlocked;
   const generationHistoryBlockReason = !series.can_enter
     ? "当前账号没有修改此剧集的权限。"
     : continuousJournalBlocksChapter
@@ -6055,12 +6062,7 @@ export function ChapterBrowser({
           ? "请先完成当前章节操作，再选用历史结果。"
           : null;
   chapterGenerationHistoryBlockRef.current = generationHistoryBlockReason;
-  const chapterManagementBlocked = chapterPanelsOpen
-    || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null
-    || continuousChapterEditor !== null || frameEditOpening
-    || storyboardGenerationDialog !== null || frameReviewDialog !== null
-    || frameOptimizeDialog !== null || frameOptimizeOpening
-    || storyboardAssetExtractionDialog !== null || storyboardAssetExtractionOpening;
+  const chapterManagementBlocked = chapterPanelsOpen || chapterEditingOrGenerationBlocked;
   const canEditStoryboard = series.can_enter && services.updateChapter !== undefined;
   const canOpenCanvas = series.can_enter && services.canvasData !== undefined;
   const canEditFrameStructure = series.can_enter
@@ -7554,7 +7556,7 @@ export function ChapterBrowser({
                   {!personalNotesOpen && (
                     <button
                       className="text-button personal-production-open-button"
-                      disabled={chapterManagementBlocked || currentAssetResult === null || currentAssetResult.status === "loading"}
+                      disabled={chapterReadOnlyPanelNavigationBlocked || currentAssetResult === null || currentAssetResult.status === "loading"}
                       onClick={openPersonalNotes}
                       type="button"
                     >
@@ -7564,7 +7566,7 @@ export function ChapterBrowser({
                   {!personalRoughCutOpen && (
                     <button
                       className="text-button personal-rough-cut-open-button"
-                      disabled={chapterManagementBlocked || chapterManagement !== null}
+                      disabled={chapterReadOnlyPanelNavigationBlocked}
                       onClick={openPersonalRoughCut}
                       type="button"
                     >
@@ -7947,7 +7949,7 @@ export function ChapterBrowser({
                               {sourceFrame !== undefined && !isReferenceOwner && (
                                 <button
                                   className="text-button frame-asset-references-open-button"
-                                  disabled={chapterManagementBlocked || chapterManagement !== null}
+                                  disabled={chapterReadOnlyPanelNavigationBlocked}
                                   onClick={() => openFrameAssetReferences(sourceFrame, frame.position)}
                                   type="button"
                                 >

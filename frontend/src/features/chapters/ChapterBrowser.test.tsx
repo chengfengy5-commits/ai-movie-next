@@ -2220,7 +2220,7 @@ describe("read-only chapter browser", () => {
       { text: "第一镜头", character: ["character-reference"], scene: ["scene-reference"] },
     ]);
     const pendingAssets = deferred<StoryboardAsset[]>();
-    const { services, listStoryboardAssets } = makeServices([current]);
+    const { services, listStoryboardAssets } = makeServices([current], {}, true);
     listStoryboardAssets.mockReturnValueOnce(pendingAssets.promise);
     const listCharacters = vi.spyOn(services, "listCharacters").mockResolvedValue([
       character("character-reference", current.series_id, "沈照"),
@@ -2265,6 +2265,8 @@ describe("read-only chapter browser", () => {
     expect(container.textContent).not.toMatch(/character-reference|canonical key|voice ref|https?:/i);
     expect(container.querySelector("audio, video, source, a")).toBeNull();
 
+    expect(screen.getByRole("button", { name: "新建章节" })).toBeDisabled();
+
     await act(async () => {
       pendingAssets.resolve([]);
       await pendingAssets.promise;
@@ -2283,6 +2285,24 @@ describe("read-only chapter browser", () => {
     expect(screen.queryByRole("region", { name: "我的制作记录" })).not.toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "镜头 1 的关联素材" })).not.toBeInTheDocument();
     expect(getRoughCut).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps read-only panel navigation blocked while the frame editor owns the chapter", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-readonly-navigation-editor-guard", "编辑器导航保护", [
+      { text: "正在编辑的镜头" },
+    ]);
+    const { services } = makeServices([current], {}, true, true);
+    renderBrowser(services);
+
+    const frame = await screen.findByRole("article", { name: "编辑器导航保护 · 镜头 1" });
+    await user.click(within(frame).getByRole("button", { name: "编辑文字" }));
+    expect(await screen.findByRole("dialog", { name: "编辑分镜文字" })).toBeInTheDocument();
+
+    expect(document.querySelector<HTMLButtonElement>(".personal-production-open-button")).toBeDisabled();
+    expect(document.querySelector<HTMLButtonElement>(".personal-rough-cut-open-button")).toBeDisabled();
+    expect(document.querySelector<HTMLButtonElement>(".frame-asset-references-open-button")).toBeDisabled();
+    expect(document.querySelector<HTMLButtonElement>(".chapter-create-button")).toBeDisabled();
   });
 
   it("ignores a close callback from an earlier reference-panel owner", async () => {
