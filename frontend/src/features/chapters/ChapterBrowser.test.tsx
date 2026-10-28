@@ -6764,4 +6764,187 @@ describe("read-only chapter browser", () => {
     scrollTo.mockRestore();
   });
 
+  it("opens the real continuous editor, sends a guarded chapter update, and confirms it from a separate readback", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-consumer", "连续编辑章节", [{
+      text: "第一段正文",
+      original_text: "打开时原文",
+      storyboard: ["continuous-shot-1"],
+      character: ["continuous-character-1"],
+      scene: [],
+      prop: [],
+      editor_unknown: { retain: true },
+    }]);
+    const storyboardAsset = { ...asset("continuous-shot-1", current.id), frame_index: 0 };
+    const base = makeServices([current], { [current.id]: [storyboardAsset] }, false, true);
+    const capability = vi.fn(async () => ({ chapterEditGuard: 1 as const }));
+    const listCharacters = vi.fn(async () => [character("continuous-character-1", series.id, "门卫")]);
+    base.services.getContinuousChapterEditCapabilities = capability;
+    base.services.listCharacters = listCharacters;
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    const checkOrphans = vi.fn(async () => ({
+      orphans: [{ type: "character" as const, id: "continuous-character-1" }],
+    }));
+    Object.assign(base.services, {
+      assetMaintenance: { checkOrphans } as unknown as NonNullable<WorkspaceServices["assetMaintenance"]>,
+    });
+    const originalSelection = vi.fn();
+
+    render(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        onContinuousOriginalChange={originalSelection}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="demo-user"
+      />,
+    );
+
+    await screen.findByRole("region", { name: "整章连续编辑入口" });
+    await user.click(screen.getByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    expect(capability).toHaveBeenCalledTimes(1);
+    expect(originalSelection).toHaveBeenLastCalledWith({ position: 1, status: "text", text: "打开时原文" });
+    const text = within(editor).getByRole("textbox", { name: "第 1 段剧本文字" });
+    await user.deselectOptions(within(editor).getByRole("listbox", { name: "第 1 段角色素材" }), "continuous-character-1");
+    await user.clear(text);
+    fireEvent.keyDown(text, { key: "z", ctrlKey: true });
+    expect(text).toHaveValue("第一段正文");
+    fireEvent.keyDown(text, { key: "z", ctrlKey: true, shiftKey: true });
+    expect(text).toHaveValue("");
+    await user.type(text, "改写后的正文");
+    expect(within(editor).getByText("1 个镜头 · 6 个文字字符")).toBeInTheDocument();
+    fireEvent.keyDown(text, { key: "s", ctrlKey: true });
+
+    await waitFor(() => expect(base.updateChapter).toHaveBeenCalledTimes(1));
+    const update = base.updateChapter.mock.calls[0]?.[2];
+    expect(update?.chapter_edit_guard).toMatchObject({
+      expected_chapter_id: current.id,
+      expected_series_id: series.id,
+      expected_content: current.content,
+      frame_sources: [{ kind: "retained", source_index: 0, storyboard_id: "continuous-shot-1" }],
+      deleted_source_indexes: [],
+    });
+    expect(update?.content?.[0]).toMatchObject({
+      text: "改写后的正文",
+      original_text: "打开时原文",
+      editor_unknown: { retain: true },
+      storyboard: ["continuous-shot-1"],
+    });
+    expect(update?.content?.[0]?.character).toEqual([]);
+    await waitFor(() => expect(checkOrphans).toHaveBeenCalledWith(series.id, {
+      items: [{ type: "character", id: "continuous-character-1" }],
+    }, expect.any(AbortSignal)));
+    expect(await within(editor).findByText(/全剧集核对发现 1 项可能孤立素材。未自动删除/))
+      .toBeInTheDocument();
+    expect(base.updateChapter).toHaveBeenCalledTimes(1);
+    expect(base.listChapters.mock.calls.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it("changes the asset selection on the frame whose select control fired", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-frame-select", "双镜头连续编辑", [
+      { text: "第一段", storyboard: ["continuous-select-shot-1"], character: [], scene: [], prop: [] },
+      { text: "第二段", storyboard: ["continuous-select-shot-2"], character: [], scene: [], prop: [] },
+    ]);
+    const storyboardAssets = [
+      { ...asset("continuous-select-shot-1", current.id), frame_index: 0 },
+      { ...asset("continuous-select-shot-2", current.id), frame_index: 1 },
+    ];
+    const base = makeServices([current], { [current.id]: storyboardAssets }, false, true);
+    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const }));
+    base.services.listCharacters = vi.fn(async () => [
+      character("continuous-select-character-1", series.id, "第一段角色"),
+      character("continuous-select-character-2", series.id, "第二段角色"),
+    ]);
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+
+    render(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="demo-user"
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    const firstSelection = within(editor).getByRole("listbox", { name: "第 1 段角色素材" });
+    const secondSelection = within(editor).getByRole("listbox", { name: "第 2 段角色素材" });
+    await user.selectOptions(secondSelection, "continuous-select-character-2");
+
+    expect(firstSelection).toHaveValue([]);
+    expect(secondSelection).toHaveValue(["continuous-select-character-2"]);
+    await user.click(within(editor).getByRole("button", { name: "保存并核对整章" }));
+    await waitFor(() => expect(base.updateChapter).toHaveBeenCalledTimes(1));
+    expect(base.updateChapter.mock.calls[0]?.[2].content).toMatchObject([
+      { text: "第一段", character: [] },
+      { text: "第二段", character: ["continuous-select-character-2"] },
+    ]);
+  });
+
+  it("attaches a delayed uncertain asset creation to its original draft after selecting another frame", async () => {
+    const user = userEvent.setup();
+    const current = chapter("chapter-continuous-asset-owner", "延迟素材创建", [
+      { text: "原目标段", storyboard: ["continuous-owner-shot-1"], character: [], scene: [], prop: [] },
+      { text: "切换后段", storyboard: ["continuous-owner-shot-2"], character: [], scene: [], prop: [] },
+    ]);
+    const storyboardAssets = [
+      { ...asset("continuous-owner-shot-1", current.id), frame_index: 0 },
+      { ...asset("continuous-owner-shot-2", current.id), frame_index: 1 },
+    ];
+    const base = makeServices([current], { [current.id]: storyboardAssets }, false, true);
+    const pendingCreate = deferred<Character>();
+    const createdCharacter = character("continuous-created-character", series.id, "新角色");
+    let directoryShowsCreatedCharacter = false;
+    const createCharacter = vi.fn(() => pendingCreate.promise);
+    const listCharacters = vi.fn(async () => directoryShowsCreatedCharacter ? [createdCharacter] : []);
+    base.services.getContinuousChapterEditCapabilities = vi.fn(async () => ({ chapterEditGuard: 1 as const }));
+    base.services.listCharacters = listCharacters;
+    base.services.listScenes = vi.fn(async () => []);
+    base.services.listProps = vi.fn(async () => []);
+    base.services.createCharacter = createCharacter;
+
+    render(
+      <ChapterBrowser
+        onBack={vi.fn()}
+        onUnauthorized={vi.fn()}
+        continuousPreviewActive
+        workbenchActive
+        series={series}
+        services={base.services}
+        userId="demo-user"
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "开启整章连续编辑" }));
+    const editor = await screen.findByRole("region", { name: "整章连续编辑" });
+    await user.type(within(editor).getByRole("textbox", { name: "新增素材名称" }), "新角色");
+    await user.click(within(editor).getByRole("button", { name: "创建并关联角色" }));
+    await waitFor(() => expect(createCharacter).toHaveBeenCalledTimes(1));
+    await user.click(within(editor).getByRole("button", { name: "第 2 段 · 原镜头 2" }));
+    expect(within(editor).getByRole("button", { name: "第 2 段 · 原镜头 2" })).toHaveAttribute("aria-pressed", "true");
+
+    directoryShowsCreatedCharacter = true;
+    await act(async () => {
+      pendingCreate.reject(new ApiError("http", "创建响应未确认", 500));
+      await Promise.resolve();
+    });
+
+    await waitFor(() => expect(within(editor).getByRole("listbox", { name: "第 1 段角色素材" }))
+      .toHaveValue(["continuous-created-character"]));
+    expect(within(editor).getByRole("listbox", { name: "第 2 段角色素材" })).toHaveValue([]);
+    expect(createCharacter).toHaveBeenCalledTimes(1);
+    expect(await within(editor).findByText("已核对并关联角色素材。")).toBeInTheDocument();
+  });
+
 });

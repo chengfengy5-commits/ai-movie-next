@@ -10,6 +10,7 @@ import {
 } from "../../shared/api/mediaGeneration";
 import type { CreatorModel } from "../../shared/api/creatorSettings";
 import { createDemoServices, type WorkspaceServices } from "../../shared/api/services";
+import { unsupportedTaskHistoryTruth } from "../../shared/api/taskDetails";
 import { defaultQuickReferenceSettings } from "./quickReference";
 import { BatchVideoGenerationPanel } from "./BatchVideoGenerationPanel";
 
@@ -81,6 +82,7 @@ function taskReceipt(taskId: string): Awaited<ReturnType<NonNullable<WorkspaceSe
     status: "processing", result: null, billingStatus: "charged", quotedAmount: 2,
     progress: 45, progressMessage: null, externalTaskId: null, externalProvider: null,
     createdAt: null, updatedAt: null,
+    historyTruth: unsupportedTaskHistoryTruth(),
   };
 }
 

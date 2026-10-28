@@ -167,6 +167,28 @@
   overflow-wrap: anywhere;
 }
 
+.task-detail-history-units,
+.task-detail-history-dispositions {
+  display: grid;
+  gap: 7px;
+  margin: 12px 0 0;
+  padding-left: 18px;
+  color: #586c68;
+  font-size: 10px;
+  line-height: 1.55;
+}
+
+.task-detail-history-units li,
+.task-detail-history-dispositions li {
+  padding-left: 2px;
+  overflow-wrap: anywhere;
+}
+
+.task-detail-history-units strong {
+  color: #3d5652;
+  font-weight: 650;
+}
+
 .task-detail-payload {
   min-width: 0;
   margin-top: 13px;

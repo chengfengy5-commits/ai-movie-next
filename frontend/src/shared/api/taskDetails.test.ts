@@ -25,6 +25,107 @@ function rawReceipt(overrides: Record<string, unknown> = {}): Record<string, unk
   };
 }
 
+function rawHistoryTruth(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    source: {
+      status: "registered",
+      source: "billing_units.operation_and_step_graph_version",
+      unit_count: 2,
+      registered_unit_count: 2,
+      operations: ["image.single", "video.single"],
+      conflicts: [],
+    },
+    worker: {
+      status: "expired_lease",
+      source: "ai_tasks.worker_lease_and_recovery_status",
+      recovery_status: "reconciling",
+      freshness: "lease_expired",
+      lease_until: "2026-10-15T07:00:00+00:00",
+      task_updated_at: "2026-10-15T07:01:00+00:00",
+      evaluated_at: "2026-10-15T08:00:00+00:00",
+    },
+    provider: {
+      status: "partial",
+      source: "external_submissions_and_linked_result_evidence",
+      unit_count: 2,
+      verified_unit_count: 1,
+      known_failure_unit_count: 0,
+      unknown_unit_count: 1,
+      unsupported_unit_count: 0,
+      units: [
+        {
+          operation: "image.single",
+          graph_version: "image-single-v1",
+          status: "unknown",
+          unit_result_status: "unknown",
+          step_statuses: ["failed"],
+          submission_statuses: ["failed"],
+          providers: ["openai"],
+          provider_evidence_count: 0,
+          timing: "unknown",
+          timely_evidence_count: 0,
+          late_evidence_count: 0,
+          unknown_timing_count: 0,
+          observed_at: null,
+          has_unverified_failed_submission: true,
+        },
+        {
+          operation: "video.single",
+          graph_version: "video-single-v1",
+          status: "verified_success",
+          unit_result_status: "succeeded",
+          step_statuses: ["result_observed"],
+          submission_statuses: ["completed"],
+          providers: ["aistarslab"],
+          provider_evidence_count: 1,
+          timing: "mixed",
+          timely_evidence_count: 1,
+          late_evidence_count: 1,
+          unknown_timing_count: 0,
+          observed_at: "2026-10-15T08:00:00+00:00",
+          has_unverified_failed_submission: false,
+        },
+      ],
+    },
+    local_disposition: {
+      status: "observed",
+      source_coverage: ["billing_units"],
+      unit_count: 2,
+      observations: [
+        {
+          status: "deadline_elapsed_unsettled",
+          source: "billing_units.deadline_at_and_result_status",
+          recorded_at: "2026-10-15T07:00:00+00:00",
+          reason: null,
+          phase: null,
+        },
+      ],
+    },
+    billing_scope: {
+      unit_count: 2,
+      legacy_quote_scope: "first_unit",
+      aggregated: false,
+    },
+    ...overrides,
+  };
+}
+
+function rawHistoryTruthWithInvalidEvidenceCount(): Record<string, unknown> {
+  const truth = rawHistoryTruth();
+  const provider = truth.provider as Record<string, unknown>;
+  const units = provider.units as Array<Record<string, unknown>>;
+  return {
+    ...truth,
+    provider: {
+      ...provider,
+      units: units.map((unit, index) => (
+        index === 0 ? { ...unit, provider_evidence_count: null } : unit
+      )),
+    },
+  };
+}
+
 function rawRequest(request: unknown): Record<string, unknown> {
   return {
     id: "task-17",
@@ -41,13 +142,61 @@ function rawRequest(request: unknown): Record<string, unknown> {
 
 describe("task detail parsing", () => {
   it("accepts nullable legacy billing fields and maps the full receipt", () => {
-    expect(parseTaskReceipt(rawReceipt(), "task-17")).toMatchObject({
+    const receipt = parseTaskReceipt(rawReceipt(), "task-17");
+    expect(receipt).toMatchObject({
       id: "task-17",
       result: "{\"frames\":[{\"text\":\"完整镜头全文\"}]}",
       billingStatus: null,
       quotedAmount: null,
       progress: 100,
     });
+    expect(receipt.historyTruth).toMatchObject({
+      source: { status: "unsupported" },
+      provider: { status: "unsupported" },
+    });
+  });
+
+  it("parses independent source, worker, provider and local facts without aggregating fees", () => {
+    const receipt = parseTaskReceipt(rawReceipt({
+      quoted_amount: 0,
+      billing_status: "unbilled",
+      history_truth: rawHistoryTruth(),
+    }), "task-17");
+
+    expect(receipt.quotedAmount).toBe(0);
+    expect(receipt.historyTruth).toMatchObject({
+      source: { status: "registered", unitCount: 2 },
+      worker: { status: "expired_lease", recoveryStatus: "reconciling" },
+      provider: {
+        status: "partial",
+        units: [
+          { status: "unknown", hasUnverifiedFailedSubmission: true },
+          {
+            status: "verified_success",
+            timing: "mixed",
+            timelyEvidenceCount: 1,
+            lateEvidenceCount: 1,
+          },
+        ],
+      },
+      localDisposition: { status: "observed" },
+      billingScope: { legacyQuoteScope: "first_unit", aggregated: false },
+    });
+  });
+
+  it("keeps the legacy receipt readable when the history truth version is newer", () => {
+    const receipt = parseTaskReceipt(rawReceipt({ history_truth: { version: 2 } }), "task-17");
+
+    expect(receipt.status).toBe("completed");
+    expect(receipt.historyTruth.source.status).toBe("unsupported");
+  });
+
+  it.each([
+    rawHistoryTruth({ source: { status: "failed" } }),
+    rawHistoryTruthWithInvalidEvidenceCount(),
+  ])("rejects malformed history truth records", (history_truth) => {
+    expect(() => parseTaskReceipt(rawReceipt({ history_truth }), "task-17"))
+      .toThrow(InvalidResponseError);
   });
 
   it.each([

@@ -20,8 +20,16 @@ from haoai_backend.shared.identity import TrustedActor
 
 from .domain import ChapterRecord, SeriesRecord, StoryboardAssetRecord, parse_source_frames, serialize_content, source_asset_ids
 from .media_writes import UNSET_CONTENT, reconcile_source_media_state
-from .errors import SeriesDataForbidden, SeriesDataNotFound
+from .errors import SeriesDataBadRequest, SeriesDataConflict, SeriesDataForbidden, SeriesDataNotFound
+from .chapter_edit_guard import (
+    ChapterEditGuardConflict,
+    ChapterEditGuardInvalid,
+    decode_chapter_content,
+    strict_json_equal,
+    validate_frame_sources,
+)
 from .ports import SeriesDataUnitOfWork
+from .schemas import ChapterEditGuard
 from .storyboard import chat_index_mapping
 from .tables import (
     ai_tasks,
@@ -356,6 +364,236 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
         self._refresh_lock(current.id, actor.user_id, now)
         return self.load_chapter(current.id) or current
 
+    def update_chapter_guarded(
+        self,
+        actor: TrustedActor,
+        chapter_id: str,
+        content: list[dict[str, Any]],
+        guard: ChapterEditGuard,
+        now: datetime,
+    ) -> ChapterRecord:
+        """Conditionally update a complete chapter in one series-data transaction."""
+        self._session.begin()
+        dialect = self._session.get_bind().dialect.name
+        if dialect == "sqlite":
+            self._session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+
+        try:
+            locator = self._session.execute(
+                select(chapters.c.series_id).where(chapters.c.id == chapter_id)
+            ).scalar_one_or_none()
+            if locator is None:
+                raise SeriesDataNotFound("章节不存在")
+
+            series_row = self._session.execute(
+                select(series).where(series.c.id == locator).with_for_update()
+            ).mappings().first()
+            if series_row is None:
+                raise SeriesDataNotFound("剧集不存在")
+            chapter_row = self._session.execute(
+                select(chapters).where(chapters.c.id == chapter_id).with_for_update()
+            ).mappings().first()
+            if chapter_row is None:
+                raise SeriesDataNotFound("章节不存在")
+            if chapter_row["series_id"] != locator:
+                raise SeriesDataConflict("章节所属剧集已变化")
+            self.require_access(actor, locator)
+
+            if guard.expected_chapter_id != chapter_id or guard.expected_series_id != locator:
+                raise ChapterEditGuardConflict("章节或剧集身份与编辑基线不一致")
+            if guard.expected_order != chapter_row["order"]:
+                raise ChapterEditGuardConflict("章节顺序已变化")
+
+            old_frames = decode_chapter_content(chapter_row["content"])
+            if not strict_json_equal(old_frames, guard.expected_content):
+                raise ChapterEditGuardConflict("章节内容已变化")
+
+            baseline_rows = self._session.execute(
+                select(storyboard_assets)
+                .where(storyboard_assets.c.chapter_id == chapter_id)
+                .order_by(storyboard_assets.c.id)
+                .with_for_update()
+            ).mappings().all()
+            expected_rows = sorted(
+                (
+                    item.id,
+                    item.series_id,
+                    item.chapter_id,
+                    item.frame_index,
+                )
+                for item in guard.expected_storyboards
+            )
+            actual_rows = sorted(
+                (
+                    row["id"],
+                    row["series_id"],
+                    row["chapter_id"],
+                    row["frame_index"],
+                )
+                for row in baseline_rows
+            )
+            if expected_rows != actual_rows:
+                raise ChapterEditGuardConflict("分镜素材目录已变化")
+
+            source_map = validate_frame_sources(
+                old_frames,
+                content,
+                [item.model_dump() for item in guard.frame_sources],
+                guard.deleted_source_indexes,
+            )
+            rows_by_id = {row["id"]: row for row in baseline_rows}
+            if len(rows_by_id) != len(baseline_rows):
+                raise ChapterEditGuardConflict("分镜素材编号重复，无法安全编辑")
+            for old_index, frame in enumerate(old_frames or []):
+                storyboard_id = _guard_storyboard_id(frame)
+                if storyboard_id is None:
+                    continue
+                row = rows_by_id.get(storyboard_id)
+                if (
+                    row is None
+                    or row["series_id"] != locator
+                    or row["chapter_id"] != chapter_id
+                    or row["frame_index"] != old_index
+                ):
+                    raise ChapterEditGuardConflict("原镜头分镜素材身份或位置已变化")
+
+            lock_row = self._session.execute(
+                select(chapter_locks)
+                .where(chapter_locks.c.chapter_id == chapter_id)
+                .with_for_update()
+            ).mappings().first()
+            lock_identity = guard.expected_lock_identity
+            if series_row["team_id"]:
+                acquired_at = _parse_lock_timestamp(lock_identity.acquired_at) if lock_identity else None
+                if (
+                    lock_row is None
+                    or lock_identity is None
+                    or lock_row["user_id"] != actor.user_id
+                    or lock_identity.user_id != actor.user_id
+                    or _as_utc_naive(lock_row["acquired_at"]) != acquired_at
+                    or _as_utc_naive(lock_row["expires_at"]) <= _as_utc_naive(now)
+                ):
+                    raise ChapterEditGuardConflict("编辑锁已变化或失效")
+            elif lock_identity is not None:
+                raise ChapterEditGuardInvalid("个人剧集不能提交团队编辑锁身份")
+
+            referenced: dict[Any, set[str]] = {
+                characters: set(),
+                scenes: set(),
+                props: set(),
+            }
+            for frame in content:
+                for field, table in (("character", characters), ("scene", scenes), ("prop", props)):
+                    values = frame.get(field, [])
+                    if isinstance(values, list):
+                        referenced[table].update(values)
+            for table, asset_ids in referenced.items():
+                if not asset_ids:
+                    continue
+                rows = self._session.execute(
+                    select(table.c.id, table.c.series_id)
+                    .where(table.c.id.in_(sorted(asset_ids)))
+                    .order_by(table.c.id)
+                    .with_for_update()
+                ).mappings().all()
+                actual = {row["id"] for row in rows if row["series_id"] == locator}
+                if actual != asset_ids:
+                    raise ChapterEditGuardConflict("镜头引用的素材不存在或不属于当前剧集")
+
+            deleted_storyboard_ids = {
+                storyboard_id
+                for source_index in guard.deleted_source_indexes
+                if old_frames is not None
+                for storyboard_id in [_guard_storyboard_id(old_frames[source_index])]
+                if storyboard_id is not None
+            }
+            content_storyboard_ids = {
+                storyboard_id
+                for frame in old_frames or []
+                for storyboard_id in [_guard_storyboard_id(frame)]
+                if storyboard_id is not None
+            }
+            preserved_unreferenced_state_ids = {
+                row["id"] for row in baseline_rows
+            } - content_storyboard_ids - deleted_storyboard_ids
+            encoded_content = serialize_content(content, ensure_ascii=False)
+            current = _chapter_record(chapter_row)
+            reconcile_source_media_state(
+                self._session,
+                current,
+                actor,
+                content_override=encoded_content,
+                preserve_unreferenced_state_ids=preserved_unreferenced_state_ids,
+            )
+            content_predicate = (
+                chapters.c.content.is_(None)
+                if chapter_row["content"] is None
+                else chapters.c.content == chapter_row["content"]
+            )
+            updated = self._session.execute(
+                update(chapters)
+                .where(
+                    chapters.c.id == chapter_id,
+                    chapters.c.series_id == locator,
+                    chapters.c.order == chapter_row["order"],
+                    content_predicate,
+                )
+                .values(content=encoded_content, updated_at=now)
+            )
+            if updated.rowcount != 1:
+                raise ChapterEditGuardConflict("章节在保存期间已变化")
+
+            self.sync_storyboard_assets(
+                chapter_id,
+                locator,
+                preserve_unreferenced_rows=True,
+                explicitly_deleted_ids=deleted_storyboard_ids,
+                preserve_unreferenced_state_ids=preserved_unreferenced_state_ids,
+            )
+            self.update_chat_mapping_explicit(chapter_id, source_map)
+
+            if series_row["team_id"]:
+                commit_now = _as_utc_naive(self._now())
+                if _as_utc_naive(lock_row["expires_at"]) <= commit_now:
+                    raise ChapterEditGuardConflict("编辑锁在提交前已过期")
+                idle = self._session.execute(
+                    select(system_configs.c.chapter_lock_idle_minutes).limit(1)
+                ).scalar_one_or_none()
+                minutes = idle if idle else 15
+                lock_refresh = self._session.execute(
+                    update(chapter_locks)
+                    .where(
+                        chapter_locks.c.id == lock_row["id"],
+                        chapter_locks.c.chapter_id == chapter_id,
+                        chapter_locks.c.user_id == actor.user_id,
+                        chapter_locks.c.acquired_at == lock_row["acquired_at"],
+                        chapter_locks.c.expires_at > commit_now,
+                    )
+                    .values(
+                        last_active_at=commit_now,
+                        expires_at=commit_now + timedelta(minutes=minutes),
+                    )
+                )
+                if lock_refresh.rowcount != 1:
+                    raise ChapterEditGuardConflict("编辑锁在保存期间已失效")
+
+            result = self._session.execute(
+                select(chapters).where(chapters.c.id == chapter_id)
+            ).mappings().first()
+            if result is None:
+                raise SeriesDataNotFound("章节不存在")
+            self._session.commit()
+            return _chapter_record(result)
+        except ChapterEditGuardInvalid as exc:
+            self._session.rollback()
+            raise SeriesDataBadRequest(str(exc)) from exc
+        except ChapterEditGuardConflict as exc:
+            self._session.rollback()
+            raise SeriesDataConflict(str(exc)) from exc
+        except Exception:
+            self._session.rollback()
+            raise
+
     def delete_frame_first_phase(self, chapter: ChapterRecord, actor: TrustedActor, frame_index: int, frames: list[Any]) -> ChapterRecord:
         encoded = serialize_content(frames, ensure_ascii=False)
         reconcile_source_media_state(self._session, chapter, actor, content_override=encoded)
@@ -420,7 +658,14 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
         return [_asset_record(row) for row in rows]
 
     def sync_storyboard_assets(
-        self, chapter_id: str, series_id: str, *, final_content: object | None = None,
+        self,
+        chapter_id: str,
+        series_id: str,
+        *,
+        final_content: object | None = None,
+        preserve_unreferenced_rows: bool = False,
+        explicitly_deleted_ids: set[object] | None = None,
+        preserve_unreferenced_state_ids: set[object] | None = None,
     ) -> ChapterRecord | None:
         chapter = self.load_chapter(chapter_id)
         if chapter is None:
@@ -465,7 +710,13 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
                 "description": frame.get("text", "") or frame.get("original_text", ""),
                 "image_url": None, "created_at": self._now(), "updated_at": self._now(),
             }
-            reconcile_source_media_state(self._session, chapter, TrustedActor(""), new_assets=(asset_row,))
+            reconcile_source_media_state(
+                self._session,
+                chapter,
+                TrustedActor(""),
+                new_assets=(asset_row,),
+                preserve_unreferenced_state_ids=preserve_unreferenced_state_ids,
+            )
             self._flush_storyboard_asset_updates(pending_asset_updates)
             pending_asset_updates.clear()
             self._session.execute(insert(storyboard_assets).values(**asset_row))
@@ -473,7 +724,14 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
             frame["storyboard"] = [asset_id]
             refs_changed = True
 
-        deleted_ids = {row["id"] for row in initial_rows if row["id"] not in referenced_ids}
+        unreferenced_ids = {row["id"] for row in initial_rows if row["id"] not in referenced_ids}
+        if explicitly_deleted_ids is not None and not set(explicitly_deleted_ids) <= unreferenced_ids:
+            raise RuntimeError("explicit storyboard deletions must reference currently unreferenced rows")
+        deleted_ids = (
+            set(explicitly_deleted_ids or ())
+            if preserve_unreferenced_rows
+            else unreferenced_ids
+        )
         next_content = final_content if final_content is not None else (serialize_content(frames, ensure_ascii=False) if refs_changed else chapter.content)
         content_changed = next_content != chapter.content
         if content_changed or deleted_ids:
@@ -483,6 +741,7 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
                 TrustedActor(""),
                 content_override=next_content if content_changed else _UNSET,
                 deleted_asset_ids=deleted_ids,
+                preserve_unreferenced_state_ids=preserve_unreferenced_state_ids,
             )
         self._flush_storyboard_asset_updates(pending_asset_updates)
         if deleted_ids:
@@ -528,6 +787,36 @@ class SqlAlchemySeriesDataUnitOfWork(SeriesDataUnitOfWork):
             else:
                 result = self._session.execute(update(chat_messages).where(chat_messages.c.id == row["id"]).values(frame_index=next_index))
                 _require_single_row_update(result, "chat frame remap")
+
+    def update_chat_mapping_explicit(
+        self,
+        chapter_id: str,
+        old_to_new: dict[int, int | None],
+    ) -> None:
+        """Apply a complete source-index mapping, including an empty mapping."""
+        rows = self._session.execute(
+            select(chat_messages.c.id, chat_messages.c.frame_index)
+            .where(
+                chat_messages.c.chapter_id == chapter_id,
+                chat_messages.c.frame_index.is_not(None),
+            )
+            .order_by(chat_messages.c.id)
+            .with_for_update()
+        ).mappings().all()
+        for row in rows:
+            old_index = row["frame_index"]
+            if type(old_index) is not int or old_index not in old_to_new:
+                raise SeriesDataConflict("聊天记录关联了无法映射的原镜头")
+            new_index = old_to_new[old_index]
+            if new_index is None:
+                self._session.execute(delete(chat_messages).where(chat_messages.c.id == row["id"]))
+            else:
+                result = self._session.execute(
+                    update(chat_messages)
+                    .where(chat_messages.c.id == row["id"])
+                    .values(frame_index=new_index)
+                )
+                _require_single_row_update(result, "explicit chat frame remap")
 
     def delete_chat_frame_and_shift(self, chapter_id: str, frame_index: int) -> None:
         self._session.execute(delete(chat_messages).where(
@@ -598,4 +887,26 @@ def _asset_record(row: Any) -> StoryboardAssetRecord:
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def _guard_storyboard_id(frame: dict[str, Any]) -> str | None:
+    value = frame.get("storyboard", [])
+    if value == []:
+        return None
+    if not isinstance(value, list) or len(value) != 1 or not isinstance(value[0], str):
+        raise ChapterEditGuardConflict("章节原分镜素材引用无法核对")
+    return value[0]
+
+
+def _parse_lock_timestamp(value: str) -> datetime:
+    try:
+        return _as_utc_naive(datetime.fromisoformat(value.replace("Z", "+00:00")))
+    except (TypeError, ValueError) as exc:
+        raise ChapterEditGuardInvalid("编辑锁时间格式无效") from exc
+
+
+def _as_utc_naive(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 

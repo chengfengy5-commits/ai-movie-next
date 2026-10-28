@@ -8,7 +8,7 @@ import type { CreatorModel, CreatorPrompt } from "../../shared/api/creatorSettin
 import type { FusedGenerationInput, FusedSubmissionReceipt } from "../../shared/api/fusedGeneration";
 import type { FusedGenerationOpenIntent } from "./fusedGenerationEntryIntent";
 import type { MediaReferenceKind, MediaReferenceUploadPort } from "../../shared/api/mediaReferenceUpload";
-import type { TaskReceipt } from "../../shared/api/taskDetails";
+import { unsupportedTaskHistoryTruth, type TaskReceipt } from "../../shared/api/taskDetails";
 import { ApiError } from "../../shared/api/errors";
 import { demoSeries } from "../series/demoSeries";
 import { FusedAssetsPage } from "./FusedAssetsPage";
@@ -138,6 +138,7 @@ function taskReceipt(overrides: Partial<TaskReceipt> = {}): TaskReceipt {
     externalProvider: null,
     createdAt: null,
     updatedAt: null,
+    historyTruth: unsupportedTaskHistoryTruth(),
     ...overrides,
   };
 }

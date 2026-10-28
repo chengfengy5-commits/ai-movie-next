@@ -262,6 +262,7 @@ export interface WorkspaceServices {
   readonly userPreferences?: UserPreferencesPort;
   createMediaExportSession?(isCurrent: () => boolean): MediaExportSessionTransport;
   listChapters(seriesId: string, signal: AbortSignal): Promise<Chapter[]>;
+  getContinuousChapterEditCapabilities?(signal: AbortSignal): Promise<{ readonly chapterEditGuard: 1 }>;
   createChapter?(seriesId: string, input: CreateChapterInput, signal: AbortSignal): Promise<Chapter>;
   reorderChapters?(seriesId: string, input: ReorderChaptersInput, signal: AbortSignal): Promise<{ message: string }>;
   getChapterEditLock?(
@@ -2125,6 +2126,7 @@ type ApiEndpoint =
   | "importSeries"
   | "uploadSeriesCover"
   | "chapters"
+  | "chapterEditGuardCapabilities"
   | "createChapter"
   | "reorderChapters"
   | "getChapterEditLock"
@@ -2311,6 +2313,9 @@ function apiRequestDefinition(
   }
   if (endpoint === "frameOptimizeCapabilities") {
     return { path: "/chat/frame-optimize/capabilities", method: "GET", expectedStatus: 200 };
+  }
+  if (endpoint === "chapterEditGuardCapabilities") {
+    return { path: "/chapters/continuous-edit/capabilities", method: "GET", expectedStatus: 200 };
   }
   if (endpoint === "frameOptimizeSubmit") {
     return { path: "/chat/frame-optimize", method: "POST", expectedStatus: 200 };
@@ -3450,6 +3455,24 @@ export function createApiServices(
         seriesId,
       );
     },
+    async getContinuousChapterEditCapabilities(signal) {
+      const token = requireApiToken(storage);
+      const payload = await requestForCurrentApiSession(
+        "chapterEditGuardCapabilities",
+        token,
+        signal,
+      );
+      if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+        throw new InvalidResponseError("连续编辑能力响应格式无效。");
+      }
+      const features = (payload as Record<string, unknown>).features;
+      if (typeof features !== "object" || features === null || Array.isArray(features)
+        || (features as Record<string, unknown>).chapter_edit_guard !== 1) {
+        throw new InvalidResponseError("当前服务未声明支持安全的整章编辑保存。");
+      }
+      ensureCurrentApiSession(storage, token, signal);
+      return { chapterEditGuard: 1 as const };
+    },
     async createChapter(seriesId, input, signal) {
       const token = requireApiToken(storage);
       return parseChapterResponse(
@@ -3844,6 +3867,7 @@ export function createApiServices(
               token,
               fetcher,
               signal: mediaSignal,
+              isCurrent,
             });
             if (mediaSignal.aborted || !isCurrent()) {
               throw new ApiError("aborted", "Request was cancelled.");

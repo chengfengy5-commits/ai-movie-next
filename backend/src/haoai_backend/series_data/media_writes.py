@@ -25,6 +25,7 @@ def reconcile_source_media_state(
     content_override: object = UNSET_CONTENT,
     new_assets: tuple[dict[str, Any], ...] = (),
     deleted_asset_ids: set[object] | None = None,
+    preserve_unreferenced_state_ids: set[object] | None = None,
 ) -> None:
     """Reconcile through the caller's Session without owning its transaction."""
     del actor  # The enclosing series writer has already checked current access.
@@ -35,6 +36,8 @@ def reconcile_source_media_state(
         kwargs["new_assets"] = new_assets
     if deleted_asset_ids:
         kwargs["deleted_asset_ids"] = set(deleted_asset_ids)
+    if preserve_unreferenced_state_ids:
+        kwargs["preserve_unreferenced_state_ids"] = set(preserve_unreferenced_state_ids)
     try:
         stage_media_reconciliation(session, chapter.id, **kwargs)
     except NotesNotFound as exc:

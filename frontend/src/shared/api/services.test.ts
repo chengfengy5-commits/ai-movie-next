@@ -54,6 +54,15 @@ function jsonResponse(payload: unknown, status = 200): Response {
   } as Response;
 }
 
+function videoResponse(url: string, status = 200): Response {
+  const response = new Response("video-bytes", {
+    status,
+    headers: { "Content-Type": "video/mp4" },
+  });
+  Object.defineProperty(response, "url", { value: url });
+  return response;
+}
+
 function requireServiceMethod<T>(method: T | undefined, name: string): NonNullable<T> {
   if (method === undefined) throw new Error(`Expected ${name} to be available.`);
   return method as NonNullable<T>;
@@ -1024,7 +1033,7 @@ describe("API services", () => {
           removed_asset_ids: [],
         });
       }
-      return new Response("video-bytes", { headers: { "Content-Type": "video/mp4" } });
+      return videoResponse(String(input));
     });
     const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
     const readForPlayback = services.getPersonalRoughCutForPlayback;
@@ -1043,6 +1052,90 @@ describe("API services", () => {
     const [input, init] = fetcher.mock.calls[1] ?? [];
     expect(String(input)).toBe("http://127.0.0.1:4175/uploads/storyboard/clip.mp4");
     expect(new Headers(init?.headers).get("Authorization")).toBe("Bearer current-media-token");
+  });
+
+  it("resolves remote rough-cut media with the captured token and fetches the signed URL anonymously", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "current-media-token");
+    const sourceUrl = "https://media.example.invalid/clip.mp4?sig=source";
+    const signedUrl = "https://media.example.invalid/clip.mp4?sig=signed";
+    const calls: Array<{ url: URL; init: RequestInit }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = new URL(String(input));
+      calls.push({ url, init });
+      if (url.pathname.endsWith("/rough-cut")) {
+        return jsonResponse({
+          chapter_id: "chapter-one",
+          revision: 1,
+          saved: true,
+          frames: [],
+          removed_asset_ids: [],
+        });
+      }
+      if (url.pathname === "/api/sign-download-urls") {
+        return Response.json({
+          items: [{ url: signedUrl, filename: "rough-cut-preview.mp4", signed: true }],
+        });
+      }
+      return videoResponse(url.href);
+    });
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const readForPlayback = services.getPersonalRoughCutForPlayback;
+    if (readForPlayback === undefined) throw new Error("Expected the API playback snapshot reader.");
+    const { reader } = await readForPlayback("chapter-one", new AbortController().signal);
+    if (reader === null) throw new Error("Expected a session-bound media reader.");
+
+    await expect(reader.read(sourceUrl, new AbortController().signal)).resolves.toBeInstanceOf(Blob);
+
+    const signer = calls.find(({ url }) => url.pathname === "/api/sign-download-urls");
+    expect(signer).toBeDefined();
+    expect(new Headers(signer?.init.headers).get("Authorization")).toBe("Bearer current-media-token");
+    expect(JSON.parse(String(signer?.init.body))).toEqual({
+      items: [{ url: sourceUrl, filename: "rough-cut-preview.mp4" }],
+    });
+    const media = calls.find(({ url }) => url.href === signedUrl);
+    expect(media).toBeDefined();
+    expect(new Headers(media?.init.headers).has("Authorization")).toBe(false);
+    expect(media?.init).toMatchObject({ mode: "cors", credentials: "omit", referrerPolicy: "no-referrer" });
+  });
+
+  it("stops a remote read after logout while download-link signing is pending", async () => {
+    const storage = new MemoryStorage();
+    storage.setItem(API_TOKEN_KEY, "old-media-token");
+    const sourceUrl = "https://media.example.invalid/clip.mp4?sig=source";
+    let resolveSigner!: (response: Response) => void;
+    const fetcher = vi.fn(async (input: RequestInfo | URL) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/rough-cut")) {
+        return jsonResponse({
+          chapter_id: "chapter-one",
+          revision: 1,
+          saved: true,
+          frames: [],
+          removed_asset_ids: [],
+        });
+      }
+      if (url.pathname === "/api/sign-download-urls") {
+        return new Promise<Response>((resolve) => { resolveSigner = resolve; });
+      }
+      return videoResponse(url.href);
+    });
+    const services = createApiServices("http://127.0.0.1:4175/api", { storage, fetcher });
+    const readForPlayback = services.getPersonalRoughCutForPlayback;
+    if (readForPlayback === undefined) throw new Error("Expected the API playback snapshot reader.");
+    const { reader } = await readForPlayback("chapter-one", new AbortController().signal);
+    if (reader === null) throw new Error("Expected a session-bound media reader.");
+
+    const pending = reader.read(sourceUrl, new AbortController().signal);
+    await vi.waitFor(() => expect(resolveSigner).toBeTypeOf("function"));
+    storage.setItem(API_TOKEN_KEY, "new-media-token");
+    resolveSigner(Response.json({
+      items: [{ url: sourceUrl, filename: "rough-cut-preview.mp4", signed: false }],
+    }));
+
+    await expect(pending).rejects.toMatchObject({ kind: "aborted" });
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(storage.getItem(API_TOKEN_KEY)).toBe("new-media-token");
   });
 
   it("keeps the canonical rough-cut session anchor after the bearer changes", async () => {

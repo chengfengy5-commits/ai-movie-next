@@ -12,7 +12,7 @@ from .domain import chapter_create_content, parse_source_frames
 from .errors import SeriesDataBadRequest, SeriesDataNotFound, SeriesDataUnavailable
 from .ports import Clock, SeriesDataUnitOfWork, UnitOfWorkFactory
 from .presentation import chapter_payload, series_detail, series_list_item, storyboard_asset_payload
-from .schemas import ChapterCreate, ChapterUpdate, DeleteFrameRequest, ReorderChaptersRequest, SeriesCreate, SeriesUpdate
+from .schemas import ChapterCreate, ChapterEditGuard, ChapterUpdate, DeleteFrameRequest, ReorderChaptersRequest, SeriesCreate, SeriesUpdate
 
 
 def get_series_list(factory: UnitOfWorkFactory | None, actor: TrustedActor) -> list[dict[str, Any]]:
@@ -173,7 +173,7 @@ def update_chapter(
             raise SeriesDataNotFound("章节不存在")
         uow.require_access(actor, chapter.series_id)
         old_frames = parse_source_frames(chapter.content)
-        values = request.model_dump()
+        values = request.model_dump(exclude={"chapter_edit_guard"})
         chapter = uow.update_chapter_fields(chapter, values, actor, (now or _utcnow)())
         uow.commit()
         if request.content is not None:
@@ -182,6 +182,26 @@ def update_chapter(
             uow.update_chat_mapping(chapter_id, old_frames, request.content)
             uow.commit()
             chapter = uow.load_chapter(chapter_id) or chapter
+        return chapter_payload(chapter)
+    except Exception:
+        uow.rollback()
+        raise
+    finally:
+        uow.close()
+
+
+def update_chapter_guarded(
+    factory: UnitOfWorkFactory | None,
+    actor: TrustedActor,
+    chapter_id: str,
+    content: list[dict[str, Any]],
+    guard: ChapterEditGuard,
+    *,
+    now: Clock | None = None,
+) -> dict[str, Any]:
+    uow = _open(factory)
+    try:
+        chapter = uow.update_chapter_guarded(actor, chapter_id, content, guard, (now or _utcnow)())
         return chapter_payload(chapter)
     except Exception:
         uow.rollback()

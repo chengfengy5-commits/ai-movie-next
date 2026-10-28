@@ -540,7 +540,7 @@ export function PersonalRoughCutPlayback({
       <div className="personal-rough-cut-playback-heading">
         <div>
           <h4>保存顺序连续试看</h4>
-          <p>仅使用已保存草稿的纳入视频和本机已鉴权读取；过滤器与未保存编辑不会改变播放顺序。</p>
+          <p>按保存顺序播放已纳入的视频，支持本地和远程来源。筛选和未保存的编辑不会改变播放顺序。</p>
         </div>
         <button
           className="secondary-button"
@@ -558,7 +558,7 @@ export function PersonalRoughCutPlayback({
         </p>
       ) : reader === null ? (
         <p className="personal-rough-cut-playback-note" role="status">
-          当前服务未提供已鉴权的视频读取，无法开始试看。
+          当前服务未提供会话约束的视频读取，无法开始试看。
         </p>
       ) : !enabled ? (
         <p className="personal-rough-cut-playback-note" role="status">

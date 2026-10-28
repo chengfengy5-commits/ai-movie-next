@@ -49,6 +49,18 @@ describe("series workbench preferences", () => {
     expect(resizeSeriesWorkbenchLeftWidth(70, 1_000, 1_000)).toBe(80);
   });
 
+  it("restores the continuous editor as its own left view and width", () => {
+    const storage = memoryStorage();
+    const preferences = {
+      route: "media" as const,
+      leftView: "continuous-preview" as const,
+      leftWidths: { storyboard: 64, assets: 58, "continuous-preview": 72 },
+    };
+
+    expect(writeSeriesWorkbenchPreferences(scope, preferences, () => storage)).toBe(true);
+    expect(readSeriesWorkbenchPreferences(scope, () => storage).preferences).toEqual(preferences);
+  });
+
   it("keeps default behavior available when browser storage fails", () => {
     expect(readSeriesWorkbenchPreferences(scope, () => { throw new Error("blocked"); }))
       .toEqual({ preferences: defaultSeriesWorkbenchPreferences, available: false });
