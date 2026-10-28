@@ -3867,6 +3867,7 @@ export function createApiServices(
               token,
               fetcher,
               signal: mediaSignal,
+              isCurrent,
             });
             if (mediaSignal.aborted || !isCurrent()) {
               throw new ApiError("aborted", "Request was cancelled.");
