@@ -127,6 +127,12 @@ class FrameOptimizeCancellationPort(Protocol):
     def cancel_owned(self, actor: TrustedActor, task_id: str) -> str: ...
 
 
+class HaoaiGroupCancellationPort(Protocol):
+    """Settle and cancel one authenticated HaoAI attempt group."""
+
+    def cancel_owned(self, actor: TrustedActor, task_id: str) -> str: ...
+
+
 CancellationConnectionFactory: TypeAlias = Callable[
     [], AbstractContextManager[object]
 ]

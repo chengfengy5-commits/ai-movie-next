@@ -31,8 +31,18 @@ from haoai_backend.generation_core.base_schema import (
     BillingUnitRow,
     UserRow,
 )
-from haoai_backend.generation_core.video_single_claims import (
-    SqlAlchemyVideoSingleClaims,
+from haoai_backend.generation_core.haoai_group.intents import (
+    SqlAlchemyHaoaiGroupIntents,
+)
+from haoai_backend.generation_core.haoai_group.media import (
+    SqlAlchemyHaoaiGroupMedia,
+)
+from haoai_backend.generation_core.haoai_group.polls import (
+    HaoaiGroupPollGrant,
+    SqlAlchemyHaoaiGroupPolls,
+)
+from haoai_backend.generation_core.haoai_group.results import (
+    SqlAlchemyHaoaiGroupResults,
 )
 from haoai_backend.generation_core.video_single_intents import (
     SqlAlchemyVideoSingleIntents,
@@ -61,6 +71,10 @@ from haoai_backend.generation_providers.video.aistarslab_provider import (
     AistarslabVideoProvider,
 )
 from haoai_backend.generation_providers.video.xai_provider import XaiVideoProvider
+from haoai_backend.generation_providers.video.haoai_provider import (
+    HaoaiExecutionBinding,
+    HaoaiVideoProvider,
+)
 from haoai_backend.media_uploads.domain import (
     MAX_VIDEO_BYTES,
     InvalidMediaUpload,
@@ -320,10 +334,13 @@ class VideoSingleExecutor:
         self._configuration = configuration
         self._registry_capabilities = registry_capabilities
         self._poll_waiter = poll_waiter
-        self._execution_port: SqlAlchemyVideoSingleClaims | None = None
+        self._execution_port: object | None = None
 
     def bind_execution_port(self, execution_port: object) -> None:
-        if not isinstance(execution_port, SqlAlchemyVideoSingleClaims):
+        if not all(
+            callable(getattr(execution_port, name, None))
+            for name in ("claim_next", "renew_or_revoke", "release_claim")
+        ):
             raise TypeError("video.single executor requires its claim port")
         self._execution_port = execution_port
 
@@ -335,6 +352,8 @@ class VideoSingleExecutor:
             or self._execution_port is None
         ):
             return "ownership_lost"
+        if _is_haoai_group_claim(self._execution_port, claim):
+            return self._execute_haoai_group_claim(claim)
         crypto = self._registry_capabilities.crypto
         proof_authority = self._registry_capabilities.proof_authority
         if not isinstance(crypto, CredentialCrypto) or not isinstance(
@@ -505,6 +524,206 @@ class VideoSingleExecutor:
             guard,
         )
 
+    def _execute_haoai_group_claim(self, claim: ClaimAuthority):
+        crypto = self._registry_capabilities.crypto
+        proof_authority = self._registry_capabilities.proof_authority
+        if not isinstance(crypto, CredentialCrypto) or not isinstance(
+            proof_authority, HmacProofAuthority
+        ):
+            return "pending"
+
+        configuration = self._configuration
+        registry = build_credential_registry(self._registry_capabilities)
+        intents = SqlAlchemyHaoaiGroupIntents(
+            configuration.session_factory,
+            configuration.db_clock,
+            configuration.id_factory,
+            registry,
+            crypto,
+            proof_authority,
+        )
+        results = SqlAlchemyHaoaiGroupResults(
+            configuration.session_factory,
+            configuration.db_clock,
+            proof_authority,
+            configuration.id_factory,
+        )
+        polls = SqlAlchemyHaoaiGroupPolls(
+            configuration.session_factory,
+            configuration.db_clock,
+            configuration.id_factory,
+            registry,
+            crypto,
+            proof_authority,
+        )
+        media = SqlAlchemyHaoaiGroupMedia(
+            configuration.session_factory,
+            configuration.db_clock,
+            proof_authority,
+            results,
+            configuration.id_factory,
+        )
+
+        prepared = intents.prepare(claim)
+        if prepared.disposition == "ownership_lost":
+            return "ownership_lost"
+        if prepared.disposition in {"unresolved", "existing"}:
+            return "pending"
+        intent = prepared.intent
+        verified = prepared.verified_input
+        if intent is None or verified is None:
+            return "pending"
+
+        guard = _AuthorityGuard(configuration, claim, intent, verified)
+        if prepared.disposition == "committed":
+            try:
+                guard.require_live()
+                references = self._prepare_references(verified, guard)
+            except _ExecutionAuthorityLost:
+                return "ownership_lost"
+            except Exception:
+                return "pending" if guard.is_live() else "ownership_lost"
+            if isinstance(references, TransferFailure):
+                return "pending" if guard.is_live() else "ownership_lost"
+            try:
+                guard.require_live()
+                provider = self._build_provider(verified, intent, guard)
+                guard.require_live()
+            except _ExecutionAuthorityLost:
+                return "ownership_lost"
+            except Exception:
+                return "pending" if guard.is_live() else "ownership_lost"
+            try:
+                guard.require_live()
+                external_ref = provider.submit_async_media(
+                    verified.snapshot,
+                    references,
+                    intent,
+                )
+            except _ExecutionAuthorityLost:
+                return "ownership_lost"
+            except Exception:
+                if not guard.is_live():
+                    return "ownership_lost"
+                external_ref = ExternalOperationRef(
+                    intent_id=intent.external_submission_id,
+                    attempt_id=intent.attempt_id,
+                    provider=intent.provider,
+                    external_id=None,
+                    create_outcome="unknown",
+                )
+            if not guard.is_live():
+                return "ownership_lost"
+            if not _external_ref_matches(external_ref, intent):
+                return "pending"
+            recorded = intents.record_submission(
+                claim, intent, verified, external_ref
+            )
+            if recorded != "recorded":
+                return recorded
+            if (
+                external_ref.create_outcome != "submitted"
+                or not _safe_provider_id(external_ref.external_id)
+            ):
+                return "pending"
+        elif prepared.disposition == "resume_query":
+            external_ref = prepared.external_ref
+            if (
+                external_ref is None
+                or not _external_ref_matches(external_ref, intent)
+                or external_ref.create_outcome != "submitted"
+                or not _safe_provider_id(external_ref.external_id)
+            ):
+                return "pending"
+            try:
+                guard.require_live()
+                provider = self._build_provider(verified, intent, guard)
+                guard.require_live()
+            except _ExecutionAuthorityLost:
+                return "ownership_lost"
+            except Exception:
+                return "pending" if guard.is_live() else "ownership_lost"
+        elif prepared.disposition == "resume_media":
+            external_ref = prepared.external_ref
+            if (
+                external_ref is None
+                or not _external_ref_matches(external_ref, intent)
+                or external_ref.create_outcome != "submitted"
+                or not _safe_provider_id(external_ref.external_id)
+            ):
+                return "pending"
+            try:
+                guard.require_live()
+                provider = self._build_provider(verified, intent, guard)
+                guard.require_live()
+                store = configuration.media_store_factory()
+                guard.require_live()
+            except _ExecutionAuthorityLost:
+                return "ownership_lost"
+            except Exception:
+                return "pending" if guard.is_live() else "ownership_lost"
+            outcome = media.recover_completed_materialization(
+                claim,
+                intent,
+                verified,
+                external_ref,
+                provider,
+                store,
+            )
+            if outcome.disposition == "completed" and outcome.receipt is not None:
+                return outcome.receipt
+            return outcome.disposition
+        else:
+            return "pending"
+
+        try:
+            guard.require_live()
+            grant = polls.reserve_query(claim, intent, verified, external_ref)
+            if not isinstance(grant, HaoaiGroupPollGrant):
+                return (
+                    "ownership_lost"
+                    if grant.disposition == "ownership_lost"
+                    else "pending"
+                )
+            guard.require_live()
+            poll_outcome = polls.query_and_accept(grant, provider)
+        except _ExecutionAuthorityLost:
+            return "ownership_lost"
+        except Exception:
+            return "pending" if guard.is_live() else "ownership_lost"
+        if not guard.is_live():
+            return "ownership_lost"
+        if poll_outcome.disposition != "accepted" or poll_outcome.observation is None:
+            return "pending"
+        if poll_outcome.observation.status == "failed":
+            return (
+                None
+                if results.settle_known_failure(claim.scope) == "settled"
+                else "pending"
+            )
+        if poll_outcome.observation.status not in {"completed", "done"}:
+            return "pending"
+        try:
+            guard.require_live()
+            store = configuration.media_store_factory()
+            guard.require_live()
+        except _ExecutionAuthorityLost:
+            return "ownership_lost"
+        except Exception:
+            return "pending" if guard.is_live() else "ownership_lost"
+        outcome = media.materialize(
+            claim,
+            intent,
+            verified,
+            grant,
+            poll_outcome,
+            provider,
+            store,
+        )
+        if outcome.disposition == "completed" and outcome.receipt is not None:
+            return outcome.receipt
+        return outcome.disposition
+
     def _prepare_references(self, verified, guard: _AuthorityGuard):
         if verified.snapshot.model_ref.provider == "aistarslab":
             return self._prepare_aistarslab_references(verified, guard)
@@ -610,7 +829,7 @@ class VideoSingleExecutor:
     def _build_provider(self, verified, intent, guard: _AuthorityGuard):
         snapshot = verified.snapshot
         binding = verified.credential_binding
-        if snapshot.model_ref.provider in {"xai", "aistarslab"}:
+        if snapshot.model_ref.provider in {"xai", "aistarslab", "haoai"}:
             http_factory = lambda: _GatedHttpContext(
                 self._configuration.http_client_factory,
                 guard,
@@ -680,6 +899,23 @@ class VideoSingleExecutor:
                 credential_resolver=resolver,
                 http_client_factory=http_factory,
                 clock=self._configuration.db_clock,
+            )
+        if snapshot.model_ref.provider == "haoai":
+            haoai_binding = HaoaiExecutionBinding(
+                owner_scope=OwnerTaskScope(
+                    snapshot.grant_snapshot.actor_id,
+                    verified.task_id,
+                    "video.single",
+                ),
+                snapshot=snapshot,
+                intent=intent,
+                credential_binding=binding,
+            )
+            return HaoaiVideoProvider(
+                binding=haoai_binding,
+                http_client_factory=http_factory,
+                credential_resolver=resolver,
+                utc_clock=self._configuration.db_clock,
             )
         raise GenerationError("unsupported_provider", "video provider is unsupported")
 
@@ -875,6 +1111,16 @@ def _external_ref_matches(value: object, intent: CommittedIntent) -> bool:
         and value.attempt_id == intent.attempt_id
         and value.provider == intent.provider
     )
+
+
+def _is_haoai_group_claim(port: object, claim: ClaimAuthority) -> bool:
+    classifier = getattr(port, "is_group_claim", None)
+    if not callable(classifier):
+        return False
+    try:
+        return classifier(claim) is True
+    except Exception:
+        return False
 
 
 def _observation_matches(

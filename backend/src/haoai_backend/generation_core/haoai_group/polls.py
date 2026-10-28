@@ -40,9 +40,6 @@ from haoai_backend.generation_core.base_schema import (
     ResultEvidenceRow,
 )
 from haoai_backend.generation_core.haoai_group.claims import _claim_live
-from haoai_backend.generation_core.haoai_group.evidence import (
-    is_signed_auth_unavailable_observation,
-)
 from haoai_backend.generation_core.haoai_group.intents import (
     _current_submission_rows,
     _database_datetime,
@@ -51,6 +48,9 @@ from haoai_backend.generation_core.haoai_group.intents import (
 from haoai_backend.generation_core.haoai_group.persistence import (
     LockedHaoaiGroupGraph,
     lock_haoai_group_graph,
+)
+from haoai_backend.generation_core.haoai_group.settlement import (
+    establish_pending_policy_stop_event,
 )
 from haoai_backend.generation_core.persistence import GenerationRecordRepository
 from haoai_backend.generation_core.schema import (
@@ -116,6 +116,34 @@ class HaoaiGroupPollGrant:
     verified_input: VerifiedHaoaiGroupExecutionInput = field(repr=False)
     external_ref: ExternalOperationRef = field(repr=False)
     _nonce: str = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True, slots=True)
+class AcceptedPollObservation:
+    """A persisted accepted reservation used only to replay signed observations."""
+
+    reservation: PollReservation
+    confirmed_at: datetime
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.reservation) is not PollReservation
+            or self.reservation.state != "accepted"
+            or not isinstance(self.confirmed_at, datetime)
+            or self.confirmed_at.tzinfo is None
+        ):
+            raise ValueError("accepted observation replay requires a durable reservation")
+
+
+@dataclass(frozen=True, slots=True)
+class HaoaiGroupPollReplayGrant:
+    """Read-only replay of an authenticated accepted observation; never queryable."""
+
+    reservation: AcceptedPollObservation
+    claim: ClaimAuthority = field(repr=False, compare=False)
+    intent: CommittedIntent = field(repr=False)
+    verified_input: VerifiedHaoaiGroupExecutionInput = field(repr=False)
+    external_ref: ExternalOperationRef = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -457,7 +485,28 @@ class SqlAlchemyHaoaiGroupPolls:
                         graph.group.get("outstanding_reservation_ref")
                         == reservation.reservation_id
                     )
-                    if not live_claim or not timely_reservation or not has_outstanding:
+                    if (
+                        reservation_row.get("state") == "closed_unknown"
+                        and reservation_row.get("observation_ref") is None
+                        and source_fact == "source_completed"
+                        and observation.status in {"completed", "done"}
+                    ):
+                        # A request that outlived its reservation can still prove
+                        # the original result, but it cannot reopen the reservation
+                        # or affect the Group's query budget and auth streak.
+                        linked = session.execute(
+                            update(PollReservationRow.__table__)
+                            .where(
+                                PollReservationRow.__table__.c.reservation_id
+                                == reservation.reservation_id,
+                                PollReservationRow.__table__.c.state
+                                == "closed_unknown",
+                                PollReservationRow.__table__.c.observation_ref.is_(None),
+                            )
+                            .values(observation_ref=evidence_id)
+                        )
+                        closed_unknown = linked.rowcount == 1
+                    elif not live_claim or not timely_reservation or not has_outstanding:
                         closed_unknown = self._close_reservation_unknown(
                             session, graph, reservation_row, evidence_id, now
                         )
@@ -597,8 +646,16 @@ class SqlAlchemyHaoaiGroupPolls:
             )
             if event is None:
                 raise RuntimeError("HaoAI policy event cannot be safely staged")
-            staged = GenerationRecordRepository(session).stage_record(event)
-            if staged.status not in {"created", "same"}:
+            if (
+                not self._read_verified(session, graph, grant.verified_input)
+                or not establish_pending_policy_stop_event(
+                    session,
+                    graph,
+                    event,
+                    proof_authority=self.proof_authority,
+                    verified_quote=grant.verified_input.snapshot.server_quote,
+                )
+            ):
                 raise RuntimeError("HaoAI policy event could not be committed")
             group_values.update(
                 {
@@ -686,22 +743,23 @@ class SqlAlchemyHaoaiGroupPolls:
             .order_by(PollReservationRow.__table__.c.sequence.desc())
             .limit(12)
         ).mappings().all()
-        auth_pairs: list[tuple[int, str, str]] = []
-        for row in prior_reservations:
-            evidence_id = row.get("observation_ref")
-            evidence = session.execute(
-                select(ResultEvidenceRow.__table__).where(
-                    ResultEvidenceRow.__table__.c.id == evidence_id
-                )
-            ).mappings().one_or_none()
-            if evidence is not None and is_signed_auth_unavailable_observation(
-                evidence, self.proof_authority
-            ):
-                auth_pairs.append((int(row["sequence"]), str(row["reservation_id"]), str(evidence_id)))
-        auth_pairs.sort()
-        if len(auth_pairs) < 12 or streak != 12:
+        if len(prior_reservations) != 12 or streak != 12:
             return None
-        selected = auth_pairs[-12:]
+        selected = list(reversed(prior_reservations))
+        auth_pairs: list[tuple[int, str, str]] = []
+        for row in selected:
+            sequence = row.get("sequence")
+            reservation_id = row.get("reservation_id")
+            evidence_id = row.get("observation_ref")
+            if (
+                type(sequence) is not int
+                or not isinstance(reservation_id, str)
+                or not reservation_id
+                or not isinstance(evidence_id, str)
+                or not evidence_id
+            ):
+                return None
+            auth_pairs.append((sequence, reservation_id, evidence_id))
         try:
             event_id = self.id_factory()
         except Exception:
@@ -728,10 +786,10 @@ class SqlAlchemyHaoaiGroupPolls:
             if len(debits) != 1:
                 return None
             original_debit_ref = str(debits[0]["id"])
-            amount = -int(debits[0]["amount"])
+            amount = int(unit.get("debited_amount", 0))
             disposition = "pending"
         elif unit.get("billing_status") == "no_charge":
-            disposition = "no_debit"
+            disposition = "pending"
         else:
             return None
         return PolicyStopEvent(
@@ -739,8 +797,8 @@ class SqlAlchemyHaoaiGroupPolls:
             group_key=reservation.group_key,
             policy_version=HAOAI_ATTEMPT_GROUP.stop_policy_version,
             reason="auth_unavailable_12",
-            reservation_refs=tuple(item[1] for item in selected),
-            observation_refs=tuple(item[2] for item in selected),
+            reservation_refs=tuple(item[1] for item in auth_pairs),
+            observation_refs=tuple(item[2] for item in auth_pairs),
             active_step_id=reservation.step_id,
             active_submission_id=reservation.submission_id,
             external_id=reservation.external_id,
@@ -1455,7 +1513,9 @@ def _valid_id(value: object) -> bool:
 
 
 __all__ = (
+    "AcceptedPollObservation",
     "HaoaiGroupPollGrant",
     "HaoaiGroupPollOutcome",
+    "HaoaiGroupPollReplayGrant",
     "SqlAlchemyHaoaiGroupPolls",
 )

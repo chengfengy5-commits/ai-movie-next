@@ -17,6 +17,7 @@ from .ports import (
     CancellationSignalRegistry,
     FrameOptimizeCancellationPort,
     FrameReviewCancellationPort,
+    HaoaiGroupCancellationPort,
     TaskCancellationWriter,
     UnitOfWorkFactory,
 )
@@ -41,6 +42,7 @@ def build_task_observation_router(
     cancellation_writer: TaskCancellationWriter | None = None,
     frame_review_cancellation: FrameReviewCancellationPort | None = None,
     frame_optimize_cancellation: FrameOptimizeCancellationPort | None = None,
+    haoai_group_cancellation: HaoaiGroupCancellationPort | None = None,
 ) -> APIRouter:
     """Build the nine routes from explicitly supplied read/auth/cancel adapters."""
     router = APIRouter(prefix="/api/chat", tags=["task-observation"])
@@ -146,6 +148,7 @@ def build_task_observation_router(
             cancellation_writer,
             frame_review_cancellation,
             frame_optimize_cancellation,
+            haoai_group_cancellation,
         )
 
     return router

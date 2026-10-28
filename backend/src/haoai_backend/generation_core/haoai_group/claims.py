@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import secrets
+import hashlib
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -12,11 +14,17 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from haoai_backend.generation_contracts.types import ClaimAuthority, OwnerTaskScope
-from haoai_backend.generation_core.base_schema import AITaskRow
+from haoai_backend.generation_core.base_schema import AITaskRow, ResultEvidenceRow
+from haoai_backend.generation_core.haoai_group.evidence import (
+    verified_group_observation_fact,
+)
 from haoai_backend.generation_core.haoai_group.persistence import (
     LockedHaoaiGroupGraph,
     lock_haoai_group_graph,
 )
+from haoai_backend.generation_core.schema import PollReservationRow
+from haoai_backend.generation_credentials.domain import HmacProofAuthority
+from haoai_backend.generation_runtime.registry import HAOAI_ATTEMPT_GROUP
 
 SessionFactory = Callable[[], Session]
 DbClock = Callable[[], datetime]
@@ -70,6 +78,7 @@ class SqlAlchemyHaoaiGroupClaims:
     db_clock: DbClock
     id_factory: IdFactory = field(default_factory=lambda: secrets.token_urlsafe)
     lease_seconds: int = _DEFAULT_LEASE_SECONDS
+    proof_authority: HmacProofAuthority | None = None
     _signals: dict[str, Event] = field(default_factory=dict, init=False, repr=False)
     _signals_lock: RLock = field(default_factory=RLock, init=False, repr=False)
 
@@ -80,6 +89,8 @@ class SqlAlchemyHaoaiGroupClaims:
             raise TypeError("claim token factory must be callable")
         if type(self.lease_seconds) is not int or self.lease_seconds <= 0:
             raise ValueError("claim lease must be a positive number of seconds")
+        if self.proof_authority is not None and type(self.proof_authority) is not HmacProofAuthority:
+            raise TypeError("Group recovery proof authority must be authenticated")
 
     def claim_next(self, task_type: str, instance: str) -> ClaimAuthority | None:
         if (
@@ -210,7 +221,9 @@ class SqlAlchemyHaoaiGroupClaims:
                 now = self._server_now()
                 if (
                     graph is None
-                    or not _group_claim_is_available(graph, now)
+                    or not _group_claim_is_available(
+                        session, graph, now, self.proof_authority
+                    )
                 ):
                     return None
                 task_table = AITaskRow.__table__
@@ -360,7 +373,9 @@ class SqlAlchemyHaoaiGroupClaims:
                         or not isinstance(lease, datetime)
                         or _aware_utc(lease) <= now
                         or graph.task.get("request_data") != expected.request_data
-                        or not _group_claim_is_active(graph, now)
+                        or not _group_claim_is_active(
+                            session, graph, now, self.proof_authority
+                        )
                     ):
                         return None
                     return ClaimAuthority(
@@ -460,20 +475,32 @@ def _lock_claimed_graph(
 
 
 def _group_claim_is_available(
+    session: Session,
     graph: LockedHaoaiGroupGraph,
     now: datetime,
+    proof_authority: HmacProofAuthority | None,
 ) -> bool:
-    return _group_claim_is_active(graph, now) and _lease_is_available(graph.task, now)
+    return _group_claim_is_active(
+        session, graph, now, proof_authority
+    ) and _lease_is_available(graph.task, now)
 
 
 def _group_claim_is_active(
+    session: Session,
     graph: LockedHaoaiGroupGraph,
     now: datetime,
+    proof_authority: HmacProofAuthority | None,
 ) -> bool:
     task = graph.task
     unit = graph.unit
     group = graph.group
     active_step = graph.steps[graph.binding.attempt_index]
+    execution_status = active_step.get("execution_status")
+    step_claimable = execution_status in {"prepared", "submitting", "submitted", "reconciling"}
+    if execution_status == "result_observed":
+        step_claimable = _has_signed_completed_observation(
+            session, graph, active_step, proof_authority
+        )
     return all(
         (
             task.get("type") == _TASK_TYPE,
@@ -488,11 +515,152 @@ def _group_claim_is_active(
             group.get("status") in {"prepared", "active", "pending_verification"},
             group.get("sticky_policy_stop_event_ref") is None,
             graph.binding.attempt_index == group.get("active_attempt"),
-            active_step.get("execution_status")
-            in {"prepared", "submitting", "submitted", "reconciling"},
+            step_claimable,
             now.tzinfo is not None,
         )
     )
+
+
+def _has_signed_completed_observation(
+    session: Session,
+    graph: LockedHaoaiGroupGraph,
+    step: dict[str, object],
+    proof_authority: HmacProofAuthority | None,
+) -> bool:
+    return (
+        _signed_observation_status(session, graph, step, proof_authority)
+        == "completed"
+    )
+
+
+def _has_signed_failed_observation(
+    session: Session,
+    graph: LockedHaoaiGroupGraph,
+    step: dict[str, object],
+    proof_authority: HmacProofAuthority | None,
+) -> bool:
+    return (
+        _signed_observation_status(session, graph, step, proof_authority)
+        == "failed"
+    )
+
+
+def _signed_observation_status(
+    session: Session,
+    graph: LockedHaoaiGroupGraph,
+    step: dict[str, object],
+    proof_authority: HmacProofAuthority | None,
+) -> str | None:
+    if type(proof_authority) is not HmacProofAuthority:
+        return None
+    submissions = tuple(
+        row
+        for row in graph.external_submissions
+        if row.get("step_id") == step.get("id")
+    )
+    submission_status = (
+        "failed" if step.get("execution_status") == "failed" else "submitted"
+    )
+    allowed_step_statuses = (
+        {"failed"}
+        if submission_status == "failed"
+        else {"submitted", "reconciling", "result_observed"}
+    )
+    if (
+        len(submissions) != 1
+        or submissions[0].get("submission_status") != submission_status
+        or step.get("execution_status") not in allowed_step_statuses
+        or not isinstance(submissions[0].get("external_task_id"), str)
+    ):
+        return None
+    reservation = session.execute(
+        select(PollReservationRow.__table__)
+        .where(
+            PollReservationRow.__table__.c.unit_id == graph.binding.unit_id,
+            PollReservationRow.__table__.c.group_key == graph.binding.group_key,
+            PollReservationRow.__table__.c.step_id == step.get("id"),
+            PollReservationRow.__table__.c.state == "accepted",
+        )
+        .order_by(PollReservationRow.__table__.c.sequence.desc())
+        .limit(1)
+    ).mappings().one_or_none()
+    if reservation is None or not isinstance(reservation.get("observation_ref"), str):
+        return None
+    evidence = session.execute(
+        select(ResultEvidenceRow.__table__).where(
+            ResultEvidenceRow.__table__.c.id == reservation.get("observation_ref"),
+            ResultEvidenceRow.__table__.c.evidence_key
+            == f"haoai-poll-v1:{reservation.get('reservation_id')}",
+            ResultEvidenceRow.__table__.c.step_id == step.get("id"),
+            ResultEvidenceRow.__table__.c.submission_id == submissions[0].get("id"),
+        )
+    ).mappings().one_or_none()
+    if evidence is None:
+        return None
+    fact = verified_group_observation_fact(evidence, proof_authority)
+    if not isinstance(fact, dict):
+        return None
+    try:
+        received = datetime.fromisoformat(str(fact.get("received_at")))
+        if received.tzinfo is None:
+            return None
+        received_utc = received.astimezone(timezone.utc)
+        timeout = _aware_utc(reservation.get("timeout_at"))
+        deadline = _aware_utc(graph.unit.get("deadline_at"))
+        reserved_at = _aware_utc(reservation.get("reserved_at"))
+    except (TypeError, ValueError):
+        return None
+    fact_source = fact.get("source_fact")
+    source_status = fact.get("source_status")
+    verified_status = (
+        "completed"
+        if fact_source == "source_completed" and source_status in {"completed", "done"}
+        else "failed"
+        if fact_source == "source_failed" and source_status == "failed"
+        else None
+    )
+    valid = bool(
+        verified_status is not None
+        and fact.get("transport") == "provider_response"
+        and reservation.get("attempt_id") == graph.binding.step_id
+        and reservation.get("step_id") == graph.binding.step_id
+        and reservation.get("submission_id") == submissions[0].get("id")
+        and reservation.get("external_id") == submissions[0].get("external_task_id")
+        and reservation.get("payload_digest") == graph.binding.request_digest
+        and type(reservation.get("sequence")) is int
+        and evidence.get("source") == "worker"
+        and evidence.get("payload_digest") == hashlib.sha256(
+            json.dumps(
+                fact,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        and evidence.get("result_digest") == fact.get("body_sha256")
+        and fact.get("schema") == "haoai_poll_observation_v1"
+        and fact.get("policy_version") == HAOAI_ATTEMPT_GROUP.policy_version
+        and fact.get("registry_version") == HAOAI_ATTEMPT_GROUP.registry_version
+        and fact.get("owner_id") == graph.owner_id
+        and fact.get("task_id") == graph.task_id
+        and fact.get("unit_id") == graph.binding.unit_id
+        and fact.get("group_key") == graph.binding.group_key
+        and fact.get("step_id") == graph.binding.step_id
+        and fact.get("submission_id") == submissions[0].get("id")
+        and fact.get("attempt_id") == graph.binding.step_id
+        and fact.get("external_id") == submissions[0].get("external_task_id")
+        and fact.get("request_digest") == graph.binding.request_digest
+        and fact.get("reservation_id") == reservation.get("reservation_id")
+        and fact.get("sequence") == reservation.get("sequence")
+        and fact.get("reservation_token_digest")
+        == hashlib.sha256(str(reservation.get("token", "")).encode("utf-8")).hexdigest()
+        and evidence.get("received_at") == _database_datetime(received_utc)
+        and received_utc < timeout
+        and received_utc < deadline
+        and reserved_at < timeout
+    )
+    return verified_status if valid else None
 
 
 def _lease_is_available(task: dict[str, object], now: datetime) -> bool:

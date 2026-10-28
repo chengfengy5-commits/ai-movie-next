@@ -65,7 +65,12 @@ _RECONCILING_RESULT = json.dumps(
 @dataclass(frozen=True, slots=True)
 class HaoaiGroupIntentPreparation:
     disposition: Literal[
-        "committed", "resume_query", "existing", "unresolved", "ownership_lost"
+        "committed",
+        "resume_query",
+        "resume_media",
+        "existing",
+        "unresolved",
+        "ownership_lost",
     ]
     verified_input: VerifiedHaoaiGroupExecutionInput | None = None
     intent: CommittedIntent | None = None
@@ -89,6 +94,7 @@ class _StagedQueryResume:
     external_ref: ExternalOperationRef
     submission: dict[str, object]
     request_snapshot: dict[str, object]
+    media_recovery: bool
 
 
 @dataclass(slots=True)
@@ -431,7 +437,7 @@ class SqlAlchemyHaoaiGroupIntents:
         if not self._confirm_query_resume(claim, staged):
             return HaoaiGroupIntentPreparation("unresolved")
         return HaoaiGroupIntentPreparation(
-            "resume_query",
+            "resume_media" if staged.media_recovery else "resume_query",
             staged.verified_input,
             staged.intent,
             staged.external_ref,
@@ -469,6 +475,10 @@ class SqlAlchemyHaoaiGroupIntents:
             external_ref=external_ref,
             submission=dict(row),
             request_snapshot=request_snapshot,
+            media_recovery=(
+                graph.steps[graph.binding.attempt_index].get("execution_status")
+                == "result_observed"
+            ),
         )
 
     def _confirm_query_resume(
@@ -491,6 +501,13 @@ class SqlAlchemyHaoaiGroupIntents:
                         or _current_submission_rows(graph)[0] != staged.submission
                         or not _known_id_submission_is_valid(
                             graph, staged.submission, now
+                        )
+                        or staged.media_recovery
+                        != (
+                            graph.steps[graph.binding.attempt_index].get(
+                                "execution_status"
+                            )
+                            == "result_observed"
                         )
                         or staged.external_ref.intent_id
                         != staged.intent.external_submission_id
@@ -1139,18 +1156,23 @@ def _known_id_shape_is_valid(
     graph: LockedHaoaiGroupGraph,
     row: dict[str, object],
     step: dict[str, object],
+    *,
+    submission_statuses: frozenset[str] = frozenset({"submitted", "unknown"}),
+    step_statuses: frozenset[str] = frozenset(
+        {"submitted", "reconciling", "result_observed"}
+    ),
 ) -> bool:
     request_snapshot = row.get("request_snapshot")
     return bool(
         graph.binding.attempt_index == graph.group.get("active_attempt")
-        and step.get("execution_status") in {"submitted", "reconciling"}
+        and step.get("execution_status") in step_statuses
         and row.get("step_id") == graph.binding.step_id
         and row.get("submission_key")
         == haoai_group_submission_key(graph.binding.unit_id, graph.binding.step_id)
         and row.get("provider") == "haoai"
         and row.get("model_ref") == graph.request_data.get("model_id")
         and row.get("request_digest") == graph.binding.request_digest
-        and row.get("submission_status") in {"submitted", "unknown"}
+        and row.get("submission_status") in submission_statuses
         and _nonempty(row.get("id"))
         and isinstance(request_snapshot, dict)
         and request_snapshot.get("owner_id") == graph.owner_id
@@ -1174,6 +1196,109 @@ def _known_id_shape_is_valid(
         and _nonempty(request_snapshot.get("credential_binding_ref"))
         and request_snapshot.get("target_snapshot")
         == graph.request_data.get("target_snapshot")
+    )
+
+
+def is_valid_started_group_submission(
+    graph: LockedHaoaiGroupGraph,
+    row: dict[str, object],
+    now: datetime,
+) -> bool:
+    """Verify the active immutable intent even when its create result is unknown."""
+
+    attempt_index = graph.binding.attempt_index
+    if (
+        type(attempt_index) is not int
+        or not 0 <= attempt_index < len(graph.steps)
+        or graph.group.get("status")
+        not in {"active", "pending_verification", "cancelled"}
+        or graph.unit.get("result_status") not in {"pending", "unknown"}
+        or graph.unit.get("success_confirmed_at") is not None
+        or (
+            graph.unit.get("user_cancelled_at") is not None
+            and graph.group.get("status") != "cancelled"
+        )
+        or graph.unit.get("refunded_amount") != 0
+    ):
+        return False
+
+    status = row.get("submission_status")
+    if status == "submitting":
+        status_pair_is_valid = bool(
+            row.get("external_task_id") is None
+            and row.get("submitted_at") is None
+            and graph.steps[attempt_index].get("execution_status") == "submitting"
+        )
+        submission_statuses = frozenset({"submitting"})
+        step_statuses = frozenset({"submitting"})
+    elif status == "unknown":
+        status_pair_is_valid = bool(
+            row.get("external_task_id") is None
+            and isinstance(row.get("submitted_at"), datetime)
+            and graph.steps[attempt_index].get("execution_status") == "reconciling"
+        )
+        submission_statuses = frozenset({"unknown"})
+        step_statuses = frozenset({"reconciling"})
+    elif status == "submitted":
+        status_pair_is_valid = bool(
+            _safe_provider_id(row.get("external_task_id"))
+            and isinstance(row.get("submitted_at"), datetime)
+            and graph.steps[attempt_index].get("execution_status")
+            in {"submitted", "reconciling", "result_observed"}
+        )
+        submission_statuses = frozenset({"submitted"})
+        step_statuses = frozenset(
+            {"submitted", "reconciling", "result_observed"}
+        )
+    else:
+        return False
+
+    first_intent_at = graph.unit.get("first_intent_at")
+    unit_deadline_at = graph.unit.get("deadline_at")
+    intent_at = row.get("intent_at")
+    deadline_at = row.get("deadline_at")
+    if (
+        not status_pair_is_valid
+        or not _known_id_shape_is_valid(
+            graph,
+            row,
+            graph.steps[attempt_index],
+            submission_statuses=submission_statuses,
+            step_statuses=step_statuses,
+        )
+        or not all(
+            isinstance(value, datetime)
+            for value in (first_intent_at, unit_deadline_at, intent_at, deadline_at, now)
+        )
+    ):
+        return False
+    try:
+        first_intent = _aware_utc(first_intent_at)
+        unit_deadline = _aware_utc(unit_deadline_at)
+        intent_time = _aware_utc(intent_at)
+        deadline = _aware_utc(deadline_at)
+        current_time = _aware_utc(now)
+        submitted_time = (
+            _aware_utc(row["submitted_at"])
+            if isinstance(row.get("submitted_at"), datetime)
+            else None
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+
+    return bool(
+        first_intent <= intent_time <= current_time < deadline
+        and deadline == unit_deadline
+        and deadline
+        == first_intent + timedelta(seconds=_ORIGINAL_DEADLINE_SECONDS)
+        and (
+            status == "submitting"
+            or (
+                submitted_time is not None
+                and intent_time <= submitted_time <= current_time
+                and submitted_time < deadline
+            )
+        )
     )
 
 

@@ -14,6 +14,9 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
 from haoai_backend.generation_contracts.types import ClaimAuthority, OwnerTaskScope
+from haoai_backend.generation_core.haoai_group.candidate_scope import (
+    has_haoai_group_candidate_marker,
+)
 from haoai_backend.generation_core.base_schema import (
     AITaskRow,
     BillingUnitRow,
@@ -219,6 +222,7 @@ class SqlAlchemyVideoSingleClaims:
             table.c.type == _TASK_TYPE,
             table.c.status.in_(_CLAIMABLE_STATUSES),
             table.c.user_cancelled_at.is_(None),
+            ~has_haoai_group_candidate_marker(table),
         ]
         if cursor is not None:
             created_at, task_id = cursor

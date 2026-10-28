@@ -12,8 +12,10 @@ from sqlalchemy import and_, exists, or_, select
 from sqlalchemy.orm import Session
 
 from haoai_backend.generation_contracts.types import OwnerTaskScope
+from haoai_backend.shared.identity import TrustedActor
 
 from .base_schema import AITaskRow, BillingUnitRow
+from .haoai_group.candidate_scope import has_haoai_group_candidate_marker
 from .video_single_results import SqlAlchemyVideoSingleResults, _UNRESOLVED_RESULT
 
 SessionFactory = Callable[[], Session]
@@ -33,6 +35,8 @@ class SqlAlchemyVideoSingleRecovery:
     session_factory: SessionFactory
     db_clock: DbClock
     results: SqlAlchemyVideoSingleResults
+    group_cancellation: object | None = None
+    group_recovery: object | None = None
     page_size: int = _MAX_PAGE_SIZE
     _cursor: tuple[datetime, str] | None = None
     _lock: Lock = field(default_factory=Lock, init=False, repr=False)
@@ -42,6 +46,14 @@ class SqlAlchemyVideoSingleRecovery:
             not callable(self.session_factory)
             or not callable(self.db_clock)
             or not callable(getattr(self.results, "settle_due", None))
+            or (
+                self.group_cancellation is not None
+                and not callable(getattr(self.group_cancellation, "cancel_owned", None))
+            )
+            or (
+                self.group_recovery is not None
+                and not callable(getattr(self.group_recovery, "scan_due", None))
+            )
             or type(self.page_size) is not int
             or not 1 <= self.page_size <= _MAX_PAGE_SIZE
         ):
@@ -65,8 +77,12 @@ class SqlAlchemyVideoSingleRecovery:
             try:
                 candidates = self._next_page(_aware_utc(now))
             except Exception:
-                return ("pending",)
-            outcomes: list[Literal["settled", "retained", "pending"]] = []
+                candidates = []
+                outcomes: list[Literal["settled", "retained", "pending"]] = [
+                    "pending"
+                ]
+            else:
+                outcomes = []
             for candidate in candidates:
                 if _is_stopping(stop_signal):
                     break
@@ -80,7 +96,64 @@ class SqlAlchemyVideoSingleRecovery:
                         stop_signal=stop_signal,
                     )
                 )
-            return tuple(outcomes)
+        if self.group_recovery is not None and not _is_stopping(stop_signal):
+            try:
+                group_outcomes = self.group_recovery.scan_due(
+                    stop_signal=stop_signal
+                )
+                if not isinstance(group_outcomes, tuple):
+                    group_outcomes = ("pending",)
+            except Exception:
+                group_outcomes = ("pending",)
+            outcomes.extend(
+                value
+                if value in {"settled", "retained", "pending"}
+                else "pending"
+                for value in group_outcomes
+            )
+        return tuple(outcomes)
+
+    def consume_cancel_and_due(
+        self,
+        scope: OwnerTaskScope,
+        *,
+        stop_signal: Event | None = None,
+    ) -> Literal[
+        "settled", "retained", "pending", "terminal_projection", "not_selected"
+    ]:
+        """Route a video cancellation through Group proof before ordinary due."""
+
+        if (
+            type(scope) is not OwnerTaskScope
+            or scope.operation != "video.single"
+            or _is_stopping(stop_signal)
+        ):
+            return "pending"
+        if self.group_recovery is not None:
+            try:
+                outcome = self.group_recovery.consume_cancel_and_due(
+                    scope, stop_signal=stop_signal
+                )
+            except Exception:
+                return "pending"
+            if outcome != "not_selected":
+                if outcome in {"settled", "retained", "pending", "terminal_projection"}:
+                    return outcome
+                return "pending"
+        elif self.group_cancellation is not None:
+            try:
+                outcome = self.group_cancellation.cancel_owned(
+                    TrustedActor(user_id=scope.user_id), scope.task_id
+                )
+            except Exception:
+                return "pending"
+            if outcome != "not_selected":
+                if outcome in {"settled", "retained", "pending", "terminal_projection"}:
+                    return outcome
+                return "pending"
+        if _is_stopping(stop_signal):
+            return "pending"
+        return self.results.settle_due(scope, stop_signal=stop_signal)
 
     def _next_page(self, now: datetime) -> list[_Candidate]:
         page = self._read_candidates(now, self._cursor, self.page_size)
@@ -122,6 +195,7 @@ class SqlAlchemyVideoSingleRecovery:
             task.c.user_cancelled_at.is_(None),
             or_(task.c.result.is_(None), task.c.result == _UNRESOLVED_RESULT),
             due_unit,
+            ~has_haoai_group_candidate_marker(task),
         ]
         if cursor is not None:
             created_at, task_id = cursor

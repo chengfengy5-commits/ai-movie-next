@@ -20,6 +20,7 @@ from haoai_backend.generation_core.base_schema import (
     CreditLogRow,
     ExternalSubmissionRow,
     ResultEvidenceRow,
+    UserCreditRow,
 )
 from haoai_backend.generation_core.schema import (
     ExecutionAttemptGroupRow,
@@ -29,6 +30,9 @@ from haoai_backend.generation_core.schema import (
 from haoai_backend.generation_core.haoai_group.claims import (
     SqlAlchemyHaoaiGroupClaims,
 )
+from haoai_backend.generation_core.haoai_group.cancellation import (
+    SqlAlchemyHaoaiGroupCancellation,
+)
 from haoai_backend.generation_core.haoai_group.intents import (
     SqlAlchemyHaoaiGroupIntents,
 )
@@ -36,7 +40,20 @@ from haoai_backend.generation_core.haoai_group.polls import (
     HaoaiGroupPollGrant,
     SqlAlchemyHaoaiGroupPolls,
 )
-from haoai_backend.generation_contracts.types import BoundCredential, ExternalOperationRef
+from haoai_backend.generation_core.haoai_group.settlement import (
+    SqlAlchemyHaoaiGroupEventSettler,
+)
+from haoai_backend.generation_core.haoai_group.recovery import (
+    SqlAlchemyHaoaiGroupRecovery,
+)
+from haoai_backend.generation_core.haoai_group.results import (
+    SqlAlchemyHaoaiGroupResults,
+)
+from haoai_backend.generation_contracts.types import (
+    BoundCredential,
+    ExternalOperationRef,
+    OwnerTaskScope,
+)
 from haoai_backend.generation_providers.video.haoai_provider import (
     HaoaiExecutionBinding,
 )
@@ -115,6 +132,7 @@ def _provider(
     status_code=200,
     body=b'{"status":"processing"}',
     request_error=None,
+    clock=None,
 ):
     binding = HaoaiExecutionBinding(
         owner_scope=claim.scope,
@@ -122,12 +140,15 @@ def _provider(
         intent=resumed.intent,
         credential_binding=resumed.verified_input.credential_binding,
     )
-    return provider_fixtures.make_provider(
+    provider, counts = provider_fixtures.make_provider(
         response=provider_fixtures.FakeResponse(status_code, body),
         binding=binding,
         credential=resumed.verified_input.provider_credential,
         request_error=request_error,
     )
+    if clock is not None:
+        provider._utc_clock = lambda: clock[0]
+    return provider, counts
 
 
 def test_haoai_group_poll_reserves_once_and_accepts_signed_ordered_observation(
@@ -534,6 +555,7 @@ def test_haoai_group_auth_unavailable_12_creates_sticky_pending_financial_event(
                 resumed,
                 status_code=403,
                 body=b"no auth available",
+                clock=clock,
             )
             outcomes.append(polls.query_and_accept(grant, provider))
 
@@ -590,6 +612,328 @@ def test_haoai_group_auth_unavailable_12_creates_sticky_pending_financial_event(
         environment.engine.dispose()
 
 
+def test_haoai_group_zero_fee_event_requires_verified_zero_ledger_before_terminal(
+    tmp_path,
+    monkeypatch,
+):
+    environment = video_fixtures._video_environment(
+        monkeypatch, tmp_path, provider="haoai"
+    )
+    try:
+        model_table = video_fixtures.joint_fixtures.system_models
+        with environment.engine.begin() as connection:
+            params = json.loads(
+                connection.execute(
+                    select(model_table.c.params).where(
+                        model_table.c.id
+                        == video_fixtures.joint_fixtures._G2_JOINT_MODEL_ID
+                    )
+                ).scalar_one()
+            )
+            params["per_second_cost"] = 0
+            connection.execute(
+                model_table.update()
+                .where(
+                    model_table.c.id
+                    == video_fixtures.joint_fixtures._G2_JOINT_MODEL_ID
+                )
+                .values(params=json.dumps(params))
+            )
+
+        task_id = _admit(environment, "haoai-group-zero-fee-conflicting-ledger-001")
+        clock = [video_fixtures._NOW]
+        claim, intents, polls, resumed, external_ref = _setup_group(
+            environment, task_id, clock
+        )
+        with Session(environment.engine) as reader:
+            task = reader.execute(
+                select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+            ).mappings().one()
+            unit = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.task_id == task_id
+                )
+            ).mappings().one()
+        assert task["billing_status"] == unit["billing_status"] == "no_charge"
+        assert task["credit_cost"] == unit["quoted_amount"] == 0
+        assert unit["debited_amount"] == unit["refunded_amount"] == 0
+
+        # A stale contradictory ledger row must make zero-fee proof fail closed.
+        with environment.engine.begin() as connection:
+            connection.execute(
+                CreditLogRow.__table__.insert().values(
+                    id="synthetic-zero-conflict-ledger",
+                    user_id=task["user_id"],
+                    amount=-1,
+                    balance_after=499,
+                    type="usage",
+                    description="synthetic conflicting ledger evidence",
+                    task_id=task_id,
+                    business_key="synthetic-zero-conflict",
+                    billing_unit_id=unit["id"],
+                    related_debit_id=None,
+                )
+            )
+
+        outcomes = []
+        for index in range(12):
+            if index:
+                clock[0] += timedelta(seconds=5)
+                resumed = intents.prepare(claim)
+                assert resumed.disposition == "resume_query"
+            grant = polls.reserve_query(
+                claim, resumed.intent, resumed.verified_input, external_ref
+            )
+            assert isinstance(grant, HaoaiGroupPollGrant)
+            provider, _ = _provider(
+                claim,
+                resumed,
+                status_code=403,
+                body=b"no auth available",
+                clock=clock,
+            )
+            outcomes.append(polls.query_and_accept(grant, provider))
+
+        with Session(environment.engine) as reader:
+            events = reader.execute(
+                select(PolicyStopEventRow.__table__).where(
+                    PolicyStopEventRow.unit_id == unit["id"]
+                )
+            ).mappings().all()
+        assert outcomes[-1].disposition != "policy_stopped"
+        assert events == []
+    finally:
+        environment.engine.dispose()
+
+
+def test_haoai_group_verified_zero_fee_event_settles_without_ledger_rows(
+    tmp_path,
+    monkeypatch,
+):
+    environment = video_fixtures._video_environment(
+        monkeypatch, tmp_path, provider="haoai"
+    )
+    try:
+        model_table = video_fixtures.joint_fixtures.system_models
+        with environment.engine.begin() as connection:
+            params = json.loads(
+                connection.execute(
+                    select(model_table.c.params).where(
+                        model_table.c.id
+                        == video_fixtures.joint_fixtures._G2_JOINT_MODEL_ID
+                    )
+                ).scalar_one()
+            )
+            params["per_second_cost"] = 0
+            connection.execute(
+                model_table.update()
+                .where(
+                    model_table.c.id
+                    == video_fixtures.joint_fixtures._G2_JOINT_MODEL_ID
+                )
+                .values(params=json.dumps(params))
+            )
+
+        task_id = _admit(environment, "haoai-group-zero-fee-settle-001")
+        clock = [video_fixtures._NOW]
+        claim, intents, polls, resumed, external_ref = _setup_group(
+            environment, task_id, clock
+        )
+        for index in range(12):
+            if index:
+                clock[0] += timedelta(seconds=5)
+                resumed = intents.prepare(claim)
+                assert resumed.disposition == "resume_query"
+            grant = polls.reserve_query(
+                claim, resumed.intent, resumed.verified_input, external_ref
+            )
+            assert isinstance(grant, HaoaiGroupPollGrant)
+            provider, _ = _provider(
+                claim,
+                resumed,
+                status_code=403,
+                body=b"no auth available",
+                clock=clock,
+            )
+            outcome = polls.query_and_accept(grant, provider)
+        assert outcome.disposition == "policy_stopped"
+
+        with Session(environment.engine) as reader:
+            event = reader.execute(
+                select(PolicyStopEventRow.__table__).where(
+                    PolicyStopEventRow.unit_id == resumed.verified_input.unit_id
+                )
+            ).mappings().one()
+            owner_id = reader.execute(
+                select(AITaskRow.__table__.c.user_id).where(AITaskRow.id == task_id)
+            ).scalar_one()
+        assert event["financial_disposition"] == "pending"
+
+        settler = SqlAlchemyHaoaiGroupEventSettler(
+            lambda: Session(environment.engine),
+            lambda: clock[0],
+            environment.capabilities.proof_authority,
+            lambda: "unused-zero-refund-id",
+        )
+        first = settler.settle_owned(owner_id, task_id)
+        replay = settler.settle_owned(owner_id, task_id)
+        assert first == replay == "settled"
+
+        with Session(environment.engine) as reader:
+            settled = reader.execute(
+                select(PolicyStopEventRow.__table__).where(
+                    PolicyStopEventRow.event_id == event["event_id"]
+                )
+            ).mappings().one()
+            ledger_rows = reader.execute(
+                select(CreditLogRow.__table__).where(
+                    CreditLogRow.task_id == task_id
+                )
+            ).mappings().all()
+        assert settled["financial_disposition"] == "no_debit"
+        assert settled["original_debit_ref"] is None
+        assert settled["refund_ref"] is None
+        assert ledger_rows == []
+    finally:
+        environment.engine.dispose()
+
+
+def test_haoai_group_policy_event_refunds_original_debit_once_and_replays(
+    tmp_path,
+    monkeypatch,
+):
+    environment = video_fixtures._video_environment(
+        monkeypatch, tmp_path, provider="haoai"
+    )
+    try:
+        task_id = _admit(environment, "haoai-group-auth12-refund-001")
+        clock = [video_fixtures._NOW]
+        claim, intents, polls, resumed, external_ref = _setup_group(
+            environment, task_id, clock
+        )
+        for index in range(12):
+            if index:
+                clock[0] += timedelta(seconds=5)
+                resumed = intents.prepare(claim)
+                assert resumed.disposition == "resume_query"
+            grant = polls.reserve_query(
+                claim, resumed.intent, resumed.verified_input, external_ref
+            )
+            assert isinstance(grant, HaoaiGroupPollGrant)
+            provider, _ = _provider(
+                claim,
+                resumed,
+                status_code=403,
+                body=b"no auth available",
+                clock=clock,
+            )
+            outcome = polls.query_and_accept(grant, provider)
+        assert outcome.disposition == "policy_stopped"
+
+        with Session(environment.engine) as reader:
+            task = reader.execute(
+                select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+            ).mappings().one()
+            unit = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.task_id == task_id
+                )
+            ).mappings().one()
+            debit = reader.execute(
+                select(CreditLogRow.__table__).where(
+                    CreditLogRow.business_key == f"debit:{unit['id']}"
+                )
+            ).mappings().one()
+            wallet_before = reader.execute(
+                select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+            ).scalar_one()
+        id_factory = lambda: "haoai-group-auth12-refund-event-001"
+        settler = SqlAlchemyHaoaiGroupEventSettler(
+            lambda: Session(environment.engine),
+            lambda: clock[0],
+            environment.capabilities.proof_authority,
+            id_factory,
+        )
+        recovery = SqlAlchemyHaoaiGroupRecovery(
+            session_factory=lambda: Session(environment.engine),
+            db_clock=lambda: clock[0],
+            cancellation=SqlAlchemyHaoaiGroupCancellation(
+                lambda: Session(environment.engine),
+                lambda: clock[0],
+                environment.capabilities.proof_authority,
+                id_factory,
+            ),
+            event_settler=settler,
+            results=SqlAlchemyHaoaiGroupResults(
+                lambda: Session(environment.engine),
+                lambda: clock[0],
+                environment.capabilities.proof_authority,
+                id_factory,
+            ),
+        )
+        outcome = recovery.consume_due(
+            OwnerTaskScope(
+                user_id=task["user_id"],
+                task_id=task_id,
+                operation="video.single",
+            )
+        )
+        assert outcome == "settled"
+
+        with Session(environment.engine) as reader:
+            events = reader.execute(
+                select(PolicyStopEventRow.__table__).where(
+                    PolicyStopEventRow.unit_id == unit["id"]
+                )
+            ).mappings().all()
+            refunds = reader.execute(
+                select(CreditLogRow.__table__).where(
+                    CreditLogRow.business_key == f"refund:{unit['id']}"
+                )
+            ).mappings().all()
+            wallet_after = reader.execute(
+                select(UserCreditRow.credits).where(UserCreditRow.user_id == task["user_id"])
+            ).scalar_one()
+            settled_unit = reader.execute(
+                select(BillingUnitRow.__table__).where(
+                    BillingUnitRow.id == unit["id"]
+                )
+            ).mappings().one()
+            settled_task = reader.execute(
+                select(AITaskRow.__table__).where(AITaskRow.id == task_id)
+            ).mappings().one()
+            settled_group = reader.execute(
+                select(ExecutionAttemptGroupRow.__table__).where(
+                    ExecutionAttemptGroupRow.__table__.c.unit_id == unit["id"]
+                )
+            ).mappings().one()
+        assert len(events) == 1
+        assert events[0]["financial_disposition"] == "refunded"
+        assert events[0]["original_debit_ref"] == debit["id"]
+        assert events[0]["refund_ref"] == refunds[0]["id"]
+        assert len(refunds) == 1
+        assert refunds[0]["related_debit_id"] == debit["id"]
+        assert refunds[0]["amount"] == unit["quoted_amount"]
+        assert wallet_after == wallet_before + unit["quoted_amount"]
+        assert settled_unit["billing_status"] == settled_task["billing_status"] == "refunded"
+        assert settled_unit["refunded_amount"] == unit["quoted_amount"]
+        assert settled_task["status"] == "failed"
+        assert settled_task["result"] is not None
+        assert json.loads(settled_task["result"])["code"] == "auth_unavailable_12"
+        assert settled_unit["result_status"] == "unknown"
+        assert settled_group["status"] == "policy_stopped"
+        assert settled_group["terminal_reason"] == "auth_unavailable_12"
+        assert settled_task["claimed_by"] is None
+        assert settled_task["claim_token"] is None
+        assert SqlAlchemyHaoaiGroupClaims(
+            session_factory=lambda: Session(environment.engine),
+            db_clock=lambda: clock[0],
+            proof_authority=environment.capabilities.proof_authority,
+        ).claim_next("video-single", "haoai-auth12-terminal-check") is None
+    finally:
+        environment.engine.dispose()
+
+
 def test_haoai_group_auth12_streak_crosses_closed_unknown_reservation_gap(
     tmp_path,
     monkeypatch,
@@ -635,6 +979,7 @@ def test_haoai_group_auth12_streak_crosses_closed_unknown_reservation_gap(
                 resumed,
                 status_code=403,
                 body=b"no auth available",
+                clock=clock,
             )
             outcomes.append(polls.query_and_accept(grant, provider))
 
