@@ -1,4 +1,4 @@
-import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { Chapter, Character, Prop, Scene, Series, StoryboardAsset, User } from "../../shared/api/contracts";
@@ -104,7 +104,251 @@ function deferred<T>() {
 }
 
 describe("read-only task page", () => {
-  afterEach(() => cleanup());
+  afterEach(() => {
+    cleanup();
+    vi.useRealTimers();
+  });
+
+  it("observes active task progress serially, keeps the open detail stable, and stops at terminal status", async () => {
+    vi.useFakeTimers();
+    const queued = task("task-active", { status: "queued", progress: 8, progress_message: "等待处理" });
+    const processing = task("task-active", { status: "processing", progress: 47, progress_message: "已完成 4 / 10 项" });
+    const completed = task("task-active", { status: "completed", progress: 100, progress_message: "已完成" });
+    const pendingPoll = deferred<MyTaskPage>();
+    const listMyTasks = vi.fn()
+      .mockResolvedValueOnce(page(1, [queued]))
+      .mockReturnValueOnce(pendingPoll.promise)
+      .mockResolvedValueOnce(page(1, [completed]));
+    const getTaskReceipt = vi.fn(async (taskId: string) => detailReceipt(taskId, "详情独立来源"));
+    renderPage(servicesWithDetails(listMyTasks, { getTaskReceipt }));
+
+    await act(async () => { await Promise.resolve(); });
+    const originalCard = screen.getByRole("article", { name: "图片，排队中" });
+    fireEvent.click(screen.getByRole("button", { name: "查看详情：图片" }));
+    await act(async () => { await Promise.resolve(); await Promise.resolve(); });
+    expect(screen.getByText("详情独立来源")).toBeInTheDocument();
+    expect(getTaskReceipt).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+    const pollSignal = listMyTasks.mock.calls[1]?.[1];
+    expect(pollSignal).toBeInstanceOf(AbortSignal);
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      pendingPoll.resolve(page(1, [processing]));
+      await pendingPoll.promise;
+    });
+    const processingCard = screen.getByRole("article", { name: "图片，处理中" });
+    expect(processingCard).toBe(originalCard);
+    expect(within(processingCard).getByText("已完成 4 / 10 项")).toBeInTheDocument();
+    expect(screen.getByText("详情独立来源")).toBeInTheDocument();
+    expect(getTaskReceipt).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(screen.getByRole("article", { name: "图片，已完成" })).toBe(originalCard);
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(3);
+    expect(getTaskReceipt).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps callback-only rerenders from starting a competing list read", async () => {
+    vi.useFakeTimers();
+    const pendingPoll = deferred<MyTaskPage>();
+    const listMyTasks = vi.fn()
+      .mockResolvedValueOnce(page(1, [task("callback-owner", { status: "processing" })]))
+      .mockReturnValueOnce(pendingPoll.promise);
+    const firstUnauthorized = vi.fn();
+    const latestUnauthorized = vi.fn();
+    const services = servicesFor(listMyTasks);
+    const onBack = vi.fn();
+    const view = render(
+      <MyTasksPage
+        onBack={onBack}
+        onUnauthorized={firstUnauthorized}
+        services={services}
+        userId={user.id}
+      />,
+    );
+
+    await act(async () => { await Promise.resolve(); });
+    view.rerender(
+      <MyTasksPage
+        onBack={onBack}
+        onUnauthorized={latestUnauthorized}
+        services={services}
+        userId={user.id}
+      />,
+    );
+    expect(listMyTasks).toHaveBeenCalledTimes(1);
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(9_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      pendingPoll.reject(new ApiError("http", "登录失效", 401));
+      await Promise.resolve();
+    });
+    expect(firstUnauthorized).not.toHaveBeenCalled();
+    expect(latestUnauthorized).toHaveBeenCalledTimes(1);
+  });
+
+  it("lets manual reread supersede an in-flight observation and ignores its late success", async () => {
+    vi.useFakeTimers();
+    const pendingPoll = deferred<MyTaskPage>();
+    const pendingManualRead = deferred<MyTaskPage>();
+    const listMyTasks = vi.fn()
+      .mockResolvedValueOnce(page(1, [task("manual-race", { status: "queued", chapter_title: "初始快照" })]))
+      .mockReturnValueOnce(pendingPoll.promise)
+      .mockReturnValueOnce(pendingManualRead.promise);
+    renderPage(servicesFor(listMyTasks));
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+    const staleSignal = listMyTasks.mock.calls[1]?.[1];
+
+    fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+    await act(async () => { await Promise.resolve(); });
+    expect(listMyTasks).toHaveBeenCalledTimes(3);
+    expect(staleSignal?.aborted).toBe(true);
+    await act(async () => {
+      pendingManualRead.resolve(page(1, [task("manual-race", { status: "processing", chapter_title: "手动新快照" })]));
+      await pendingManualRead.promise;
+    });
+    expect(screen.getByText("手动新快照")).toBeInTheDocument();
+
+    await act(async () => {
+      pendingPoll.resolve(page(1, [task("manual-race", { status: "completed", chapter_title: "过期自动快照" })]));
+      await pendingPoll.promise;
+    });
+    expect(screen.getByText("手动新快照")).toBeInTheDocument();
+    expect(screen.queryByText("过期自动快照")).not.toBeInTheDocument();
+  });
+
+  it("keeps page and user changes isolated from a late poll and handles a current polling 401", async () => {
+    vi.useFakeTimers();
+    const stalePoll = deferred<MyTaskPage>();
+    const oldList = vi.fn()
+      .mockResolvedValueOnce(page(1, [task("old-owner", { status: "queued", chapter_title: "旧账号任务" })], 20))
+      .mockReturnValueOnce(stalePoll.promise)
+      .mockResolvedValueOnce(page(2, [task("page-two", { status: "processing", chapter_title: "第二页任务" })], 20));
+    const onUnauthorized = vi.fn();
+    const oldServices = servicesFor(oldList);
+    const view = renderPage(oldServices, vi.fn(), onUnauthorized);
+    await act(async () => { await Promise.resolve(); });
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(oldList).toHaveBeenCalledTimes(2);
+
+    fireEvent.click(screen.getByRole("button", { name: "下一页" }));
+    await act(async () => { await Promise.resolve(); });
+    expect(oldList).toHaveBeenCalledTimes(3);
+    expect(screen.getByText("第二页任务")).toBeInTheDocument();
+    const staleSignal = oldList.mock.calls[1]?.[1];
+    expect(staleSignal?.aborted).toBe(true);
+    await act(async () => {
+      stalePoll.reject(new ApiError("http", "旧账号登录失效", 401));
+      await Promise.resolve();
+    });
+    expect(onUnauthorized).not.toHaveBeenCalled();
+
+    const newInitial = deferred<MyTaskPage>();
+    const newList = vi.fn()
+      .mockReturnValueOnce(newInitial.promise)
+      .mockRejectedValueOnce(new ApiError("http", "当前账号登录失效", 401));
+    const newServices = servicesFor(newList);
+    view.rerender(
+      <MyTasksPage services={newServices} userId="next-user" onBack={vi.fn()} onUnauthorized={onUnauthorized} />,
+    );
+    expect(screen.queryByText("第二页任务")).not.toBeInTheDocument();
+    await act(async () => {
+      newInitial.resolve(page(2, [task("new-owner", { status: "processing", chapter_title: "新账号任务" })], 20));
+      await newInitial.promise;
+    });
+    expect(screen.getByText("新账号任务")).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(onUnauthorized).toHaveBeenCalledTimes(1);
+    expect(newList).toHaveBeenCalledTimes(2);
+  });
+
+  it("retains the last snapshot through bounded observation failures and resumes by manual reread", async () => {
+    vi.useFakeTimers();
+    const active = task("task-retry-observation", { status: "processing", chapter_title: "保留的任务快照" });
+    const listMyTasks = vi.fn()
+      .mockResolvedValueOnce(page(1, [active]))
+      .mockRejectedValueOnce(new ApiError("network", "暂时断网"))
+      .mockRejectedValueOnce(new ApiError("network", "仍然断网"))
+      .mockRejectedValueOnce(new ApiError("network", "连续断网"))
+      .mockResolvedValueOnce(page(1, [task("task-retry-observation", { status: "completed", chapter_title: "恢复后的任务快照" })]));
+    renderPage(servicesFor(listMyTasks));
+    await act(async () => { await Promise.resolve(); });
+    const originalCard = screen.getByRole("article", { name: "图片，处理中" });
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(3_000); });
+    expect(screen.getByRole("status")).toHaveTextContent("1/3");
+    expect(screen.getByText("保留的任务快照")).toBeInTheDocument();
+    expect(screen.getByRole("article", { name: "图片，处理中" })).toBe(originalCard);
+    await act(async () => { await vi.advanceTimersByTimeAsync(5_999); });
+    expect(listMyTasks).toHaveBeenCalledTimes(2);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByRole("status")).toHaveTextContent("2/3");
+    await act(async () => { await vi.advanceTimersByTimeAsync(11_999); });
+    expect(listMyTasks).toHaveBeenCalledTimes(3);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(screen.getByRole("status")).toHaveTextContent("连续失败 3 次");
+    expect(screen.getByText("保留的任务快照")).toBeInTheDocument();
+    await act(async () => { await vi.advanceTimersByTimeAsync(60_000); });
+    expect(listMyTasks).toHaveBeenCalledTimes(4);
+
+    fireEvent.click(screen.getByRole("button", { name: "重新读取" }));
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByText("恢复后的任务快照")).toBeInTheDocument();
+    expect(screen.queryByText(/连续失败 3 次/)).not.toBeInTheDocument();
+    expect(listMyTasks).toHaveBeenCalledTimes(5);
+  });
+
+  it("pauses hidden observation, resumes when visible, and aborts an unmounted read", async () => {
+    vi.useFakeTimers();
+    const pendingPoll = deferred<MyTaskPage>();
+    const onUnauthorized = vi.fn();
+    const listMyTasks = vi.fn()
+      .mockResolvedValueOnce(page(1, [task("visibility-task", { status: "processing" })]))
+      .mockReturnValueOnce(pendingPoll.promise);
+    const view = renderPage(servicesFor(listMyTasks), vi.fn(), onUnauthorized);
+    await act(async () => { await Promise.resolve(); });
+    const originalHidden = Object.getOwnPropertyDescriptor(document, "hidden");
+    const setHidden = (hidden: boolean) => {
+      Object.defineProperty(document, "hidden", { configurable: true, value: hidden });
+      fireEvent(document, new Event("visibilitychange"));
+    };
+
+    try {
+      setHidden(true);
+      await act(async () => { await vi.advanceTimersByTimeAsync(6_000); });
+      expect(listMyTasks).toHaveBeenCalledTimes(1);
+
+      setHidden(false);
+      await act(async () => { await vi.advanceTimersByTimeAsync(2_999); });
+      expect(listMyTasks).toHaveBeenCalledTimes(1);
+      await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+      expect(listMyTasks).toHaveBeenCalledTimes(2);
+      const pollSignal = listMyTasks.mock.calls[1]?.[1];
+      expect(pollSignal).toBeInstanceOf(AbortSignal);
+
+      view.unmount();
+      expect(pollSignal?.aborted).toBe(true);
+      await act(async () => {
+        pendingPoll.reject(new ApiError("http", "登录失效", 401));
+        await Promise.resolve();
+      });
+      expect(onUnauthorized).not.toHaveBeenCalled();
+    } finally {
+      if (originalHidden === undefined) Reflect.deleteProperty(document, "hidden");
+      else Object.defineProperty(document, "hidden", originalHidden);
+    }
+  });
 
   it("shows server order and conservative text without rendering request or result media", async () => {
     const first = task("task-first", {

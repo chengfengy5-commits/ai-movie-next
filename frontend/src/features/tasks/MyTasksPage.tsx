@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ApiError } from "../../shared/api/errors";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
 import { MY_TASK_PAGE_SIZE, projectMyTask, type MyTaskPage as MyTaskPageData } from "../../shared/api/myTasks";
@@ -15,6 +15,33 @@ interface ErrorPresentation {
   title: string;
   message: string;
   kind: string;
+}
+
+interface OwnedTaskPage {
+  data: MyTaskPageData;
+  services: WorkspaceServices;
+  userId: string;
+}
+
+interface TaskListOwner {
+  services: WorkspaceServices;
+  userId: string;
+  page: number;
+  reloadKey: number;
+}
+
+const TASK_OBSERVATION_INTERVAL_MS = 3_000;
+const MAX_TASK_OBSERVATION_FAILURES = 3;
+const ACTIVE_TASK_STATUSES = new Set(["queued", "processing", "cancelling"]);
+
+function hasActiveTasks(page: MyTaskPageData): boolean {
+  return page.tasks.some((task) => ACTIVE_TASK_STATUSES.has(task.status));
+}
+
+function canRetryTaskObservation(error: ApiError): boolean {
+  return error.kind === "network"
+    || error.kind === "timeout"
+    || (error.status !== null && error.status >= 500);
 }
 
 function presentError(error: ApiError): ErrorPresentation {
@@ -156,43 +183,192 @@ interface SelectedTaskDetail {
 export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTasksPageProps) {
   const [requestedPage, setRequestedPage] = useState(1);
   const [reloadKey, setReloadKey] = useState(0);
-  const [pageData, setPageData] = useState<MyTaskPageData | null>(null);
+  const [pageSnapshot, setPageSnapshot] = useState<OwnedTaskPage | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<ApiError | null>(null);
+  const [observationNotice, setObservationNotice] = useState<string | null>(null);
+  const [observationSuspended, setObservationSuspended] = useState(false);
+  const [documentVisible, setDocumentVisible] = useState(
+    () => typeof document === "undefined" || !document.hidden,
+  );
   const [selectedTaskDetail, setSelectedTaskDetail] = useState<SelectedTaskDetail | null>(null);
   const detailOpenGenerationRef = useRef(0);
+  const listReadGenerationRef = useRef(0);
+  const observationFailureCountRef = useRef(0);
+  const onUnauthorizedRef = useRef(onUnauthorized);
+  onUnauthorizedRef.current = onUnauthorized;
+  const listOwnerRef = useRef<TaskListOwner>({ services, userId, page: requestedPage, reloadKey });
+  const listReadCancelRef = useRef<(() => void) | null>(null);
+  const observationCancelRef = useRef<(() => void) | null>(null);
+
+  const pageData = pageSnapshot !== null
+    && pageSnapshot.services === services
+    && pageSnapshot.userId === userId
+    ? pageSnapshot.data
+    : null;
+
+  function invalidateListReads(): void {
+    listReadGenerationRef.current += 1;
+    listReadCancelRef.current?.();
+    listReadCancelRef.current = null;
+    observationCancelRef.current?.();
+    observationCancelRef.current = null;
+  }
+
+  useLayoutEffect(() => {
+    invalidateListReads();
+    listOwnerRef.current = { services, userId, page: requestedPage, reloadKey };
+    observationFailureCountRef.current = 0;
+    setLoading(true);
+    setError(null);
+    setObservationNotice(null);
+    setObservationSuspended(false);
+  }, [reloadKey, requestedPage, services, userId]);
+
+  useEffect(() => {
+    const updateVisibility = () => setDocumentVisible(!document.hidden);
+    document.addEventListener("visibilitychange", updateVisibility);
+    return () => document.removeEventListener("visibilitychange", updateVisibility);
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
     let current = true;
+    const requestGeneration = listReadGenerationRef.current;
+    const owner = listOwnerRef.current;
+    const isCurrent = () => current
+      && requestGeneration === listReadGenerationRef.current
+      && owner === listOwnerRef.current;
+    const cancel = () => {
+      if (!current) return;
+      current = false;
+      controller.abort();
+      if (listReadCancelRef.current === cancel) listReadCancelRef.current = null;
+    };
+    listReadCancelRef.current = cancel;
     setLoading(true);
     setError(null);
 
     void services.listMyTasks(requestedPage, controller.signal).then((result) => {
-      if (!current || controller.signal.aborted) {
-        return;
-      }
-      setPageData(result);
+      if (!isCurrent() || controller.signal.aborted) return;
+      setPageSnapshot({ data: result, services, userId });
       setLoading(false);
     }).catch((cause: unknown) => {
-      if (!current || controller.signal.aborted) {
-        return;
-      }
+      if (!isCurrent() || controller.signal.aborted) return;
       const nextError = normalizeApiError(cause);
       if (nextError.status === 401) {
-        onUnauthorized();
+        onUnauthorizedRef.current();
+        setLoading(false);
         return;
       }
-      setPageData(null);
+      setPageSnapshot(null);
       setError(nextError);
       setLoading(false);
     });
 
     return () => {
-      current = false;
-      controller.abort();
+      cancel();
     };
-  }, [onUnauthorized, reloadKey, requestedPage, services, userId]);
+  }, [reloadKey, requestedPage, services, userId]);
+
+  const currentPageData = pageData?.page === requestedPage ? pageData : null;
+
+  useEffect(() => {
+    if (
+      !documentVisible
+      || observationSuspended
+      || currentPageData === null
+      || !hasActiveTasks(currentPageData)
+    ) {
+      return;
+    }
+
+    let current = true;
+    let timer: number | null = null;
+    let controller: AbortController | null = null;
+    const requestGeneration = listReadGenerationRef.current;
+    const owner = listOwnerRef.current;
+    const isCurrent = () => current
+      && requestGeneration === listReadGenerationRef.current
+      && owner === listOwnerRef.current;
+
+    const clearTimer = () => {
+      if (timer !== null) {
+        window.clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    const cancel = () => {
+      if (!current) return;
+      current = false;
+      clearTimer();
+      controller?.abort();
+      controller = null;
+      if (observationCancelRef.current === cancel) observationCancelRef.current = null;
+    };
+    observationCancelRef.current = cancel;
+
+    const schedule = (delay: number) => {
+      if (!isCurrent() || timer !== null || controller !== null || !documentVisible) return;
+      timer = window.setTimeout(() => {
+        timer = null;
+        void observe();
+      }, delay);
+    };
+
+    const observe = async () => {
+      if (!isCurrent() || controller !== null || !documentVisible) return;
+      const requestController = new AbortController();
+      controller = requestController;
+      try {
+        const result = await services.listMyTasks(requestedPage, requestController.signal);
+        if (!isCurrent() || requestController.signal.aborted) return;
+        controller = null;
+        observationFailureCountRef.current = 0;
+        setObservationNotice(null);
+        setPageSnapshot({ data: result, services, userId });
+        if (hasActiveTasks(result)) schedule(TASK_OBSERVATION_INTERVAL_MS);
+      } catch (cause: unknown) {
+        if (!isCurrent() || requestController.signal.aborted) return;
+        controller = null;
+        const nextError = normalizeApiError(cause);
+        if (nextError.status === 401) {
+          setObservationSuspended(true);
+          onUnauthorizedRef.current();
+          return;
+        }
+
+        const presentation = presentError(nextError);
+        if (!canRetryTaskObservation(nextError)) {
+          setObservationNotice(`自动刷新已停止：${presentation.title}。${presentation.message} 当前列表已保留；可点击“重新读取”再试。`);
+          setObservationSuspended(true);
+          return;
+        }
+
+        observationFailureCountRef.current += 1;
+        const consecutiveFailures = observationFailureCountRef.current;
+        if (consecutiveFailures >= MAX_TASK_OBSERVATION_FAILURES) {
+          setObservationNotice(`自动刷新连续失败 ${MAX_TASK_OBSERVATION_FAILURES} 次，已暂停。当前列表已保留；可点击“重新读取”恢复。${presentation.message}`);
+          setObservationSuspended(true);
+          return;
+        }
+
+        setObservationNotice(`自动刷新暂时失败（${consecutiveFailures}/${MAX_TASK_OBSERVATION_FAILURES}），当前列表已保留，稍后重试。${presentation.message}`);
+        schedule(TASK_OBSERVATION_INTERVAL_MS * (2 ** consecutiveFailures));
+      }
+    };
+
+    schedule(TASK_OBSERVATION_INTERVAL_MS);
+    return cancel;
+  }, [
+    currentPageData,
+    documentVisible,
+    observationSuspended,
+    requestedPage,
+    services,
+    userId,
+  ]);
 
   useEffect(() => {
     setSelectedTaskDetail(null);
@@ -210,9 +386,12 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
   }
 
   function reread() {
+    invalidateListReads();
     setSelectedTaskDetail(null);
-    setPageData(null);
+    setPageSnapshot(null);
     setError(null);
+    setObservationNotice(null);
+    setObservationSuspended(false);
     setLoading(true);
     setReloadKey((key) => key + 1);
   }
@@ -229,6 +408,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
     ) {
       return;
     }
+    invalidateListReads();
     setSelectedTaskDetail(null);
     setError(null);
     setLoading(true);
@@ -238,7 +418,7 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
   const totalPages = pageData === null
     ? null
     : Math.max(1, Math.ceil(pageData.total / MY_TASK_PAGE_SIZE));
-  const visiblePageData = pageData?.page === requestedPage ? pageData : null;
+  const visiblePageData = currentPageData;
   const needsFirstPageAction = visiblePageData !== null
     && visiblePageData.tasks.length === 0
     && visiblePageData.page > (totalPages ?? 1);
@@ -265,6 +445,12 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
         <span className="readonly-pill"><span aria-hidden="true">◉</span> 只读记录</span>
         <p>这里仅显示任务状态快照；打开详情后按需读取完整文本记录。</p>
       </div>
+
+      {observationNotice !== null && (
+        <div className="my-tasks-readonly-note" aria-live="polite" role="status">
+          <p>{observationNotice}</p>
+        </div>
+      )}
 
       {loading && (
         <div className="state-panel loading-panel" role="status" aria-live="polite">
@@ -345,8 +531,6 @@ export function MyTasksPage({ services, userId, onBack, onUnauthorized }: MyTask
         && selectedTaskDetail.userId === userId
         && selectedTaskDetail.services === services
         && selectedTaskDetail.page === requestedPage
-        && pageData?.page === requestedPage
-        && pageData.tasks.some((task) => task.id === selectedTaskDetail.task.id)
         && (
           <TaskDetailDialog
             key={selectedTaskDetail.openGeneration}
