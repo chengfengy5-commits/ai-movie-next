@@ -2359,10 +2359,26 @@ export function CanvasWorkspace({
   });
   imageGenerationModeRef.current = imageGeneration.state.mode !== null;
 
+  function dismissCanvasOnEscape(): void {
+    const hasLinkGesture = connecting || connectionSource !== null;
+    if (portDragRef.current !== null || hasLinkGesture
+      || selectedNodeRef.current !== null || selectedEdge !== null) {
+      cancelManualPortDrag();
+      if (hasLinkGesture) {
+        setConnecting(false);
+        setConnectionSource(null);
+      }
+      selectCanvasNode(null);
+      setSelectedEdge(null);
+      return;
+    }
+    closeRef.current();
+  }
+
   const focus = useSeriesDialogFocus({
     active: !closePrompt && sourceEditor === null && generationDialog === null && imageGeneration.state.mode === null,
     canDismiss: true,
-    onDismiss: () => closeRef.current(),
+    onDismiss: dismissCanvasOnEscape,
   });
   const close = useCallback(() => {
     if (documentState.hasPendingWork() || sourceOutcomeUnresolved || imageGenerationBlockedRef.current || generationIntentRef.current !== null
