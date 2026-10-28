@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from datetime import datetime
-from typing import Any, Protocol
+from typing import Any, ContextManager, Protocol
 
 from haoai_backend.generation_contracts.records import GenerationResultReceipt
 from haoai_backend.generation_contracts.ports import CallerTransaction
@@ -43,6 +43,43 @@ class SeriesDataUnitOfWork(Protocol):
         guard: ChapterEditGuard,
         now: datetime,
     ) -> ChapterRecord: ...
+    def stage_update_chapter_guarded(
+        self,
+        actor: TrustedActor,
+        chapter_id: str,
+        content: list[dict[str, Any]],
+        guard: ChapterEditGuard,
+        now: datetime,
+    ) -> ChapterRecord: ...
+    def stage_create_continuous_asset(
+        self,
+        actor: TrustedActor,
+        series_id: str,
+        chapter_id: str,
+        asset_kind: str,
+        values: Mapping[str, Any],
+        source_context: ChapterEditGuard,
+        now: datetime,
+    ) -> dict[str, Any]: ...
+    def verify_continuous_operation_lock(
+        self,
+        actor: TrustedActor,
+        series_id: str,
+        chapter_id: str,
+        guard: ChapterEditGuard,
+        now: datetime,
+    ) -> None: ...
+    def continuous_operation_schema_ready(self) -> bool: ...
+    def begin_continuous_operation(self) -> None: ...
+    def continuous_operation_savepoint(self) -> ContextManager[Any]: ...
+    def get_continuous_operation_receipt(
+        self,
+        owner_id: str,
+        operation_id: str,
+        *,
+        for_update: bool,
+    ) -> dict[str, Any] | None: ...
+    def insert_continuous_operation_receipt(self, values: Mapping[str, Any]) -> None: ...
     def delete_frame_first_phase(self, chapter: ChapterRecord, actor: TrustedActor, frame_index: int, frames: list[Any]) -> ChapterRecord: ...
     def delete_chapter(self, chapter: ChapterRecord) -> tuple[str, dict[str, set[object]]]: ...
     def cleanup_orphans(self, series_id: str, refs: dict[str, set[object]]) -> None: ...

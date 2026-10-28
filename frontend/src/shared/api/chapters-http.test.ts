@@ -1,4 +1,5 @@
 // @vitest-environment node
+import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -6,6 +7,7 @@ import { InvalidResponseError, type ChapterEditGuard } from "./contracts";
 import { createApiServices } from "./services";
 import { API_TOKEN_KEY, type StorageLike } from "./storage";
 import { projectStoryboardFrames } from "../../features/chapters/storyboardProjection";
+import { continuousSourceSnapshotBinding } from "./continuousChapterOperations";
 
 const fixturePath = fileURLToPath(new URL("../../../../tools/api-fixture/server.mjs", import.meta.url));
 
@@ -231,6 +233,195 @@ describe("chapter and storyboard API services over real HTTP", () => {
       "getContinuousChapterEditCapabilities",
     );
     await expect(getCapabilities(new AbortController().signal)).rejects.toMatchObject({ name: "InvalidResponseError" });
+  });
+
+  it("negotiates the operation receipt and sends the frozen request bytes to the original UUID routes", async () => {
+    const operationId = "00000000-0000-4000-8000-000000000001";
+    const editorSessionId = "00000000-0000-4000-8000-000000000002";
+    const requestBody = `{"protocol_version":1, "editor_session_id":"${editorSessionId}","command":{"kind":"save-chapter"}}`;
+    const requestBodySha256 = createHash("sha256").update(requestBody, "utf8").digest("hex");
+    const sourceBinding = await continuousSourceSnapshotBinding(requestBodySha256);
+    const targetManifestDigest = createHash("sha256").update(JSON.stringify(["source:0"]), "utf8").digest("hex");
+    const canonicalResponseJson = JSON.stringify({ content: [{ storyboard: [] }], id: "chapter/a", series_id: "series-a" });
+    const receipt = {
+      receipt_version: 1,
+      operation_id: operationId,
+      owner_id: "user-a",
+      editor_session_id: editorSessionId,
+      series_id: "series-a",
+      chapter_id: "chapter/a",
+      command_kind: "save-chapter",
+      request_body_sha256: requestBodySha256,
+      source_snapshot_digest: sourceBinding,
+      target_draft_id: null,
+      target_manifest_digest: targetManifestDigest,
+      outcome: "committed",
+      http_status: 200,
+      result_identity: {
+        kind: "save-chapter",
+        series_id: "series-a",
+        chapter_id: "chapter/a",
+        draft_frame_ids: ["source:0"],
+        manifest_digest: targetManifestDigest,
+        source_snapshot_digest: sourceBinding,
+        frame_storyboard_ids: [[]],
+      },
+      result: { content: [{ storyboard: [] }], id: "chapter/a", series_id: "series-a" },
+      canonical_response_json: canonicalResponseJson,
+      result_digest: createHash("sha256").update(canonicalResponseJson, "utf8").digest("hex"),
+      committed_at: "2026-10-28T00:00:00",
+    };
+    const requests: Array<{ method: string; url: string; body: string | null }> = [];
+    const { services } = createServices("http://127.0.0.1/api", {
+      fetcher: async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        requests.push({ method, url, body: typeof init?.body === "string" ? init.body : null });
+        const payload = url.endsWith("/chapters/continuous-edit/capabilities")
+          ? { features: { chapter_edit_guard: 1, continuous_edit_operation_receipt: 1 } }
+          : method === "POST" ? { receipt, result: receipt.result } : { receipt };
+        return new Response(JSON.stringify(payload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+
+    const getCapabilities = requireServiceMethod(
+      services.getContinuousChapterEditCapabilities,
+      "getContinuousChapterEditCapabilities",
+    );
+    await expect(getCapabilities(new AbortController().signal)).resolves.toEqual({
+      chapterEditGuard: 1,
+      operationReceipt: 1,
+    });
+    const operations = services.continuousChapterOperations;
+    if (operations === undefined) throw new Error("Expected continuous chapter operation API.");
+    await expect(operations.submit("chapter/a", operationId, requestBody, new AbortController().signal))
+      .resolves.toMatchObject({ receipt: { operation_id: operationId, outcome: "committed" } });
+    await expect(operations.lookup("chapter/a", operationId, new AbortController().signal))
+      .resolves.toMatchObject({ receipt: { operation_id: operationId } });
+
+    expect(requests).toEqual([
+      {
+        method: "GET",
+        url: "http://127.0.0.1/api/chapters/continuous-edit/capabilities",
+        body: null,
+      },
+      {
+        method: "POST",
+        url: `http://127.0.0.1/api/chapters/chapter%2Fa/continuous-edit/operations/${operationId}`,
+        body: requestBody,
+      },
+      {
+        method: "GET",
+        url: `http://127.0.0.1/api/chapters/chapter%2Fa/continuous-edit/operations/${operationId}`,
+        body: null,
+      },
+    ]);
+  });
+
+  it("accepts a durable operation rejection at actual HTTP 409 without widening generic request errors", async () => {
+    const operationId = "00000000-0000-4000-8000-000000000011";
+    const editorSessionId = "00000000-0000-4000-8000-000000000012";
+    const requestBody = JSON.stringify({ protocol_version: 1, editor_session_id: editorSessionId, command: { kind: "save-chapter" } });
+    const requestBodySha256 = createHash("sha256").update(requestBody, "utf8").digest("hex");
+    const sourceBinding = await continuousSourceSnapshotBinding(requestBodySha256);
+    const targetManifestDigest = createHash("sha256").update(JSON.stringify(["draft-a"]), "utf8").digest("hex");
+    const canonicalResponseJson = JSON.stringify({ detail: "章节来源已变化" });
+    const receipt = {
+      receipt_version: 1,
+      operation_id: operationId,
+      owner_id: "user-a",
+      editor_session_id: editorSessionId,
+      series_id: "series-a",
+      chapter_id: "chapter-a",
+      command_kind: "save-chapter",
+      request_body_sha256: requestBodySha256,
+      source_snapshot_digest: sourceBinding,
+      target_draft_id: null,
+      target_manifest_digest: targetManifestDigest,
+      outcome: "rejected",
+      http_status: 409,
+      result_identity: {
+        kind: "save-chapter",
+        series_id: "series-a",
+        chapter_id: "chapter-a",
+        draft_frame_ids: ["draft-a"],
+        manifest_digest: targetManifestDigest,
+        source_snapshot_digest: sourceBinding,
+      },
+      result: { detail: "章节来源已变化" },
+      canonical_response_json: canonicalResponseJson,
+      result_digest: createHash("sha256").update(canonicalResponseJson, "utf8").digest("hex"),
+      committed_at: "2026-10-28T00:00:00",
+    };
+    const { services } = createServices("http://127.0.0.1/api", {
+      fetcher: async (input, init) => {
+        const url = input instanceof Request ? input.url : String(input);
+        const method = init?.method ?? (input instanceof Request ? input.method : "GET");
+        if (url.endsWith("/chapters/continuous-edit/capabilities")) {
+          return new Response(JSON.stringify({ features: { chapter_edit_guard: 1, continuous_edit_operation_receipt: 1 } }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        if (method === "POST") {
+          return new Response(JSON.stringify({ receipt, error: receipt.result }), {
+            status: 409,
+            headers: { "Content-Type": "application/json" },
+          });
+        }
+        return new Response(JSON.stringify({ detail: "generic conflict" }), {
+          status: 409,
+          headers: { "Content-Type": "application/json" },
+        });
+      },
+    });
+
+    const operations = services.continuousChapterOperations;
+    if (operations === undefined) throw new Error("Expected continuous chapter operation API.");
+    await expect(operations.submit("chapter-a", operationId, requestBody, new AbortController().signal))
+      .resolves.toMatchObject({ receipt: { outcome: "rejected", http_status: 409 } });
+    const updateChapter = requireServiceMethod(services.updateChapter, "updateChapter");
+    await expect(updateChapter("series-a", "chapter-a", { content: [] }, new AbortController().signal))
+      .rejects.toMatchObject({ kind: "http", status: 409 });
+  });
+
+  it("keeps unauthenticated, missing, server, and receipt-less conflict responses unconfirmed", async () => {
+    for (const status of [401, 403, 404, 500]) {
+      const { services } = createServices("http://127.0.0.1/api", {
+        fetcher: async () => new Response(JSON.stringify({ detail: "synthetic failure" }), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      });
+      const operations = services.continuousChapterOperations;
+      if (operations === undefined) throw new Error("Expected continuous chapter operation API.");
+      await expect(operations.submit(
+        "chapter-a",
+        "00000000-0000-4000-8000-000000000041",
+        "{}",
+        new AbortController().signal,
+      )).rejects.toMatchObject({ kind: "http", status });
+    }
+
+    for (const status of [400, 409]) {
+      const { services } = createServices("http://127.0.0.1/api", {
+        fetcher: async () => new Response(JSON.stringify({ detail: "receipt missing" }), {
+          status,
+          headers: { "Content-Type": "application/json" },
+        }),
+      });
+      const operations = services.continuousChapterOperations;
+      if (operations === undefined) throw new Error("Expected continuous chapter operation API.");
+      await expect(operations.submit(
+        "chapter-a",
+        "00000000-0000-4000-8000-000000000042",
+        "{}",
+        new AbortController().signal,
+      )).rejects.toMatchObject({ name: "InvalidResponseError" });
+    }
   });
 
   afterEach(() => vi.restoreAllMocks());

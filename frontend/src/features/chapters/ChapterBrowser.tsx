@@ -16,6 +16,12 @@ import type { FusedGenerationMemberType } from "../../shared/api/fusedGeneration
 import type { PersonalProductionSnapshot } from "../../shared/api/personalProductionNotes";
 import type { PersonalRoughCutSnapshot } from "../../shared/api/personalRoughCut";
 import { normalizeApiError, type WorkspaceServices } from "../../shared/api/services";
+import type { StorageLike } from "../../shared/api/storage";
+import {
+  continuousTargetManifestDigest,
+  type ContinuousChapterOperationRequest,
+  type ContinuousChapterOperationKind,
+} from "../../shared/api/continuousChapterOperations";
 import {
   type StoryboardAssetKind,
   type StoryboardAssetSaveInput,
@@ -137,6 +143,30 @@ import {
   type ContinuousDraftFrame,
 } from "./continuousChapterEditing";
 import { ContinuousChapterEditor, type ContinuousAssetKind } from "./ContinuousChapterEditor";
+import { ContinuousChapterRecoveryPanel } from "./ContinuousChapterRecoveryPanel";
+import {
+  continuousChapterJournalScope,
+  continuousChapterOperationStorage,
+  continuousChapterOperationJournalIdentity,
+  useContinuousChapterOperationJournal,
+  type ContinuousChapterOperationJournalState,
+} from "./useContinuousChapterOperationJournal";
+import {
+  continuousChapterJournalMatchesScope,
+  continuousChapterOperationJournalKey,
+  continuousChapterOperationRoute,
+  continuousOperationReceiptMatchesJournal,
+  createContinuousOperationJournalEnvelope,
+  discardUndispatchedContinuousChapterJournal,
+  digestContinuousSource,
+  freezeContinuousOperationRequest,
+  readContinuousChapterJournal,
+  resolveContinuousChapterJournal,
+  withContinuousChapterOperationLock,
+  writeContinuousChapterJournal,
+  ContinuousChapterJournalError,
+  type ContinuousChapterOperationEnvelope,
+} from "./continuousChapterOperationJournal";
 
 interface ChapterBrowserProps {
   series: Series;
@@ -246,6 +276,9 @@ interface FrameTextEditorContext extends ChapterEditLockOwner {
 
 interface ContinuousChapterEditorContext extends ChapterEditLockOwner {
   readonly sessionId: string;
+  readonly editorSessionId: string;
+  readonly documentId: string;
+  readonly sessionGeneration: number;
   readonly snapshot: ContinuousChapterDraftSnapshot;
   readonly draft: readonly ContinuousDraftFrame[];
   readonly undoStack: readonly (readonly ContinuousDraftFrame[])[];
@@ -261,6 +294,20 @@ interface ContinuousChapterEditorContext extends ChapterEditLockOwner {
     readonly draftId: string;
   } | null;
   readonly notice: string | null;
+}
+
+interface PreparedContinuousOperation {
+  readonly scope: ReturnType<typeof continuousChapterJournalScope>;
+  readonly storage: StorageLike;
+  readonly key: string;
+  readonly journal: ReturnType<typeof createContinuousOperationJournalEnvelope>;
+}
+
+interface ContinuousRecoveredDraft {
+  readonly snapshot: ContinuousChapterDraftSnapshot;
+  readonly frames: readonly ContinuousDraftFrame[];
+  readonly selectedIndex: number;
+  readonly dirty: boolean;
 }
 
 interface FrameReviewDialogOwner {
@@ -364,6 +411,10 @@ function sameChapterBrowserScope(left: ChapterBrowserScope, right: ChapterBrowse
   return left.userId === right.userId
     && left.services === right.services
     && left.seriesId === right.seriesId;
+}
+
+function isLocalDemoServices(services: WorkspaceServices): boolean {
+  return services.mode === "demo" && services.apiBaseUrl === null;
 }
 
 function sameAssetCatalog<T extends { id: string }>(left: T[], right: T[]): boolean {
@@ -942,6 +993,21 @@ export function ChapterBrowser({
   const [selectedChapterId, setSelectedChapterId] = useState<string | null>(null);
   const selectedChapterIdRef = useRef(selectedChapterId);
   selectedChapterIdRef.current = selectedChapterId;
+  const continuousJournalBinding = selectedChapterId === null || isLocalDemoServices(services) ? null : {
+    actorId: userId,
+    apiBaseUrl: services.apiBaseUrl ?? "",
+    seriesId: series.id,
+    chapterId: selectedChapterId,
+    sessionGeneration,
+  };
+  const continuousJournalIdentity = continuousJournalBinding === null
+    ? null
+    : continuousChapterOperationJournalIdentity(continuousJournalBinding);
+  const continuousJournal = useContinuousChapterOperationJournal(continuousJournalBinding, services);
+  const continuousJournalStateRef = useRef(continuousJournal.state);
+  continuousJournalStateRef.current = continuousJournal.state;
+  const continuousJournalReadEpoch = useRef(0);
+  const [continuousJournalBusy, setContinuousJournalBusy] = useState(false);
   const [assetResult, setAssetResult] = useState<AssetResult | null>(null);
   const [frameResourceCatalogs, setFrameResourceCatalogs] = useState<Pick<FrameResourceDirectories, "characters" | "scenes" | "props" | "fused">>(() => ({
     characters: { status: "loading" },
@@ -2466,7 +2532,11 @@ export function ChapterBrowser({
 
   function selectChapter(chapterId: string, expectedRequestGeneration: number) {
     const directory = chapterDirectoryRef.current;
-    if (continuousChapterEditorRef.current !== null) {
+    const activeContinuous = continuousChapterEditorRef.current;
+    const hasDurableOperation = activeContinuous !== null
+      && currentContinuousJournalState(activeContinuous.scope, activeContinuous.chapter.id).status === "ready"
+      && currentContinuousJournalState(activeContinuous.scope, activeContinuous.chapter.id).journal !== null;
+    if (activeContinuous !== null && !hasDurableOperation) {
       setChapterMutationNotice("请先保存并结束连续编辑，或明确放弃草稿后再切换章节。");
       return;
     }
@@ -2485,7 +2555,11 @@ export function ChapterBrowser({
 
   function selectChapterNow(chapterId: string, expectedRequestGeneration: number): void {
     const directory = chapterDirectoryRef.current;
-    if (continuousChapterEditorRef.current !== null) return;
+    const activeContinuous = continuousChapterEditorRef.current;
+    const hasDurableOperation = activeContinuous !== null
+      && currentContinuousJournalState(activeContinuous.scope, activeContinuous.chapter.id).status === "ready"
+      && currentContinuousJournalState(activeContinuous.scope, activeContinuous.chapter.id).journal !== null;
+    if (activeContinuous !== null && !hasDurableOperation) return;
     if (
       expectedRequestGeneration !== chapterRequestGeneration.current
       || expectedRequestGeneration !== directory.requestGeneration
@@ -3235,6 +3309,7 @@ export function ChapterBrowser({
       || !sameChapterBrowserScope(directory.scope, currentScope)
       || directory.requestGeneration !== chapterRequestGeneration.current || directory.chapters !== chapters
       || !isChapterSelectableFromDirectory(directory.chapters, selectedChapter.id, series.id)) return;
+    if (!await ensureNoContinuousOperationForChapter(currentScope, selectedChapter.id)) return;
     const initialText = readEditableFrameText(selectedChapter, position);
     const initialFrame = selectedChapter.content?.[position - 1];
     if (initialText === null || initialFrame === undefined) {
@@ -3384,12 +3459,474 @@ export function ChapterBrowser({
       && sameChapterBrowserScope(scope, activeScopeRef.current)
       && owner.chapter.id === chapterId
       && owner.requestGeneration === requestGeneration
+      && owner.sessionGeneration === sessionGenerationRef.current
       && requestGeneration === chapterRequestGeneration.current
       && selectedChapterIdRef.current === chapterId
       && sameChapterBrowserScope(directory.scope, scope)
       && directory.requestGeneration === requestGeneration
       && matching.length === 1
       && matching[0]?.series_id === scope.seriesId;
+  }
+
+  function continuousJournalIdentityFor(scope: ChapterBrowserScope, chapterId: string): string {
+    return continuousChapterOperationJournalIdentity({
+      actorId: scope.userId,
+      apiBaseUrl: scope.services.apiBaseUrl ?? "",
+      seriesId: scope.seriesId,
+      chapterId,
+      sessionGeneration: sessionGenerationRef.current,
+    });
+  }
+
+  function setContinuousJournalStateForCurrentScope(
+    scope: ChapterBrowserScope,
+    chapterId: string,
+    next: ContinuousChapterOperationJournalState,
+  ): void {
+    if (isLocalDemoServices(scope.services)
+      || !sameChapterBrowserScope(scope, activeScopeRef.current)
+      || selectedChapterIdRef.current !== chapterId
+      || next.identity !== continuousJournalIdentityFor(scope, chapterId)
+      || next.identity !== continuousJournalIdentity) return;
+    continuousJournalStateRef.current = next;
+    continuousJournal.setState(next);
+  }
+
+  function currentContinuousJournalState(scope: ChapterBrowserScope, chapterId: string): ContinuousChapterOperationJournalState {
+    if (isLocalDemoServices(scope.services)) {
+      return { identity: null, status: "empty", journal: null, message: null };
+    }
+    const expectedIdentity = continuousJournalIdentityFor(scope, chapterId);
+    const state = continuousJournalStateRef.current;
+    return state.identity === expectedIdentity
+      ? state
+      : { identity: expectedIdentity, status: "checking", journal: null, message: null };
+  }
+
+  async function ensureNoContinuousOperationForChapter(
+    scope: ChapterBrowserScope,
+    chapterId: string,
+  ): Promise<boolean> {
+    if (isLocalDemoServices(scope.services)) {
+      const directory = chapterDirectoryRef.current;
+      const matches = directory.chapters?.filter((chapter) => chapter.id === chapterId) ?? [];
+      return sameChapterBrowserScope(scope, activeScopeRef.current)
+        && selectedChapterIdRef.current === chapterId
+        && sameChapterBrowserScope(directory.scope, scope)
+        && directory.requestGeneration === chapterRequestGeneration.current
+        && matches.length === 1
+        && matches[0]?.series_id === scope.seriesId;
+    }
+
+    const identity = continuousJournalIdentityFor(scope, chapterId);
+    try {
+      const journalScope = continuousChapterJournalScope(
+        scope.userId,
+        scope.services.apiBaseUrl,
+        scope.seriesId,
+        chapterId,
+      );
+      const storage = continuousChapterOperationStorage(scope.services);
+      const key = continuousChapterOperationJournalKey(journalScope);
+      const journal = await readContinuousChapterJournal(storage, key);
+      if (!sameChapterBrowserScope(scope, activeScopeRef.current)
+        || selectedChapterIdRef.current !== chapterId
+        || sessionGenerationRef.current !== sessionGeneration) return false;
+      if (journal !== null && !continuousChapterJournalMatchesScope(journal, journalScope)) {
+        throw new Error("本地原操作记录与当前账号、接口或章节不匹配；记录已保留。");
+      }
+      if (journal !== null) {
+        setContinuousJournalStateForCurrentScope(scope, chapterId, {
+          identity,
+          status: "ready",
+          journal,
+          message: "本章有未完成审阅的原操作；请先在恢复面板核对原 UUID。",
+        });
+        setChapterMutationNotice("本章有未完成审阅的原操作；请先核对原操作，不能启动新的编辑写入。");
+        return false;
+      }
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        identity,
+        status: "empty",
+        journal: null,
+        message: null,
+      });
+      return true;
+    } catch (cause) {
+      if (sameChapterBrowserScope(scope, activeScopeRef.current)
+        && selectedChapterIdRef.current === chapterId
+        && sessionGenerationRef.current === sessionGeneration) {
+        setContinuousJournalStateForCurrentScope(scope, chapterId, {
+          identity,
+          status: "error",
+          journal: null,
+          message: cause instanceof Error ? cause.message : "本地原操作记录不可用；本章写入保持锁定。",
+        });
+        setChapterMutationNotice(cause instanceof Error ? cause.message : "本地原操作记录不可用；本章写入保持锁定。");
+      }
+      return false;
+    }
+  }
+
+  async function prepareContinuousOperation(
+    owner: ContinuousChapterEditorContext,
+    kind: ContinuousChapterOperationKind,
+    targetDraftId: string | null,
+    request: ContinuousChapterOperationRequest,
+  ): Promise<PreparedContinuousOperation> {
+    const journalScope = continuousChapterJournalScope(
+      owner.scope.userId,
+      owner.scope.services.apiBaseUrl,
+      owner.scope.seriesId,
+      owner.chapter.id,
+    );
+    const storage = continuousChapterOperationStorage(owner.scope.services);
+    const key = continuousChapterOperationJournalKey(journalScope);
+    const frozen = await freezeContinuousOperationRequest(request);
+    const draftFrameIds = owner.draft.map((frame) => frame.draftId);
+    const [sourceSnapshotDigest, targetManifestDigest] = await Promise.all([
+      digestContinuousSource(frozen.bodySha256),
+      continuousTargetManifestDigest(draftFrameIds),
+    ]);
+    const operationId = crypto.randomUUID();
+    const journal = createContinuousOperationJournalEnvelope({
+      scope: journalScope,
+      editorSessionId: owner.editorSessionId,
+      documentId: owner.documentId,
+      authSessionGeneration: owner.sessionGeneration,
+      snapshot: owner.snapshot,
+      frames: owner.draft,
+      selectedDraftId: owner.draft[owner.selectedIndex]?.draftId ?? null,
+      operationId,
+      kind,
+      targetDraftId,
+      draftFrameIds,
+      bodyJson: frozen.bodyJson,
+      bodySha256: frozen.bodySha256,
+      sourceSnapshotDigest,
+      targetManifestDigest,
+      phase: "captured_not_dispatched",
+      route: continuousChapterOperationRoute(owner.chapter.id, operationId),
+    });
+    return {
+      scope: journalScope,
+      storage,
+      key,
+      journal,
+    };
+  }
+
+  async function verifyContinuousOperationPreflight(
+    owner: ContinuousChapterEditorContext,
+    request: ContinuousChapterOperationRequest,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const [directory, assets, catalogs] = await Promise.all([
+      owner.scope.services.listChapters(owner.scope.seriesId, signal),
+      owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
+      readContinuousCatalogs(owner.scope, signal),
+    ]);
+    if (!isContinuousChapterEditorCurrent(owner.sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) {
+      throw new ApiError("aborted", "Request was cancelled.");
+    }
+    const matching = directory.filter((item) => item.id === owner.chapter.id && item.series_id === owner.scope.seriesId);
+    const fresh = matching.length === 1 ? matching[0] : undefined;
+    if (fresh === undefined || fresh.order !== owner.snapshot.chapter.order
+      || !sameChapterContent(fresh.content, owner.snapshot.chapter.content)
+      || !sameStoryboardAssetPositions([...owner.snapshot.expectedStoryboards], assets)) {
+      throw new ApiError("http", "章节或分镜目录已变化；原稿仍保留，操作尚未发出。", 409);
+    }
+    const command = request.command;
+    const sourceChapter = command.kind === "save-chapter"
+      ? { ...fresh, content: command.content as Chapter["content"] }
+      : fresh;
+    validateContinuousCatalogReferences(sourceChapter, catalogs);
+    if (owner.lockIdentity !== null) {
+      const readLock = owner.scope.services.getChapterEditLock;
+      if (readLock === undefined) throw new ApiError("invalid-response", "无法重新核对章节编辑锁。", null);
+      const lock = owner.lockLease === null
+        ? await readLock(owner.chapter.id, signal)
+        : await readLock(owner.chapter.id, signal, owner.lockLease);
+      if (!isContinuousChapterEditorCurrent(owner.sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) {
+        throw new ApiError("aborted", "Request was cancelled.");
+      }
+      if (!validOwnedChapterLock(lock, owner.scope.userId) || !sameChapterEditLockIdentity(owner.lockIdentity, lock)) {
+        throw new ApiError("http", "章节编辑锁身份或有效期已变化；原稿仍保留，操作尚未发出。", 409);
+      }
+    }
+  }
+
+  async function inspectContinuousOperationTarget(
+    journal: ContinuousChapterOperationEnvelope,
+    scope: ChapterBrowserScope,
+    signal: AbortSignal,
+  ): Promise<"matches" | "changed"> {
+    const receipt = journal.observation.receipt;
+    if (receipt === null) throw new ApiError("invalid-response", "原操作回执尚未读取。", null);
+    const [directory, assets] = await Promise.all([
+      scope.services.listChapters(scope.seriesId, signal),
+      scope.services.listStoryboardAssets(scope.seriesId, journal.origin.chapter_id, signal),
+    ]);
+    const matching = directory.filter((item) => item.id === journal.origin.chapter_id && item.series_id === scope.seriesId);
+    if (matching.length !== 1) return "changed";
+    const chapter = matching[0]!;
+    if (receipt.outcome === "rejected") {
+      return chapter.order === journal.snapshot.chapter.order
+        && sameChapterContent(chapter.content, journal.snapshot.chapter.content)
+        && sameStoryboardAssetPositions([...journal.snapshot.expected_storyboards], assets)
+        ? "matches"
+        : "changed";
+    }
+    if (journal.operation.kind === "save-chapter") {
+      const expected = receipt.result.content;
+      return Array.isArray(expected)
+        && continuousWriteReadbackMatches(expected as StoryboardFrame[], chapter, assets, scope.seriesId)
+        ? "matches"
+        : "changed";
+    }
+    const baselineMatches = chapter.order === journal.snapshot.chapter.order
+      && sameChapterContent(chapter.content, journal.snapshot.chapter.content)
+      && sameStoryboardAssetPositions([...journal.snapshot.expected_storyboards], assets);
+    if (!baselineMatches) return "changed";
+    const assetId = receipt.result_identity.asset_id;
+    if (typeof assetId !== "string" || assetId === "") return "changed";
+    const catalogs = await readContinuousCatalogs(scope, signal);
+    const candidates = journal.operation.kind === "create-character" ? catalogs.characters
+      : journal.operation.kind === "create-scene" ? catalogs.scenes
+        : catalogs.props;
+    return candidates.filter((item) => item.id === assetId && item.series_id === scope.seriesId).length === 1
+      ? "matches"
+      : "changed";
+  }
+
+  async function submitContinuousOperation(
+    owner: ContinuousChapterEditorContext,
+    prepared: PreparedContinuousOperation,
+    request: ContinuousChapterOperationRequest,
+    pendingUpdate: ReturnType<typeof buildGuardedChapterUpdate> | null,
+    pendingAssetCreate: ContinuousChapterEditorContext["pendingAssetCreate"],
+  ): Promise<void> {
+    const port = owner.scope.services.continuousChapterOperations;
+    if (port === undefined) {
+      updateContinuousChapterEditor(owner.sessionId, (current) => ({
+        ...current,
+        busy: false,
+        pendingUpdate: null,
+        pendingAssetCreate: null,
+        notice: "当前服务未接入原操作回执；请求尚未发出。",
+      }));
+      return;
+    }
+    const identity = continuousJournalIdentityFor(owner.scope, owner.chapter.id);
+    let savedJournal: ContinuousChapterOperationEnvelope | null = null;
+    let dispatchPossible = false;
+    let confirmedSave = false;
+    const isCurrent = () => isContinuousChapterEditorCurrent(
+      owner.sessionId,
+      owner.scope,
+      owner.chapter.id,
+      owner.requestGeneration,
+      owner.lifecycleController.signal,
+    ) && sessionGenerationRef.current === owner.sessionGeneration;
+
+    try {
+      await withContinuousChapterOperationLock(prepared.key, async (lease) => {
+        const existing = await readContinuousChapterJournal(prepared.storage, prepared.key);
+        if (existing !== null) {
+          if (continuousChapterJournalMatchesScope(existing, prepared.scope)) {
+            savedJournal = existing;
+            setContinuousJournalStateForCurrentScope(owner.scope, owner.chapter.id, {
+              identity,
+              status: "ready",
+              journal: existing,
+              message: "本章已有原操作记录；当前请求未覆盖该记录，也未发送。",
+            });
+          }
+          throw new Error("本章已有原操作记录；当前请求未发送。");
+        }
+
+        lease.assertActive();
+        const captured = await writeContinuousChapterJournal(
+          prepared.storage,
+          prepared.key,
+          prepared.journal,
+          lease,
+          null,
+        );
+        savedJournal = captured;
+        setContinuousJournalStateForCurrentScope(owner.scope, owner.chapter.id, {
+          identity,
+          status: "ready",
+          journal: captured,
+          message: "完整原稿与请求已写入并回读；正在重新核对章节和编辑锁。",
+        });
+
+        await verifyContinuousOperationPreflight(owner, request, owner.lifecycleController.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+
+        lease.assertActive();
+        const possible = await writeContinuousChapterJournal(
+          prepared.storage,
+          prepared.key,
+          { ...captured, phase: "dispatch_possible", observation: { ...captured.observation, message: "请求可能已发出；恢复时只查询原 UUID。" } },
+          lease,
+          captured.integrity_sha256,
+        );
+        savedJournal = possible;
+        dispatchPossible = true;
+        setContinuousJournalStateForCurrentScope(owner.scope, owner.chapter.id, {
+          identity,
+          status: "ready",
+          journal: possible,
+          message: "请求可能已发出；系统只会读取原操作 UUID，不会自动重发。",
+        });
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+
+        const response = await port.submit(
+          owner.chapter.id,
+          possible.operation.operation_id,
+          possible.operation.request_body_json,
+          owner.lifecycleController.signal,
+        );
+        const receipt = response.receipt;
+        if (!continuousOperationReceiptMatchesJournal(receipt, possible, owner.scope.userId)) {
+          throw new ApiError("invalid-response", "原操作回执与已保存请求不匹配；记录保持待核对。", null);
+        }
+        if (!isCurrent()) return;
+        lease.assertActive();
+        const terminal = await writeContinuousChapterJournal(
+          prepared.storage,
+          prepared.key,
+          {
+            ...possible,
+            phase: receipt.outcome === "committed" ? "receipt_committed_pending_target_read" : "receipt_rejected",
+            observation: {
+              message: "已读取原操作回执，正在独立核对当前章节与素材目录。",
+              receipt,
+              result: receipt.result,
+              target_status: "unchecked",
+            },
+          },
+          lease,
+          possible.integrity_sha256,
+        );
+        savedJournal = terminal;
+        setContinuousJournalStateForCurrentScope(owner.scope, owner.chapter.id, {
+          identity,
+          status: "ready",
+          journal: terminal,
+          message: receipt.outcome === "committed" ? "收到成功回执；正在读取当前目标。" : "收到拒绝回执；正在读取当前目标。",
+        });
+        if (!isCurrent()) return;
+
+        let targetStatus: "matches" | "changed" = "changed";
+        let targetMessage = "原操作已结束，但当前目标与原快照有变化；本章仍保持冻结。";
+        try {
+          targetStatus = await inspectContinuousOperationTarget(terminal, owner.scope, owner.lifecycleController.signal);
+          targetMessage = targetStatus === "matches"
+            ? "原回执与当前目标已独立核对；请审阅原稿后明确选择下一步。"
+            : "原操作已结束，但当前目标与原快照有变化；本章仍保持冻结。";
+        } catch (cause) {
+          if (!isCurrent()) return;
+          const error = normalizeApiError(cause);
+          if (error.status === 401) unauthorizedHandlerRef.current();
+          targetMessage = error.status === 401
+            ? "原回执已保存；登录状态已变化，当前目标尚未核对。"
+            : "原回执已保存，但当前目标暂时无法读取；原记录保持不变。";
+          lease.assertActive();
+          const unavailable = await writeContinuousChapterJournal(
+            prepared.storage,
+            prepared.key,
+            {
+              ...terminal,
+              observation: { ...terminal.observation, message: targetMessage, target_status: "unavailable" },
+            },
+            lease,
+            terminal.integrity_sha256,
+          );
+          savedJournal = unavailable;
+          setContinuousJournalStateForCurrentScope(owner.scope, owner.chapter.id, {
+            identity,
+            status: "ready",
+            journal: unavailable,
+            message: targetMessage,
+          });
+          return;
+        }
+        if (!isCurrent()) return;
+        lease.assertActive();
+        const reviewed = await writeContinuousChapterJournal(
+          prepared.storage,
+          prepared.key,
+          {
+            ...terminal,
+            observation: { ...terminal.observation, message: targetMessage, target_status: targetStatus },
+          },
+          lease,
+          terminal.integrity_sha256,
+        );
+        savedJournal = reviewed;
+        setContinuousJournalStateForCurrentScope(owner.scope, owner.chapter.id, {
+          identity,
+          status: "ready",
+          journal: reviewed,
+          message: targetMessage,
+        });
+        if (receipt.outcome === "committed") {
+          updateContinuousChapterEditor(owner.sessionId, (current) => ({
+            ...current,
+            busy: false,
+            pendingUpdate: null,
+            pendingAssetCreate: null,
+            notice: targetMessage,
+          }));
+        }
+        confirmedSave = targetStatus === "matches"
+          && receipt.outcome === "committed"
+          && receipt.command_kind === "save-chapter";
+      });
+      if (confirmedSave && pendingUpdate?.content !== undefined && isCurrent()) {
+        const directory = await owner.scope.services.listChapters(owner.scope.seriesId, owner.lifecycleController.signal);
+        const matches = directory.filter((chapter) => chapter.id === owner.chapter.id && chapter.series_id === owner.scope.seriesId);
+        if (matches.length === 1) {
+          await checkContinuousRemovedAssets(
+            owner.sessionId,
+            owner,
+            matches[0]!,
+            removedContinuousAssetCandidates(owner.snapshot, pendingUpdate.content),
+          );
+        }
+      }
+    } catch (cause) {
+      if (savedJournal !== null) {
+        setContinuousJournalStateForCurrentScope(owner.scope, owner.chapter.id, {
+          identity,
+          status: "ready",
+          journal: savedJournal,
+          message: cause instanceof Error
+            ? cause.message
+            : dispatchPossible
+              ? "请求可能已发出；原记录已保留，请重新读取原 UUID。"
+              : "请求尚未发出；原草稿记录已保留，可明确放弃该未发送记录。",
+        });
+      }
+      if (!isCurrent()) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      updateContinuousChapterEditor(owner.sessionId, (current) => ({
+        ...current,
+        busy: false,
+        pendingUpdate: dispatchPossible ? pendingUpdate : null,
+        pendingAssetCreate: dispatchPossible ? pendingAssetCreate : null,
+        notice: dispatchPossible
+          ? "请求可能已发出；草稿冻结，恢复时只读取原 UUID。"
+          : savedJournal !== null
+            ? "原稿与请求已保留，但请求尚未发出；可在恢复面板明确放弃此记录。"
+            : cause instanceof ContinuousChapterJournalError
+              ? cause.message
+              : error.detail ?? error.message ?? "写入准备失败；请求未发送。",
+      }));
+    }
   }
 
   function publishContinuousOriginal(owner: ContinuousChapterEditorContext, index: number): void {
@@ -3408,7 +3945,60 @@ export function ChapterBrowser({
     });
   }
 
-  async function openContinuousChapterEditor(): Promise<void> {
+  function createRecoveredContinuousDraft(
+    journal: ContinuousChapterOperationEnvelope,
+    chapter: Chapter,
+    storyboards: StoryboardAsset[],
+    catalogs: ContinuousAssetCatalog,
+    lockIdentity: ChapterEditLockIdentity,
+  ): ContinuousRecoveredDraft {
+    const lockSnapshot = lockIdentity === null
+      ? null
+      : { user_id: lockIdentity.userId, acquired_at: lockIdentity.acquiredAt };
+    const receipt = journal.observation.receipt;
+    if (receipt?.outcome === "committed" && journal.operation.kind === "save-chapter") {
+      const snapshot = createContinuousChapterDraft(chapter, storyboards, lockSnapshot);
+      return { snapshot, frames: snapshot.frames, selectedIndex: 0, dirty: false };
+    }
+
+    const snapshot: ContinuousChapterDraftSnapshot = {
+      ...journal.snapshot,
+      chapter,
+      lockIdentity: lockSnapshot,
+      expectedStoryboards: journal.snapshot.expected_storyboards,
+    };
+    let frames = [...journal.snapshot.frames];
+    if (receipt?.outcome === "committed" && journal.operation.kind !== "save-chapter") {
+      const targetDraftId = journal.operation.target_draft_id;
+      const targetMatches = frames.map((frame, index) => frame.draftId === targetDraftId ? index : -1)
+        .filter((index) => index >= 0);
+      const assetId = receipt.result_identity.asset_id;
+      if (targetMatches.length !== 1 || typeof assetId !== "string") {
+        throw new ApiError("invalid-response", "已确认素材无法唯一关联到原镜头草稿；原记录保持不变。", null);
+      }
+      const targetIndex = targetMatches[0]!;
+      const target = frames[targetIndex]!;
+      const kind = journal.operation.kind === "create-character" ? "character"
+        : journal.operation.kind === "create-scene" ? "scene" : "prop";
+      const catalog = kind === "character" ? catalogs.characters : kind === "scene" ? catalogs.scenes : catalogs.props;
+      if (catalog.filter((asset) => asset.id === assetId && asset.series_id === chapter.series_id).length !== 1) {
+        throw new ApiError("invalid-response", "原回执素材 ID 未在当前目录中唯一找到；原记录保持不变。", null);
+      }
+      const values = kind === "character" ? target.characterIds : kind === "scene" ? target.sceneIds : target.propIds;
+      const nextValues = values.includes(assetId) ? [...values] : [...values, assetId];
+      const update = kind === "character" ? { characterIds: nextValues }
+        : kind === "scene" ? { sceneIds: nextValues }
+          : { propIds: nextValues };
+      frames = frames.map((frame, index) => index === targetIndex ? { ...frame, ...update } : frame);
+    }
+    const selectedDraftId = journal.selected_draft_id;
+    const selectedIndex = selectedDraftId === null
+      ? 0
+      : Math.max(0, frames.findIndex((frame) => frame.draftId === selectedDraftId));
+    return { snapshot, frames, selectedIndex, dirty: true };
+  }
+
+  async function openContinuousChapterEditor(recovery?: ContinuousChapterOperationEnvelope): Promise<void> {
     const directory = chapterDirectoryRef.current;
     const chapter = selectedChapter;
     if (!canEditStoryboard || !continuousPreviewActive || chapter === null || chapters === null
@@ -3418,10 +4008,19 @@ export function ChapterBrowser({
       || frameEditOpening || !sameChapterBrowserScope(directory.scope, currentScope)
       || directory.requestGeneration !== chapterRequestGeneration.current || directory.chapters !== chapters
       || !isChapterSelectableFromDirectory(directory.chapters, chapter.id, series.id)) return;
+    if (recovery === undefined) {
+      if (!await ensureNoContinuousOperationForChapter(currentScope, chapter.id)) return;
+    } else {
+      const journalScope = continuousChapterJournalScope(userId, services.apiBaseUrl, series.id, chapter.id);
+      if (!continuousChapterJournalMatchesScope(recovery, journalScope)
+        || recovery.observation.receipt === null
+        || recovery.observation.target_status !== "matches") return;
+    }
 
     const capabilityReader = services.getContinuousChapterEditCapabilities;
-    if (capabilityReader === undefined || services.updateChapter === undefined) {
-      setChapterMutationNotice("当前服务未确认整章条件保存能力；连续编辑保持只读。");
+    if (capabilityReader === undefined || services.continuousChapterOperations === undefined
+      || services.updateChapter === undefined) {
+      setChapterMutationNotice("当前服务未接入连续编辑原操作回执；为避免重复写入，整章编辑保持只读。");
       return;
     }
 
@@ -3451,8 +4050,8 @@ export function ChapterBrowser({
     try {
       const capability = await capabilityReader(controller.signal);
       if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
-      if (capability.chapterEditGuard !== 1) {
-        throw new ApiError("invalid-response", "服务未声明整章条件保存协议；已停止编辑。", null);
+      if (capability.chapterEditGuard !== 1 || capability.operationReceipt !== 1) {
+        throw new ApiError("invalid-response", "服务未声明连续编辑原操作回执协议；已停止编辑。", null);
       }
       const freshDirectory = await services.listChapters(series.id, controller.signal);
       if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
@@ -3460,8 +4059,8 @@ export function ChapterBrowser({
       if (matches.length !== 1 || matches[0]?.series_id !== series.id) {
         throw new ApiError("http", "最新目录无法唯一核对当前章节。", 409);
       }
-      const freshChapter = matches[0];
-      const [storyboards, characters, scenes, props] = await Promise.all([
+      let freshChapter = matches[0];
+      let [storyboards, characters, scenes, props] = await Promise.all([
         services.listStoryboardAssets(series.id, chapter.id, controller.signal),
         services.listCharacters(series.id, controller.signal),
         services.listScenes(series.id, controller.signal),
@@ -3469,8 +4068,15 @@ export function ChapterBrowser({
       ]);
       if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
       applyFreshChapterDirectory(freshDirectory, base.scope);
-      const catalogs = { characters, scenes, props };
+      let catalogs = { characters, scenes, props };
       validateContinuousCatalogReferences(freshChapter, catalogs);
+      if (recovery !== undefined) {
+        const targetStatus = await inspectContinuousOperationTarget(recovery, base.scope, controller.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        if (targetStatus !== "matches") {
+          throw new ApiError("http", "原回执目标已变化；重新打开草稿前必须重新核对，原记录保持不变。", 409);
+        }
+      }
 
       let lockNotice: string | null = null;
       if (typeof series.team_id === "string" && series.team_id !== "") {
@@ -3513,11 +4119,41 @@ export function ChapterBrowser({
         }
       }
       if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
-      const snapshot = createContinuousChapterDraft(
-        freshChapter,
-        storyboards,
-        lockIdentity === null ? null : { user_id: lockIdentity.userId, acquired_at: lockIdentity.acquiredAt },
-      );
+      if (recovery !== undefined) {
+        const targetStatus = await inspectContinuousOperationTarget(recovery, base.scope, controller.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        if (targetStatus !== "matches") {
+          throw new ApiError("http", "取得当前编辑锁后目标发生变化；原草稿保持冻结。", 409);
+        }
+        const currentDirectory = await services.listChapters(series.id, controller.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        const currentMatches = currentDirectory.filter((item) => item.id === chapter.id && item.series_id === series.id);
+        if (currentMatches.length !== 1) throw new ApiError("http", "恢复时章节无法唯一核对。", 409);
+        freshChapter = currentMatches[0]!;
+        [storyboards, characters, scenes, props] = await Promise.all([
+          services.listStoryboardAssets(series.id, chapter.id, controller.signal),
+          services.listCharacters(series.id, controller.signal),
+          services.listScenes(series.id, controller.signal),
+          services.listProps(series.id, controller.signal),
+        ]);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        catalogs = { characters, scenes, props };
+        validateContinuousCatalogReferences(freshChapter, catalogs);
+        const finalTargetStatus = await inspectContinuousOperationTarget(recovery, base.scope, controller.signal);
+        if (!isCurrent()) throw new ApiError("aborted", "Request was cancelled.");
+        if (finalTargetStatus !== "matches") {
+          throw new ApiError("http", "草稿恢复时目标再次变化；原记录保持不变。", 409);
+        }
+      }
+      const freshLockSnapshot = lockIdentity === null
+        ? null
+        : { user_id: lockIdentity.userId, acquired_at: lockIdentity.acquiredAt };
+      const recovered = recovery === undefined
+        ? null
+        : createRecoveredContinuousDraft(recovery, freshChapter, storyboards, catalogs, lockIdentity);
+      const snapshot = recovered?.snapshot ?? createContinuousChapterDraft(freshChapter, storyboards, freshLockSnapshot);
+      const draft = recovered?.frames ?? snapshot.frames;
+      const selectedDraftIndex = recovered?.selectedIndex ?? 0;
       const sessionId = `${chapter.id}:${workflowEpoch}:${Date.now()}`;
       const owner: ContinuousChapterEditorContext = {
         ...base,
@@ -3529,13 +4165,16 @@ export function ChapterBrowser({
         lockIdentity,
         lockNotice,
         sessionId,
+        editorSessionId: crypto.randomUUID(),
+        documentId: crypto.randomUUID(),
+        sessionGeneration: sessionGenerationRef.current,
         snapshot,
-        draft: snapshot.frames,
+        draft,
         undoStack: [],
         redoStack: [],
         catalogs,
-        selectedIndex: 0,
-        dirty: false,
+        selectedIndex: selectedDraftIndex,
+        dirty: recovered?.dirty ?? false,
         busy: false,
         pendingUpdate: null,
         pendingAssetCreate: null,
@@ -3543,7 +4182,20 @@ export function ChapterBrowser({
       };
       continuousChapterEditorRef.current = owner;
       setContinuousChapterEditor(owner);
-      publishContinuousOriginal(owner, 0);
+      publishContinuousOriginal(owner, selectedDraftIndex);
+      if (recovery !== undefined) {
+        try {
+          await clearReviewedContinuousJournal(base.scope, chapter.id, recovery, isCurrent);
+        } catch (cause) {
+          const state = currentContinuousJournalState(base.scope, chapter.id);
+          setContinuousJournalStateForCurrentScope(base.scope, chapter.id, {
+            ...state,
+            status: "ready",
+            journal: recovery,
+            message: cause instanceof Error ? cause.message : "草稿已恢复到当前页面，但原记录未能安全清理；请重试恢复。",
+          });
+        }
+      }
     } catch (cause) {
       if (isCurrent()) {
         const error = normalizeApiError(cause);
@@ -3721,83 +4373,393 @@ export function ChapterBrowser({
     if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
   }
 
-  async function verifyContinuousUnknown(sessionId: string): Promise<void> {
-    const owner = continuousChapterEditorRef.current;
-    if (owner === null || owner.sessionId !== sessionId || owner.busy) return;
-    const controller = owner.lifecycleController;
-    updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: true, notice: "正在重新读取确认结果…" }));
+  async function verifyContinuousOperationJournal(chapterId: string): Promise<void> {
+    if (continuousJournalBusy) return;
+    const scope = activeScopeRef.current;
+    const identity = continuousJournalIdentityFor(scope, chapterId);
+    const state = currentContinuousJournalState(scope, chapterId);
+    if (selectedChapterIdRef.current !== chapterId || state.identity !== identity) return;
+    if (state.status !== "ready" || state.journal === null) {
+      continuousJournal.reload();
+      return;
+    }
+    const journal = state.journal;
+    if (journal.phase === "captured_not_dispatched") {
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        ...state,
+        message: "记录明确显示请求尚未发出；请放弃此未发送记录，或返回后重新打开草稿。",
+      });
+      return;
+    }
+    const port = scope.services.continuousChapterOperations;
+    if (port === undefined) {
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        ...state,
+        message: "当前服务未提供原操作查询；记录已保留，本章写入继续锁定。",
+      });
+      return;
+    }
+    const epoch = ++continuousJournalReadEpoch.current;
+    const controller = new AbortController();
+    const isCurrent = () => epoch === continuousJournalReadEpoch.current
+      && selectedChapterIdRef.current === chapterId
+      && sameChapterBrowserScope(scope, activeScopeRef.current)
+      && sessionGenerationRef.current === sessionGeneration;
+    setContinuousJournalBusy(true);
     try {
-      if (owner.pendingAssetCreate !== null) {
-        const catalogs = await readContinuousCatalogs(owner.scope, controller.signal);
-        if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, controller.signal)) return;
-        const { kind, name, draftId } = owner.pendingAssetCreate;
-        const items = kind === "character" ? catalogs.characters : kind === "scene" ? catalogs.scenes : catalogs.props;
-        const matches = items.filter((item) => item.series_id === owner.scope.seriesId && assetLibraryName(item) === name);
-        if (matches.length === 1) {
-          attachContinuousAsset(owner, draftId, kind, matches[0]!.id, catalogs);
-        } else {
-          updateContinuousChapterEditor(sessionId, (current) => ({
-            ...current,
-            busy: false,
-            notice: matches.length === 0
-              ? "目录中仍未找到该素材；创建结果未确认，不会再次创建。"
-              : "目录中出现多个同名素材，无法唯一确认；请人工核对。",
-          }));
+      const response = await port.lookup(chapterId, journal.operation.operation_id, controller.signal);
+      if (!isCurrent()) return;
+      if (!continuousOperationReceiptMatchesJournal(response.receipt, journal, scope.userId)) {
+        throw new ApiError("invalid-response", "查询到的回执与原 UUID、账号或请求摘要不匹配；原记录保持不变。", null);
+      }
+      const journalScope = continuousChapterJournalScope(
+        scope.userId,
+        scope.services.apiBaseUrl,
+        scope.seriesId,
+        chapterId,
+      );
+      const storage = continuousChapterOperationStorage(scope.services);
+      const key = continuousChapterOperationJournalKey(journalScope);
+      await withContinuousChapterOperationLock(key, async (lease) => {
+        const current = await readContinuousChapterJournal(storage, key);
+        if (!isCurrent()) return;
+        if (current === null || current.integrity_sha256 !== journal.integrity_sha256
+          || !continuousChapterJournalMatchesScope(current, journalScope)) {
+          throw new Error("原操作记录在查询期间已变化；当前记录保持不变。");
         }
-        return;
-      }
-      if (owner.pendingUpdate === null) {
-        updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: false, notice: "没有待确认的写入。" }));
-        return;
-      }
-      const [directory, assets] = await Promise.all([
-        owner.scope.services.listChapters(owner.scope.seriesId, controller.signal),
-        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, controller.signal),
-      ]);
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, controller.signal)) return;
-      const matching = directory.filter((item) => item.id === owner.chapter.id && item.series_id === owner.scope.seriesId);
-      const fresh = matching.length === 1 ? matching[0] : undefined;
-      const content = owner.pendingUpdate.content;
-      const confirmed = fresh !== undefined && content !== undefined
-        && continuousWriteReadbackMatches(content, fresh, assets, owner.scope.seriesId);
-      if (confirmed) {
-        const orphanCandidates = removedContinuousAssetCandidates(owner.snapshot, content);
-        applyFreshChapterDirectory(directory, owner.scope);
-        refreshAssetsAfterFrameRead(owner.chapter.id, assets);
-        const nextSnapshot = createContinuousChapterDraft(fresh, assets, owner.snapshot.lockIdentity);
-        const next = updateContinuousChapterEditor(sessionId, (current) => ({
+        const phase = response.receipt.outcome === "committed"
+          ? "receipt_committed_pending_target_read" as const
+          : "receipt_rejected" as const;
+        const receiptJournal = await writeContinuousChapterJournal(storage, key, {
           ...current,
-          chapter: fresh,
-          snapshot: nextSnapshot,
-          draft: nextSnapshot.frames,
-          undoStack: [],
-          redoStack: [],
-          selectedIndex: Math.min(current.selectedIndex, Math.max(0, nextSnapshot.frames.length - 1)),
-          dirty: false,
-          busy: false,
-          pendingUpdate: null,
-          pendingAssetCreate: null,
-          notice: "已从服务器重新读取并确认整章保存。",
-        }));
-        if (next !== null) publishContinuousOriginal(next, next.selectedIndex);
-        await checkContinuousRemovedAssets(sessionId, owner, fresh, orphanCandidates);
-      } else {
-        updateContinuousChapterEditor(sessionId, (current) => ({
-          ...current,
-          busy: false,
-          notice: "重新读取后仍无法确认原写入结果。草稿与原请求保持冻结，不会自动重发。",
-        }));
-      }
+          phase,
+          observation: {
+            message: "已读取原操作回执，正在独立核对当前目标。",
+            receipt: response.receipt,
+            result: response.receipt.result,
+            target_status: "unchecked",
+          },
+        }, lease, current.integrity_sha256);
+        if (!isCurrent()) return;
+        setContinuousJournalStateForCurrentScope(scope, chapterId, {
+          identity,
+          status: "ready",
+          journal: receiptJournal,
+          message: "已读取原操作回执，正在独立核对当前目标。",
+        });
+        try {
+          const targetStatus = await inspectContinuousOperationTarget(receiptJournal, scope, controller.signal);
+          if (!isCurrent()) return;
+          const message = targetStatus === "matches"
+            ? "原回执与当前目标已独立核对；请审阅原稿后明确选择下一步。"
+            : "当前目标与原快照有变化；原草稿和回执保留，本章写入仍锁定。";
+          const reviewed = await writeContinuousChapterJournal(storage, key, {
+            ...receiptJournal,
+            observation: { ...receiptJournal.observation, message, target_status: targetStatus },
+          }, lease, receiptJournal.integrity_sha256);
+          if (!isCurrent()) return;
+          setContinuousJournalStateForCurrentScope(scope, chapterId, {
+            identity,
+            status: "ready",
+            journal: reviewed,
+            message,
+          });
+        } catch (cause) {
+          if (!isCurrent()) return;
+          const error = normalizeApiError(cause);
+          if (error.status === 401) unauthorizedHandlerRef.current();
+          const message = error.status === 401
+            ? "原回执已保存；登录状态已变化，当前目标尚未核对。"
+            : "原回执已保存，但当前目标暂时无法读取；原记录保持不变。";
+          const unavailable = await writeContinuousChapterJournal(storage, key, {
+            ...receiptJournal,
+            observation: { ...receiptJournal.observation, message, target_status: "unavailable" },
+          }, lease, receiptJournal.integrity_sha256);
+          if (!isCurrent()) return;
+          setContinuousJournalStateForCurrentScope(scope, chapterId, {
+            identity,
+            status: "ready",
+            journal: unavailable,
+            message,
+          });
+        }
+      });
     } catch (cause) {
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, controller.signal)) return;
+      if (!isCurrent()) return;
       const error = normalizeApiError(cause);
       if (error.status === 401) unauthorizedHandlerRef.current();
-      updateContinuousChapterEditor(sessionId, (current) => ({
-        ...current,
-        busy: false,
-        notice: error.status === 401 ? "登录状态已失效，当前请求结果仍待确认。" : "重新读取失败；草稿和原请求仍保留。",
-      }));
+      const latest = currentContinuousJournalState(scope, chapterId);
+      if (latest.journal !== null) {
+        setContinuousJournalStateForCurrentScope(scope, chapterId, {
+          ...latest,
+          status: "ready",
+          message: error.status === 404
+            ? "原 UUID 暂无可读回执；不会按内容或名称猜测，也不会重新提交。"
+            : error.status === 401
+              ? "当前登录状态无权读取原操作；原草稿和记录仍保留。"
+              : error.message ?? "重新读取失败；原草稿和记录仍保留。",
+        });
+      }
+    } finally {
+      if (epoch === continuousJournalReadEpoch.current) setContinuousJournalBusy(false);
     }
+  }
+
+  async function discardUndispatchedContinuousJournal(chapterId: string): Promise<void> {
+    const scope = activeScopeRef.current;
+    const identity = continuousJournalIdentityFor(scope, chapterId);
+    const state = currentContinuousJournalState(scope, chapterId);
+    const journal = state.journal;
+    if (state.status !== "ready" || journal === null || journal.phase !== "captured_not_dispatched"
+      || journal.observation.receipt !== null || selectedChapterIdRef.current !== chapterId) return;
+    const journalScope = continuousChapterJournalScope(scope.userId, scope.services.apiBaseUrl, scope.seriesId, chapterId);
+    const storage = continuousChapterOperationStorage(scope.services);
+    const key = continuousChapterOperationJournalKey(journalScope);
+    const epoch = ++continuousJournalReadEpoch.current;
+    const actionSessionGeneration = sessionGenerationRef.current;
+    const isActionCurrent = () => epoch === continuousJournalReadEpoch.current
+      && selectedChapterIdRef.current === chapterId
+      && sameChapterBrowserScope(scope, activeScopeRef.current)
+      && sessionGenerationRef.current === actionSessionGeneration;
+    const isJournalCurrent = () => isActionCurrent()
+      && currentContinuousJournalState(scope, chapterId).journal?.integrity_sha256 === journal.integrity_sha256;
+    setContinuousJournalBusy(true);
+    try {
+      await withContinuousChapterOperationLock(key, async (lease) => {
+        await discardUndispatchedContinuousChapterJournal(storage, key, journal, lease, isJournalCurrent);
+      });
+      if (!isActionCurrent()) return;
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        identity, status: "empty", journal: null, message: null,
+      });
+      const owner = continuousChapterEditorRef.current;
+      if (owner?.documentId === journal.origin.document_id) {
+        continuousChapterEditorRef.current = null;
+        setContinuousChapterEditor(null);
+        owner.lifecycleController.abort();
+        onContinuousOriginalChange?.(null);
+        void releaseOrRefreshChapterEditLock(owner, { refreshLockSnapshot: true });
+      }
+    } catch (cause) {
+      if (!isJournalCurrent()) return;
+      const latest = currentContinuousJournalState(scope, chapterId);
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        ...latest,
+        status: "ready",
+        journal,
+        message: cause instanceof Error ? cause.message : "本地原记录未清除；本章写入继续锁定。",
+      });
+    } finally {
+      if (epoch === continuousJournalReadEpoch.current) setContinuousJournalBusy(false);
+    }
+  }
+
+  async function clearReviewedContinuousJournal(
+    scope: ChapterBrowserScope,
+    chapterId: string,
+    journal: ContinuousChapterOperationEnvelope,
+    isCurrent?: () => boolean,
+  ): Promise<void> {
+    const journalScope = continuousChapterJournalScope(scope.userId, scope.services.apiBaseUrl, scope.seriesId, chapterId);
+    const storage = continuousChapterOperationStorage(scope.services);
+    const key = continuousChapterOperationJournalKey(journalScope);
+    await withContinuousChapterOperationLock(key, async (lease) => {
+      const current = await readContinuousChapterJournal(storage, key);
+      if (isCurrent !== undefined && !isCurrent()) {
+        throw new ApiError("aborted", "当前章节或账号范围已变化；原操作记录保持不变。", null);
+      }
+      if (current === null || current.integrity_sha256 !== journal.integrity_sha256) {
+        throw new Error("原记录在确认前已变化，未清除。");
+      }
+      if (isCurrent !== undefined && !isCurrent()) {
+        throw new ApiError("aborted", "当前章节或账号范围已变化；原操作记录保持不变。", null);
+      }
+      await resolveContinuousChapterJournal(storage, key, current, lease, isCurrent);
+    });
+    if (isCurrent !== undefined && !isCurrent()) {
+      throw new ApiError("aborted", "当前章节或账号范围已变化；不会更新新范围的本地状态。", null);
+    }
+    setContinuousJournalStateForCurrentScope(scope, chapterId, {
+      identity: continuousJournalIdentityFor(scope, chapterId),
+      status: "empty",
+      journal: null,
+      message: null,
+    });
+  }
+
+  async function resolveReviewedContinuousJournal(chapterId: string): Promise<void> {
+    const scope = activeScopeRef.current;
+    const state = currentContinuousJournalState(scope, chapterId);
+    const journal = state.journal;
+    if (state.status !== "ready" || journal === null || journal.observation.receipt === null
+      || journal.observation.target_status !== "matches"
+      || journal.operation.kind !== "save-chapter"
+      || journal.observation.receipt.outcome !== "committed"
+      || selectedChapterIdRef.current !== chapterId) return;
+    const epoch = ++continuousJournalReadEpoch.current;
+    const actionSessionGeneration = sessionGenerationRef.current;
+    const controller = new AbortController();
+    const isActionCurrent = () => epoch === continuousJournalReadEpoch.current
+      && selectedChapterIdRef.current === chapterId
+      && sameChapterBrowserScope(scope, activeScopeRef.current)
+      && sessionGenerationRef.current === actionSessionGeneration
+      && !controller.signal.aborted;
+    const isJournalCurrent = () => isActionCurrent()
+      && currentContinuousJournalState(scope, chapterId).journal?.integrity_sha256 === journal.integrity_sha256;
+    setContinuousJournalBusy(true);
+    try {
+      const targetStatus = await inspectContinuousOperationTarget(journal, scope, controller.signal);
+      if (!isJournalCurrent()) return;
+      if (targetStatus !== "matches") {
+        const message = "原操作回执仍保留，但当前章节已变化；请重新读取并审阅当前内容。";
+        const journalScope = continuousChapterJournalScope(scope.userId, scope.services.apiBaseUrl, scope.seriesId, chapterId);
+        const storage = continuousChapterOperationStorage(scope.services);
+        const key = continuousChapterOperationJournalKey(journalScope);
+        await withContinuousChapterOperationLock(key, async (lease) => {
+          const current = await readContinuousChapterJournal(storage, key);
+          if (!isJournalCurrent()) return;
+          if (current === null || current.integrity_sha256 !== journal.integrity_sha256) {
+            throw new Error("原记录在重新核对期间已变化；当前记录保持不变。");
+          }
+          const changed = await writeContinuousChapterJournal(storage, key, {
+            ...current,
+            observation: { ...current.observation, message, target_status: "changed" },
+          }, lease, current.integrity_sha256);
+          if (isJournalCurrent()) {
+            setContinuousJournalStateForCurrentScope(scope, chapterId, {
+              identity: continuousJournalIdentityFor(scope, chapterId),
+              status: "ready",
+              journal: changed,
+              message,
+            });
+          }
+        });
+        return;
+      }
+      if (!isJournalCurrent()) return;
+      await clearReviewedContinuousJournal(scope, chapterId, journal, isJournalCurrent);
+      if (!isActionCurrent()) return;
+      const owner = continuousChapterEditorRef.current;
+      if (owner?.documentId === journal.origin.document_id) {
+        continuousChapterEditorRef.current = null;
+        setContinuousChapterEditor(null);
+        owner.lifecycleController.abort();
+        onContinuousOriginalChange?.(null);
+        void releaseOrRefreshChapterEditLock(owner, { refreshLockSnapshot: true });
+      }
+    } catch (cause) {
+      if (!isJournalCurrent()) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
+      const latest = currentContinuousJournalState(scope, chapterId);
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        ...latest,
+        status: "ready",
+        journal,
+        message: error.detail ?? error.message ?? "当前章节尚未重新核对；原记录保持不变，本章写入继续锁定。",
+      });
+    } finally {
+      if (epoch === continuousJournalReadEpoch.current) setContinuousJournalBusy(false);
+    }
+  }
+
+  async function continueReviewedContinuousDraft(chapterId: string): Promise<void> {
+    if (continuousJournalBusy) return;
+    const scope = activeScopeRef.current;
+    const state = currentContinuousJournalState(scope, chapterId);
+    const journal = state.journal;
+    if (state.status !== "ready" || journal === null || journal.observation.receipt === null
+      || journal.observation.target_status !== "matches" || selectedChapterIdRef.current !== chapterId) return;
+    const currentOwner = continuousChapterEditorRef.current;
+    if (currentOwner === null) {
+      await openContinuousChapterEditor(journal);
+      return;
+    }
+    if (currentOwner.documentId !== journal.origin.document_id
+      || !isContinuousChapterEditorCurrent(
+        currentOwner.sessionId,
+        scope,
+        chapterId,
+        currentOwner.requestGeneration,
+        currentOwner.lifecycleController.signal,
+      )) {
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        ...state,
+        message: "当前编辑会话与原操作来源不同；原稿保持冻结，请先切换到可恢复的当前会话。",
+      });
+      return;
+    }
+    const epoch = ++continuousJournalReadEpoch.current;
+    const controller = new AbortController();
+    const isCurrent = () => epoch === continuousJournalReadEpoch.current
+      && selectedChapterIdRef.current === chapterId
+      && sameChapterBrowserScope(scope, activeScopeRef.current)
+      && sessionGenerationRef.current === currentOwner.sessionGeneration
+      && isContinuousChapterEditorCurrent(
+        currentOwner.sessionId,
+        scope,
+        chapterId,
+        currentOwner.requestGeneration,
+        currentOwner.lifecycleController.signal,
+      )
+      && !controller.signal.aborted;
+    setContinuousJournalBusy(true);
+    try {
+      if (await inspectContinuousOperationTarget(journal, scope, controller.signal) !== "matches" || !isCurrent()) {
+        throw new Error("原操作目标已变化；原稿和回执仍保留，本章继续锁定。");
+      }
+      const [directory, storyboards, catalogs] = await Promise.all([
+        scope.services.listChapters(scope.seriesId, controller.signal),
+        scope.services.listStoryboardAssets(scope.seriesId, chapterId, controller.signal),
+        readContinuousCatalogs(scope, controller.signal),
+      ]);
+      if (!isCurrent()) return;
+      const matching = directory.filter((chapter) => chapter.id === chapterId && chapter.series_id === scope.seriesId);
+      if (matching.length !== 1) throw new Error("当前章节无法唯一核对；原稿和回执仍保留。");
+      const chapter = matching[0]!;
+      const recovered = createRecoveredContinuousDraft(journal, chapter, storyboards, catalogs, currentOwner.lockIdentity);
+      const nextOwner: ContinuousChapterEditorContext = {
+        ...currentOwner,
+        chapter,
+        snapshot: recovered.snapshot,
+        draft: recovered.frames,
+        selectedIndex: recovered.selectedIndex,
+        dirty: recovered.dirty,
+        undoStack: [],
+        redoStack: [],
+        catalogs,
+        busy: false,
+        pendingUpdate: null,
+        pendingAssetCreate: null,
+        notice: recovered.dirty
+          ? "原草稿已恢复到当前会话；请继续编辑并创建新的原操作记录。"
+          : "已保存章节已核对；可继续从当前章节编辑。",
+      };
+      continuousChapterEditorRef.current = nextOwner;
+      setContinuousChapterEditor(nextOwner);
+      publishContinuousOriginal(nextOwner, recovered.selectedIndex);
+      if (await inspectContinuousOperationTarget(journal, scope, controller.signal) !== "matches" || !isCurrent()) {
+        throw new Error("确认期间目标发生变化；原记录仍保留，当前草稿保持冻结。");
+      }
+      await clearReviewedContinuousJournal(scope, chapterId, journal, isCurrent);
+    } catch (cause) {
+      if (!isCurrent()) return;
+      const latest = currentContinuousJournalState(scope, chapterId);
+      setContinuousJournalStateForCurrentScope(scope, chapterId, {
+        ...latest,
+        status: "ready",
+        journal,
+        message: cause instanceof Error ? cause.message : "当前无法继续已核对草稿；原记录保持不变。",
+      });
+    } finally {
+      if (epoch === continuousJournalReadEpoch.current) setContinuousJournalBusy(false);
+    }
+  }
+
+  async function verifyContinuousUnknown(sessionId: string): Promise<void> {
+    const owner = continuousChapterEditorRef.current;
+    if (owner === null || owner.sessionId !== sessionId) return;
+    await verifyContinuousOperationJournal(owner.chapter.id);
   }
 
   async function checkContinuousRemovedAssets(
@@ -3863,10 +4825,15 @@ export function ChapterBrowser({
   async function saveContinuousChapterEditor(sessionId: string): Promise<void> {
     const owner = continuousChapterEditorRef.current;
     if (owner === null || owner.sessionId !== sessionId || !owner.dirty || owner.busy
-      || owner.pendingUpdate !== null || owner.pendingAssetCreate !== null || services.updateChapter === undefined) return;
+      || owner.pendingUpdate !== null || owner.pendingAssetCreate !== null) return;
     let update: ReturnType<typeof buildGuardedChapterUpdate>;
+    let chapterEditGuard: Record<string, unknown>;
     try {
       update = buildGuardedChapterUpdate(owner.snapshot, owner.draft);
+      if (update.chapter_edit_guard === undefined) {
+        throw new Error("无法构造完整的章节条件保存基线。");
+      }
+      chapterEditGuard = { ...update.chapter_edit_guard };
     } catch (cause) {
       updateContinuousChapterEditor(sessionId, (current) => ({
         ...current,
@@ -3874,79 +4841,42 @@ export function ChapterBrowser({
       }));
       return;
     }
-    const signal = owner.lifecycleController.signal;
-    const updateChapter = owner.scope.services.updateChapter;
-    if (updateChapter === undefined) {
-      updateContinuousChapterEditor(sessionId, (current) => ({ ...current, notice: "当前服务未接入整章保存。" }));
-      return;
-    }
-    updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: true, pendingUpdate: update, notice: "正在核对章节、分镜素材和编辑锁…" }));
-    let writeStarted = false;
+    const request: ContinuousChapterOperationRequest = {
+      protocol_version: 1,
+      editor_session_id: owner.editorSessionId,
+      command: {
+        kind: "save-chapter",
+        content: update.content ?? [],
+        chapter_edit_guard: chapterEditGuard,
+        draft_frame_ids: owner.draft.map((frame) => frame.draftId),
+      },
+    };
+    updateContinuousChapterEditor(sessionId, (current) => ({
+      ...current,
+      busy: true,
+      pendingUpdate: update,
+      notice: "正在完整保存原稿与请求记录…",
+    }));
     try {
-      const [directory, assets, catalogs] = await Promise.all([
-        owner.scope.services.listChapters(owner.scope.seriesId, signal),
-        owner.scope.services.listStoryboardAssets(owner.scope.seriesId, owner.chapter.id, signal),
-        readContinuousCatalogs(owner.scope, signal),
-      ]);
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
-      const matching = directory.filter((item) => item.id === owner.chapter.id && item.series_id === owner.scope.seriesId);
-      const fresh = matching.length === 1 ? matching[0] : undefined;
-      if (fresh === undefined || fresh.order !== owner.snapshot.chapter.order
-        || !sameChapterContent(fresh.content, owner.snapshot.chapter.content)
-        || !sameStoryboardAssetPositions(owner.snapshot.expectedStoryboards.map((item) => ({ ...item })), assets)) {
-        updateContinuousChapterEditor(sessionId, (current) => ({
-          ...current,
-          busy: false,
-          pendingUpdate: null,
-          notice: "章节或分镜目录已变化；草稿保留，未发送写入。请重新读取核对后再开新会话。",
-        }));
+      if (!await ensureNoContinuousOperationForChapter(owner.scope, owner.chapter.id)) {
+        updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: false, pendingUpdate: null }));
         return;
       }
-      validateContinuousCatalogReferences({ ...owner.chapter, content: update.content ?? [] }, catalogs);
-      if (owner.lockIdentity !== null) {
-        const readLock = owner.scope.services.getChapterEditLock;
-        if (readLock === undefined) throw new ApiError("invalid-response", "无法重新核对章节编辑锁。", null);
-        const lock = owner.lockLease === null
-          ? await readLock(owner.chapter.id, signal)
-          : await readLock(owner.chapter.id, signal, owner.lockLease);
-        if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
-        if (!validOwnedChapterLock(lock, owner.scope.userId) || !sameChapterEditLockIdentity(owner.lockIdentity, lock)) {
-          throw new ApiError("http", "章节编辑锁身份或有效期已变化，未发送整章写入。", 409);
-        }
-      }
-      updateContinuousChapterEditor(sessionId, (current) => ({ ...current, catalogs, notice: "目录与编辑锁已核对，正在保存…" }));
-      writeStarted = true;
-      await updateChapter(owner.scope.seriesId, owner.chapter.id, update, signal);
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      const prepared = await prepareContinuousOperation(owner, "save-chapter", null, request);
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, owner.lifecycleController.signal)) return;
+      await submitContinuousOperation(owner, prepared, request, update, null);
+    } catch (cause) {
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, owner.lifecycleController.signal)) return;
+      const error = normalizeApiError(cause);
+      if (error.status === 401) unauthorizedHandlerRef.current();
       updateContinuousChapterEditor(sessionId, (current) => ({
         ...current,
         busy: false,
-        notice: "写入已返回，正在重新读取核对…",
+        pendingUpdate: null,
+        notice: cause instanceof ContinuousChapterJournalError
+          ? cause.message
+          : error.message ?? "原稿持久化失败；请求未发送。",
       }));
-      await verifyContinuousUnknown(sessionId);
-    } catch (cause) {
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
-      const error = normalizeApiError(cause);
-      if (error.status === 401) unauthorizedHandlerRef.current();
-      const uncertain = writeStarted && (error.status === 408 || error.status === null || error.status >= 500 || error.kind === "network" || error.kind === "timeout");
-      if (uncertain) {
-        updateContinuousChapterEditor(sessionId, (current) => ({
-          ...current,
-          busy: false,
-          pendingUpdate: update,
-          notice: "保存请求已发出，但结果未确认；不会自动再次发送。",
-        }));
-        await verifyContinuousUnknown(sessionId);
-      } else {
-        updateContinuousChapterEditor(sessionId, (current) => ({
-          ...current,
-          busy: false,
-          pendingUpdate: null,
-          notice: writeStarted
-            ? error.detail ?? error.message
-            : error.detail ?? error.message ?? "保存前核对失败，草稿保留且未发送写入。",
-        }));
-      }
     }
   }
 
@@ -3960,7 +4890,6 @@ export function ChapterBrowser({
       || owner.pendingAssetCreate !== null) return;
     const draftId = owner.draft[owner.selectedIndex]?.draftId;
     if (draftId === undefined) return;
-    const signal = owner.lifecycleController.signal;
     const existingCatalog = owner.catalogs;
     const existing = (kind === "character" ? existingCatalog.characters : kind === "scene" ? existingCatalog.scenes : existingCatalog.props)
       .filter((asset) => asset.series_id === owner.scope.seriesId && assetLibraryName(asset) === name);
@@ -3969,44 +4898,63 @@ export function ChapterBrowser({
       else updateContinuousChapterEditor(sessionId, (current) => ({ ...current, notice: "素材目录中存在同名项目，无法唯一确认。" }));
       return;
     }
-    const create = kind === "character" ? owner.scope.services.createCharacter
-      : kind === "scene" ? owner.scope.services.createScene
-        : owner.scope.services.createProp;
-    if (create === undefined) {
-      updateContinuousChapterEditor(sessionId, (current) => ({ ...current, notice: "当前服务没有接入该类素材创建。" }));
+    let baseUpdate: ReturnType<typeof buildGuardedChapterUpdate>;
+    let sourceContext: Record<string, unknown>;
+    try {
+      baseUpdate = buildGuardedChapterUpdate(owner.snapshot, owner.draft);
+      if (baseUpdate.chapter_edit_guard === undefined) {
+        throw new Error("无法构造完整的章节条件保存基线。");
+      }
+      sourceContext = { ...baseUpdate.chapter_edit_guard };
+    } catch (cause) {
+      updateContinuousChapterEditor(sessionId, (current) => ({
+        ...current,
+        notice: cause instanceof Error ? cause.message : "连续编辑草稿无法安全构造。",
+      }));
       return;
     }
-    updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: true, notice: "正在创建素材并核对目录…" }));
-    let createStarted = false;
+    const operationKind: ContinuousChapterOperationKind = kind === "character" ? "create-character"
+      : kind === "scene" ? "create-scene" : "create-prop";
+    const input = kind === "character" ? { name, description: "" }
+      : kind === "scene" ? { title: name, description: "" }
+        : { name, description: "" };
+    const request: ContinuousChapterOperationRequest = {
+      protocol_version: 1,
+      editor_session_id: owner.editorSessionId,
+      command: {
+        kind: operationKind,
+        input,
+        target_draft_id: draftId,
+        source_context: sourceContext,
+        draft_frame_ids: owner.draft.map((frame) => frame.draftId),
+      },
+    };
+    updateContinuousChapterEditor(sessionId, (current) => ({
+      ...current,
+      busy: true,
+      pendingAssetCreate: { kind, name, draftId },
+      notice: "正在完整保存素材操作记录…",
+    }));
     try {
-      createStarted = true;
-      if (kind === "character") await owner.scope.services.createCharacter!(owner.scope.seriesId, { name, description: "" }, signal);
-      else if (kind === "scene") await owner.scope.services.createScene!(owner.scope.seriesId, { title: name, description: "" }, signal);
-      else await owner.scope.services.createProp!(owner.scope.seriesId, { name, description: "" }, signal);
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
-      const catalogs = await readContinuousCatalogs(owner.scope, signal);
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
-      const items = kind === "character" ? catalogs.characters : kind === "scene" ? catalogs.scenes : catalogs.props;
-      const matches = items.filter((asset) => asset.series_id === owner.scope.seriesId && assetLibraryName(asset) === name);
-      if (matches.length === 1) attachContinuousAsset(owner, draftId, kind, matches[0]!.id, catalogs);
-      else updateContinuousChapterEditor(sessionId, (current) => ({
-        ...current,
-        busy: false,
-        pendingAssetCreate: { kind, name, draftId },
-        notice: matches.length === 0 ? "创建已返回，但目录暂未确认素材；不会自动重建。" : "目录出现多个同名素材，创建结果无法唯一确认。",
-      }));
+      if (!await ensureNoContinuousOperationForChapter(owner.scope, owner.chapter.id)) {
+        updateContinuousChapterEditor(sessionId, (current) => ({ ...current, busy: false, pendingAssetCreate: null }));
+        return;
+      }
+      const prepared = await prepareContinuousOperation(owner, operationKind, draftId, request);
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, owner.lifecycleController.signal)) return;
+      await submitContinuousOperation(owner, prepared, request, null, { kind, name, draftId });
     } catch (cause) {
-      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, signal)) return;
+      if (!isContinuousChapterEditorCurrent(sessionId, owner.scope, owner.chapter.id, owner.requestGeneration, owner.lifecycleController.signal)) return;
       const error = normalizeApiError(cause);
       if (error.status === 401) unauthorizedHandlerRef.current();
-      const uncertain = createStarted && (error.status === 408 || error.status === null || error.status >= 500 || error.kind === "network" || error.kind === "timeout");
       updateContinuousChapterEditor(sessionId, (current) => ({
         ...current,
         busy: false,
-        pendingAssetCreate: uncertain ? { kind, name, draftId } : null,
-        notice: uncertain ? "素材创建结果未确认；不会自动再次创建，请重新读取目录。" : error.detail ?? error.message,
+        pendingAssetCreate: null,
+        notice: cause instanceof ContinuousChapterJournalError
+          ? cause.message
+          : error.message ?? "素材操作记录未能安全保存；请求未发送。",
       }));
-      if (uncertain) await verifyContinuousUnknown(sessionId);
     }
   }
 
@@ -4020,6 +4968,7 @@ export function ChapterBrowser({
       || !sameChapterBrowserScope(directoryAtOpen.scope, currentScope)
       || directoryAtOpen.requestGeneration !== chapterRequestGeneration.current
       || !isChapterSelectableFromDirectory(directoryAtOpen.chapters, selectedChapter.id, series.id)) return;
+    if (!await ensureNoContinuousOperationForChapter(currentScope, selectedChapter.id)) return;
     if (mode.kind === "delete" && selectedChapter.content !== null && selectedChapter.content.length <= 1) {
       setChapterMutationNotice("章节至少保留一个镜头，当前操作未打开。");
       return;
@@ -4842,6 +5791,10 @@ export function ChapterBrowser({
   }
 
   const selectedIndex = chapters?.findIndex((chapter) => chapter.id === selectedChapterId) ?? -1;
+  const continuousJournalPanelState = selectedChapterId === null || isLocalDemoServices(services)
+    ? { identity: null, status: "empty", journal: null, message: null } as ContinuousChapterOperationJournalState
+    : currentContinuousJournalState(currentScope, selectedChapterId);
+  const continuousJournalBlocksChapter = selectedChapterId !== null && continuousJournalPanelState.status !== "empty";
   const chapterPanelsOpen = personalNotesOpen || personalRoughCutOpen || frameAssetReferencesOpen || productionChecklistOpen;
   const chapterManagementBlocked = chapterPanelsOpen
     || chapterOrderEditor !== null || frameTextEditor !== null || frameStructureEditor !== null
@@ -6102,8 +7055,23 @@ export function ChapterBrowser({
         </button>
       </div>
 
+      {selectedChapter !== null && continuousJournalBlocksChapter && (
+        <ContinuousChapterRecoveryPanel
+          chapterTitle={displayChapterTitle(selectedChapter)}
+          status={continuousJournalPanelState.status}
+          journal={continuousJournalPanelState.journal}
+          message={continuousJournalPanelState.message}
+          busy={continuousJournalBusy || continuousChapterEditor?.busy === true}
+          onRetryRead={continuousJournal.reload}
+          onVerify={() => void verifyContinuousOperationJournal(selectedChapter.id)}
+          onResolve={() => void resolveReviewedContinuousJournal(selectedChapter.id)}
+          onContinueDraft={() => void continueReviewedContinuousDraft(selectedChapter.id)}
+          onDiscardUndispatched={() => void discardUndispatchedContinuousJournal(selectedChapter.id)}
+        />
+      )}
+
       <div className="chapter-browser-layout">
-        <aside className="chapter-list-panel" aria-label="章节列表" hidden={continuousPreviewActive && continuousChapterEditor !== null}>
+        <aside className="chapter-list-panel" aria-label="章节列表" hidden={continuousPreviewActive && continuousChapterEditor !== null && !continuousJournalBlocksChapter}>
           <div className="chapter-list-heading">
             <div>
               <p className="eyebrow">剧集章节</p>
@@ -6293,7 +7261,7 @@ export function ChapterBrowser({
                   {canEditFrameStructure && (
                     <button
                       className="text-button frame-structure-insert-opening"
-                      disabled={chaptersLoading || chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                      disabled={chaptersLoading || chapterManagementBlocked || chapterManagement !== null || frameEditOpening || continuousJournalBlocksChapter}
                       onClick={() => void openFrameStructureEditor({ kind: "insert", afterPosition: 0 })}
                       title={chapterManagementBlocked ? "请先关闭当前制作记录或编辑窗口" : undefined}
                       type="button"
@@ -6624,7 +7592,7 @@ export function ChapterBrowser({
                               {canEditStoryboard && sourceFrame !== undefined && frame.text.kind !== "invalid" && (
                                 <button
                                   className="text-button frame-text-edit-button"
-                                  disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                                  disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening || continuousJournalBlocksChapter}
                                   onClick={() => void openFrameTextEditor(frame.position)}
                                   title={chapterPanelsOpen ? "请先关闭当前制作记录或原图引用面板" : undefined}
                                   type="button"
@@ -6649,14 +7617,14 @@ export function ChapterBrowser({
                                 <>
                                   <button
                                     className="text-button frame-structure-insert-after"
-                                    disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                                    disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening || continuousJournalBlocksChapter}
                                     onClick={() => void openFrameStructureEditor({ kind: "insert", afterPosition: frame.position })}
                                     title={chapterManagementBlocked ? "请先关闭当前制作记录或编辑窗口" : undefined}
                                     type="button"
                                   >在此镜头后插入</button>
                                   <button
                                     className="text-button chapter-delete-action frame-structure-delete"
-                                    disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening || frames.length <= 1}
+                                    disabled={chapterManagementBlocked || chapterManagement !== null || frameEditOpening || frames.length <= 1 || continuousJournalBlocksChapter}
                                     onClick={() => void openFrameStructureEditor({ kind: "delete", position: frame.position })}
                                     title={frames.length <= 1 ? "章节至少保留一个镜头" : undefined}
                                     type="button"
@@ -6917,7 +7885,7 @@ export function ChapterBrowser({
               {chapterMutationNotice !== null && <p role="status">{chapterMutationNotice}</p>}
               <button
                 className="primary-button"
-                disabled={!canEditStoryboard || chapterManagementBlocked || chapterManagement !== null || frameEditOpening}
+                disabled={!canEditStoryboard || chapterManagementBlocked || chapterManagement !== null || frameEditOpening || continuousJournalBlocksChapter}
                 onClick={() => void openContinuousChapterEditor()}
                 type="button"
               >{frameEditOpening ? "正在核对章节与编辑锁…" : "开启整章连续编辑"}</button>
@@ -6925,7 +7893,7 @@ export function ChapterBrowser({
           )}
           {continuousPreviewActive && continuousChapterEditor !== null
             && sameChapterBrowserScope(continuousChapterEditor.scope, currentScope)
-            && continuousChapterEditor.chapter.id === selectedChapterId && (
+            && continuousChapterEditor.chapter.id === selectedChapterId && !continuousJournalBlocksChapter && (
             <ContinuousChapterEditor
               busy={continuousChapterEditor.busy}
               catalogs={continuousChapterEditor.catalogs}
